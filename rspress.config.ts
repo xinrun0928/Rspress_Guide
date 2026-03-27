@@ -58,9 +58,9 @@ export default defineConfig({
    */
   logo: {
     // 亮色主题下显示的 Logo
-    light: '/images/logo.png',
+    light: '/icon.png',
     // 暗色主题下显示的 Logo
-    dark: '/images/logo.png',
+    dark: '/icon.png',
   },
 
   // ==============================================
