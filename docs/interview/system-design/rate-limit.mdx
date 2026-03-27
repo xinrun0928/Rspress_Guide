@@ -1,0 +1,700 @@
+# 限流：保护系统的「守门员」
+
+双十一零点，商品秒杀开始。
+
+瞬间涌入的流量是平时的 100 倍。
+
+如果没有限流，系统会被打爆。
+
+**限流，就是系统的守门员。**
+
+## 一、为什么需要限流
+
+### 1.1 限流的场景
+
+```
+限流典型场景：
+
+┌─────────────────────────────────────────────────────┐
+│                   限流场景                           │
+├─────────────────────────────────────────────────────┤
+│                                                     │
+│  1. 接口保护                                        │
+│  ├── 防止恶意刷接口                                 │
+│  ├── 防止突发流量冲击系统                           │
+│  └── 保障核心接口稳定性                            │
+│                                                     │
+│  2. 系统保护                                        │
+│  ├── 防止数据库被打爆                               │
+│  ├── 防止缓存雪崩                                   │
+│  └── 防止下游服务过载                              │
+│                                                     │
+│  3. 资源保护                                        │
+│  ├── CPU、内存、网络带宽                            │
+│  └── 防止资源耗尽                                  │
+│                                                     │
+└─────────────────────────────────────────────────────┘
+```
+
+### 1.2 限流算法
+
+```
+┌─────────────────────────────────────────────────────┐
+│                   限流算法                           │
+├─────────────────────────────────────────────────────┤
+│                                                     │
+│  计数器算法                                         │
+│  ├── 固定窗口：简单，但有临界问题                    │
+│  └── 滑动窗口：精确，但实现复杂                    │
+│                                                     │
+│  漏桶算法                                           │
+│  ├── 流量恒定，易于整形                            │
+│  └── 不适合突发流量                                │
+│                                                     │
+│  令牌桶算法                                         │
+│  ├── 允许突发                                       │
+│  └── Guava RateLimiter 实现                        │
+│                                                     │
+│  计数器算法                                         │
+│  ├── 多维度组合                                     │
+│  └── Redis + Lua 实现                              │
+│                                                     │
+└─────────────────────────────────────────────────────┘
+```
+
+## 二、限流算法实现
+
+### 2.1 固定窗口计数器
+
+```java title="src/main/java/FixedWindowRateLimiter.java"
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class FixedWindowRateLimiter {
+
+    private int windowSize; // 窗口大小（秒）
+    private int maxRequests; // 窗口内最大请求数
+    private AtomicInteger count = new AtomicInteger(0);
+    private volatile long windowStart;
+
+    public FixedWindowRateLimiter(int windowSize, int maxRequests) {
+        this.windowSize = windowSize;
+        this.maxRequests = maxRequests;
+        this.windowStart = System.currentTimeMillis() / (windowSize * 1000L);
+    }
+
+    // 尝试获取令牌
+    public boolean tryAcquire() {
+        long currentWindow = System.currentTimeMillis() / (windowSize * 1000L);
+
+        // 窗口重置
+        if (currentWindow > windowStart) {
+            synchronized (this) {
+                if (currentWindow > windowStart) {
+                    windowStart = currentWindow;
+                    count.set(0);
+                }
+            }
+        }
+
+        return count.incrementAndGet() <= maxRequests;
+    }
+
+    // 获取剩余请求数
+    public int getRemaining() {
+        return Math.max(0, maxRequests - count.get());
+    }
+}
+```
+
+### 2.2 滑动窗口计数器
+
+```java title="src/main/java/SlidingWindowRateLimiter.java"
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.ConcurrentLinkedDeque;
+
+public class SlidingWindowRateLimiter {
+
+    private int windowSizeInSeconds;
+    private int maxRequests;
+    private ConcurrentLinkedDeque<Long> timestamps = new ConcurrentLinkedDeque<>();
+
+    public SlidingWindowRateLimiter(int windowSizeInSeconds, int maxRequests) {
+        this.windowSizeInSeconds = windowSizeInSeconds;
+        this.maxRequests = maxRequests;
+    }
+
+    // 尝试获取令牌
+    public synchronized boolean tryAcquire() {
+        long now = System.currentTimeMillis();
+        long windowStart = now - windowSizeInSeconds * 1000L;
+
+        // 移除过期的请求记录
+        while (!timestamps.isEmpty() && timestamps.peekFirst() < windowStart) {
+            timestamps.pollFirst();
+        }
+
+        // 检查是否超限
+        if (timestamps.size() < maxRequests) {
+            timestamps.addLast(now);
+            return true;
+        }
+
+        return false;
+    }
+
+    // 获取剩余请求数
+    public int getRemaining() {
+        long now = System.currentTimeMillis();
+        long windowStart = now - windowSizeInSeconds * 1000L;
+
+        // 移除过期记录
+        while (!timestamps.isEmpty() && timestamps.peekFirst() < windowStart) {
+            timestamps.pollFirst();
+        }
+
+        return Math.max(0, maxRequests - timestamps.size());
+    }
+}
+```
+
+### 2.3 漏桶算法
+
+```java title="src/main/java/LeakyBucketRateLimiter.java"
+import java.util.concurrent.atomic.AtomicLong;
+
+public class LeakyBucketRateLimiter {
+
+    private double capacity; // 桶容量
+    private double leakRate; // 漏出速率（个/秒）
+    private double currentWater; // 当前水量
+    private long lastLeakTime; // 上次漏水时间
+
+    public LeakyBucketRateLimiter(double capacity, double leakRate) {
+        this.capacity = capacity;
+        this.leakRate = leakRate;
+        this.currentWater = 0;
+        this.lastLeakTime = System.currentTimeMillis();
+    }
+
+    // 尝试放入请求
+    public synchronized boolean tryAcquire() {
+        leak(); // 先漏水
+
+        if (currentWater < capacity) {
+            currentWater++;
+            return true;
+        }
+
+        return false;
+    }
+
+    // 漏水
+    private void leak() {
+        long now = System.currentTimeMillis();
+        long elapsed = now - lastLeakTime;
+        lastLeakTime = now;
+
+        // 计算漏出的水量
+        double leaked = elapsed * leakRate / 1000.0;
+        currentWater = Math.max(0, currentWater - leaked);
+    }
+}
+```
+
+### 2.4 令牌桶算法
+
+```java title="src/main/java/TokenBucketRateLimiter.java"
+import java.util.concurrent.atomic.AtomicLong;
+
+public class TokenBucketRateLimiter {
+
+    private double capacity; // 桶容量
+    private double refillRate; // 补充速率（个/秒）
+    private AtomicLong tokens;
+    private AtomicLong lastRefillTime;
+
+    public TokenBucketRateLimiter(double capacity, double refillRate) {
+        this.capacity = capacity;
+        this.refillRate = refillRate;
+        this.tokens = new AtomicLong((long) capacity);
+        this.lastRefillTime = new AtomicLong(System.currentTimeMillis());
+    }
+
+    // 尝试获取令牌
+    public synchronized boolean tryAcquire() {
+        refill();
+
+        if (tokens.get() > 0) {
+            tokens.decrementAndGet();
+            return true;
+        }
+
+        return false;
+    }
+
+    // 获取令牌（阻塞）
+    public void acquire() throws InterruptedException {
+        while (!tryAcquire()) {
+            Thread.sleep(10);
+        }
+    }
+
+    // 补充令牌
+    private void refill() {
+        long now = System.currentTimeMillis();
+        long elapsed = now - lastRefillTime.get();
+        lastRefillTime.set(now);
+
+        double tokensToAdd = elapsed * refillRate / 1000.0;
+        long newTokens = Math.min(capacity, (long) (tokens.get() + tokensToAdd));
+        tokens.set(newTokens);
+    }
+
+    // 获取剩余令牌数
+    public double getAvailableTokens() {
+        refill();
+        return tokens.get();
+    }
+}
+```
+
+## 三、分布式限流
+
+### 3.1 Redis 滑动窗口
+
+```java title="src/main/java/RedisRateLimiter.java"
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
+import java.util.Arrays;
+import java.util.List;
+
+public class RedisRateLimiter {
+
+    private StringRedisTemplate redisTemplate;
+
+    // Lua 脚本保证原子性
+    private static final String SLIDING_WINDOW_SCRIPT =
+        "local key = KEYS[1]\n" +
+        "local window = tonumber(ARGV[1])\n" +
+        "local limit = tonumber(ARGV[2])\n" +
+        "local now = tonumber(ARGV[3])\n" +
+        "local windowStart = now - window\n" +
+        "\n" +
+        "-- 移除窗口外的请求\n" +
+        "redis.call('ZREMRANGEBYSCORE', key, '-inf', windowStart)\n" +
+        "\n" +
+        "-- 获取当前窗口内的请求数\n" +
+        "local current = redis.call('ZCARD', key)\n" +
+        "\n" +
+        "-- 检查是否超限\n" +
+        "if current < limit then\n" +
+        "    redis.call('ZADD', key, now, now .. ':' .. math.random())\n" +
+        "    redis.call('EXPIRE', key, window / 1000 + 1)\n" +
+        "    return 1\n" +
+        "else\n" +
+        "    return 0\n" +
+        "end";
+
+    // 滑动窗口限流
+    public boolean tryAcquire(String key, int windowMs, int limit) {
+        DefaultRedisScript<Long> script = new DefaultRedisScript<>();
+        script.setScriptText(SLIDING_WINDOW_SCRIPT);
+        script.setResultType(Long.class);
+
+        Long result = redisTemplate.execute(
+            script,
+            Arrays.asList(key),
+            String.valueOf(windowMs),
+            String.valueOf(limit),
+            String.valueOf(System.currentTimeMillis())
+        );
+
+        return result != null && result == 1;
+    }
+
+    // 多维度限流
+    public boolean tryAcquireMulti(String userId, String api, int windowMs, int limit) {
+        // 用户维度限流
+        String userKey = "ratelimit:user:" + userId;
+        boolean userOk = tryAcquire(userKey, windowMs, limit);
+
+        // API 维度限流
+        String apiKey = "ratelimit:api:" + api;
+        boolean apiOk = tryAcquire(apiKey, windowMs, limit);
+
+        return userOk && apiOk;
+    }
+}
+```
+
+### 3.2 Redis 令牌桶
+
+```java title="src/main/java/RedisTokenBucket.java"
+import org.springframework.data.redis.core.StringRedisTemplate;
+
+public class RedisTokenBucket {
+
+    private StringRedisTemplate redisTemplate;
+
+    // 令牌桶 Lua 脚本
+    private static final String TOKEN_BUCKET_SCRIPT =
+        "local key = KEYS[1]\n" +
+        "local capacity = tonumber(ARGV[1])\n" +
+        "local rate = tonumber(ARGV[2])\n" +
+        "local now = tonumber(ARGV[3])\n" +
+        "\n" +
+        "local data = redis.call('HMGET', key, 'tokens', 'last_time')\n" +
+        "local tokens = tonumber(data[1]) or capacity\n" +
+        "local last_time = tonumber(data[2]) or now\n" +
+        "\n" +
+        "-- 计算应该补充的令牌数\n" +
+        "local elapsed = math.max(0, now - last_time)\n" +
+        "local new_tokens = math.min(capacity, tokens + elapsed * rate)\n" +
+        "\n" +
+        "if new_tokens >= 1 then\n" +
+        "    new_tokens = new_tokens - 1\n" +
+        "    redis.call('HMSET', key, 'tokens', new_tokens, 'last_time', now)\n" +
+        "    redis.call('EXPIRE', key, math.ceil(capacity / rate) + 1)\n" +
+        "    return 1\n" +
+        "else\n" +
+        "    redis.call('HMSET', key, 'tokens', new_tokens, 'last_time', now)\n" +
+        "    redis.call('EXPIRE', key, math.ceil(capacity / rate) + 1)\n" +
+        "    return 0\n" +
+        "end";
+
+    // 获取令牌
+    public boolean tryAcquire(String key, int capacity, double rate) {
+        Long result = redisTemplate.execute(
+            new DefaultRedisScript<>(TOKEN_BUCKET_SCRIPT, Long.class),
+            Arrays.asList(key),
+            String.valueOf(capacity),
+            String.valueOf(rate),
+            String.valueOf(System.currentTimeMillis() / 1000.0)
+        );
+
+        return result != null && result == 1;
+    }
+}
+```
+
+## 四、限流应用
+
+### 4.1 接口限流注解
+
+```java title="src/main/java/RateLimitAspect.java"
+@Aspect
+@Component
+public class RateLimitAspect {
+
+    @Autowired
+    private RedisRateLimiter redisRateLimiter;
+
+    @Around("@annotation(rateLimit)")
+    public Object around(ProceedingJoinPoint joinPoint, RateLimit rateLimit)
+            throws Throwable {
+        String key = rateLimit.key();
+        int windowMs = rateLimit.windowMs();
+        int limit = rateLimit.limit();
+
+        // 获取用户 ID（从上下文）
+        String userId = getUserId();
+        if (userId != null) {
+            key = key + ":" + userId;
+        }
+
+        boolean allowed = redisRateLimiter.tryAcquire(key, windowMs, limit);
+
+        if (!allowed) {
+            throw new RateLimitException("请求过于频繁，请稍后再试");
+        }
+
+        return joinPoint.proceed();
+    }
+
+    private String getUserId() {
+        // 从 Security Context 获取
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+        if (auth != null && auth.getPrincipal() instanceof UserDetails) {
+            return ((UserDetails) auth.getPrincipal()).getUsername();
+        }
+        return null;
+    }
+}
+
+// 自定义注解
+@Target(ElementType.METHOD)
+@Retention(RetentionPolicy.RUNTIME)
+public @interface RateLimit {
+    String key() default "";
+    int windowMs() default 1000;
+    int limit() default 100;
+}
+
+// 使用示例
+@RateLimit(key = "api:order", windowMs = 1000, limit = 10)
+public Order createOrder(CreateOrderRequest request) {
+    // 创建订单
+}
+```
+
+### 4.2 网关限流
+
+```java title="src/main/java/GatewayRateLimiter.java"
+public class GatewayRateLimiterConfig {
+
+    // Spring Cloud Gateway 限流配置
+    // application.yml
+    /*
+    spring:
+      cloud:
+        gateway:
+          routes:
+            - id: order-service
+              uri: lb://order-service
+              filters:
+                - name: RequestRateLimiter
+                  args:
+                    redis-rate-limiter.replenishRate: 100
+                    redis-rate-limiter.burstCapacity: 200
+                    key-resolver: "#{@userKeyResolver}"
+    */
+
+    // 自定义 Key Resolver
+    @Bean
+    public KeyResolver userKeyResolver() {
+        return exchange -> {
+            String userId = exchange.getRequest().getHeaders().getFirst("X-User-Id");
+            if (userId == null) {
+                userId = exchange.getRequest().getRemoteAddress().getAddress().getHostAddress();
+            }
+            return Mono.just(userId);
+        };
+    }
+
+    // API 维度限流
+    @Bean
+    public KeyResolver apiKeyResolver() {
+        return exchange -> Mono.just(
+            exchange.getRequest().getPath().value()
+        );
+    }
+
+    // 用户 + API 组合限流
+    @Bean
+    public KeyResolver userApiKeyResolver() {
+        return exchange -> {
+            String userId = exchange.getRequest().getHeaders().getFirst("X-User-Id");
+            String api = exchange.getRequest().getPath().value();
+            return Mono.just(userId + ":" + api);
+        };
+    }
+}
+```
+
+### 4.3 多级限流
+
+```java title="src/main/java/MultiLevelRateLimiter.java"
+public class MultiLevelRateLimiter {
+
+    private RedisRateLimiter redisRateLimiter;
+
+    // 限流层级
+    public boolean tryAcquire(String userId, String api) {
+        // 1. 用户维度：每秒 10 次
+        String userKey = "ratelimit:user:" + userId;
+        boolean userAllowed = redisRateLimiter.tryAcquire(userKey, 1000, 10);
+        if (!userAllowed) {
+            return false;
+        }
+
+        // 2. API 维度：每秒 1000 次
+        String apiKey = "ratelimit:api:" + api;
+        boolean apiAllowed = redisRateLimiter.tryAcquire(apiKey, 1000, 1000);
+        if (!apiAllowed) {
+            return false;
+        }
+
+        // 3. 全局限流：每秒 10000 次
+        String globalKey = "ratelimit:global";
+        boolean globalAllowed = redisRateLimiter.tryAcquire(globalKey, 1000, 10000);
+        if (!globalAllowed) {
+            return false;
+        }
+
+        return true;
+    }
+}
+```
+
+## 五、限流策略
+
+### 5.1 限流后的处理
+
+```java title="src/main/java/RateLimitHandler.java"
+public class RateLimitHandler {
+
+    // 限流后的处理策略
+
+    // 1. 直接拒绝
+    public void handleDirectReject(HttpServletResponse response) throws IOException {
+        response.setStatus(429);
+        response.setContentType("application/json");
+        response.getWriter().write(
+            "{\"code\":429,\"message\":\"请求过于频繁\"}"
+        );
+    }
+
+    // 2. 返回重试时间
+    public void handleWithRetryAfter(HttpServletResponse response,
+                                     long retryAfterMs) throws IOException {
+        response.setStatus(429);
+        response.setHeader("Retry-After", String.valueOf(retryAfterMs / 1000));
+        response.setContentType("application/json");
+        response.getWriter().write(
+            "{\"code\":429,\"message\":\"请求过于频繁\",\"retryAfter\":" +
+            retryAfterMs + "}"
+        );
+    }
+
+    // 3. 排队等待
+    public CompletableFuture<Object> handleWithQueue(Supplier<Object> task,
+                                                     int maxQueueSize) {
+        return CompletableFuture.supplyAsync(task);
+    }
+}
+```
+
+### 5.2 降级与限流
+
+```java title="src/main/java/RateLimitWithDegrade.java"
+public class RateLimitWithDegrade {
+
+    // 限流 + 降级
+
+    @Autowired
+    private RedisRateLimiter redisRateLimiter;
+
+    @HystrixCommand(fallbackMethod = "fallback")
+    public Result doSomething(String param) {
+        // 限流检查
+        String key = "ratelimit:" + getApi();
+        if (!redisRateLimiter.tryAcquire(key, 1000, 100)) {
+            throw new RateLimitException("限流中");
+        }
+
+        // 业务逻辑
+        return doBusiness(param);
+    }
+
+    // 降级方法
+    public Result fallback(String param, Throwable t) {
+        if (t instanceof RateLimitException) {
+            return Result.fail("系统繁忙，请稍后重试");
+        }
+        return Result.fail("服务暂不可用");
+    }
+}
+```
+
+## 六、面试高频问题
+
+### Q1：常见限流算法有哪些？
+
+```
+1. 固定窗口计数器
+   - 实现简单
+   - 有临界问题：窗口边界可能有 2 倍流量
+
+2. 滑动窗口计数器
+   - 精确
+   - 实现复杂一点
+
+3. 漏桶算法
+   - 流量平滑
+   - 不适合突发流量
+
+4. 令牌桶算法
+   - 允许突发
+   - Guava、Redis 实现
+```
+
+### Q2：分布式限流如何保证准确性？
+
+```
+保证准确性的方法：
+
+1. Redis + Lua
+   - 保证原子性
+   - 避免并发问题
+
+2. 滑动窗口
+   - 比固定窗口更精确
+   - 解决边界问题
+
+3. 多级限流
+   - 用户维度 + API 维度 + 全局维度
+   - 组合策略
+
+4. 同步机制
+   - 使用 Redisson 的信号量
+   - 悲观限流
+```
+
+### Q3：如何选择限流参数？
+
+```
+参数选择原则：
+
+1. QPS 估算
+   - 根据系统能力估算
+   - 留 20% 余量
+
+2. 用户维度
+   - 考虑正常用户行为
+   - 设置合理的上限
+
+3. 业务特性
+   - 秒杀：低 QPS，高并发
+   - 查询：高 QPS，低并发
+
+4. 动态调整
+   - 根据监控数据调整
+   - 高峰期自动提高
+```
+
+## 七、总结
+
+```
+┌─────────────────────────────────────────────────────┐
+│                  限流核心知识点                          │
+├─────────────────────────────────────────────────────┤
+│                                                     │
+│  限流算法                                            │
+│  ├── 固定窗口：简单，有边界问题                       │
+│  ├── 滑动窗口：精确，实现复杂                        │
+│  ├── 漏桶：流量平滑，不适合突发                      │
+│  └── 令牌桶：允许突发，常用                          │
+│                                                     │
+│  分布式限流                                          │
+│  ├── Redis + Lua 保证原子性                        │
+│  ├── 多维度限流                                     │
+│  └── 多级限流策略                                   │
+│                                                     │
+│  应用场景                                            │
+│  ├── 网关限流                                       │
+│  ├── 接口限流                                       │
+│  └── 系统保护                                       │
+│                                                     │
+│  注意事项                                            │
+│  ├── 限流后友好提示                                 │
+│  ├── 留有应急通道                                   │
+│  └── 动态调整参数                                   │
+│                                                     │
+└─────────────────────────────────────────────────────┘
+```
+
+**面试加分点**：
+- 能解释各种限流算法的原理和优缺点
+- 能实现单机和分布式限流
+- 能设计多维度限流策略
+- 能说明限流后的降级处理

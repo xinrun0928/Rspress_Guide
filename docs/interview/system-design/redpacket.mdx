@@ -1,0 +1,652 @@
+# 红包系统：如何在 10 万人同时抢的时候不「塌房」
+
+微信红包，春节高峰期每秒几十万并发。
+
+一个人发红包，10 万人同时抢。
+
+每笔红包金额还要随机生成。
+
+**这个系统是怎么做到的？**
+
+## 一、红包系统的核心问题
+
+### 1.1 技术挑战
+
+```
+红包系统的挑战：
+
+┌─────────────────────────────────────────────────────┐
+│                   红包系统挑战                        │
+├─────────────────────────────────────────────────────┤
+│                                                     │
+│  1. 高并发                                          │
+│  ├── 春节红包：每秒几十万请求                        │
+│  ├── 瞬时流量洪峰                                  │
+│  └── 需要扛住不崩溃                                │
+│                                                     │
+│  2. 数据一致性                                      │
+│  ├── 金额不能超发                                  │
+│  ├── 金额不能少发                                  │
+│  └── 每人只能抢一次                                │
+│                                                     │
+│  3. 随机金额生成                                    │
+│  ├── 金额要看起来随机                              │
+│  ├── 最后一个红包金额固定                          │
+│  └── 金额分布要合理                                │
+│                                                     │
+│  4. 性能要求                                        │
+│  ├── 用户感知要快（< 1 秒）                        │
+│  ├── 不能出现超发                                  │
+│  └── 不能出现重复领取                              │
+│                                                     │
+└─────────────────────────────────────────────────────┘
+```
+
+### 1.2 解决方案概览
+
+```
+解决方案：
+
+1. 异步化
+   - 用户请求先入队列
+   - 异步处理抢红包逻辑
+   - 立即返回排队中
+
+2. 预扣减
+   - 抢红包时先扣库存
+   - 失败则回滚
+   - 保证不超发
+
+3. 分桶存储
+   - 按红包 ID 分桶
+   - 减少并发冲突
+   - 提高吞吐量
+
+4. 幂等设计
+   - 用户抢红包时检查幂等
+   - 重复请求直接返回
+```
+
+## 二、红包金额算法
+
+### 2.1 二倍均值法
+
+```java title="src/main/java/HongbaoAlgorithm.java"
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.util.Random;
+
+public class HongbaoAlgorithm {
+
+    private Random random = new Random();
+
+    /**
+     * 二倍均值法生成红包金额
+     *
+     * 原理：
+     * - 剩余红包金额 / 剩余人数 * 2 = 随机范围上限
+     * - 随机生成 [0.01, 上限) 的金额
+     * - 最后一个红包拿剩余全部
+     *
+     * 优点：
+     * - 金额看起来随机
+     * - 不会分出极端金额
+     * - 每人至少能拿到最小金额
+     */
+    public BigDecimal[] generateHongbao(BigDecimal totalAmount,
+                                         int totalCount,
+                                         BigDecimal minAmount) {
+        BigDecimal[] amounts = new BigDecimal[totalCount];
+        BigDecimal remaining = totalAmount;
+        int remainingCount = totalCount;
+
+        for (int i = 0; i < totalCount - 1; i++) {
+            // 计算当前红包的最大可能金额
+            // double avg = remaining / remainingCount;
+            // double max = avg * 2;
+            BigDecimal avg = remaining.divide(
+                BigDecimal.valueOf(remainingCount), 2, RoundingMode.HALF_UP);
+            BigDecimal max = avg.multiply(BigDecimal.valueOf(2));
+
+            // 随机生成金额（注意浮点数精度问题）
+            double bound = max.subtract(minAmount)
+                .multiply(BigDecimal.valueOf(100)).doubleValue();
+
+            int amountCent = random.nextInt((int) bound + 1);
+            BigDecimal amount = minAmount.add(
+                BigDecimal.valueOf(amountCent).divide(BigDecimal.valueOf(100), 2, RoundingMode.HALF_UP));
+
+            amounts[i] = amount;
+            remaining = remaining.subtract(amount);
+            remainingCount--;
+        }
+
+        // 最后一个红包，拿剩余全部
+        amounts[totalCount - 1] = remaining;
+
+        return amounts;
+    }
+}
+```
+
+### 2.2 预处理法
+
+```java title="src/main/java/PreGenerateHongbao.java"
+import java.math.BigDecimal;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+
+public class PreGenerateHongbao {
+
+    /**
+     * 预处理方式：发红包时直接生成所有金额
+     *
+     * 适用场景：
+     * - 红包数量较小（如 < 100 个）
+     * - 对性能要求高
+     */
+    public List<BigDecimal> preGenerate(BigDecimal totalAmount,
+                                        int totalCount,
+                                        BigDecimal minAmount) {
+        // 使用线程安全的随机数生成器
+        List<Double> amounts = new ArrayList<>();
+
+        // 随机分配所有金额（粗略）
+        for (int i = 0; i < totalCount; i++) {
+            amounts.add(Math.random());
+        }
+
+        // 归一化，确保总额正确
+        double sum = amounts.stream().mapToDouble(Double::doubleValue).sum();
+        List<BigDecimal> result = new ArrayList<>();
+
+        for (int i = 0; i < totalCount - 1; i++) {
+            BigDecimal amount = totalAmount
+                .multiply(BigDecimal.valueOf(amounts.get(i) / sum))
+                .setScale(2, BigDecimal.ROUND_HALF_UP);
+
+            // 确保最小金额
+            if (amount.compareTo(minAmount) < 0) {
+                amount = minAmount;
+            }
+
+            result.add(amount);
+        }
+
+        // 最后一个红包拿剩余
+        result.add(totalAmount.subtract(
+            result.stream().reduce(BigDecimal.ZERO, BigDecimal::add)));
+
+        // 打乱顺序
+        Collections.shuffle(result);
+
+        return result;
+    }
+}
+```
+
+## 三、红包系统设计
+
+### 3.1 数据模型
+
+```java title="src/main/java/HongbaoModels.java"
+public class HongbaoModels {
+
+    // 红包
+    public static class Hongbao {
+        private Long id;
+        private String hongbaoNo;      // 红包编号
+        private Long senderId;         // 发送者
+        private BigDecimal totalAmount; // 总金额
+        private Integer totalCount;   // 总个数
+        private Integer remainCount;  // 剩余个数
+        private BigDecimal remainAmount; // 剩余金额
+        private HongbaoType type;     // 类型：普通/口令
+        private String password;       // 口令（口令红包）
+        private HongbaoStatus status; // 状态
+        private Long createTime;
+        private Long expireTime;
+    }
+
+    // 红包领取记录
+    public static class HongbaoRecord {
+        private Long id;
+        private String hongbaoNo;    // 红包编号
+        private Long receiverId;      // 领取者
+        private BigDecimal amount;    // 领取金额
+        private Long receiveTime;    // 领取时间
+    }
+
+    // 红包状态
+    public enum HongbaoStatus {
+        SENDING,      // 发红包中
+        SENDED,       // 已发出
+        EXPIRED,      // 已过期
+        FINISHED      // 已领完
+    }
+
+    // 红包类型
+    public enum HongbaoType {
+        NORMAL,      // 普通红包
+        PASSWORD,    // 口令红包
+        LUCKY        // 拼手气红包
+    }
+}
+```
+
+### 3.2 发红包流程
+
+```java title="src/main/java/SendHongbaoService.java"
+@Service
+public class SendHongbaoService {
+
+    @Autowired
+    private HongbaoDao hongbaoDao;
+
+    @Autowired
+    private HongbaoGenerator generator;
+
+    @Autowired
+    private AccountService accountService;
+
+    @Transactional
+    public Hongbao sendHongbao(Long senderId, BigDecimal totalAmount,
+                               int totalCount, String type) {
+        // 1. 校验参数
+        BigDecimal minAmount = new BigDecimal("0.01");
+        if (totalAmount.compareTo(minAmount.multiply(BigDecimal.valueOf(totalCount))) < 0) {
+            throw new BusinessException("红包金额太小");
+        }
+
+        // 2. 扣减用户余额（先扣）
+        accountService.decreaseBalance(senderId, totalAmount);
+
+        // 3. 生成红包
+        String hongbaoNo = generateHongbaoNo();
+        List<BigDecimal> amounts = generator.generateHongbao(
+            totalAmount, totalCount, minAmount);
+
+        // 4. 存储红包信息
+        Hongbao hongbao = new Hongbao();
+        hongbao.setHongbaoNo(hongbaoNo);
+        hongbao.setSenderId(senderId);
+        hongDecimal.setTotalAmount(totalAmount);
+        hongbao.setTotalCount(totalCount);
+        hongbao.setRemainCount(totalCount);
+        hongbao.setRemainAmount(totalAmount);
+        hongbao.setStatus(HongbaoStatus.SENDED);
+        hongbao.setCreateTime(System.currentTimeMillis());
+        hongbao.setExpireTime(System.currentTimeMillis() + 24 * 3600 * 1000L);
+
+        hongbaoDao.insert(hongbao);
+
+        // 5. 预存储每个红包金额（用于抢红包时快速获取）
+        for (int i = 0; i < amounts.size(); i++) {
+            storeHongbaoItem(hongbaoNo, i, amounts.get(i));
+        }
+
+        return hongbao;
+    }
+
+    // 存储单个红包金额（使用 Redis List）
+    private void storeHongbaoItem(String hongbaoNo, int index,
+                                   BigDecimal amount) {
+        String key = "hongbao:items:" + hongbaoNo;
+        redisTemplate.opsForList().rightPush(key, amount.toString());
+        redisTemplate.expire(key, 24, TimeUnit.HOURS);
+    }
+
+    // 生成红包编号
+    private String generateHongbaoNo() {
+        // 时间戳 + 随机数
+        return String.format("%s%06d",
+            System.currentTimeMillis(),
+            ThreadLocalRandom.current().nextInt(1000000));
+    }
+}
+```
+
+### 3.3 抢红包流程
+
+```java title="src/main/java/GrabHongbaoService.java"
+@Service
+public class GrabHongbaoService {
+
+    @Autowired
+    private HongbaoDao hongbaoDao;
+
+    @Autowired
+    private HongbaoRecordDao recordDao;
+
+    @Autowired
+    private AccountService accountService;
+
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    // 抢红包
+    public GrabResult grabHongbao(Long userId, String hongbaoNo) {
+        // 1. 检查是否已经抢过（幂等）
+        String idempotentKey = "hongbao:grabbed:" + hongbaoNo + ":" + userId;
+        Boolean alreadyGrabbed = redisTemplate.hasKey(idempotentKey);
+        if (Boolean.TRUE.equals(alreadyGrabbed)) {
+            return GrabResult.alreadyGrabbed();
+        }
+
+        // 2. 检查红包是否存在
+        Hongbao hongbao = hongbaoDao.findByHongbaoNo(hongbaoNo);
+        if (hongbao == null) {
+            return GrabResult.hongbaoNotFound();
+        }
+
+        // 3. 检查红包状态
+        if (hongbao.getStatus() == HongbaoStatus.EXPIRED ||
+            hongbao.getRemainCount() <= 0) {
+            return GrabResult.hongbaoFinished();
+        }
+
+        // 4. 获取红包金额（从 Redis List 弹出一个）
+        String itemsKey = "hongbao:items:" + hongbaoNo;
+        Object amountStr = redisTemplate.opsForList().leftPop(itemsKey);
+
+        if (amountStr == null) {
+            return GrabResult.hongbaoFinished();
+        }
+
+        BigDecimal amount = new BigDecimal(amountStr.toString());
+
+        // 5. 更新红包剩余数量和金额（乐观锁 + Redis 原子操作）
+        int updated = hongbaoDao.decreaseRemain(hongbao.getId());
+        if (updated == 0) {
+            // 乐观锁失败，退款
+            redisTemplate.opsForList().leftPush(itemsKey, amountStr);
+            return GrabResult.hongbaoFinished();
+        }
+
+        // 6. 增加用户余额
+        accountService.increaseBalance(userId, amount);
+
+        // 7. 记录领取明细
+        HongbaoRecord record = new HongbaoRecord();
+        record.setHongbaoNo(hongbaoNo);
+        record.setReceiverId(userId);
+        record.setAmount(amount);
+        record.setReceiveTime(System.currentTimeMillis());
+        recordDao.insert(record);
+
+        // 8. 标记用户已领取（幂等）
+        redisTemplate.opsForValue().set(idempotentKey, "1", 24, TimeUnit.HOURS);
+
+        return GrabResult.success(amount);
+    }
+}
+```
+
+### 3.4 乐观锁实现
+
+```java title="src/main/java/HongbaoDao.java"
+@Repository
+public class HongbaoDao {
+
+    @Autowired
+    private JdbcTemplate jdbcTemplate;
+
+    // 乐观锁扣减剩余数量
+    public int decreaseRemain(Long hongbaoId) {
+        String sql = "UPDATE hongbao SET " +
+            "remain_count = remain_count - 1, " +
+            "remain_amount = remain_amount - ?, " +
+            "status = CASE WHEN remain_count - 1 <= 0 THEN 'FINISHED' ELSE status END " +
+            "WHERE id = ? AND remain_count > 0";
+
+        int updated = jdbcTemplate.update(sql,
+            BigDecimal.ZERO, // 金额已在应用层扣减，这里扣减 0
+            hongbaoId);
+
+        return updated;
+    }
+
+    // 乐观锁扣减剩余金额和数量
+    public int decreaseRemainWithAmount(Long hongbaoId, BigDecimal amount) {
+        String sql = "UPDATE hongbao SET " +
+            "remain_count = remain_count - 1, " +
+            "remain_amount = remain_amount - ?, " +
+            "status = CASE WHEN remain_count - 1 <= 0 THEN 'FINISHED' ELSE status END " +
+            "WHERE id = ? AND remain_count > 0 AND remain_amount >= ?";
+
+        return jdbcTemplate.update(sql, amount, hongbaoId, amount);
+    }
+}
+```
+
+## 四、高并发优化
+
+### 4.1 多级缓存
+
+```java title="src/main/java/HongbaoCacheService.java"
+public class HongbaoCacheService {
+
+    private RedisTemplate<String, Object> redisTemplate;
+
+    // 三级缓存
+    public Hongbao getHongbao(String hongbaoNo) {
+        // 1. 本地缓存
+        Hongbao cached = localCache.get(hongbaoNo);
+        if (cached != null) {
+            return cached;
+        }
+
+        // 2. Redis 缓存
+        String redisKey = "hongbao:info:" + hongbaoNo;
+        Map<Object, Object> redisData = redisTemplate.opsForHash().entries(redisKey);
+
+        if (!redisData.isEmpty()) {
+            Hongbao hongbao = convertFromRedis(redisData);
+            localCache.put(hongbaoNo, hongbao);
+            return hongbao;
+        }
+
+        // 3. 数据库查询
+        Hongbao hongbao = hongbaoDao.findByHongbaoNo(hongbaoNo);
+        if (hongbao != null) {
+            // 回填缓存
+            putToCache(hongbao);
+        }
+
+        return hongbao;
+    }
+
+    // 更新缓存
+    public void updateCache(Hongbao hongbao) {
+        // 删除本地缓存
+        localCache.invalidate(hongbao.getHongbaoNo());
+
+        // 更新 Redis
+        String redisKey = "hongbao:info:" + hongbao.getHongbaoNo();
+        putToRedis(hongbao);
+    }
+}
+```
+
+### 4.2 分桶存储
+
+```java title="src/main/java/ShardedHongbaoStorage.java"
+public class ShardedHongbaoStorage {
+
+    private int shardCount = 16; // 分成 16 个桶
+
+    // 根据红包 ID 确定桶
+    private int getShardIndex(Long hongbaoId) {
+        return (int) (hongbaoId % shardCount);
+    }
+
+    // 分桶存储红包金额
+    public void storeHongbaoItems(Long hongbaoId, List<BigDecimal> amounts) {
+        String baseKey = "hongbao:items:";
+
+        for (int i = 0; i < amounts.size(); i++) {
+            int shardIndex = i % shardCount;
+            String key = baseKey + hongbaoId + ":" + shardIndex;
+
+            redisTemplate.opsForList().rightPush(key, amounts.get(i).toString());
+        }
+    }
+
+    // 分桶领取
+    public BigDecimal grabFromShard(Long hongbaoId, Long userId) {
+        int shardIndex = getShardIndex(hongbaoId);
+        String key = "hongbao:items:" + hongbaoId + ":" + shardIndex;
+
+        // 从指定桶获取
+        Object amountStr = redisTemplate.opsForList().leftPop(key);
+
+        if (amountStr == null) {
+            // 尝试其他桶（如果当前桶为空）
+            for (int i = 0; i < shardCount; i++) {
+                if (i == shardIndex) continue;
+                String altKey = "hongbao:items:" + hongbaoId + ":" + i;
+                amountStr = redisTemplate.opsForList().leftPop(altKey);
+                if (amountStr != null) break;
+            }
+        }
+
+        return amountStr != null ? new BigDecimal(amountStr.toString()) : null;
+    }
+}
+```
+
+### 4.3 异步处理
+
+```java title="src/main/java/AsyncGrabHongbao.java"
+public class AsyncGrabHongbao {
+
+    @Autowired
+    private KafkaTemplate<String, String> kafkaTemplate;
+
+    // 用户请求快速入队
+    public void enqueueGrabRequest(Long userId, String hongbaoNo) {
+        String message = userId + ":" + hongbaoNo;
+        kafkaTemplate.send("grab-hongbao-topic", message);
+    }
+
+    // 消费者异步处理
+    @KafkaListener(topics = "grab-hongbao-topic")
+    public void handleGrabRequest(String message) {
+        String[] parts = message.split(":");
+        Long userId = Long.parseLong(parts[0]);
+        String hongbaoNo = parts[1];
+
+        try {
+            GrabResult result = grabHongbaoService.grabHongbao(userId, hongbaoNo);
+
+            // 发送通知
+            kafkaTemplate.send("grab-result-topic",
+                userId + ":" + result.getCode());
+        } catch (Exception e) {
+            // 失败重试
+            kafkaTemplate.send("grab-retry-topic", message);
+        }
+    }
+}
+```
+
+## 五、面试高频问题
+
+### Q1：如何保证红包金额不超发？
+
+```
+保证不超发的方案：
+
+1. 预扣减
+   - 发红包时预扣总金额
+   - 抢红包时扣减剩余金额
+
+2. 乐观锁
+   - UPDATE 时检查 remain_count > 0
+   - 确保并发安全
+
+3. Redis 原子操作
+   - 使用 Lua 脚本保证原子性
+   - 扣减剩余数量和金额
+
+4. 数据库约束
+   - remain_amount >= 0 约束
+   - 超发时更新失败
+```
+
+### Q2：如何保证抢红包的公平性？
+
+```
+公平性保证：
+
+1. 先到先得
+   - 队列异步处理
+   - 严格按请求顺序
+
+2. 幂等设计
+   - 防止重复领取
+   - 使用唯一标识
+
+3. 随机金额
+   - 二倍均值算法
+   - 金额看起来随机
+
+4. 限流
+   - 防止恶意刷接口
+   - 保护系统稳定性
+```
+
+### Q3：红包金额如何设计才合理？
+
+```
+红包金额设计原则：
+
+1. 最小金额
+   - 微信红包最小 0.01 元
+
+2. 最大金额
+   - 单个红包不超过总金额的一定比例
+
+3. 分布合理
+   - 二倍均值：金额分布均匀
+   - 不会出现极端值
+
+4. 总额一致
+   - 所有金额之和 = 红包总金额
+```
+
+## 六、总结
+
+```
+┌─────────────────────────────────────────────────────┐
+│                 红包系统核心知识点                        │
+├─────────────────────────────────────────────────────┤
+│                                                     │
+│  金额算法                                            │
+│  ├── 二倍均值法：金额分布均匀                        │
+│  └── 预处理法：提前生成所有金额                      │
+│                                                     │
+│  高并发处理                                          │
+│  ├── 预扣减：先扣总金额                             │
+│  ├── 乐观锁：防止超发                              │
+│  ├── 分桶存储：减少并发冲突                        │
+│  └── 异步队列：削峰填谷                            │
+│                                                     │
+│  幂等设计                                            │
+│  ├── 用户维度：防止重复领取                        │
+│  └── 红包维度：防止重复发放                        │
+│                                                     │
+│  注意事项                                            │
+│  ├── 金额不能为负                                  │
+│  ├── 最后一包要拿完                                │
+│  └── 并发安全最重要                                │
+│                                                     │
+└─────────────────────────────────────────────────────┘
+```
+
+**面试加分点**：
+- 能解释红包金额算法（二倍均值）
+- 能设计高并发下的抢红包流程
+- 能说明如何保证不超发
+- 能分析乐观锁和异步处理的作用

@@ -1,0 +1,570 @@
+# 排行榜系统：如何让你的系统「稳坐第一」
+
+微博热搜、抖音热榜、游戏排行榜——
+
+这些排行榜背后的技术是什么？
+
+## 一、排行榜系统的核心问题
+
+### 1.1 应用场景
+
+```
+┌─────────────────────────────────────────────────────┐
+│                   排行榜典型场景                      │
+├─────────────────────────────────────────────────────┤
+│                                                     │
+│  社交平台                                            │
+│  ├── 热搜榜：微博热搜、抖音热榜                      │
+│  ├── 粉丝榜：用户粉丝数量排行                       │
+│  └── 活跃榜：用户活跃度排行                         │
+│                                                     │
+│  游戏                                               │
+│  ├── 等级榜：玩家等级排名                           │
+│  ├── 战力榜：玩家战斗力排名                         │
+│  └── 财富榜：玩家金币排名                           │
+│                                                     │
+│  电商                                               │
+│  ├── 销量榜：商品销量排名                           │
+│  ├── 好评榜：店铺评分排名                           │
+│  └── 新品榜：新上架商品排名                         │
+│                                                     │
+└─────────────────────────────────────────────────────┘
+```
+
+### 1.2 技术挑战
+
+```
+排行榜系统的挑战：
+
+1. 实时性
+   - 分数变化后立即反映到排行榜
+   - 用户期望看到实时排名
+
+2. 高并发
+   - 热点事件导致大量用户同时更新分数
+   - 同时有大量用户查询排行榜
+
+3. 数据量
+   - 可能需要排名亿级用户
+   - 查询 Top N 时需要高效排序
+
+4. 准确性
+   - 同分时需要公平排名
+   - 分数相同时按时间或 ID 排序
+```
+
+## 二、Redis 实现排行榜
+
+### 2.1 基本实现
+
+```java title="src/main/java/RedisRankingService.java"
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.ZSetOperations;
+import java.util.*;
+
+public class RedisRankingService {
+
+    private StringRedisTemplate redisTemplate;
+
+    // 添加/更新用户分数
+    public void updateScore(String leaderboardKey, String userId, double score) {
+        redisTemplate.opsForZSet().add(leaderboardKey, userId, score);
+    }
+
+    // 获取用户排名（从 0 开始）
+    public Long getRank(String leaderboardKey, String userId) {
+        Long rank = redisTemplate.opsForZSet().reverseRank(leaderboardKey, userId);
+        return rank != null ? rank + 1 : null; // 转为从 1 开始
+    }
+
+    // 获取 Top N
+    public List<Map.Entry<String, Double>> getTopN(String leaderboardKey, int n) {
+        Set<ZSetOperations.TypedTuple<String>> topN =
+            redisTemplate.opsForZSet().reverseRangeWithScores(leaderboardKey, 0, n - 1);
+
+        if (topN == null) {
+            return Collections.emptyList();
+        }
+
+        List<Map.Entry<String, Double>> result = new ArrayList<>();
+        for (ZSetOperations.TypedTuple<String> tuple : topN) {
+            result.add(new AbstractMap.SimpleEntry<>(tuple.getValue(), tuple.getScore()));
+        }
+        return result;
+    }
+
+    // 获取用户的分数和排名
+    public Map<String, Object> getUserInfo(String leaderboardKey, String userId) {
+        Map<String, Object> info = new HashMap<>();
+
+        Double score = redisTemplate.opsForZSet().score(leaderboardKey, userId);
+        Long rank = redisTemplate.opsForZSet().reverseRank(leaderboardKey, userId);
+
+        info.put("userId", userId);
+        info.put("score", score);
+        info.put("rank", rank != null ? rank + 1 : null);
+
+        return info;
+    }
+
+    // 删除用户
+    public void removeUser(String leaderboardKey, String userId) {
+        redisTemplate.opsForZSet().remove(leaderboardKey, userId);
+    }
+}
+```
+
+### 2.2 分数增量更新
+
+```java title="src/main/java/ScoreIncrementService.java"
+public class ScoreIncrementService {
+
+    private StringRedisTemplate redisTemplate;
+
+    // 增加用户分数（原子操作）
+    public Double incrementScore(String leaderboardKey, String userId, double delta) {
+        return redisTemplate.opsForZSet().incrementScore(leaderboardKey, userId, delta);
+    }
+
+    // 批量增加分数（使用 Pipeline）
+    public void batchIncrementScore(String leaderboardKey, Map<String, Double> increments) {
+        redisTemplate.executePipelined((RedisCallback<Object>) connection -> {
+            ZSetOperations zSetOps = redisTemplate.opsForZSet();
+
+            for (Map.Entry<String, Double> entry : increments.entrySet()) {
+                zSetOps.incrementScore(leaderboardKey, entry.getKey(), entry.getValue());
+            }
+
+            return null;
+        });
+    }
+
+    // 应用场景：用户每完成一次任务，增加 10 分
+    public void onTaskComplete(String userId) {
+        String leaderboardKey = "leaderboard:task";
+        incrementScore(leaderboardKey, userId, 10);
+    }
+
+    // 应用场景：用户每消费 1 元，增加 1 积分
+    public void onConsume(String userId, int amount) {
+        String leaderboardKey = "leaderboard:points";
+        incrementScore(leaderboardKey, userId, amount);
+    }
+}
+```
+
+### 2.3 排行榜分页
+
+```java title="src/main/java/RankingPaginationService.java"
+public class RankingPaginationService {
+
+    private StringRedisTemplate redisTemplate;
+
+    // 分页获取排行榜
+    public RankingPage getRankingByPage(String leaderboardKey, int page, int pageSize) {
+        int start = (page - 1) * pageSize;
+        int end = start + pageSize - 1;
+
+        // 获取指定页的数据
+        Set<ZSetOperations.TypedTuple<String>> items =
+            redisTemplate.opsForZSet().reverseRangeWithScores(leaderboardKey, start, end);
+
+        // 获取总数
+        Long total = redisTemplate.opsForZSet().size(leaderboardKey);
+
+        RankingPage result = new RankingPage();
+        result.setCurrentPage(page);
+        result.setPageSize(pageSize);
+        result.setTotal(total != null ? total : 0);
+        result.setTotalPages((int) Math.ceil((double) total / pageSize));
+
+        List<RankingItem> rankingItems = new ArrayList<>();
+        int rank = start + 1;
+
+        if (items != null) {
+            for (ZSetOperations.TypedTuple<String> item : items) {
+                RankingItem ri = new RankingItem();
+                ri.setRank(rank++);
+                ri.setUserId(item.getValue());
+                ri.setScore(item.getScore());
+                rankingItems.add(ri);
+            }
+        }
+
+        result.setItems(rankingItems);
+        return result;
+    }
+
+    // 获取用户周围的排名
+    public RankingPage getRankingAroundUser(String leaderboardKey, String userId,
+                                           int halfRange) {
+        Long rank = redisTemplate.opsForZSet().reverseRank(leaderboardKey, userId);
+        if (rank == null) {
+            return null;
+        }
+
+        long start = Math.max(0, rank - halfRange);
+        long end = rank + halfRange;
+
+        Set<ZSetOperations.TypedTuple<String>> items =
+            redisTemplate.opsForZSet().reverseRangeWithScores(leaderboardKey, start, end);
+
+        RankingPage result = new RankingPage();
+        List<RankingItem> rankingItems = new ArrayList<>();
+        int currentRank = (int) start + 1;
+
+        if (items != null) {
+            for (ZSetOperations.TypedTuple<String> item : items) {
+                RankingItem ri = new RankingItem();
+                ri.setRank(currentRank++);
+                ri.setUserId(item.getValue());
+                ri.setScore(item.getScore());
+                rankingItems.add(ri);
+            }
+        }
+
+        result.setItems(rankingItems);
+        result.setCurrentUserRank((int) rank + 1);
+        return result;
+    }
+}
+```
+
+## 三、复杂排名规则
+
+### 3.1 同分排名处理
+
+```java title="src/main/java/ComplexRankingService.java"
+public class ComplexRankingService {
+
+    private StringRedisTemplate redisTemplate;
+
+    // 多维度排序：分数 + 时间戳
+    // ZSet 的 score 是一个 double，可以将分数和时间戳组合
+    public void updateScoreWithTime(String leaderboardKey, String userId,
+                                    double score, long timestamp) {
+        // 将分数和时间戳组合成一个 double
+        // 分数部分：高 16 位
+        // 时间戳部分：低 8 位
+        double combinedScore = score * 1_000_000_000L + (100_000_000L - timestamp % 100_000_000L);
+        redisTemplate.opsForZSet().add(leaderboardKey, userId, combinedScore);
+    }
+
+    // 多维度排序：分数 + 等级 + 时间戳
+    public void updateScoreWithMultiDimension(String leaderboardKey, String userId,
+                                              double score, int level, long timestamp) {
+        // 分数：高 14 位
+        // 等级：中 6 位
+        // 时间戳：低 8 位
+        double combinedScore = score * 1_000_000_000_000_000L
+                             + level * 100_000_000_000_000L
+                             + (100_000_000L - timestamp % 100_000_000L);
+        redisTemplate.opsForZSet().add(leaderboardKey, userId, combinedScore);
+    }
+
+    // 同分时按 ID 排序
+    public void updateScoreWithId(String leaderboardKey, String userId,
+                                  double score, long userNumericId) {
+        // 分数：高 14 位
+        // ID：低 14 位（取反使得 ID 小的排在前面）
+        double combinedScore = score * 10_000_000_000_000_000L
+                             + (999_999_999_999_99L - userNumericId);
+        redisTemplate.opsForZSet().add(leaderboardKey, userId, combinedScore);
+    }
+}
+```
+
+### 3.2 实时榜单 vs 历史榜单
+
+```java title="src/main/java/MultiLeaderboardService.java"
+public class MultiLeaderboardService {
+
+    private StringRedisTemplate redisTemplate;
+
+    // 实时榜单（今日）
+    public void updateTodayRanking(String userId, double score) {
+        String todayKey = "leaderboard:daily:" + getTodayKey();
+        redisTemplate.opsForZSet().incrementScore(todayKey, userId, score);
+    }
+
+    // 历史榜单（累计）
+    public void updateTotalRanking(String userId, double score) {
+        String totalKey = "leaderboard:total";
+        redisTemplate.opsForZSet().incrementScore(totalKey, userId, score);
+    }
+
+    // 定时任务：每日 0 点归档昨日数据
+    public void archiveYesterdayRanking() {
+        String yesterdayKey = "leaderboard:daily:" + getYesterdayKey();
+        String archiveKey = "leaderboard:archive:" + getYesterdayKey();
+
+        // 复制到归档 key
+        redisTemplate.opsForZSet().rename(yesterdayKey, archiveKey);
+
+        // 设置过期时间（保留 30 天）
+        redisTemplate.expire(archiveKey, Duration.ofDays(30));
+    }
+
+    // 获取今日 + 历史累计排名
+    public Map<String, Object> getFullRanking(String userId) {
+        Map<String, Object> result = new HashMap<>();
+
+        // 今日排名
+        String todayKey = "leaderboard:daily:" + getTodayKey();
+        result.put("todayRank", getRank(todayKey, userId));
+        result.put("todayScore", getScore(todayKey, userId));
+
+        // 累计排名
+        String totalKey = "leaderboard:total";
+        result.put("totalRank", getRank(totalKey, userId));
+        result.put("totalScore", getScore(totalKey, userId));
+
+        return result;
+    }
+
+    private Long getRank(String key, String userId) {
+        Long rank = redisTemplate.opsForZSet().reverseRank(key, userId);
+        return rank != null ? rank + 1 : null;
+    }
+
+    private Double getScore(String key, String userId) {
+        return redisTemplate.opsForZSet().score(key, userId);
+    }
+
+    private String getTodayKey() {
+        return LocalDate.now().toString();
+    }
+
+    private String getYesterdayKey() {
+        return LocalDate.now().minusDays(1).toString();
+    }
+}
+```
+
+## 四、分布式排行榜
+
+### 4.1 分桶策略
+
+```java title="src/main/java/ShardedRankingService.java"
+public class ShardedRankingService {
+
+    private StringRedisTemplate redisTemplate;
+    private int shardCount = 10; // 分成 10 个桶
+
+    // 根据用户 ID 确定桶
+    private String getShardKey(String leaderboardKey, String userId) {
+        int shardIndex = Math.abs(userId.hashCode()) % shardCount;
+        return leaderboardKey + ":shard:" + shardIndex;
+    }
+
+    // 添加/更新分数（自动路由到对应桶）
+    public void updateScore(String leaderboardKey, String userId, double score) {
+        String shardKey = getShardKey(leaderboardKey, userId);
+        redisTemplate.opsForZSet().add(shardKey, userId, score);
+    }
+
+    // 获取排名（需要合并所有桶）
+    public Long getRank(String leaderboardKey, String userId) {
+        double userScore = 0;
+        int lowerRank = 0;
+        int equalRank = 0;
+
+        // 遍历所有桶
+        for (int i = 0; i < shardCount; i++) {
+            String shardKey = leaderboardKey + ":shard:" + i;
+
+            // 统计比该用户分数高的用户数
+            Long count = redisTemplate.opsForZSet().reverseRank(shardKey, userId);
+            if (count != null) {
+                lowerRank += count.intValue();
+            }
+
+            // 统计同分数的用户数
+            Double score = redisTemplate.opsForZSet().score(shardKey, userId);
+            if (score != null && score.equals(getScore(leaderboardKey, userId))) {
+                Long eqCount = redisTemplate.opsForZSet().count(shardKey, score, score);
+                if (eqCount != null) {
+                    equalRank += eqCount.intValue();
+                }
+            }
+        }
+
+        // 计算最终排名
+        return (long) lowerRank + 1;
+    }
+
+    // 获取 Top N（需要合并所有桶）
+    public List<RankingItem> getTopN(String leaderboardKey, int n) {
+        // 从每个桶获取 Top N
+        List<RankingItem> allItems = new ArrayList<>();
+
+        for (int i = 0; i < shardCount; i++) {
+            String shardKey = leaderboardKey + ":shard:" + i;
+            Set<ZSetOperations.TypedTuple<String>> shardTop =
+                redisTemplate.opsForZSet().reverseRangeWithScores(shardKey, 0, n - 1);
+
+            if (shardTop != null) {
+                for (ZSetOperations.TypedTuple<String> tuple : shardTop) {
+                    RankingItem item = new RankingItem();
+                    item.setUserId(tuple.getValue());
+                    item.setScore(tuple.getScore());
+                    allItems.add(item);
+                }
+            }
+        }
+
+        // 合并后排序
+        allItems.sort((a, b) -> {
+            int cmp = Double.compare(b.getScore(), a.getScore());
+            return cmp != 0 ? cmp : a.getUserId().compareTo(b.getUserId());
+        });
+
+        return allItems.subList(0, Math.min(n, allItems.size()));
+    }
+
+    private Double getScore(String leaderboardKey, String userId) {
+        String shardKey = getShardKey(leaderboardKey, userId);
+        return redisTemplate.opsForZSet().score(shardKey, userId);
+    }
+}
+```
+
+### 4.2 排行榜预计算
+
+```java title="src/main/java/RankingPrecomputeService.java"
+public class RankingPrecomputeService {
+
+    private StringRedisTemplate redisTemplate;
+
+    // 定时更新排行榜缓存
+    @Scheduled(cron = "0 */5 * * * ?") // 每 5 分钟
+    public void precomputeTopN() {
+        // 从 Redis 获取完整排行榜
+        Set<ZSetOperations.TypedTuple<String>> all =
+            redisTemplate.opsForZSet().reverseRangeWithScores(
+                "leaderboard:total", 0, 999
+            );
+
+        if (all == null) return;
+
+        // 预计算 Top 1000
+        List<String> top100 = new ArrayList<>();
+        int rank = 1;
+        for (ZSetOperations.TypedTuple<String> tuple : all) {
+            if (rank > 100) break;
+            top100.add(formatRankingItem(rank++, tuple.getValue(), tuple.getScore()));
+        }
+
+        // 缓存到 Redis
+        String cacheKey = "leaderboard:cache:top1000";
+        redisTemplate.delete(cacheKey);
+        redisTemplate.opsForList().rightPushAll(cacheKey, top100);
+
+        // 设置缓存过期时间（略大于计算间隔）
+        redisTemplate.expire(cacheKey, Duration.ofMinutes(6));
+    }
+
+    // 获取缓存的排行榜
+    public List<String> getCachedTopN(int n) {
+        String cacheKey = "leaderboard:cache:top1000";
+        return redisTemplate.opsForList().range(cacheKey, 0, n - 1);
+    }
+
+    private String formatRankingItem(int rank, String userId, Double score) {
+        return rank + "**" + userId + "**" + score;
+    }
+}
+```
+
+## 五、面试高频问题
+
+### Q1：Redis ZSet 如何实现排行榜？
+
+```
+Redis ZSet 实现原理：
+
+1. ZSet 内部使用跳表 + 字典
+   - 跳表：支持快速排序和范围查询
+   - 字典：支持 O(1) 的 score 查询
+
+2. 常用命令：
+   - ZADD：添加/更新分数
+   - ZREVRANK：获取排名（从大到小）
+   - ZREVRANGE：获取 Top N
+   - ZINCRBY：增加分数
+
+3. 性能：
+   - 时间复杂度 O(log N)
+   - 单节点可达 10 万 QPS
+```
+
+### Q2：如何处理热点事件导致的并发更新？
+
+```
+热点处理策略：
+
+1. 内存合并
+   - 先在内存中合并更新
+   - 定期批量写入 Redis
+
+2. 异步队列
+   - 更新请求写入队列
+   - 消费者异步处理
+
+3. 分桶聚合
+   - 按用户 ID 分桶
+   - 减少写冲突
+
+4. 降级方案
+   - 热点期间使用粗粒度计数
+   - 活动结束后合并
+```
+
+### Q3：如何实现实时性和准确性的平衡？
+
+```
+策略：
+
+1. 缓存 + 回源
+   - 热点数据使用本地缓存
+   - 按时间窗口更新
+
+2. 延迟聚合
+   - 分数变化先记录
+   - 定期批量聚合更新
+
+3. 近似算法
+   - 使用概率数据结构
+   - HyperLogLog、Count-Min Sketch
+```
+
+## 六、总结
+
+```
+┌─────────────────────────────────────────────────────┐
+│              排行榜系统核心知识点                        │
+├─────────────────────────────────────────────────────┤
+│                                                     │
+│  Redis ZSet 实现                                    │
+│  ├── ZADD：更新分数                                 │
+│  ├── ZREVRANK：获取排名                             │
+│  └── ZREVRANGE：获取 Top N                         │
+│                                                     │
+│  高级功能                                            │
+│  ├── 多维度排序                                     │
+│  ├── 实时榜 vs 历史榜                               │
+│  └── 分桶策略                                       │
+│                                                     │
+│  性能优化                                            │
+│  ├── Pipeline 批量操作                              │
+│  ├── 预计算缓存                                     │
+│  └── 分桶减少竞争                                   │
+│                                                     │
+└─────────────────────────────────────────────────────┘
+```
+
+**面试加分点**：
+- 能说明 Redis ZSet 的实现原理
+- 能设计多维度排序方案
+- 能解释热点事件的处理策略
+- 能分析实时性和准确性的权衡
