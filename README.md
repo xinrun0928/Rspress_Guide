@@ -313,14 +313,11 @@ Guide/
 │   └── devops/                  # 工程化与运维
 ├── .cursor/
 │   └── rules/                    # Cursor AI 规则
-│       ├── rspress-codeblock.mdc # 代码块规范
-│       ├── rspress-container.mdc # 容器规范
-│       ├── rspress-badge.mdc    # 徽章规范
-│       ├── rspress-writing.mdc   # 写作风格指南
-│       ├── rspress-checklist.mdc # 内容质量清单
-│       ├── rspress-interview.mdc # 面试专题写法
-│       ├── rspress-meta.mdc     # 目录与导航规范
-│       └── rspress-migration.mdc # 迁移规范
+│       ├── rspress-syntax.mdc      # 基础语法（代码块、容器、徽章、导航）
+│       ├── rspress-writing.mdc      # 写作风格指南
+│       ├── rspress-interview.mdc    # 面试专题写法
+│       ├── rspress-notation.mdc     # 符号转义规范
+│       └── rspress-migration.mdc   # 迁移规范
 ├── package.json
 └── README.md
 ```
