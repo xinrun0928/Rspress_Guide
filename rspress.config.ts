@@ -87,7 +87,7 @@ export default defineConfig({
         // 链接模式：link = 跳转到外部链接
         mode: 'link',
         // 点击图标跳转的目标 URL
-        content: 'https://github.com/xinrun0928/Repress_Guide',
+        content: 'https://github.com/xinrun0928/Rspress_Guide',
       },
     ],
 
@@ -111,7 +111,7 @@ export default defineConfig({
      */
     editLink: {
       // 文档在 Git 仓库中的根目录 URL
-      docRepoBaseUrl: 'https://github.com/xinrun0928/Repress_Guide/tree/main/website/docs',
+      docRepoBaseUrl: 'https://github.com/xinrun0928/Rspress_Guide/tree/main/website/docs',
     },
 
     /**
@@ -120,7 +120,7 @@ export default defineConfig({
      * 支持 HTML 标签，可插入链接、样式等
      */
     footer: {
-      message: 'Copyright © 2025-2026 <a href="https://github.com/xinrun0928/Repress_Guide">Guide</a>',
+      message: 'Copyright © 2025-2026 <a href="https://github.com/xinrun0928/Rspress_Guide">Guide</a>',
     }
   },
 
