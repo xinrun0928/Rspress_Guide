@@ -1,0 +1,956 @@
+# 分库分表（高并发数据存储解决方案）
+
+---
+
+## 场景切入：单机数据库的"天花板"
+
+深夜，你突然收到告警：数据库 CPU 99%，连接数打满，磁盘 I/O 100%。你紧急扩容、重启服务，但问题很快又出现了。用户量从 10 万增长到 1000 万，订单数据从 100 万增长到 10 亿——你的单机数据库已经撑不住了。
+
+这是每一个高速增长的业务都会遇到的"甜蜜烦恼"：**单机数据库的性能是有上限的。**
+
+你可能想过：加内存、加 CPU、换 SSD……但这些"垂直扩展"（Scale Up）的手段，终有尽头。真正的解决方案是"水平扩展"（Scale Out）——把数据分散到多个数据库实例中。
+
+问题是：**数据如何分散？分散后如何查询？跨库关联怎么办？扩容缩容如何实现？**
+
+这就是分库分表要解决的问题。
+
+---
+
+## 一、为什么需要分库分表
+
+### 1.1 单机数据库的三大瓶颈
+
+单机数据库的性能瓶颈主要来自三个方面：
+
+**瓶颈一：连接数上限**
+
+每个数据库连接都是一个 socket 连接，数据库需要为每个连接分配一定的内存资源（通常 2-10KB/连接）。MySQL 的 `max_connections` 默认是 151，即使调大到 10000，在高并发场景下也不够用。
+
+更关键的是，每个业务请求可能需要多次数据库查询，如果并发请求数超过连接数，请求就会排队等待。
+
+```sql
+-- 查看当前连接数
+SHOW STATUS LIKE 'Threads_connected';
+
+-- 查看最大连接数
+SHOW VARIABLES LIKE 'max_connections';
+```
+
+**瓶颈二：磁盘 I/O 瓶颈**
+
+数据库的核心操作是磁盘 I/O。当数据量超过内存大小时，热数据无法全部缓存在内存中，每次查询都需要磁盘 I/O。
+
+即使使用 SSD，I/O 次数过多也会成为瓶颈：
+
+- 一次全表扫描可能需要读取数百万条数据
+- 随机写入（Update/Delete）会产生大量磁盘碎片
+- 索引深度增加（超过 3 层），查询需要更多 I/O
+
+**瓶颈三：存储容量上限**
+
+单表数据量过大时，性能会急剧下降：
+
+| 数据量级 | 性能表现 | 原因 |
+|---|---|---|
+| < 1000 万 | 查询毫秒级 | 数据可全部缓存，B+ 树高度 2-3 |
+| 1000-5000 万 | 查询可能秒级 | B+ 树高度 4，I/O 次数增加 |
+| > 5000 万 | 查询明显变慢 | 索引退化，需要分区/分表 |
+
+### 1.2 垂直拆分 vs 水平拆分
+
+分库分表有两种基本策略：**垂直拆分**和**水平拆分**。
+
+| 拆分方式 | 核心思想 | 适用场景 |
+|---|---|---|
+| **垂直拆分** | 按业务模块拆分，减少单库/单表的数据量 | 单表字段过多、业务边界清晰 |
+| **水平拆分** | 按数据行拆分，将数据分散到多个库/表 | 单表数据量过大、高并发写入 |
+
+**两者的核心区别**：
+
+- 垂直拆分解决的是"胖表"问题，拆分后每个库/表的数据量减少
+- 水平拆分解决的是"数据量爆炸"问题，拆分后每个分片的数据相对均衡
+
+### 1.3 分库分表的历史演进
+
+分库分表不是一蹴而就的，通常经历以下阶段：
+
+```
+第一阶段：单机数据库
+    │
+    ├── 性能瓶颈：连接数、磁盘 I/O、存储容量
+    │
+    ▼
+第二阶段：读写分离
+    │
+    ├── 读写分离 + 主从复制
+    ├── 写操作在主库，读操作在从库
+    ├── 问题：主从延迟、数据一致性
+    │
+    ▼
+第三阶段：垂直拆分
+    │
+    ├── 按业务模块拆库（订单库、用户库、商品库）
+    ├── 按字段拆表（大表拆成小表）
+    │
+    ▼
+第四阶段：水平拆分
+    │
+    ├── 按分片键哈希/范围拆分
+    ├── 多库多表，数据均匀分布
+    ├── 问题：跨分片查询、分布式事务
+    │
+    ▼
+第五阶段：数据库中间件
+    │
+    ├── ShardingSphere、MyCat 等中间件
+    ├── 屏蔽分库分表的复杂性
+    ├── 支持透明的分片路由
+```
+
+---
+
+## 二、垂直拆分：让数据库"瘦"下来
+
+### 2.1 垂直分库：按业务模块拆库
+
+垂直分库是最常见的拆分方式，核心思想是**按业务模块将系统拆分成多个独立的数据库**。
+
+典型的拆分示例：
+
+```
+原始架构：
+┌─────────────────────────────────────────┐
+│              应用系统                     │
+│   订单模块 | 用户模块 | 商品模块 | 支付模块  │
+└─────────────────────────────────────────┘
+                    │
+                    ▼
+┌─────────────────────────────────────────┐
+│              单机数据库                   │
+│   orders | users | products | payments   │
+└─────────────────────────────────────────┘
+
+拆分后架构：
+┌─────────────────────────────────────────┐
+│              应用系统                     │
+│   订单模块 | 用户模块 | 商品模块 | 支付模块  │
+└─────────────────────────────────────────┘
+       │          │          │          │
+       ▼          ▼          ▼          ▼
+┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐
+│ 订单库  │ │ 用户库  │ │ 商品库  │ │ 支付库  │
+│ orders  │ │ users   │ │products │ │payments │
+└─────────┘ └─────────┘ └─────────┘ └─────────┘
+```
+
+**垂直分库的优势**：
+
+- 每个数据库独立部署，可以独立优化（配置参数、索引、缓存）
+- 不同模块的故障相互隔离，提高系统可用性
+- 不同模块可以选用不同的数据库（MySQL、MongoDB、ElasticSearch）
+
+**垂直分库的注意事项**：
+
+- 跨库关联查询：需要通过应用层 Join 或 API 聚合
+- 分布式事务：需要引入分布式事务解决方案
+- 数据同步：如果需要跨库查询，需要引入数据同步机制
+
+### 2.2 垂直分表：按字段冷热拆表
+
+垂直分表针对的是"胖表"问题——表字段太多，导致单行数据过大，查询效率低下。
+
+**常见的拆分策略**：
+
+**策略一：冷热分离**
+
+将频繁查询的字段（热数据）和很少查询的字段（冷数据）分开存储。
+
+```sql
+-- 用户表原始设计
+CREATE TABLE user (
+    id BIGINT PRIMARY KEY,
+    username VARCHAR(50),
+    password VARCHAR(100),      -- 几乎不查询
+    nickname VARCHAR(50),
+    avatar VARCHAR(200),        -- 大字段
+    email VARCHAR(100),
+    phone VARCHAR(20),
+    real_name VARCHAR(50),
+    id_card VARCHAR(20),        -- 很少查询
+    address TEXT,               -- 大字段
+    created_at DATETIME,
+    updated_at DATETIME
+);
+
+-- 拆分为热表和冷表
+CREATE TABLE user (
+    id BIGINT PRIMARY KEY,
+    username VARCHAR(50),
+    nickname VARCHAR(50),
+    email VARCHAR(100),
+    phone VARCHAR(20),
+    created_at DATETIME,
+    updated_at DATETIME
+);  -- 热表：频繁查询
+
+CREATE TABLE user_profile (
+    id BIGINT PRIMARY KEY,
+    user_id BIGINT,             -- 关联主键
+    password VARCHAR(100),
+    avatar VARCHAR(200),
+    real_name VARCHAR(50),
+    id_card VARCHAR(20),
+    address TEXT,
+    updated_at DATETIME
+);  -- 冷表：按需查询
+```
+
+**策略二：大字段拆分**
+
+将大字段（TEXT、BLOB）单独存储，减少单行数据大小。
+
+```sql
+-- 大字段拆分示例
+CREATE TABLE article (
+    id BIGINT PRIMARY KEY,
+    title VARCHAR(200),
+    author_id BIGINT,
+    summary VARCHAR(500),       -- 文章摘要
+    content TEXT,               -- 大字段，单独存储
+    created_at DATETIME
+);
+
+-- 拆分为基础表和内容表
+CREATE TABLE article_base (
+    id BIGINT PRIMARY KEY,
+    title VARCHAR(200),
+    author_id BIGINT,
+    summary VARCHAR(500),
+    created_at DATETIME
+);
+
+CREATE TABLE article_content (
+    id BIGINT PRIMARY KEY,
+    article_id BIGINT,
+    content LONGTEXT
+);
+```
+
+---
+
+## 三、水平拆分：让数据"飞"起来
+
+### 3.1 水平分片的两种策略
+
+水平拆分（也叫水平分片）将数据按行拆分，分散到多个库/表中。核心问题是：**如何决定一条数据应该放在哪个分片？**
+
+**策略一：哈希分片**
+
+根据分片键的哈希值决定数据归属。
+
+```java
+// 哈希分片算法
+public int hashSharding(String shardKey, int shardCount) {
+    return Math.abs(shardKey.hashCode()) % shardCount;
+}
+
+// 示例：按 user_id 分 4 个库
+// user_id = 10001 → hash = 10001 % 4 = 1 → 路由到 user_db_1
+// user_id = 10002 → hash = 10002 % 4 = 2 → 路由到 user_db_2
+// user_id = 10003 → hash = 10003 % 4 = 3 → 路由到 user_db_3
+// user_id = 10004 → hash = 10004 % 4 = 0 → 路由到 user_db_0
+```
+
+**哈希分片的优势**：
+
+- 数据分布均匀，每个分片数据量接近
+- 写入分散，避免单点热写
+
+**哈希分片的劣势**：
+
+- 按范围查询困难（如查询某时间段的数据）
+- 扩容时数据迁移量大
+
+**策略二：范围分片**
+
+根据分片键的值域范围决定数据归属。
+
+```java
+// 范围分片算法
+public int rangeSharding(long shardKey, int shardCount) {
+    if (shardKey < 1000000) return 0;
+    if (shardKey < 2000000) return 1;
+    if (shardKey < 3000000) return 2;
+    return 3;
+}
+
+// 示例：按用户 ID 范围分库
+// user_id = 10001 → 0 ≤ 10001 < 1000000 → 路由到 user_db_0
+// user_id = 1000001 → 1000000 ≤ 1000001 < 2000000 → 路由到 user_db_1
+```
+
+**范围分片的优势**：
+
+- 支持范围查询（如查询某时间区间的订单）
+- 扩容时只需要调整范围边界
+
+**范围分片的劣势**：
+
+- 可能产生热点问题（新增用户集中在最新分片）
+- 数据分布可能不均匀
+
+### 3.2 分片键的选择原则
+
+分片键是水平分库分表的核心，选择不当会导致严重性能问题。
+
+**核心原则一：避免跨分片查询**
+
+如果查询条件包含分片键，查询可以直接路由到目标分片；如果不包含分片键，则需要扫描所有分片。
+
+```sql
+-- 假设 orders 表按 user_id 分片
+-- 按 user_id 查询（好）
+SELECT * FROM orders WHERE user_id = '10001';
+
+-- 按 order_id 查询（问题）
+SELECT * FROM orders WHERE order_id = 'ORDER001';
+-- 需要扫描所有分片，性能差
+
+-- 按 create_time 查询（问题）
+SELECT * FROM orders WHERE create_time > '2024-01-01';
+-- 需要扫描所有分片
+```
+
+**核心原则二：分片键值应分布均匀**
+
+如果分片键的值分布不均（如按性别分片），会导致数据倾斜。
+
+```java
+// 错误示例：按性别分片，数据严重不均
+// male: 80%, female: 20% → 分片不均匀
+
+// 正确示例：按 user_id 分片，数据均匀分布
+```
+
+**核心原则三：分片键应与业务查询高频场景匹配**
+
+选择分片键时，要分析业务查询的常见模式：
+
+| 业务场景 | 推荐分片键 | 说明 |
+|---|---|---|
+| 电商订单系统 | user_id | 大多数查询以用户为中心 |
+| 日志系统 | 时间 | 大多数查询按时间范围 |
+| 社交系统 | user_id | 查询某用户的好友、动态 |
+
+### 3.3 分布式 ID：分库分表的"身份证"
+
+水平分库分表后，每条数据需要一个全局唯一的 ID 作为"身份证"，用于：
+
+- 唯一标识一条数据
+- 作为分片键（如按 ID 哈希分片）
+- 支持跨分片查询
+
+常见的分布式 ID 生成方案：
+
+| 方案 | 优点 | 缺点 | 适用场景 |
+|---|---|---|---|
+| UUID | 简单、无依赖 | 无序、存储大 | 不推荐 |
+| 数据库自增 | 简单、连续 | 需要独立数据库 | 小规模 |
+| Redis INCR | 性能高、可设置步长 | 依赖 Redis | 中等规模 |
+| 雪花算法 | 高性能、有序 | 依赖时钟 | 大规模系统 |
+
+**雪花算法（Snowflake）** 是目前最流行的分布式 ID 方案：
+
+```java
+// Twitter Snowflake 算法
+public class SnowflakeIdGenerator {
+    private final long epoch = 1609459200000L;  // 2021-01-01
+    private final long workerIdBits = 5L;
+    private final long datacenterIdBits = 5L;
+    private final long sequenceBits = 12L;
+
+    private final long maxWorkerId = ~(-1L << workerIdBits);
+    private final long maxDatacenterId = ~(-1L << datacenterIdBits);
+
+    private final long workerIdShift = sequenceBits;
+    private final long datacenterIdShift = sequenceBits + workerIdBits;
+    private final long timestampLeftShift = sequenceBits + workerIdBits + datacenterIdBits;
+    private final long sequenceMask = ~(-1L << sequenceBits);
+
+    private long workerId;
+    private long datacenterId;
+    private long sequence = 0L;
+    private long lastTimestamp = -1L;
+
+    public SnowflakeIdGenerator(long workerId, long datacenterId) {
+        if (workerId > maxWorkerId || workerId < 0) {
+            throw new IllegalArgumentException("workerId 超出范围");
+        }
+        if (datacenterId > maxDatacenterId || datacenterId < 0) {
+            throw new IllegalArgumentException("datacenterId 超出范围");
+        }
+        this.workerId = workerId;
+        this.datacenterId = datacenterId;
+    }
+
+    public synchronized long nextId() {
+        long timestamp = timeGen();
+
+        if (timestamp < lastTimestamp) {
+            throw new RuntimeException("时钟回拨");
+        }
+
+        if (timestamp == lastTimestamp) {
+            sequence = (sequence + 1) & sequenceMask;
+            if (sequence == 0) {
+                timestamp = tilNextMillis(lastTimestamp);
+            }
+        } else {
+            sequence = 0L;
+        }
+
+        lastTimestamp = timestamp;
+
+        return ((timestamp - epoch) << timestampLeftShift)
+                | (datacenterId << datacenterIdShift)
+                | (workerId << workerIdShift)
+                | sequence;
+    }
+}
+```
+
+雪花算法的 ID 结构：
+
+```
+┌─────────────────────────────────────────────────────┐
+│                  64-bit Snowflake ID                  │
+├─────────┬──────────┬──────────┬───────────┬────────┤
+│ sign(1) │ timestamp │ datacenter │ worker    │ seq    │
+│         │  (41 bits) │   (5 bits) │ (5 bits)  │(12 bits)│
+└─────────┴──────────┴──────────┴───────────┴────────┘
+```
+
+- 第 1 位：符号位，始终为 0
+- 第 2-42 位：时间戳（毫秒级），可用 69 年
+- 第 43-47 位：数据中心 ID（0-31）
+- 第 48-52 位：工作机器 ID（0-31）
+- 第 53-64 位：序列号（每毫秒最多 4096 个 ID）
+
+---
+
+## 四、跨分片查询：分库分表的"痛"
+
+### 4.1 跨分片关联查询
+
+分库分表后，最棘手的问题是跨分片的关联查询。
+
+**场景：查询用户的所有订单（用户表和订单表都按 user_id 分片）**
+
+如果用户表和订单表按相同的分片键（user_id）分片，且分片数量相同，则同用户的数据在同一分片，可以直接关联：
+
+```sql
+-- 假设 user_db_1 和 order_db_1 都包含 user_id = 10001 的数据
+SELECT u.*, o.*
+FROM user u
+JOIN `order` o ON u.user_id = o.user_id
+WHERE u.user_id = 10001;
+-- 路由到同一个分片，可以正常关联
+```
+
+**场景：查询订单及其商品信息（商品表按 product_id 分片）**
+
+订单表按 user_id 分片，商品表按 product_id 分片，跨分片无法直接关联：
+
+```sql
+-- 错误：无法跨分片关联
+SELECT o.*, p.*
+FROM `order` o
+JOIN product p ON o.product_id = p.product_id
+WHERE o.order_id = 'ORDER001';
+
+-- 解决方案：应用层聚合
+// 1. 查询订单（路由到对应分片）
+Order order = orderService.getOrderById(orderId);
+// 2. 查询商品（路由到对应分片）
+Product product = productService.getProductById(order.getProductId());
+// 3. 应用层组合结果
+```
+
+### 4.2 跨分片聚合查询
+
+跨分片的 count、sum、avg 等聚合查询需要先在每个分片执行，然后合并结果：
+
+```java
+// 跨分片 count 查询
+public long countOrders(Long userId) {
+    long total = 0;
+
+    // 遍历所有分片
+    for (int i = 0; i < SHARD_COUNT; i++) {
+        // 计算该用户在此分片的订单数
+        String sql = "SELECT COUNT(*) FROM orders_" + i + " WHERE user_id = ?";
+        long count = jdbcTemplate.queryForObject(sql, Long.class, userId);
+        total += count;
+    }
+
+    return total;
+}
+```
+
+**分页查询的复杂性**：
+
+```java
+// 错误示例：简单的 LIMIT 无法跨分片分页
+// 假设每个分片有 100 条数据
+// LIMIT 0, 10 可能返回分片 1 的 10 条
+// 但如果分片 1 只有 8 条符合条件，实际只返回 8 条
+
+// 正确方案：先聚合，再分页
+public Page<Order> queryOrdersPage(int page, int size, Long userId) {
+    List<Order> allOrders = new ArrayList<>();
+
+    // 1. 从所有分片查询数据
+    for (int i = 0; i < SHARD_COUNT; i++) {
+        String sql = "SELECT * FROM orders_" + i + " WHERE user_id = ?";
+        List<Order> orders = jdbcTemplate.query(sql, userId);
+        allOrders.addAll(orders);
+    }
+
+    // 2. 内存中排序
+    allOrders.sort(Comparator.comparing(Order::getCreatedAt).reversed());
+
+    // 3. 内存中分页
+    int start = (page - 1) * size;
+    int end = start + size;
+    List<Order> pageData = allOrders.subList(
+        Math.min(start, allOrders.size()),
+        Math.min(end, allOrders.size())
+    );
+
+    // 4. 构建分页结果
+    return new Page<>(pageData, allOrders.size(), page, size);
+}
+```
+
+### 4.3 跨分片查询的解决方案
+
+**方案一：ES 搜索引擎**
+
+将数据同步到 Elasticsearch，用 ES 的分布式查询能力解决跨分片查询问题：
+
+```
+┌─────────────────────────────────────────────────────┐
+│                    写入流程                          │
+├─────────────────────────────────────────────────────┤
+│                                                      │
+│   应用 ──→ 分库分表（MySQL）                         │
+│              │                                       │
+│              └──→ 数据同步（Canal / Debezium）        │
+│                         │                            │
+│                         ▼                            │
+│                   Elasticsearch                      │
+│                                                      │
+└─────────────────────────────────────────────────────┘
+```
+
+**方案二：异构索引表**
+
+为每张表维护一份"异构索引表"，按查询维度重新分片：
+
+```sql
+-- 原始订单表（按 user_id 分片）
+CREATE TABLE orders_by_user (
+    id BIGINT PRIMARY KEY,
+    user_id BIGINT,
+    product_id BIGINT,
+    amount DECIMAL(10,2),
+    created_at DATETIME,
+    PRIMARY KEY (id, user_id)  -- 复合主键包含分片键
+);
+
+-- 异构索引表（按 product_id 分片，用于按商品查询订单）
+CREATE TABLE orders_by_product (
+    id BIGINT PRIMARY KEY,
+    user_id BIGINT,
+    product_id BIGINT,
+    amount DECIMAL(10,2),
+    created_at DATETIME,
+    PRIMARY KEY (id, product_id)  -- 复合主键包含 product_id
+);
+```
+
+---
+
+## 五、ShardingSphere：分库分表的"利器"
+
+### 5.1 ShardingSphere 架构
+
+ShardingSphere 是一款分布式的数据库生态系统，包含数据分片、分布式事务、数据弹性等模块。
+
+```
+┌─────────────────────────────────────────────────────┐
+│                    ShardingSphere                    │
+├─────────────────────────────────────────────────────┤
+│                                                      │
+│   ShardingSphere-JDBC        ShardingSphere-Proxy   │
+│   (Java 应用内嵌)              (独立代理进程)        │
+│                                                      │
+├─────────────────────────────────────────────────────┤
+│                                                      │
+│              ShardingSphere-Sidecar                  │
+│                   (Kubernetes)                       │
+│                                                      │
+└─────────────────────────────────────────────────────┘
+```
+
+| 组件 | 特点 | 适用场景 |
+|---|---|---|
+| ShardingSphere-JDBC | 轻量级、Java 应用内嵌 | 高性能场景 |
+| ShardingSphere-Proxy | 独立进程、异构语言支持 | 多语言环境 |
+| ShardingSphere-Sidecar | Kubernetes 部署 | 云原生场景 |
+
+### 5.2 ShardingSphere 配置示例
+
+```yaml
+# application.yml
+spring:
+  shardingsphere:
+    datasource:
+      names: ds0, ds1
+      ds0:
+        type: com.zaxxer.hikari.HikariDataSource
+        driver-class-name: com.mysql.cj.jdbc.Driver
+        jdbc-url: jdbc:mysql://localhost:3306/ds0
+        username: root
+        password: password
+      ds1:
+        type: com.zaxxer.hikari.HikariDataSource
+        driver-class-name: com.mysql.cj.jdbc.Driver
+        jdbc-url: jdbc:mysql://localhost:3306/ds1
+        username: root
+        password: password
+
+    rules:
+      sharding:
+        tables:
+          # 配置 t_order 表的分片规则
+          t_order:
+            # 实际数据节点：ds0.t_order_0, ds0.t_order_1, ds1.t_order_0, ds1.t_order_1
+            actual-data-nodes: ds${0..1}.t_order_${0..1}
+            table-strategy:
+              standard:
+                # 分片键
+                sharding-column: order_id
+                # 分片算法
+                sharding-algorithm-name: order_inline
+            key-generate-strategy:
+              column: order_id
+              key-generator-name: snowflake
+
+        # 分片算法配置
+        sharding-algorithms:
+          order_inline:
+            type: INLINE
+            props:
+              algorithm-expression: t_order_${order_id % 4}
+
+        # 分布式 ID 生成器
+        key-generators:
+          snowflake:
+            type: SNOWFLAKE
+
+    props:
+      sql-show: true  # 显示 SQL 执行日志
+```
+
+### 5.3 分片算法详解
+
+ShardingSphere 内置了多种分片算法：
+
+**哈希分片算法（INLINE）**：
+
+```yaml
+sharding-algorithms:
+  order_inline:
+    type: INLINE
+    props:
+      algorithm-expression: t_order_${order_id % 4}
+# order_id = 1001 → t_order_1
+# order_id = 1002 → t_order_2
+# order_id = 1003 → t_order_3
+# order_id = 1004 → t_order_0
+```
+
+**范围分片算法（INTERVAL）**：
+
+```yaml
+sharding-algorithms:
+  order_range:
+    type: INTERVAL
+    props:
+      datetime-pattern: "yyyy-MM-dd HH:mm:ss"
+      datetime-lower: "2024-01-01 00:00:00"
+      datetime-interval-amount: 1
+      datetime-interval-unit: MONTHS
+      sharding-suffix-pattern: "_yyyyMM"
+      datetime-range-lower: "2024-01-01 00:00:00"
+      datetime-range-upper: "2024-12-31 23:59:59"
+```
+
+**一致性哈希算法（CONSISTENT_HASH）**：
+
+```yaml
+sharding-algorithms:
+  order_consistent_hash:
+    type: CONSISTENT_HASH
+    props:
+      virtual-nodes: 10  # 虚拟节点数，提高均匀性
+```
+
+---
+
+## 六、运维挑战：分库分表后的"烦恼"
+
+### 6.1 数据迁移：如何平滑迁移历史数据
+
+分库分表最难的不是配置，而是**如何把历史数据迁移到新架构中**。
+
+**迁移方案一：双写方案**
+
+```
+阶段一：开启双写
+┌─────────────────────────────────────────────────────┐
+│                                                      │
+│   应用 ──→ 旧表                                      │
+│      │                                              │
+│      └──→ 新表（同时写入）                            │
+│                                                      │
+└─────────────────────────────────────────────────────┘
+
+阶段二：数据校验
+┌─────────────────────────────────────────────────────┐
+│                                                      │
+│   校验脚本对比旧表和新表的数据                         │
+│   - 记录数对比                                       │
+│   - 数据内容对比                                     │
+│   - 修复差异数据                                     │
+│                                                      │
+└─────────────────────────────────────────────────────┘
+
+阶段三：切换读流量
+┌─────────────────────────────────────────────────────┐
+│                                                      │
+│   读流量：旧表 → 新表（灰度切换）                      │
+│   写流量：双写                                       │
+│                                                      │
+└─────────────────────────────────────────────────────┘
+
+阶段四：停用旧表
+┌─────────────────────────────────────────────────────┐
+│                                                      │
+│   读/写流量全部切换到新表                             │
+│   旧表下线                                           │
+│                                                      │
+└─────────────────────────────────────────────────────┘
+```
+
+**迁移方案二：Binlog 同步**
+
+使用 Canal 或 Debezium 监听 Binlog，将数据同步到新架构：
+
+```yaml
+# Canal 配置示例
+canal:
+  server:
+    port: 11111
+  destination: orders
+  filter: orders.*  # 只同步 orders 库
+
+# 数据同步任务
+sync:
+  - source:
+      type: canal
+      destination: orders
+    target:
+      type: sharding-sphere
+      shardings:
+        - ds0.t_order_0
+        - ds0.t_order_1
+        - ds1.t_order_0
+        - ds1.t_order_1
+```
+
+### 6.2 扩容缩容：如何应对业务增长
+
+分库分表后，扩容是最头疼的问题。
+
+**问题一：哈希分片扩容困难**
+
+假设当前有 4 个分片，扩容到 8 个分片：
+
+```java
+// 原算法
+shard = orderId % 4;
+
+// 新算法
+shard = orderId % 8;
+
+// 问题：旧数据路由错误
+// orderId = 1001 → 1001 % 4 = 1（旧分片）
+// orderId = 1001 → 1001 % 8 = 9（旧分片）？
+// 实际上：1001 % 8 = 1（旧分片，恰好正确）
+// 但 1003 % 4 = 3（旧分片）
+//      1003 % 8 = 3（旧分片，恰好正确）
+// 这只是巧合，数据量大时会出现大量错误
+
+// 真正的问题是：
+// orderId = 1002 → 1002 % 4 = 2（旧分片）
+// orderId = 1002 → 1002 % 8 = 2（新分片应该是 ds2，但旧数据在 ds2？）
+// 1002 % 4 = 2，意味着旧数据在 ds2
+// 1002 % 8 = 2，意味着新数据也应该在 ds2
+// 但新分片 ds2 实际对应 ds2 + 4 = ds6，数据在新位置
+```
+
+**解决方案：一致性哈希环**
+
+```java
+// 一致性哈希环
+public class ConsistentHashRing {
+    private final SortedMap<Long, String> ring = new TreeMap<>();
+    private final int virtualNodes;
+
+    public ConsistentHashRing(List<String> shards, int virtualNodes) {
+        this.virtualNodes = virtualNodes;
+        for (String shard : shards) {
+            addNode(shard);
+        }
+    }
+
+    public void addNode(String shard) {
+        for (int i = 0; i < virtualNodes; i++) {
+            long hash = hash(shard + "#VN" + i);
+            ring.put(hash, shard);
+        }
+    }
+
+    public String getNode(String key) {
+        if (ring.isEmpty()) {
+            return null;
+        }
+        long hash = hash(key);
+        Map.Entry<Long, String> entry = ring.ceilingEntry(hash);
+        if (entry == null) {
+            entry = ring.firstEntry();
+        }
+        return entry.getValue();
+    }
+
+    private long hash(String key) {
+        return Math.abs(key.hashCode());
+    }
+}
+```
+
+**扩容策略：倍增扩容**
+
+每次扩容时，将分片数量翻倍（如 4 → 8 → 16），只迁移 50% 的数据：
+
+```java
+// 倍增扩容
+// 原分片：ds0, ds1, ds2, ds3
+// 新分片：ds0, ds1, ds2, ds3, ds4, ds5, ds6, ds7
+
+// 迁移规则：
+// ds0 → ds0 + ds4（50% 数据迁移）
+// ds1 → ds1 + ds5
+// ds2 → ds2 + ds6
+// ds3 → ds3 + ds7
+```
+
+---
+
+## 七、读写分离与分库分表的关系
+
+### 7.1 读写分离的本质
+
+读写分离是**在主从架构下，将读请求分散到从库**，核心解决的是"读并发"问题。
+
+```
+┌─────────────────────────────────────────────────────┐
+│                                                      │
+│                    写操作                            │
+│                      │                               │
+│                      ▼                               │
+│                ┌──────────┐                          │
+│                │   主库   │                          │
+│                │ (写 + 读)│                          │
+│                └──────────┘                          │
+│                    │ 复制                           │
+│         ┌──────────┼──────────┐                      │
+│         ▼          ▼          ▼                     │
+│    ┌─────────┐ ┌─────────┐ ┌─────────┐              │
+│    │  从库1  │ │  从库2  │ │  从库3  │              │
+│    │  (读)   │ │  (读)   │ │  (读)   │              │
+│    └─────────┘ └─────────┘ └─────────┘              │
+│                                                      │
+└─────────────────────────────────────────────────────┘
+```
+
+### 7.2 读写分离 vs 分库分表
+
+| 对比项 | 读写分离 | 分库分表 |
+|---|---|---|
+| 解决的问题 | 读并发高 | 数据量大 |
+| 数据一致性 | 主从延迟 | 分片键路由 |
+| 跨库查询 | 简单（无需跨库） | 复杂（需要跨分片） |
+| 扩容方式 | 增加从库 | 重新分片（数据迁移） |
+| 实现复杂度 | 低 | 高 |
+
+### 7.3 两者的结合
+
+在实际生产环境中，读写分离和分库分表通常结合使用：
+
+```
+架构示例：
+┌─────────────────────────────────────────────────────┐
+│                                                      │
+│  ┌─────────┐  ┌─────────┐                           │
+│  │ 订单库1 │  │ 订单库2 │  ← 水平分库                │
+│  │主 + 从 │  │主 + 从  │                           │
+│  └─────────┘  └─────────┘                           │
+│       │            │                                │
+│       └─────┬───────┘                                │
+│             ▼                                       │
+│      ┌─────────────┐                                 │
+│      │ ShardingSphere │                              │
+│      │   中间件     │                               │
+│      └─────────────┘                                 │
+│             │                                       │
+│             ▼                                       │
+│      ┌─────────────┐                                 │
+│      │ 应用层      │                                │
+│      │ (读写分离)   │                                │
+│      └─────────────┘                                 │
+│                                                      │
+└─────────────────────────────────────────────────────┘
+```
+
+---
+
+## 总结
+
+分库分表是应对高并发数据存储的"终极武器"，但也是"双刃剑"——它带来的复杂性和运维成本不容忽视。
+
+**面试追问方向：**
+
+- 分库分表后，如何保证分布式 ID 的全局唯一性？雪花算法有什么缺点？
+- 如果按订单时间分片，如何优化"查询某用户最近一个月订单"的性能？
+- 分库分表后，MySQL 的自增主键还能用吗？
+
+这些追问方向，也是你深入理解分库分表的关键。
+
+---
+
+**留给你的思考题：**
+
+假设你的系统按 user_id 分成了 8 个库/表，当前数据量是 1 亿。用户反馈"查询我的所有订单"变慢了，你怀疑是分库分表的问题，但实际上真的是这样吗？想想可能的其他原因。

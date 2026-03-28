@@ -1,0 +1,1298 @@
+# 缓存预热、预计算与降级策略
+
+import { Badge } from '@rspress/core/theme';
+
+凌晨 3 点，你刚处理完一次 Redis 故障。系统恢复正常，Redis 已经重启，数据完好无损。但当你松了一口气时，监控面板上的数据库 CPU 开始飙升——每秒 5000 个请求全部穿透到数据库，数据库在 30 秒内被打爆。
+
+这就是**缓存冷启动**的杀伤力。
+
+Redis 里的数据还在，但应用服务器的本地缓存已经空了。更糟糕的是，Redis 重启后是"空的"（RDB/AOF 恢复需要时间），所有请求像洪水一样涌向数据库。
+
+这不是 Redis 的错，而是你没有为"缓存失效"做好准备。
+
+---
+
+## 一、缓存预热的必要性
+
+### 什么是缓存冷启动
+
+|缓存冷启动|指的是缓存为空或接近空的初始状态，此时大量请求无法命中缓存，直接打到数据库。
+
+**触发场景**：
+- 系统首次部署，缓存完全为空
+- Redis 故障恢复后，缓存重建
+- 缓存过期淘汰后，热点数据丢失
+- 系统重启后，本地缓存失效
+
+### 冷启动的危害
+
+冷启动期间，系统会面临三重打击：
+
+1. **数据库压力暴增**：缓存命中率从 95% 跌到 0%，数据库 QPS 可能增加 20 倍
+2. **接口 RT 飙升**：数据库响应远慢于缓存，RT 从 5ms 变成 200ms+
+3. **连锁故障**：数据库慢查询占用连接，可能导致应用层连接池耗尽
+
+:::warning 冷启动不是小概率事件
+Redis 故障在生产环境中并不罕见。一次内存溢出、一次网络抖动、一次运维误操作，都可能导致 Redis 重启。**冷启动不是极端场景，而是每个高并发系统都必须面对的问题**。
+:::
+
+---
+
+## 二、缓存预热的方式
+
+### 1. 启动时加载
+
+系统启动时，主动将热点数据加载到缓存：
+
+```java
+@Component
+public class CacheWarmUpRunner implements CommandLineRunner {
+
+    @Autowired
+    private ProductDAO productDAO;
+
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    @Override
+    public void run(String... args) {
+        log.info("Starting cache warm-up...");
+
+        // 预热商品数据
+        warmUpProducts();
+
+        // 预热用户数据
+        warmUpUsers();
+
+        // 预热配置数据
+        warmUpConfigs();
+
+        log.info("Cache warm-up completed");
+    }
+
+    private void warmUpProducts() {
+        long start = System.currentTimeMillis();
+
+        // 加载 Top 1000 热门商品
+        List<Product> hotProducts = productDAO.findHotProducts(1000);
+        for (Product product : hotProducts) {
+            String key = "product:" + product.getId();
+            redisTemplate.opsForValue().set(key, product, 1, TimeUnit.HOURS);
+        }
+
+        // 加载分类商品列表
+        List<Category> categories = categoryDAO.findAll();
+        for (Category category : categories) {
+            String key = "category:" + category.getId() + ":products";
+            List<Product> categoryProducts = productDAO.findByCategoryId(category.getId(), 100);
+            redisTemplate.opsForValue().set(key, categoryProducts, 30, TimeUnit.MINUTES);
+        }
+
+        log.info("Warmed up {} products in {}ms", hotProducts.size(),
+                System.currentTimeMillis() - start);
+    }
+
+    private void warmUpUsers() {
+        // 加载活跃用户信息
+        List<Long> activeUserIds = userActivityDAO.getActiveUserIds(5000);
+        for (Long userId : activeUserIds) {
+            UserProfile profile = userDAO.findProfileById(userId);
+            String key = "user:" + userId + ":profile";
+            redisTemplate.opsForValue().set(key, profile, 24, TimeUnit.HOURS);
+        }
+    }
+
+    private void warmUpConfigs() {
+        // 加载系统配置
+        Map<String, String> configs = configDAO.findAllConfigs();
+        redisTemplate.opsForHash().putAll("system:configs", configs);
+    }
+}
+```
+
+### 2. 定时任务预热
+
+除了启动时预热，还应该设置定时任务，持续补充热点数据：
+
+```java
+@Component
+public class CachePreheatScheduler {
+
+    @Autowired
+    private ProductDAO productDAO;
+
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    // 每 10 分钟预热一次
+    @Scheduled(cron = "0 */10 * * * ?")
+    public void scheduledPreheat() {
+        log.info("Starting scheduled cache preheat...");
+
+        try {
+            // 刷新热门商品
+            refreshHotProducts();
+
+            // 刷新活动数据
+            refreshActivityData();
+
+            // 刷新排行榜
+            refreshRankingData();
+
+        } catch (Exception e) {
+            log.error("Scheduled preheat failed", e);
+        }
+    }
+
+    private void refreshHotProducts() {
+        // 获取过去 1 小时内的热销商品
+        List<Long> hotProductIds = orderDAO.getHotProductIdsLastHour(100);
+        for (Long productId : hotProductIds) {
+            Product product = productDAO.findById(productId);
+            String key = "product:" + productId;
+            // 设置较短过期时间 + 随机偏移
+            long ttl = 1800 + ThreadLocalRandom.current().nextInt(300);
+            redisTemplate.opsForValue().set(key, product, ttl, TimeUnit.SECONDS);
+        }
+    }
+}
+```
+
+### 3. 活动前预热
+
+大促、秒杀等活动前，需要专门的预热策略：
+
+```java
+@Service
+public class FlashSalePreheatService {
+
+    @Autowired
+    private FlashSaleDAO flashSaleDAO;
+
+    @Autowired
+    private ProductDAO productDAO;
+
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    /**
+     * 活动开始前 N 小时执行预热
+     */
+    public void preheatForFlashSale(Long activityId, int hoursBeforeStart) {
+        FlashSaleActivity activity = flashSaleDAO.findById(activityId);
+        if (activity == null || !activity.isUpcoming()) {
+            return;
+        }
+
+        log.info("Starting preheat for flash sale: {}, starts at: {}",
+                activityId, activity.getStartTime());
+
+        // 1. 预热活动商品
+        List<FlashSaleItem> items = flashSaleDAO.findItemsByActivityId(activityId);
+        for (FlashSaleItem item : items) {
+            String productKey = "flashsale:" + activityId + ":product:" + item.getProductId();
+            Product product = productDAO.findById(item.getProductId());
+            redisTemplate.opsForValue().set(productKey, product, hoursBeforeStart + 2, TimeUnit.HOURS);
+
+            // 2. 预热库存信息
+            String stockKey = "flashsale:" + activityId + ":stock:" + item.getProductId();
+            redisTemplate.opsForValue().set(stockKey, item.getStock(), hoursBeforeStart + 2, TimeUnit.HOURS);
+
+            // 3. 预热限购信息
+            String limitKey = "flashsale:" + activityId + ":limit:" + item.getProductId();
+            redisTemplate.opsForHash().putAll(limitKey, Map.of(
+                    "perUserLimit", item.getPerUserLimit(),
+                    "totalLimit", item.getTotalLimit()
+            ));
+        }
+
+        // 4. 预热活动状态
+        String statusKey = "flashsale:" + activityId + ":status";
+        redisTemplate.opsForValue().set(statusKey, "WAITING", hoursBeforeStart + 2, TimeUnit.HOURS);
+
+        log.info("Flash sale preheat completed, {} items preheated", items.size());
+    }
+}
+```
+
+### 预热方式对比
+
+| 预热方式 | 优点 | 缺点 | 适用场景 |
+|---|---|---|---|
+| 启动时加载 | 简单可靠 | 启动时间长，可能超时 | 系统首次部署 |
+| 定时任务 | 持续补充热点 | 增加数据库负担 | 日常运维 |
+| 活动前预热 | 有针对性，效果好 | 需要人工介入 | 大促、秒杀 |
+
+---
+
+## 三、缓存预热的风险
+
+### 1. 预热时间长
+
+如果预热数据量很大，可能导致应用启动超时：
+
+```java
+// 反面案例：预热时间过长
+@Component
+public class BadWarmUpRunner implements CommandLineRunner {
+
+    @Override
+    public void run(String... args) {
+        // 预热 1000 万商品，这可能导致启动超时
+        List<Product> allProducts = productDAO.findAll();  // 1000万条
+        for (Product product : allProducts) {
+            redisTemplate.opsForValue().set("product:" + product.getId(), product);
+        }
+    }
+}
+
+// 正面案例：分批预热，避免超时
+@Component
+public class GoodWarmUpRunner implements CommandLineRunner {
+
+    @Override
+    public void run(String... args) {
+        // 分批加载，每批 1000 条
+        int batchSize = 1000;
+        int offset = 0;
+
+        while (true) {
+            List<Product> batch = productDAO.findHotProducts(batchSize, offset);
+            if (batch.isEmpty()) break;
+
+            for (Product product : batch) {
+                redisTemplate.opsForValue().set("product:" + product.getId(), product);
+            }
+
+            offset += batchSize;
+
+            // 每批之间短暂休息，避免占用全部连接
+            try {
+                Thread.sleep(100);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+}
+```
+
+### 2. 预热期间性能抖动
+
+预热会占用 Redis 连接和 CPU，可能影响正常请求：
+
+```java
+// 使用独立连接池进行预热，避免影响业务连接
+@Configuration
+public class PreheatRedisConfig {
+
+    @Bean("preheatJedisPool")
+    public JedisPool preheatJedisPool() {
+        JedisPoolConfig config = new JedisPoolConfig();
+        config.setMaxTotal(5);  // 预热专用，连接数小
+        config.setMaxIdle(2);
+        config.setMinIdle(1);
+        return new JedisPool(config, "redis-host", 6379, 2000);
+    }
+}
+
+@Service
+public class PreheatService {
+
+    @Autowired
+    @Qualifier("preheatJedisPool")
+    private JedisPool preheatPool;
+
+    public void preheat() {
+        try (Jedis jedis = preheatPool.getResource()) {
+            // 使用预热专用连接
+            for (Product product : products) {
+                jedis.set("product:" + product.getId(), toJson(product));
+            }
+        }
+    }
+}
+```
+
+### 3. 预热数据过期
+
+预热的数据可能在预热完成前就过期了：
+
+```java
+// 确保预热数据的过期时间足够长
+@Service
+public class SmartPreheatService {
+
+    private static final long MIN_PREHEAT_TTL = 30;  // 最少保留 30 分钟
+
+    public void preheat(Product product) {
+        // 动态计算过期时间：活动开始前 1 小时 + 30 分钟缓冲
+        LocalDateTime activityStart = getActivityStartTime();
+        long secondsUntilStart = Duration.between(LocalDateTime.now(), activityStart).getSeconds();
+        long ttl = Math.max(secondsUntilStart + 1800, MIN_PREHEAT_TTL * 60);
+
+        String key = "product:" + product.getId();
+        redisTemplate.opsForValue().set(key, product, ttl, TimeUnit.SECONDS);
+    }
+}
+```
+
+---
+
+## 四、缓存预计算
+
+### 什么是缓存预计算
+
+|缓存预计算|指的是提前计算热点数据的聚合结果，将计算结果存入缓存，减少实时计算的压力。
+
+**典型场景**：
+- 商品的销量排行、评分排行
+- 用户的推荐列表
+- 各类统计指标（DAU、GMV）
+- 复杂查询的中间结果
+
+### 预计算示例：商品排行榜
+
+```java
+@Service
+public class RankingPreheatService {
+
+    @Autowired
+    private OrderDAO orderDAO;
+
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    @Autowired
+    private RedisTemplate<String, String> stringRedisTemplate;
+
+    // 每 5 分钟更新一次排行榜
+    @Scheduled(cron = "0 */5 * * * ?")
+    public void updateProductRanking() {
+        log.info("Updating product ranking...");
+
+        long start = System.currentTimeMillis();
+
+        // 1. 计算销量排行
+        List<RankingItem> salesRanking = orderDAO.getSalesRanking(100);
+        String salesKey = "ranking:product:sales:daily";
+        updateZSet(salesKey, salesRanking);
+
+        // 2. 计算销售额排行
+        List<RankingItem> revenueRanking = orderDAO.getRevenueRanking(100);
+        String revenueKey = "ranking:product:revenue:daily";
+        updateZSet(revenueKey, revenueRanking);
+
+        // 3. 计算评分排行
+        List<RankingItem> ratingRanking = orderDAO.getRatingRanking(100);
+        String ratingKey = "ranking:product:rating:daily";
+        updateZSet(ratingKey, ratingRanking);
+
+        log.info("Product ranking updated in {}ms", System.currentTimeMillis() - start);
+    }
+
+    private void updateZSet(String key, List<RankingItem> items) {
+        if (items.isEmpty()) {
+            return;
+        }
+
+        // 使用 Redis 事务保证原子性
+        RedisCallback<Object> callback = connection -> {
+            connection.del(key.getBytes());
+            for (RankingItem item : items) {
+                connection.zSetCommands().zAdd(
+                        key.getBytes(),
+                        item.getScore(),
+                        String.valueOf(item.getProductId()).getBytes()
+                );
+            }
+            // 设置过期时间
+            stringRedisTemplate.expire(key, 24, TimeUnit.HOURS);
+            return null;
+        };
+
+        redisTemplate.execute(callback);
+    }
+}
+```
+
+### 预计算示例：用户推荐列表
+
+```java
+@Service
+public class RecommendationPreheatService {
+
+    @Autowired
+    private UserBehaviorDAO behaviorDAO;
+
+    @Autowired
+    private RecommendationDAO recommendationDAO;
+
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    // 为活跃用户预计算推荐列表
+    @Scheduled(cron = "0 0 2 * * ?")  // 每天凌晨 2 点执行
+    public void precomputeRecommendations() {
+        log.info("Starting recommendation precomputation...");
+
+        // 获取过去 7 天活跃的用户
+        List<Long> activeUserIds = userDAO.getActiveUserIdsLastDays(7);
+
+        for (Long userId : activeUserIds) {
+            try {
+                // 1. 获取用户行为特征
+                UserFeatures features = extractFeatures(userId);
+
+                // 2. 计算推荐候选集
+                List<Long> candidateProductIds = recommendationDAO.getCandidates(features, 200);
+
+                // 3. 计算推荐得分并排序
+                List<ScoredProduct> recommendations = calculateRecommendations(
+                        userId, candidateProductIds, features);
+
+                // 4. 存入缓存
+                String key = "user:" + userId + ":recommendations";
+                redisTemplate.opsForValue().set(key, recommendations, 12, TimeUnit.HOURS);
+
+            } catch (Exception e) {
+                log.error("Failed to precompute recommendations for user: {}", userId, e);
+            }
+        }
+
+        log.info("Recommendation precomputation completed for {} users", activeUserIds.size());
+    }
+}
+```
+
+### 预计算 vs 实时计算
+
+| 维度 | 预计算 | 实时计算 |
+|---|---|---|
+| 响应速度 | 极快（直接读缓存） | 较慢（需要计算） |
+| 数据新鲜度 | 有延迟（几分钟到几小时） | 实时 |
+| 计算成本 | 低（一次性计算） | 高（每次请求都计算） |
+| 适用场景 | 热点数据、低变更频率 | 冷门数据、高变更频率 |
+
+---
+
+## 五、缓存降级的原因
+
+### 缓存降级 vs 缓存失效
+
+|概念 | 说明 |
+|---|---|
+| 缓存失效 | 缓存数据过期或被删除，下次访问重新加载 |
+| 缓存降级 | 主动放弃缓存，直接访问数据库或返回兜底数据 |
+
+缓存降级通常是**主动为之**，而缓存失效是**被动发生**。
+
+### 触发缓存降级的场景
+
+**1. Redis 不可用**
+
+```java
+@Service
+public class CacheService {
+
+    private static final int MAX_RETRY = 3;
+    private static final long RETRY_DELAY_MS = 100;
+
+    public Product getProduct(Long productId) {
+        String key = "product:" + productId;
+
+        for (int i = 0; i < MAX_RETRY; i++) {
+            try {
+                // 尝试从缓存获取
+                Product cached = (Product) redisTemplate.opsForValue().get(key);
+                if (cached != null) {
+                    return cached;
+                }
+
+                // 缓存未命中，查询数据库
+                Product product = productDAO.findById(productId);
+                if (product != null) {
+                    redisTemplate.opsForValue().set(key, product, 1, TimeUnit.HOURS);
+                }
+                return product;
+
+            } catch (RedisConnectionException e) {
+                log.warn("Redis connection failed, retry {}/{}", i + 1, MAX_RETRY);
+                if (i < MAX_RETRY - 1) {
+                    try {
+                        Thread.sleep(RETRY_DELAY_MS);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                    }
+                } else {
+                    // Redis 完全不可用，降级到数据库直查
+                    return getProductFromDBDirectly(productId);
+                }
+            }
+        }
+
+        return getProductFromDBDirectly(productId);
+    }
+
+    private Product getProductFromDBDirectly(Long productId) {
+        log.warn("Cache degraded, querying database directly for product: {}", productId);
+        return productDAO.findById(productId);
+    }
+}
+```
+
+**2. 命中率过低**
+
+当缓存命中率持续低于阈值时，说明缓存系统可能存在问题，此时降级到数据库可以避免大量无效的缓存查询开销：
+
+```java
+@Service
+public class AdaptiveCacheService {
+
+    private static final double HIT_RATIO_THRESHOLD = 0.5;
+    private static final long METRICS_WINDOW_MS = 60000;
+
+    private final AtomicLong totalRequests = new AtomicLong(0);
+    private final AtomicLong cacheHits = new AtomicLong(0);
+    private volatile boolean degraded = false;
+
+    public Object get(String key, Supplier<Object> dbLoader) {
+        totalRequests.incrementAndGet();
+
+        if (degraded) {
+            // 降级模式：直接查数据库
+            return dbLoader.get();
+        }
+
+        try {
+            Object result = redisTemplate.opsForValue().get(key);
+            if (result != null) {
+                cacheHits.incrementAndGet();
+                return result;
+            }
+
+            // 缓存未命中
+            result = dbLoader.get();
+            if (result != null) {
+                redisTemplate.opsForValue().set(key, result, 30, TimeUnit.MINUTES);
+            }
+            return result;
+
+        } catch (Exception e) {
+            log.error("Cache access failed", e);
+            return dbLoader.get();
+        } finally {
+            // 检查是否需要降级
+            checkDegradation();
+        }
+    }
+
+    private void checkDegradation() {
+        long total = totalRequests.get();
+        long hits = cacheHits.get();
+
+        if (total > 100 && hits * 1.0 / total < HIT_RATIO_THRESHOLD) {
+            if (!degraded) {
+                log.warn("Cache hit ratio {} below threshold {}, enabling degradation",
+                        hits * 1.0 / total, HIT_RATIO_THRESHOLD);
+                degraded = true;
+                // 发送告警
+                alertService.send("Cache degradation enabled");
+            }
+        }
+
+        // 重置计数器
+        if (total > 10000) {
+            totalRequests.set(0);
+            cacheHits.set(0);
+        }
+    }
+}
+```
+
+**3. 内存不足**
+
+当 Redis 内存使用率持续高于 90%，可能出现 OOM，此时应该降级部分非核心缓存：
+
+```java
+@Service
+public class MemoryAwareCacheService {
+
+    @Scheduled(fixedRate = 10000)
+    public void monitorMemory() {
+        String info = jedis.info("memory");
+        long usedMemory = getUsedMemory(info);
+        long maxMemory = getMaxMemory(info);
+        double usage = (double) usedMemory / maxMemory;
+
+        if (usage > 0.95) {
+            log.error("Redis memory usage {}% is critical, starting degradation", usage * 100);
+            startDegradation();
+        } else if (usage > 0.85) {
+            log.warn("Redis memory usage {}% is high", usage * 100);
+            evictNonEssentialData();
+        }
+    }
+
+    private void startDegradation() {
+        // 1. 清理非核心缓存
+        cleanNonEssentialCache();
+
+        // 2. 切换到本地缓存模式
+        enableLocalCacheOnly();
+
+        // 3. 减少写入
+        disableNonCriticalWrites();
+
+        // 4. 发送告警
+        alertService.sendCritical("Redis memory critical, cache degraded");
+    }
+
+    private void cleanNonEssentialCache() {
+        // 清理推荐数据、行为数据等非核心缓存
+        Set<String> keys = jedis.keys("recommendation:*");
+        if (!keys.isEmpty()) {
+            jedis.del(keys.toArray(new String[0]));
+            log.info("Deleted {} non-essential recommendation keys", keys.size());
+        }
+    }
+}
+```
+
+---
+
+## 六、缓存降级的策略
+
+### 1. 返回默认值
+
+最简单粗暴的降级策略，返回预设的兜底数据：
+
+```java
+@Service
+public class DefaultValueCacheService {
+
+    private static final Product DEFAULT_PRODUCT = new Product(-1L, "商品已下架", 0.0);
+    private static final UserProfile DEFAULT_USER = new UserProfile(-1L, "未知用户");
+
+    public Product getProduct(Long productId) {
+        String key = "product:" + productId;
+        try {
+            Product product = (Product) redisTemplate.opsForValue().get(key);
+            return product != null ? product : DEFAULT_PRODUCT;
+        } catch (Exception e) {
+            log.error("Failed to get product from cache", e);
+            return DEFAULT_PRODUCT;
+        }
+    }
+
+    public UserProfile getUserProfile(Long userId) {
+        String key = "user:" + userId + ":profile";
+        try {
+            UserProfile profile = (UserProfile) redisTemplate.opsForValue().get(key);
+            return profile != null ? profile : DEFAULT_USER;
+        } catch (Exception e) {
+            log.error("Failed to get user profile from cache", e);
+            return DEFAULT_USER;
+        }
+    }
+}
+```
+
+### 2. 降级到本地缓存
+
+当 Redis 不可用时，使用本地缓存作为兜底：
+
+```java
+@Service
+public class LocalCacheFallbackService {
+
+    // 本地缓存作为兜底
+    private final LoadingCache<String, Product> localCache = Caffeine.newBuilder()
+            .maximumSize(1000)
+            .expireAfterWrite(5, TimeUnit.MINUTES)
+            .build(key -> loadFromDB(key));
+
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    public Product getProduct(String productId) {
+        String key = "product:" + productId;
+
+        // 1. 尝试 Redis
+        try {
+            Product product = (Product) redisTemplate.opsForValue().get(key);
+            if (product != null) {
+                // 回填本地缓存
+                localCache.put(key, product);
+                return product;
+            }
+        } catch (Exception e) {
+            log.warn("Redis unavailable, falling back to local cache", e);
+            // Redis 不可用，降级到本地缓存
+            return localCache.getIfPresent(key);
+        }
+
+        // 2. 查询数据库
+        Product product = loadFromDB(productId);
+        if (product != null) {
+            try {
+                redisTemplate.opsForValue().set(key, product, 1, TimeUnit.HOURS);
+            } catch (Exception e) {
+                log.warn("Failed to write to Redis", e);
+            }
+            // 同时写入本地缓存
+            localCache.put(key, product);
+        }
+
+        return product;
+    }
+
+    private Product loadFromDB(String productId) {
+        // 从数据库加载
+        return productDAO.findById(Long.parseLong(productId));
+    }
+}
+```
+
+### 3. 降级到数据库直查
+
+放弃缓存，直接查询数据库（作为最后的兜底）：
+
+```java
+@Service
+public class DatabaseFallbackService {
+
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    @Autowired
+    private ProductDAO productDAO;
+
+    // 熔断器：连续失败 N 次后开启降级
+    private final CircuitBreaker circuitBreaker = new CircuitBreaker(5, 60000);
+
+    public Product getProduct(Long productId) {
+        String key = "product:" + productId;
+
+        // 检查熔断器状态
+        if (circuitBreaker.isOpen()) {
+            log.warn("Circuit breaker is open, querying database directly");
+            return queryDatabaseDirectly(productId);
+        }
+
+        try {
+            Product product = (Product) redisTemplate.opsForValue().get(key);
+            if (product != null) {
+                circuitBreaker.recordSuccess();
+                return product;
+            }
+
+            product = queryDatabaseDirectly(productId);
+
+            // 尝试回填缓存（失败不阻断）
+            try {
+                redisTemplate.opsForValue().set(key, product, 1, TimeUnit.HOURS);
+            } catch (Exception e) {
+                log.warn("Failed to write to cache after DB query", e);
+            }
+
+            return product;
+
+        } catch (Exception e) {
+            circuitBreaker.recordFailure();
+            log.error("Cache query failed, falling back to database", e);
+            return queryDatabaseDirectly(productId);
+        }
+    }
+
+    private Product queryDatabaseDirectly(Long productId) {
+        return productDAO.findById(productId);
+    }
+
+    // 简单的熔断器实现
+    static class CircuitBreaker {
+        private final int failureThreshold;
+        private final long recoveryTimeout;
+        private final AtomicInteger failureCount = new AtomicInteger(0);
+        private volatile long lastFailureTime = 0;
+
+        public CircuitBreaker(int failureThreshold, long recoveryTimeout) {
+            this.failureThreshold = failureThreshold;
+            this.recoveryTimeout = recoveryTimeout;
+        }
+
+        public void recordSuccess() {
+            failureCount.set(0);
+        }
+
+        public void recordFailure() {
+            int count = failureCount.incrementAndGet();
+            lastFailureTime = System.currentTimeMillis();
+        }
+
+        public boolean isOpen() {
+            if (failureCount.get() >= failureThreshold) {
+                if (System.currentTimeMillis() - lastFailureTime > recoveryTimeout) {
+                    // 半开状态，允许尝试一次
+                    failureCount.set(failureThreshold - 1);
+                    return false;
+                }
+                return true;
+            }
+            return false;
+        }
+    }
+}
+```
+
+---
+
+## 七、缓存与降级的联动方案
+
+### 分层降级策略
+
+```java
+@Service
+public class TieredDegradationService {
+
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    // L1: 本地缓存
+    private final LoadingCache<String, Object> l1Cache = Caffeine.newBuilder()
+            .maximumSize(500)
+            .expireAfterWrite(1, TimeUnit.MINUTES)
+            .build(key -> null);
+
+    // L2: Redis
+    // L3: 数据库
+
+    public Object getProduct(String key, Class<?> entityClass, Supplier<Object> dbLoader) {
+        // 层级 1: 本地缓存
+        Object result = l1Cache.getIfPresent(key);
+        if (result != null) {
+            return result;
+        }
+
+        // 层级 2: Redis
+        try {
+            result = redisTemplate.opsForValue().get(key);
+            if (result != null) {
+                // 回填 L1
+                l1Cache.put(key, result);
+                return result;
+            }
+        } catch (Exception e) {
+            log.warn("Redis unavailable at L2", e);
+        }
+
+        // 层级 3: 数据库
+        result = dbLoader.get();
+
+        // 回填 L2（失败不阻断）
+        if (result != null) {
+            try {
+                redisTemplate.opsForValue().set(key, result, 1, TimeUnit.HOURS);
+                l1Cache.put(key, result);
+            } catch (Exception e) {
+                log.warn("Failed to write back to L2", e);
+            }
+        }
+
+        return result;
+    }
+}
+```
+
+### 降级恢复策略
+
+降级不是目的，恢复才是。降级后需要自动或手动恢复：
+
+```java
+@Service
+public class DegradationRecoveryService {
+
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    private volatile boolean degraded = false;
+
+    @Scheduled(fixedRate = 10000)
+    public void checkRecovery() {
+        if (degraded) {
+            // 尝试连接 Redis
+            try {
+                redisTemplate.opsForValue().get("health:check");
+                log.info("Redis connection recovered, disabling degradation");
+                degraded = false;
+                // 触发缓存预热
+                triggerPreheat();
+            } catch (Exception e) {
+                log.debug("Redis still unavailable");
+            }
+        }
+    }
+
+    private void triggerPreheat() {
+        // 通知预热服务重新加载热点数据
+        applicationEventPublisher.publishEvent(new CachePreheatEvent());
+    }
+}
+```
+
+---
+
+## 八、大促/秒杀场景下的缓存保障策略
+
+### 大促前：多轮预热
+
+```java
+@Service
+public class BigSaleCacheStrategy {
+
+    // 活动前 24 小时：第一次预热
+    @Scheduled(cron = "0 0 0 * * ?")
+    public void firstRoundPreheat() {
+        preheatHotProducts(500);
+        preheatUserCarts(10000);
+    }
+
+    // 活动前 6 小时：第二次预热
+    @Scheduled(cron = "0 0 18 * * ?")
+    public void secondRoundPreheat() {
+        preheatHotProducts(2000);
+        preheatFlashSaleItems();
+        preheatStockData();
+    }
+
+    // 活动前 1 小时：第三次预热
+    @Scheduled(cron = "0 0 23 * * ?")
+    public void finalRoundPreheat() {
+        preheatHotProducts(5000);
+        warmUpStockCache();
+    }
+
+    private void preheatHotProducts(int limit) {
+        List<Product> products = productDAO.findHotProducts(limit);
+        for (Product product : products) {
+            String key = "product:" + product.getId();
+            redisTemplate.opsForValue().set(key, product, 2, TimeUnit.HOURS);
+        }
+    }
+
+    private void preheatFlashSaleItems() {
+        List<FlashSaleActivity> activities = flashSaleDAO.getUpcomingActivities();
+        for (FlashSaleActivity activity : activities) {
+            flashSalePreheatService.preheatForFlashSale(activity.getId(), 2);
+        }
+    }
+
+    private void warmUpStockCache() {
+        // 确保库存数据已预热
+        Set<String> stockKeys = redisTemplate.keys("flashsale:*:stock:*");
+        if (stockKeys.isEmpty()) {
+            log.error("Stock cache is empty, critical for flash sale!");
+            alertService.sendCritical("Flash sale stock not preheated!");
+        }
+    }
+}
+```
+
+### 大促中：动态扩容 + 熔断降级
+
+```java
+@Service
+public class BigSaleProtectionService {
+
+    private static final double MAX_REDIS_MEMORY_USAGE = 0.85;
+    private static final double MAX_DB_CPU_USAGE = 0.80;
+
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    @Autowired
+    private DatabaseMonitor databaseMonitor;
+
+    @Autowired
+    private AlertService alertService;
+
+    @Scheduled(fixedRate = 5000)
+    public void monitorAndProtect() {
+        // 1. 检查 Redis 内存
+        String memoryInfo = jedis.info("memory");
+        double redisMemoryUsage = calculateMemoryUsage(memoryInfo);
+
+        if (redisMemoryUsage > MAX_REDIS_MEMORY_USAGE) {
+            log.warn("Redis memory usage {}% exceeds threshold", redisMemoryUsage * 100);
+            // 降级非核心缓存
+            degradeNonEssentialCache();
+            alertService.send("Redis memory high, non-essential cache degraded");
+        }
+
+        // 2. 检查数据库 CPU
+        double dbCpuUsage = databaseMonitor.getCpuUsage();
+        if (dbCpuUsage > MAX_DB_CPU_USAGE) {
+            log.warn("Database CPU usage {}% exceeds threshold", dbCpuUsage * 100);
+            // 全面降级，减少写操作
+            enableWriteDegradation();
+            alertService.sendCritical("Database CPU critical, write operations degraded");
+        }
+
+        // 3. 检查响应时间
+        double avgResponseTime = metricsCollector.getAvgResponseTime("getProduct");
+        if (avgResponseTime > 100) {  // 100ms
+            log.warn("Response time {}ms exceeds threshold", avgResponseTime);
+            // 临时提高本地缓存优先级
+            enableL1Priority();
+        }
+    }
+
+    private void degradeNonEssentialCache() {
+        // 清理推荐数据、历史数据等
+        Set<String> keys = jedis.keys("recommendation:*");
+        keys.addAll(jedis.keys("history:*"));
+        keys.addAll(jedis.keys("analytics:*"));
+        if (!keys.isEmpty()) {
+            jedis.del(keys.toArray(new String[0]));
+        }
+    }
+
+    private void enableWriteDegradation() {
+        // 关闭非关键写操作
+        writeService.disableNonCriticalWrites();
+    }
+
+    private void enableL1Priority() {
+        // 提高 L1 缓存权重，减少 Redis 请求
+        configService.set("cache.l1.priority", "HIGH");
+    }
+}
+```
+
+### 大促后：快速恢复
+
+```java
+@Service
+public class BigSaleRecoveryService {
+
+    @PostConstruct
+    public void postSaleRecovery() {
+        // 大促结束后 1 小时执行恢复
+        scheduleRecovery();
+    }
+
+    private void scheduleRecovery() {
+        // 1. 清理过期活动数据
+        cleanExpiredActivityData();
+
+        // 2. 重新统计销量
+        resyncSalesData();
+
+        // 3. 恢复被降级的缓存
+        restoreDegradedCache();
+
+        // 4. 释放临时资源
+        releaseTemporaryResources();
+    }
+
+    private void restoreDegradedCache() {
+        // 恢复推荐数据
+        recommendationService.fullRefresh();
+        // 恢复历史数据
+        historyService.rebuild();
+    }
+}
+```
+
+---
+
+## 九、缓存的热升级与动态刷新
+
+### 什么是热升级
+
+|热升级|指的是在不重启应用的情况下，更新缓存数据或配置。
+
+**使用场景**：
+- 紧急修复：修复了商品价格，需要立即更新缓存
+- 配置变更：修改了系统参数，需要实时生效
+- 数据迁移：将数据从 A Redis 迁移到 B Redis
+
+### 热升级的实现
+
+```java
+@Service
+public class HotUpgradeCacheService {
+
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    @Autowired
+    private ProductDAO productDAO;
+
+    /**
+     * 热更新单个商品缓存
+     */
+    @PostMapping("/cache/product/{productId}/refresh")
+    public Result<Void> refreshProductCache(@PathVariable Long productId) {
+        log.info("Hot refreshing product cache: {}", productId);
+
+        // 1. 从数据库加载最新数据
+        Product product = productDAO.findById(productId);
+        if (product == null) {
+            return Result.error("Product not found");
+        }
+
+        // 2. 更新缓存
+        String key = "product:" + productId;
+        redisTemplate.opsForValue().set(key, product, 1, TimeUnit.HOURS);
+
+        // 3. 删除相关缓存（可能有聚合数据依赖此商品）
+        deleteRelatedCaches(productId);
+
+        return Result.success();
+    }
+
+    /**
+     * 热更新配置缓存
+     */
+    @PostMapping("/cache/config/refresh")
+    public Result<Void> refreshConfigCache() {
+        log.info("Hot refreshing config cache");
+
+        // 1. 从数据库加载最新配置
+        Map<String, String> configs = configDAO.findAllConfigs();
+
+        // 2. 原子性更新
+        String key = "system:configs";
+        redisTemplate.delete(key);
+        redisTemplate.opsForHash().putAll(key, configs);
+
+        return Result.success();
+    }
+
+    /**
+     * 批量刷新缓存
+     */
+    @PostMapping("/cache/batch/refresh")
+    public Result<Integer> batchRefreshCache(@RequestBody List<Long> productIds) {
+        int success = 0;
+        for (Long productId : productIds) {
+            try {
+                Product product = productDAO.findById(productId);
+                if (product != null) {
+                    String key = "product:" + productId;
+                    redisTemplate.opsForValue().set(key, product, 1, TimeUnit.HOURS);
+                    success++;
+                }
+            } catch (Exception e) {
+                log.error("Failed to refresh cache for product: {}", productId, e);
+            }
+        }
+
+        return Result.success(success);
+    }
+
+    private void deleteRelatedCaches(Long productId) {
+        // 删除分类页缓存
+        Product product = productDAO.findById(productId);
+        if (product != null) {
+            String categoryKey = "category:" + product.getCategoryId() + ":products";
+            redisTemplate.delete(categoryKey);
+
+            // 删除搜索缓存
+            String searchKey = "search:*:" + productId + "*";
+            Set<String> keys = redisTemplate.keys(searchKey);
+            if (!keys.isEmpty()) {
+                redisTemplate.delete(keys);
+            }
+        }
+    }
+}
+```
+
+### 动态刷新机制
+
+```java
+@Service
+public class DynamicRefreshService {
+
+    @Autowired
+    private ConfigWatcher configWatcher;
+
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    @PostConstruct
+    public void init() {
+        // 监听配置变更
+        configWatcher.watch("product:*", this::onProductConfigChange);
+        configWatcher.watch("system:*", this::onSystemConfigChange);
+    }
+
+    private void onProductConfigChange(String key, String value) {
+        log.info("Product config changed: {} = {}", key, value);
+        // 解析变更的 key，如 "product:100:price"
+        String[] parts = key.split(":");
+        if (parts.length >= 2) {
+            Long productId = Long.parseLong(parts[1]);
+            // 删除该商品的缓存，让下次请求重新加载
+            redisTemplate.delete("product:" + productId);
+        }
+    }
+
+    private void onSystemConfigChange(String key, String value) {
+        log.info("System config changed: {} = {}", key, value);
+        // 系统配置变更通常是全局的，广播通知所有节点
+        redisTemplate.convertAndSend("config:changed", key);
+    }
+}
+```
+
+---
+
+## 十、总结
+
+缓存预热、预计算与降级策略是高并发系统的"三板斧"：
+
+### 缓存预热
+
+- **必要性**：冷启动会导致数据库被打爆
+- **方式**：启动时加载、定时任务预热、活动前预热
+- **风险**：预热时间长、影响正常请求、数据过期
+- **最佳实践**：分批预热、使用独立连接、设置足够长的过期时间
+
+### 缓存预计算
+
+- **适用场景**：排行榜、推荐列表、统计指标
+- **优势**：响应快、减轻计算压力
+- **劣势**：数据有延迟、需要额外存储
+
+### 缓存降级
+
+- **触发条件**：Redis 不可用、命中率过低、内存不足
+- **策略**：默认值兜底、本地缓存降级、数据库直查
+- **关键**：分级降级、自动恢复
+
+---
+
+## 面试追问预判
+
+**Q1：缓存预热具体怎么做？**
+
+根据场景选择方式：1）启动时加载热点数据到缓存；2）定时任务持续补充热点；3）大促前专门预热。关键点：分批加载避免超时、使用独立连接池、设置足够长的过期时间。
+
+**Q2：Redis 故障时如何保证系统可用？**
+
+多级降级策略：1）L1 本地缓存兜底；2）L2 Redis 不可用时直接查数据库；3）设置熔断器，连续失败 N 次后自动降级。关键是监控 + 告警 + 快速恢复。
+
+**Q3：如何实现缓存的热更新？**
+
+不重启应用更新缓存的方式：1）提供管理接口，支持手动刷新单个或批量 key；2）监听配置中心变更，自动刷新相关缓存；3）设置较短的过期时间，让缓存自然过期后重新加载。
+
+**Q4：预计算的数据如何保证实时性？**
+
+常用方案：1）缩短预计算周期（如从小时级到分钟级）；2）使用增量计算，只计算变更的部分；3）对于要求实时性极高的数据，用实时计算 + 异步修正（如 Storm/Flink）。
+
+**Q5：缓存降级和熔断的关系？**
+
+缓存降级是降级策略的一种，熔断是实现降级的一种手段。熔断器可以监控缓存调用失败率，失败率超过阈值时自动开启降级，避免大量无效请求打爆缓存服务。

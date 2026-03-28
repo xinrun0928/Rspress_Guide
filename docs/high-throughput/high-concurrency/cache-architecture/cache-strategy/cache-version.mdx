@@ -1,0 +1,850 @@
+# 缓存版本控制与乐观锁
+
+import { Badge } from '@rspress/core/theme';
+
+> [!WARNING]
+> 前置知识：本篇文章涉及 Redis、数据库并发控制、乐观锁/悲观锁等知识，建议先掌握 Redis 数据结构和数据库事务机制。
+
+---
+
+你打开监控系统，看到一个诡异的数字：商品 A 的库存显示 100 件，但过去一小时已经卖出了 150 件。系统没有任何报错，数据库记录也显示只扣减了 100 次。
+
+问题出在哪？
+
+排查后发现：商品 A 的库存数据被缓存了。两个用户同时读取到缓存中的 100，然后各自扣减 1，各自写入数据库。两次扣减，数据库从 100 变成 99，而不是 98。
+
+这种「后写覆盖先写」的问题，在并发环境下非常常见。问题的根源是：**缺少并发控制机制**。
+
+这一讲，我们来探讨如何通过缓存版本控制和乐观锁，解决并发更新导致的覆盖问题。
+
+---
+
+## 一、为什么需要缓存版本控制
+
+### 1.1 并发更新导致的覆盖问题
+
+考虑一个典型场景：电商系统中，商品信息被缓存以提升读取性能。
+
+```text
+T0 时刻：缓存中 product:100 = {id: 100, stock: 10, version: 1}
+
+T1 时刻：用户A读取商品，得到 stock=10
+T2 时刻：用户B读取商品，得到 stock=10（同样从缓存读取）
+T3 时刻：用户A购买成功，扣减1件，更新数据库 stock=9
+T4 时刻：用户A更新缓存 product:100 = {id: 100, stock: 9, version: 2}
+T5 时刻：用户B也想购买，扣减1件，更新数据库 stock=9（覆盖了A的更新！）
+T6 时刻：用户B更新缓存 product:100 = {id: 100, stock: 9, version: 3}
+
+最终结果：
+- 数据库显示 stock=9（错误，应该是8）
+- 缓存显示 stock=9（错误，应该是8）
+- 少扣减了1件，库存对不上
+```
+
+这就是经典的 Lost Update（丢失更新）问题。在单机环境下，数据库的事务锁可以防止这种问题。但一旦引入缓存，数据库的锁机制就被绕过了。
+
+### 1.2 缓存版本控制的核心思想
+
+解决方案的核心思路是：**给每次更新加上「先后顺序」，后到的更新必须知道自己是「后来者」**。
+
+```text
+版本号 1：{id: 100, stock: 10}
+版本号 2：{id: 100, stock: 9}   ← 线程A更新，version=2
+版本号 3：{id: 100, stock: 8}   ← 线程B更新，version=3
+
+如果线程B的更新带着 version=2 到来，系统发现当前版本是2，可以执行更新。
+如果线程B的更新带着 version=1 到来，系统发现当前版本是2，拒绝执行（已经被更新过了）。
+```
+
+这就是**乐观锁**的核心思想：**假设并发冲突是小概率事件，更新前检查版本号，如果不匹配则拒绝更新**。
+
+### 1.3 版本控制的三要素
+
+一个完整的缓存版本控制方案，需要包含三个要素：
+
+| 要素 | 说明 | 实现方式 |
+|---|---|---|
+| **版本标识** | 唯一标识数据的版本 | 递增整数、时间戳、UUID |
+| **版本检查** | 更新前验证版本是否匹配 | CAS 操作、Lua 脚本 |
+| **冲突处理** | 版本不匹配时的处理策略 | 重试、合并、降级 |
+
+---
+
+## 二、简单版本号方案
+
+### 2.1 基础版本号实现
+
+最简单的方式是在缓存数据结构中增加一个版本字段：
+
+```java title="带版本号的缓存数据"
+@Data
+public class VersionedData<T> {
+    private T data;
+    private Long version;
+    private Long lastModified;
+    
+    public boolean isStale(long expectedVersion) {
+        return this.version != expectedVersion;
+    }
+}
+```
+
+写入缓存时递增版本号：
+
+```java
+public void setWithVersion(String key, Product product, long version) {
+    VersionedData<Product> cached = new VersionedData<>();
+    cached.setData(product);
+    cached.setVersion(version);
+    cached.setLastModified(System.currentTimeMillis());
+    
+    redisTemplate.opsForValue().set(key, cached);
+}
+```
+
+### 2.2 increment 更新前检查
+
+Redis 提供了原子递增操作，可以利用这个特性实现简单的版本检查：
+
+```java
+public boolean updateStockWithVersion(String key, int delta, long expectedVersion) {
+    // Lua 脚本：检查版本号并原子更新
+    String script = 
+        "local current = redis.call('HGET', KEYS[1], 'version') " +
+        "if current == false then return -1 end " +  -- key不存在
+        "if tonumber(current) ~= tonumber(ARGV[1]) then return -2 end " +  -- 版本不匹配
+        "local stock = redis.call('HINCRBY', KEYS[1], 'stock', ARGV[2]) " +
+        "redis.call('HINCRBY', KEYS[1], 'version', 1) " +
+        "return stock";
+    
+    Long result = redisTemplate.execute(
+        new DefaultRedisScript<>(script, Long.class),
+        Collections.singletonList(key),
+        expectedVersion, delta);
+    
+    return result != null && result >= 0;
+}
+```
+
+### 2.3 简单方案的问题
+
+简单版本号方案有一个致命缺陷：**无法处理 ABA 问题**。
+
+---
+
+## 三、ABA 问题和解决方案
+
+### 3.1 什么是 ABA 问题
+
+ABA 问题是并发编程中的经典问题：
+
+```text
+线程A读取数据，得到 value=A，version=1
+线程B修改数据：A→B，version=2
+线程B修改数据：B→A，version=3
+线程A再次读取，得到 value=A，version=3
+
+线程A认为数据没有被修改过，但实际上已经经历了两次变更！
+```
+
+在缓存场景下，ABA 问题可能导致：
+
+```text
+T1：用户A读取商品库存 stock=100，version=1
+T2：管理员修正库存，先减后加，stock=100，version=3
+T3：用户A扣减库存，基于 version=1 检测通过，stock=99
+
+结果：库存虽然没变，但版本冲突被错误放过了。
+```
+
+### 3.2 ABA 问题的解决方案
+
+**方案一：使用时间戳或随机数作为版本标识**
+
+不依赖简单的递增整数，而是使用时间戳 + 随机数：
+
+```java
+public String generateVersionId() {
+    return System.currentTimeMillis() + ":" + UUID.randomUUID().toString().substring(0, 8);
+}
+```
+
+但这仍然无法完全解决 ABA 问题——两次修改可能在同一毫秒内完成。
+
+**方案二：添加变更计数器**
+
+除了主版本号，再加一个「变更次数」字段：
+
+```java
+@Data
+public class VersionedData<T> {
+    private T data;
+    private Long version;          // 主版本号
+    private Long changeCount;     // 变更计数器
+    private Long lastModified;
+}
+```
+
+更新时同时检查两个字段：
+
+```lua
+-- 检查版本和变更计数
+local currentVersion = redis.call('HGET', KEYS[1], 'version')
+local currentChangeCount = redis.call('HGET', KEYS[1], 'changeCount')
+
+if currentVersion ~= ARGV[1] then return -1 end
+if currentChangeCount ~= ARGV[2] then return -2 end
+
+redis.call('HINCRBY', KEYS[1], 'version', 1)
+redis.call('HINCRBY', KEYS[1], 'changeCount', 1)
+redis.call('HINCRBY', KEYS[1], 'stock', ARGV[3])
+
+return 1
+```
+
+**方案三：使用唯一事务 ID（推荐）**
+
+为每次更新生成唯一的业务事务 ID：
+
+```java
+@Data
+public class VersionedData<T> {
+    private T data;
+    private Long version;
+    private String transactionId;  // 唯一事务ID
+    private Long lastModified;
+}
+```
+
+更新时记录事务 ID，查询时验证：
+
+```java
+public UpdateResult updateWithTransaction(String key, Product product, 
+        String expectedTxId, long expectedVersion) {
+    
+    VersionedData<Product> cached = redisTemplate.opsForValue().get(key);
+    
+    if (cached == null) {
+        return UpdateResult.NOT_FOUND;
+    }
+    
+    // 检查版本和事务ID
+    if (cached.getVersion() != expectedVersion) {
+        return UpdateResult.VERSION_CONFLICT;
+    }
+    
+    if (!expectedTxId.equals(cached.getTransactionId())) {
+        // 相同数据已被其他事务更新过
+        return UpdateResult.TRANSACTION_CONFLICT;
+    }
+    
+    // 执行更新
+    cached.setData(product);
+    cached.setVersion(expectedVersion + 1);
+    cached.setTransactionId(UUID.randomUUID().toString());
+    redisTemplate.opsForValue().set(key, cached);
+    
+    return UpdateResult.SUCCESS;
+}
+```
+
+### 3.3 ABA 问题的实际影响
+
+在大多数业务场景下，ABA 问题的影响可能没有你想象的那么大：
+
+- **库存扣减**：ABA 不影响最终结果，只要操作是幂等的
+- **金额修改**：ABA 可能导致金额计算错误，必须严格避免
+- **配置变更**：ABA 可能导致配置覆盖，需要关注
+
+**判断标准**：如果业务对「中间状态变更」敏感，就需要解决 ABA 问题。
+
+---
+
+## 四、CAS 在缓存中的应用
+
+### 4.1 什么是 CAS
+
+CAS（Check-And-Swap）是一种乐观并发控制机制：
+
+1. 读取数据的当前值和版本号
+2. 基于读取的值进行计算
+3. 更新前检查版本号是否发生变化
+4. 如果版本号没变，执行更新；否则拒绝
+
+CAS 的核心优势是**无锁**——不需要获取锁，所有线程都可以并发读取，只有更新时才可能冲突。
+
+### 4.2 Redis 的 CAS 实现
+
+Redis 本身不直接支持 CAS，但我们可以用 Lua 脚本模拟：
+
+```lua title="Redis CAS 实现"
+-- check_and_swap.lua
+-- KEYS[1]: 缓存key
+-- ARGV[1]: 期望的版本号
+-- ARGV[2]: 新数据(JSON)
+
+local current = redis.call('GET', KEYS[1])
+if current == false then
+    return {-1, nil}  -- key不存在
+end
+
+local data = cjson.decode(current)
+if data.version ~= tonumber(ARGV[1]) then
+    return {0, current}  -- 版本不匹配，返回当前数据
+end
+
+-- 版本匹配，执行更新
+data.version = data.version + 1
+local newData = cjson.encode(data)
+redis.call('SET', KEYS[1], newData)
+
+return {1, newData}  -- 更新成功
+```
+
+### 4.3 Redis WATCH + MULTI + EXEC
+
+Redis 提供了事务机制，其中的 WATCH 命令可以监控 key 的变化：
+
+```java
+public boolean updateWithWatch(String key, Function<VersionedData, VersionedData> updater) {
+    // 监视key
+    redisTemplate.execute(new SessionCallback<Boolean>() {
+        @Override
+        public Boolean execute(RedisOperations operations) throws DataAccessException {
+            operations.watch(key);
+            
+            // 读取数据
+            VersionedData data = (VersionedData) operations.opsForValue().get(key);
+            if (data == null) {
+                operations.unwatch();
+                return false;
+            }
+            
+            // 开启事务
+            operations.multi();
+            
+            // 执行更新操作（进入队列，不立即执行）
+            data.setVersion(data.getVersion() + 1);
+            operations.opsForValue().set(key, updater.apply(data));
+            
+            // 执行事务，如果watch的key没有变化，返回成功
+            return operations.exec();
+        }
+    });
+}
+```
+
+`WATCH + MULTI + EXEC` 的语义是：
+
+- `WATCH`：监视指定的 key
+- `MULTI`：开启事务，后续命令进入队列
+- `EXEC`：执行事务，如果被监视的 key 在 `WATCH` 和 `EXEC` 之间被修改过，事务失败返回 null
+
+### 4.4 WATCH 的限制
+
+Redis 的 WATCH 有几个重要限制：
+
+1. **只支持单个 key**：不能同时监视多个 key
+2. **不支持回滚**：事务失败后不会自动重试
+3. **不是真正的 ACID**：Redis 事务不支持回滚
+
+对于复杂的并发控制场景，建议使用 Lua 脚本，因为 Lua 脚本在 Redis 中是原子执行的。
+
+---
+
+## 五、乐观锁的版本更新策略
+
+### 5.1 策略一：更新时检查版本（Compare-And-Set）
+
+这是最直接的乐观锁实现：
+
+```java title="更新时检查版本"
+public boolean updateStock(String key, int delta) {
+    while (true) {
+        // 1. 读取当前数据
+        VersionedData<Product> cached = redisTemplate.opsForValue().get(key);
+        if (cached == null) {
+            return false;
+        }
+        
+        long currentVersion = cached.getVersion();
+        long currentStock = cached.getData().getStock();
+        
+        // 2. 检查库存是否足够
+        if (currentStock + delta < 0) {
+            return false;
+        }
+        
+        // 3. 构造新数据
+        Product newProduct = cached.getData().clone();
+        newProduct.setStock(currentStock + delta);
+        
+        VersionedData<Product> newCached = new VersionedData<>();
+        newCached.setData(newProduct);
+        newCached.setVersion(currentVersion + 1);
+        
+        // 4. 尝试更新（版本检查）
+        Boolean success = redisTemplate.opsForValue()
+            .setIfAbsent(key, newCached);  // 这里需要自定义实现
+        
+        if (success) {
+            return true;
+        }
+        
+        // 5. 版本冲突，重试
+        log.info("版本冲突，key={}，重试", key);
+    }
+}
+```
+
+这种策略的问题是：每次更新失败都需要重试，在高并发场景下可能重试多次。
+
+### 5.2 策略二：先删后写（Delete-Then-Write）
+
+考虑到并发更新的复杂性，很多场景选择「先删后写」：
+
+```java title="先删后写"
+public void updateAndInvalidateCache(String key, Product newProduct) {
+    // 1. 更新数据库
+    database.update(newProduct);
+    
+    // 2. 删除缓存
+    redisTemplate.delete(key);
+    
+    // 3. 发送消息，异步重建缓存（可选）
+    kafkaTemplate.send("cache-invalidate", key);
+}
+```
+
+先删后写的优势：
+
+- **简单**：不需要处理版本冲突
+- **幂等**：删除操作天然幂等
+- **最终一致**：下次读取时自动重建
+
+先删后写的问题：
+
+- **缓存穿透**：删除后、写入前这段时间，所有请求都回源
+- **更新丢失**：如果删除失败，数据可能不一致
+
+### 5.3 策略三：先写后删（Write-Then-Delete）
+
+这是 Cache Aside 模式的标准做法：
+
+```java title="先写后删"
+public void updateProduct(String key, Product newProduct) {
+    // 1. 更新数据库
+    database.update(newProduct);
+    
+    // 2. 删除缓存
+    redisTemplate.delete(key);
+}
+```
+
+先写后删和先删后写的区别在于：
+
+| 策略 | 优势 | 风险 |
+|---|---|---|
+| 先删后写 | 避免读到旧数据 | 缓存穿透 |
+| 先写后删 | 保证数据不丢失 | 可能读到短暂旧数据 |
+
+### 5.4 两种策略的选择
+
+**选择「先删后写」的场景**：
+
+- 数据一致性要求极高，不能容忍任何旧数据
+- 读请求量远小于写请求量
+- 可以接受删除失败后的补偿机制
+
+**选择「先写后删」的场景**：
+
+- 大多数场景——Cache Aside 的默认选择
+- 读请求量远大于写请求量
+- 可以容忍短暂的数据不一致
+
+---
+
+## 六、缓存版本在实际业务中的应用
+
+### 6.1 商品库存场景
+
+库存扣减是缓存版本控制最经典的应用场景：
+
+```java title="库存扣减（乐观锁版本）"
+@Service
+public class StockService {
+    
+    private static final String STOCK_KEY = "stock:";
+    
+    @Autowired
+    private RedisTemplate<String, VersionedData<ProductStock>> redisTemplate;
+    
+    public DeductResult deductStock(Long productId, Integer quantity) {
+        String key = STOCK_KEY + productId;
+        
+        int maxRetries = 3;
+        while (maxRetries-- > 0) {
+            // 1. 读取缓存
+            VersionedData<ProductStock> cached = redisTemplate.opsForValue().get(key);
+            
+            if (cached == null) {
+                return DeductResult.CACHE_MISS;
+            }
+            
+            ProductStock stock = cached.getData();
+            long currentVersion = cached.getVersion();
+            
+            // 2. 检查库存
+            if (stock.getAvailableStock() < quantity) {
+                return DeductResult.INSUFFICIENT_STOCK;
+            }
+            
+            // 3. 构造新库存
+            ProductStock newStock = stock.clone();
+            newStock.setAvailableStock(stock.getAvailableStock() - quantity);
+            newStock.setLockedStock(stock.getLockedStock() + quantity);
+            
+            // 4. CAS 更新
+            boolean success = casUpdate(key, currentVersion, newStock);
+            
+            if (success) {
+                // 5. 异步同步到数据库
+                syncToDatabase(productId, quantity);
+                return DeductResult.SUCCESS;
+            }
+            
+            // 5. 失败重试
+            log.info("CAS更新失败，重试，productId={}", productId);
+        }
+        
+        return DeductResult.CONCURRENT_CONFLICT;
+    }
+    
+    private boolean casUpdate(String key, long expectedVersion, ProductStock newStock) {
+        // Lua 脚本实现原子 CAS
+        String script = 
+            "local data = redis.call('GET', KEYS[1]) " +
+            "if not data then return 0 end " +
+            "local obj = cjson.decode(data) " +
+            "if obj.version ~= tonumber(ARGV[1]) then return 0 end " +
+            "obj.version = obj.version + 1 " +
+            "obj.data.stock = ARGV[2] " +
+            "obj.data.locked = ARGV[3] " +
+            "redis.call('SET', KEYS[1], cjson.encode(obj)) " +
+            "return 1";
+        
+        Long result = redisTemplate.execute(
+            new DefaultRedisScript<>(script, Long.class),
+            Collections.singletonList(key),
+            expectedVersion, 
+            newStock.getAvailableStock(),
+            newStock.getLockedStock());
+        
+        return result != null && result == 1;
+    }
+}
+```
+
+### 6.2 余额扣减场景
+
+余额扣减对并发控制的要求比库存更高——余额不能出现负数，更不能出现「变多」的情况。
+
+```java title="余额扣减（更严格的乐观锁）"
+@Service
+public class BalanceService {
+    
+    public TransferResult transfer(Long fromUserId, Long toUserId, BigDecimal amount) {
+        String fromKey = "balance:" + fromUserId;
+        String toKey = "balance:" + toUserId;
+        
+        // 1. 获取分布式锁（防止同一用户并发扣款）
+        String lockKey = "lock:balance:" + fromUserId;
+        RLock lock = redissonClient.getLock(lockKey);
+        lock.lock(10, TimeUnit.SECONDS);
+        
+        try {
+            // 2. 读取余额
+            BigDecimal fromBalance = getBalance(fromKey);
+            BigDecimal toBalance = getBalance(toKey);
+            
+            // 3. 检查余额
+            if (fromBalance.compareTo(amount) < 0) {
+                return TransferResult.INSUFFICIENT_BALANCE;
+            }
+            
+            // 4. 执行扣款和入账
+            BigDecimal newFromBalance = fromBalance.subtract(amount);
+            BigDecimal newToBalance = toBalance.add(amount);
+            
+            // 5. 乐观锁更新（使用 Redis WATCH）
+            boolean success = watchUpdate(fromKey, toKey, 
+                fromBalance, newFromBalance, 
+                toBalance, newToBalance);
+            
+            if (!success) {
+                return TransferResult.CONCURRENT_CONFLICT;
+            }
+            
+            // 6. 异步落库
+            asyncPersistTransfer(fromUserId, toUserId, amount);
+            
+            return TransferResult.SUCCESS;
+        } finally {
+            lock.unlock();
+        }
+    }
+    
+    private boolean watchUpdate(String fromKey, String toKey,
+            BigDecimal oldFromBalance, BigDecimal newFromBalance,
+            BigDecimal oldToBalance, BigDecimal newToBalance) {
+        
+        return redisTemplate.execute(new SessionCallback<Boolean>() {
+            @Override
+            public Boolean execute(RedisOperations operations) throws DataAccessException {
+                operations.watch(fromKey, toKey);
+                
+                BigDecimal currentFrom = getBalance(operations, fromKey);
+                BigDecimal currentTo = getBalance(operations, toKey);
+                
+                // 验证余额未被其他事务修改
+                if (currentFrom.compareTo(oldFromBalance) != 0 ||
+                    currentTo.compareTo(oldToBalance) != 0) {
+                    operations.unwatch();
+                    return false;
+                }
+                
+                operations.multi();
+                operations.opsForValue().set(fromKey, newFromBalance);
+                operations.opsForValue().set(toKey, newToBalance);
+                
+                List<Object> results = operations.exec();
+                return !results.isEmpty();
+            }
+        });
+    }
+}
+```
+
+### 6.3 配置更新场景
+
+系统配置通常保存在缓存中，更新时需要确保不覆盖其他节点的并发修改：
+
+```java title="配置更新（版本控制）"
+@Service
+public class ConfigService {
+    
+    private static final String CONFIG_KEY = "config:";
+    private static final String CONFIG_VERSION_KEY = "config:version:";
+    
+    public boolean updateConfig(String configKey, Map<String, Object> config) {
+        String dataKey = CONFIG_KEY + configKey;
+        String versionKey = CONFIG_VERSION_KEY + configKey;
+        
+        // 1. 获取当前版本号
+        Long currentVersion = redisTemplate.opsForValue().increment(versionKey);
+        
+        // 2. 添加版本信息
+        config.put("_version", currentVersion);
+        config.put("_updatedAt", System.currentTimeMillis());
+        
+        // 3. 更新配置
+        redisTemplate.opsForValue().set(dataKey, config);
+        
+        // 4. 发布配置变更事件
+        applicationEventPublisher.publishEvent(
+            new ConfigChangedEvent(configKey, currentVersion));
+        
+        return true;
+    }
+    
+    public ConfigUpdateResult checkAndUpdate(String configKey, 
+            Map<String, Object> expectedConfig, Map<String, Object> newConfig) {
+        
+        String dataKey = CONFIG_KEY + configKey;
+        
+        VersionedData<Map<String, Object>> cached = 
+            redisTemplate.opsForValue().get(dataKey);
+        
+        if (cached == null) {
+            return ConfigUpdateResult.NOT_FOUND;
+        }
+        
+        // 检查配置是否被其他节点修改
+        if (!cached.getData().get("_version")
+                .equals(expectedConfig.get("_version"))) {
+            return ConfigUpdateResult.CONFLICT;
+        }
+        
+        // 版本匹配，执行更新
+        newConfig.put("_version", cached.getVersion() + 1);
+        newConfig.put("_updatedAt", System.currentTimeMillis());
+        
+        redisTemplate.opsForValue().set(dataKey, newConfig);
+        
+        return ConfigUpdateResult.SUCCESS;
+    }
+}
+```
+
+---
+
+## 七、版本号冲突的告警与补偿机制
+
+### 7.1 冲突监控
+
+生产环境中，需要监控版本冲突的发生频率：
+
+```java title="版本冲突监控"
+@Service
+public class VersionConflictMonitor {
+    
+    private static final String CONFLICT_COUNT_KEY = "monitor:version_conflict:";
+    
+    public void recordConflict(String key) {
+        redisTemplate.opsForValue().increment(CONFLICT_COUNT_KEY + getMetricKey(key));
+    }
+    
+    public VersionConflictStats getConflictStats() {
+        // 获取过去一小时的冲突统计
+        Set<String> keys = redisTemplate.keys(CONFLICT_COUNT_KEY + "*");
+        
+        Map<String, Long> stats = new HashMap<>();
+        for (String key : keys) {
+            Long count = redisTemplate.opsForValue().get(key);
+            stats.put(key, count != null ? count : 0L);
+        }
+        
+        return new VersionConflictStats(stats);
+    }
+    
+    @Scheduled(fixedRate = 300_000)  // 每5分钟
+    public void checkConflictThreshold() {
+        VersionConflictStats stats = getConflictStats();
+        
+        for (Map.Entry<String, Long> entry : stats.getStats().entrySet()) {
+            if (entry.getValue() > CONFLICT_THRESHOLD) {
+                // 发送告警
+                alertService.alert("版本冲突率过高", 
+                    Map.of("key", entry.getKey(), "count", entry.getValue()));
+            }
+        }
+    }
+}
+```
+
+### 7.2 自动补偿机制
+
+当版本冲突频繁发生时，可以启用自动补偿机制：
+
+```java title="自动补偿"
+@Service
+public class AutoCompensationService {
+    
+    public void compensate(String key) {
+        // 1. 读取缓存
+        VersionedData<?> cached = redisTemplate.opsForValue().get(key);
+        
+        if (cached == null) {
+            return;
+        }
+        
+        // 2. 从数据库获取最新数据
+        Object latestData = loadFromDatabase(key);
+        
+        if (latestData == null) {
+            // 数据已被删除，删除缓存
+            redisTemplate.delete(key);
+            return;
+        }
+        
+        // 3. 比较版本
+        VersionedData<?> latestCached = buildVersionedData(latestData);
+        
+        if (latestCached.getVersion() > cached.getVersion()) {
+            // 数据库版本更新，直接覆盖缓存
+            redisTemplate.opsForValue().set(key, latestCached);
+            log.info("补偿成功，key={}, 旧版本={}, 新版本={}", 
+                key, cached.getVersion(), latestCached.getVersion());
+        }
+    }
+    
+    @Scheduled(fixedRate = 60_000)  // 每分钟执行
+    public void periodicCompensation() {
+        // 找出冲突频繁的 key，进行批量补偿
+        List<String> conflictKeys = conflictKeyRegistry.getConflictKeys();
+        
+        for (String key : conflictKeys) {
+            try {
+                compensate(key);
+            } catch (Exception e) {
+                log.error("补偿失败，key={}", key, e);
+            }
+        }
+    }
+}
+```
+
+### 7.3 人工干预流程
+
+对于重要的数据，当冲突次数超过阈值时，需要人工介入：
+
+```text
+┌─────────────┐    冲突次数 > 阈值    ┌─────────────┐
+│   自动监控   │ ──────────────────> │   告警通知   │
+└─────────────┘                     └─────────────┘
+                                          │
+                                          ▼
+                                   ┌─────────────┐
+                                   │ 人工检查    │
+                                   └─────────────┘
+                                          │
+                    ┌─────────────────────┼─────────────────────┐
+                    ▼                     ▼                     ▼
+           ┌─────────────┐          ┌─────────────┐       ┌─────────────┐
+           │ 数据正确    │          │ 需要补偿    │       │ 需要回滚    │
+           │ 无需处理    │          │ 执行补偿    │       │ 回滚到某版本│
+           └─────────────┘          └─────────────┘       └─────────────┘
+```
+
+---
+
+## 八、总结
+
+缓存版本控制是解决并发更新覆盖问题的核心技术。
+
+| 策略 | 适用场景 | 复杂度 | 性能影响 |
+|---|---|---|---|
+| 简单版本号 | 低并发、简单场景 | 低 | 小 |
+| CAS 乐观锁 | 高并发、数据一致性要求高 | 中 | 中 |
+| 分布式锁 | 强一致性要求、复杂事务 | 高 | 大 |
+| 先删后写 | 读多写少、允许短暂不一致 | 低 | 小 |
+| 先写后删 | Cache Aside 标准模式 | 低 | 小 |
+
+选择版本控制策略时，需要考虑：
+
+1. **并发程度**：并发越高，越需要乐观锁
+2. **一致性要求**：金融、库存必须严格一致；浏览量可以容忍最终一致
+3. **实现成本**：越严格的方案，实现和维护成本越高
+4. **性能要求**：乐观锁会引入重试，需要评估重试率
+
+**没有银弹，只有权衡**。理解每种方案的优缺点，才能做出正确的选择。
+
+---
+
+## 面试追问预判
+
+**面试官可能追问的方向：**
+
+1. **乐观锁 vs 悲观锁**：在什么场景下选择乐观锁？什么场景下选择悲观锁？
+
+2. **ABA 问题的实际影响**：在你的业务场景中，ABA 问题会导致什么后果？如何避免？
+
+3. **版本号的生成方式**：自增、时间戳、UUID 各有什么优缺点？
+
+4. **Redis 事务的局限性**：Redis 的 WATCH 为什么不能监视多个 key？如何解决这个问题？
+
+5. **分布式事务中的版本控制**：如果涉及跨数据库的分布式事务，如何保证一致性？
+
+6. **缓存击穿与版本控制的结合**：热点数据使用版本控制时，如何避免击穿？
+
+这些问题都是面试中的高频追问，建议读者结合实际项目经验来回答。

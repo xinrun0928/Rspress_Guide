@@ -1,0 +1,351 @@
+import { Badge } from '@rspress/core/theme';
+
+# 线程池与并发优化：高并发的后台支撑
+
+> [!WARNING]
+> 前置知识：本篇文章是线程池与并发优化的入口，涵盖线程池监控、调优经验、定时任务优化、Disruptor 四大方向。建议按顺序阅读，理解线程池在并发系统中的核心作用。
+
+---
+
+线程池，是 Java 并发编程中最容易被忽视、又最容易被用错的组件。
+
+说它容易被忽视，是因为大多数人只把它当作「创建线程的替代品」；说它容易被用错，是因为线程池的参数配置直接影响系统的吞吐量和响应时间——配置不对，轻则性能下降，重则系统崩溃。
+
+但线程池的监控和调优，却是生产环境中最重要的能力之一。一个优秀的工程师，能通过线程池的监控数据，在问题发生之前就发现端倪。
+
+这一讲，我们来掌握线程池的监控和调优能力。
+
+---
+
+## 一、知识版图：线程池与并发优化全景
+
+```text
+┌─────────────────────────────────────────────────────────────────┐
+│                  线程池与并发优化                                  │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   ┌──────────────────────────────────────────────────────────┐  │
+│   │                    线程池核心                            │  │
+│   │                                                          │  │
+│   │   corePoolSize  ·  maxPoolSize  ·  queue  ·  reject    │  │
+│   │                                                          │  │
+│   │   任务提交 → 核心线程 → 队列 → 临时线程 → 拒绝策略        │  │
+│   └──────────────────────────────────────────────────────────┘  │
+│                                                                 │
+│   ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐  │
+│   │   线程池监控     │  │  线程池调优      │  │  定时任务优化   │  │
+│   │                 │  │                 │  │                 │  │
+│   │  活跃线程数     │  │  IO 密集型配置   │  │  ScheduledThread│  │
+│   │  队列积压       │  │  CPU 密集型配置   │  │  cron 表达式     │  │
+│   │  拒绝次数       │  │  队列选择        │  │  分布式定时任务  │  │
+│   │  监控告警       │  │  拒绝策略        │  │                 │  │
+│   └────────┬────────┘  └────────┬────────┘  └────────┬────────┘  │
+│            │                     │                      │           │
+│            └─────────────────────┴──────────────────────┘           │
+│                                  │                                   │
+│   ┌─────────────────────────────▼────────────────────────────────┐  │
+│   │                    Disruptor 高性能队列                        │  │
+│   │                                                            │  │
+│   │    无锁队列  ·  缓存行填充  ·  百万级 QPS  ·  低延迟          │  │
+│   └─────────────────────────────────────────────────────────────┘  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 二、线程池监控：了解线程池的「健康状况」
+
+### 核心监控指标
+
+线程池有四个核心监控指标：
+
+```java
+public class ThreadPoolMetrics {
+
+    public static Map<String, Object> collectMetrics(ThreadPoolExecutor executor) {
+        Map<String, Object> metrics = new HashMap<>();
+
+        // 1. 活跃线程数：正在执行任务的线程数
+        metrics.put("activeCount", executor.getActiveCount());
+
+        // 2. 当前线程数：当前池中的线程数
+        metrics.put("poolSize", executor.getPoolSize());
+
+        // 3. 核心线程数
+        metrics.put("corePoolSize", executor.getCorePoolSize());
+
+        // 4. 最大线程数
+        metrics.put("maximumPoolSize", executor.getMaximumPoolSize());
+
+        // 5. 队列大小
+        metrics.put("queueSize", executor.getQueue().size());
+
+        // 6. 队列容量
+        metrics.put("queueCapacity", executor.getQueue().remainingCapacity());
+
+        // 7. 已完成任务数（累计）
+        metrics.put("completedTaskCount", executor.getCompletedTaskCount());
+
+        // 8. 历史最大线程数
+        metrics.put("largestPoolSize", executor.getLargestPoolSize());
+
+        return metrics;
+    }
+}
+```
+
+### 线程池状态的判断
+
+```java
+public String getThreadPoolStatus(ThreadPoolExecutor executor) {
+    // 活跃线程数 == 核心线程数：线程池处于正常负载状态
+    // 活跃线程数 == 最大线程数：线程池已经饱和
+    // 队列积压 > 队列容量 * 0.8：队列即将满
+    // 拒绝次数 > 0：有任务被拒绝
+
+    int active = executor.getActiveCount();
+    int core = executor.getCorePoolSize();
+    int max = executor.getMaximumPoolSize();
+    int queueSize = executor.getQueue().size();
+    int queueCapacity = executor.getQueue().remainingCapacity();
+
+    if (active == max && queueSize >= queueCapacity * 0.8) {
+        return "WARNING: 线程池已饱和，队列即将满，请扩容";
+    } else if (active >= core * 0.8) {
+        return "INFO: 线程池负载较高，建议关注";
+    } else {
+        return "OK: 线程池运行正常";
+    }
+}
+```
+
+### 监控告警配置
+
+```yaml
+# Prometheus + Grafana 监控告警配置
+alerts:
+  - name: ThreadPoolSaturation
+    condition: activeCount >= maximumPoolSize * 0.9
+    severity: warning
+    message: "线程池已饱和，可能导致请求排队"
+    action: "考虑增加最大线程数或优化任务执行时间"
+
+  - name: ThreadPoolQueueFull
+    condition: queueSize >= queueCapacity * 0.8
+    severity: critical
+    message: "线程池队列即将满，可能导致任务被拒绝"
+    action: "紧急扩容或降级非核心任务"
+```
+
+---
+
+## 三、线程池调优：核心参数的配置艺术
+
+### CPU 密集型 vs IO 密集型
+
+| 任务类型 | 核心线程数公式 | 原因 |
+|---|---|---|
+| CPU 密集型 | `CPU 核心数 + 1` | 线程大部分时间在执行 CPU 指令，不需要过多线程 |
+| IO 密集型 | `CPU 核心数 × 2` 或更多 | 线程大部分时间在等待 IO，可以容纳更多线程 |
+
+```java
+// 获取 CPU 核心数
+int cpuCores = Runtime.getRuntime().availableProcessors();
+
+// CPU 密集型线程池
+ExecutorService cpuExecutor = new ThreadPoolExecutor(
+    cpuCores + 1,  // 核心线程数
+    cpuCores + 1,  // 最大线程数（不需要临时线程）
+    0L, TimeUnit.MILLISECONDS,
+    new LinkedBlockingQueue<>(1000)
+);
+
+// IO 密集型线程池
+ExecutorService ioExecutor = new ThreadPoolExecutor(
+    cpuCores * 2,        // 核心线程数
+    cpuCores * 4,        // 最大线程数
+    60L, TimeUnit.SECONDS,
+    new LinkedBlockingQueue<>(1000)
+);
+```
+
+### 队列的选择
+
+| 队列类型 | 特点 | 适用场景 |
+|---|---|---|
+| LinkedBlockingQueue | 无界队列，可能导致 OOM | 任务量可控、不怕堆积 |
+| ArrayBlockingQueue | 有界队列 | 需要限制任务堆积 |
+| SynchronousQueue | 不存储任务，直接交接 | 高并发、任务执行快 |
+| PriorityBlockingQueue | 优先级队列 | 需要按优先级处理 |
+
+```java
+// SynchronousQueue：直接交接，不存储
+// 适用于任务执行非常快，不希望任务堆积的场景
+// 特点：必须有空闲线程才能提交任务
+ExecutorService directExecutor = new ThreadPoolExecutor(
+    10, 20,
+    60L, TimeUnit.SECONDS,
+    new SynchronousQueue<>()  // 不存储任务
+);
+
+// 有界队列：限制任务堆积
+// 队列满了之后，会创建临时线程（直到 maxPoolSize）
+// 临时线程用完后，才会触发拒绝策略
+ExecutorService boundedExecutor = new ThreadPoolExecutor(
+    10, 50,
+    60L, TimeUnit.SECONDS,
+    new ArrayBlockingQueue<>(1000)  // 最多堆积 1000 个任务
+);
+```
+
+### 拒绝策略的定制
+
+```java
+// 自定义拒绝策略：记录日志 + 告警 + 兜底
+ThreadPoolExecutor executor = new ThreadPoolExecutor(
+    10, 50,
+    60L, TimeUnit.SECONDS,
+    new ArrayBlockingQueue<>(1000),
+    new ThreadFactoryBuilder().setNameFormat("biz-%d").build(),
+    (r, pool) -> {
+        // 1. 记录日志
+        log.error("线程池已满，已拒绝 {} 个任务", pool.getTaskCount() - pool.getCompletedTaskCount());
+
+        // 2. 发送告警
+        Metrics.counter("threadpool_rejected").increment();
+        AlertService.send("线程池拒绝策略触发");
+
+        // 3. 兜底处理（由调用线程执行）
+        if (!pool.isShutdown()) {
+            r.run();  // 由当前线程执行
+        }
+    }
+);
+```
+
+---
+
+## 四、定时任务优化：ScheduledExecutorService
+
+### 定时任务的坑
+
+| 坑 | 说明 | 解决方案 |
+|---|---|---|
+| 任务堆积 | 任务执行时间 > 间隔时间 | 使用_schedule而非_scheduleAtFixedRate |
+| 多实例重复执行 | 分布式环境下多个实例同时执行 | 使用分布式调度（XXL-Job） |
+| 线程泄漏 | 未正确关闭线程池 | 手动管理线程池生命周期 |
+
+```java
+// 错误写法：任务堆积
+ScheduledExecutorService executor = Executors.newScheduledThreadPool(4);
+// 如果 task() 执行时间是 5 秒，scheduleAtFixedRate 每 1 秒执行一次
+// 5 秒内会有 5 个任务同时执行
+executor.scheduleAtFixedRate(task, 0, 1, TimeUnit.SECONDS);
+
+// 正确写法：任务执行完再计算下次时间
+executor.scheduleWithFixedDelay(task, 0, 1, TimeUnit.SECONDS);
+```
+
+### 分布式定时任务
+
+单机定时任务在分布式环境下会重复执行，需要使用分布式调度框架：
+
+| 框架 | 特点 | 适用场景 |
+|---|---|---|
+| XXL-Job | 轻量级、UI 友好 | 中小型系统 |
+| ElasticJob | 支持分片、任务依赖 | 复杂任务 |
+| PowerJob | 功能丰富、支持 MapReduce | 大型系统 |
+
+---
+
+## 五、Disruptor：高性能队列
+
+### Disruptor 的性能优势
+
+Disruptor 是 LMAX 交易所开发的高性能队列，性能比 JDK 的 BlockingQueue 高 10 倍：
+
+| 对比项 | BlockingQueue | Disruptor |
+|---|---|---|
+| 吞吐量 | 10 万 QPS | 100 万+ QPS |
+| 延迟 | 微秒级 | 纳秒级 |
+| 实现方式 | 锁 + 条件变量 | 无锁（CAS） |
+| 适用场景 | 通用场景 | 超低延迟场景 |
+
+### Disruptor 的核心配置
+
+```java
+// 1. 创建事件工厂
+public class OrderEventFactory implements EventFactory<OrderEvent> {
+    @Override
+    public OrderEvent newInstance() {
+        return new OrderEvent();
+    }
+}
+
+// 2. 创建 Disruptor
+Disruptor<OrderEvent> disruptor = new Disruptor<>(
+    new OrderEventFactory(),  // 事件工厂
+    1024 * 1024,              // 缓冲区大小（2 的幂次）
+    DaemonThreadFactory.INSTANCE,  // 线程工厂
+    ProducerType.SINGLE,      // 单生产者
+    new BlockingWaitStrategy()  // 等待策略
+);
+
+// 3. 注册处理器
+disruptor.handleEventsWith((event, sequence, endOfBatch) -> {
+    // 处理事件
+    processOrder(event);
+});
+
+// 4. 启动
+RingBuffer<OrderEvent> ringBuffer = disruptor.start();
+
+// 5. 发布事件
+long sequence = ringBuffer.next();
+try {
+    OrderEvent event = ringBuffer.get(sequence);
+    event.setOrderId(orderId);
+    event.setAmount(amount);
+} finally {
+    ringBuffer.publish(sequence);
+}
+```
+
+### 等待策略的选择
+
+| 等待策略 | 特点 | 适用场景 |
+|---|---|---|
+| BlockingWaitStrategy | 使用锁，最节省 CPU | 吞吐量优先 |
+| BusySpinWaitStrategy | 忙等待，极低延迟 | 超低延迟、延迟敏感 |
+| SleepingWaitStrategy | 睡一觉再试 | 低延迟、低 CPU |
+| YieldWaitStrategy | yield 让出 CPU | 介于 Blocking 和 BusySpin 之间 |
+
+---
+
+## 六、复习路径建议
+
+### 第一阶段：掌握监控
+
+1. 重点掌握线程池的四个核心监控指标
+2. 理解线程池饱和状态的判断
+
+### 第二阶段：精通调优
+
+1. 掌握 CPU 密集型和 IO 密集型的配置差异
+2. 理解队列选择对线程池行为的影响
+
+### 第三阶段：了解进阶
+
+1. 了解 Disruptor 的适用场景
+2. 理解等待策略的选择
+
+---
+
+## 延伸思考
+
+线程池的学习，本质上是在理解**资源与任务的匹配**。
+
+核心线程数决定了「常驻」的处理能力，最大线程数决定了「峰值」的处理能力，队列决定了「缓冲」能力，拒绝策略决定了「超载」时的行为。每一个参数，都是在性能和可靠性之间做权衡。
+
+下次配置线程池之前，先问自己：**我的任务是 CPU 密集型还是 IO 密集型？最大能容忍多少任务堆积？拒绝了我该怎么办？**

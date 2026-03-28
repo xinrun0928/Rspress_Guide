@@ -1,0 +1,823 @@
+import { Badge } from '@rspress/core/theme';
+
+# 虚拟线程（Virtual Thread）性能优势与原理深度解析
+
+JEP 444，2024 年 9 月正式 GA。
+
+等了这么久，虚拟线程终于从 JDK 21 的预览特性变成了正式版本。
+
+但很多人对虚拟线程的理解还停留在「Java 可以创建几百万个线程了」——这个理解对，但也不对。
+
+对，是因为虚拟线程确实让你可以创建海量的线程。
+不对，是因为**创建海量线程本身不是目的**，理解虚拟线程的关键在于：**它怎么实现这个能力，以及为什么这能带来性能提升**。
+
+今天，我们从原理开始，彻底讲透虚拟线程。
+
+## 一、传统线程的局限性
+
+在深入虚拟线程之前，我们需要先理解传统线程的局限性。
+
+### 1.1 线程创建的开销
+
+创建一个传统线程，需要经过以下步骤：
+
+```java
+Thread thread = new Thread(() -> {
+    // 任务
+});
+thread.start();
+```
+
+在 JVM 层面，这会触发：
+
+1. **分配线程对象**：JVM 堆上分配 Thread 对象
+2. **分配 native 线程栈**：向 OS 申请内存，默认 1MB（可通过 -Xss 配置）
+3. **创建 native 线程**：调用 pthread_create 等系统调用
+4. **注册线程到 JVM**：与 GC、安全管理器等组件关联
+
+```c
+// OpenJDK 伪代码：Thread.createNativeThread()
+private native int allocate_thread_id();
+private void create(java.lang.Thread$Startup starter) {
+    // 1. 分配线程 ID
+    int tid = allocate_thread_id();
+    
+    // 2. 创建 native 线程栈
+    long stackSize = getStackSize(requestedStackSize);
+    native_thread = nativeCreate(stackSize, daemon, priority);
+    
+    // 3. 注册到 JVM
+    add_thread_to_list(native_thread);
+}
+```
+
+每次创建线程都需要一次系统调用，这个开销在大量创建线程时会成为瓶颈。
+
+### 1.2 栈内存占用
+
+传统线程的栈内存是「预分配」的。无论线程实际使用多少，每个线程至少占用 320KB～1MB 的栈空间。
+
+```bash
+# 默认栈大小
+$ java -XX:+PrintFlagsFinal -version | grep ThreadStackSize
+intx ThreadStackSize                          = 1024
+
+# 10万个线程需要的内存
+10万 × 1MB = 100GB
+```
+
+这就是为什么传统线程模型下，我们很难创建几十万个并发线程——光是栈内存就需要几百 GB。
+
+:::warning 栈大小的选择
+
+| 栈大小 | 适用场景 |
+|---|---|
+| 256KB | 简单任务，不深入递归 |
+| 512KB | 一般业务代码 |
+| 1MB | 默认值，深度递归或复杂框架（如 Spring） |
+| 2MB+ | 特殊需求，如大数据处理 |
+
+栈太小可能导致 StackOverflowError，栈太大又会浪费内存。
+
+:::
+
+### 1.3 线程调度的成本
+
+传统线程的调度是由 OS 负责的抢占式调度。当 OS 决定切换线程时：
+
+1. 保存当前线程的 CPU 上下文（寄存器、程序计数器等）
+2. 从就绪队列选择下一个要运行的线程
+3. 恢复新线程的 CPU 上下文
+
+这个上下文切换（Context Switch）的开销在现代 CPU 上大约是几微秒。虽然看起来不多，但当线程数量激增时，频繁的上下文切换会成为性能瓶颈。
+
+```bash
+# 查看上下文切换次数
+$ vmstat 1
+procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+ 1  0      0 123456  78900  456000    0    0     0     0  123  456  5  2 93  0  0
+```
+
+`cs`（context switch）列反映了上下文切换的频率。
+
+### 1.4 传统线程模型的瓶颈总结
+
+```
+传统线程模型的问题：
+
+线程创建成本高
+    └─ 系统调用 + 内存分配 + 线程注册
+    └─ 单机难以支撑百万级并发
+
+栈内存预分配
+    └─ 100万线程 × 1MB = 1TB 内存
+    └─ 即使线程空闲，内存也被占用
+
+线程调度依赖 OS
+    └─ 上下文切换开销
+    └─ 线程调度延迟不可控
+    └─ 难以针对 Java 任务特点优化
+```
+
+这些问题在 IO 密集型场景下尤为突出：线程大部分时间在等待 IO，CPU 几乎闲置，但 OS 还在辛辛苦苦地切换线程。
+
+## 二、虚拟线程的核心原理
+
+虚拟线程是 JDK 21 正式引入的新特性，它解决传统线程问题的思路是：**把「执行」和「调度」分开**。
+
+### 2.1 核心概念：Carrier Thread + Continuation
+
+虚拟线程的设计基于三个核心概念：
+
+| 概念 | 说明 |
+|---|---|
+| **Virtual Thread（虚拟线程）** | 用户代码使用的「线程」，不直接对应 OS 线程 |
+| **Carrier Thread（承载线程）** | 真正执行代码的 OS 线程，多个虚拟线程可以复用同一个 Carrier Thread |
+| **Continuation（续体）** | 虚拟线程的执行单元，可以在任意点挂起和恢复 |
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Carrier Thread (OS Thread)               │
+│                                                             │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐ │
+│  │Continuation A │    │Continuation B │    │Continuation C │ │
+│  │  (虚拟线程1)  │    │  (虚拟线程2)  │    │  (虚拟线程3)  │ │
+│  │               │    │               │    │               │ │
+│  │   运行中...   │    │   已挂起      │    │   等待执行    │ │
+│  └──────────────┘    └──────────────┘    └──────────────┘ │
+│                                                             │
+│  虚拟线程A 执行一会儿 → yield() → 虚拟线程B 执行一会儿... │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+在任意时刻，一个 Carrier Thread 只会运行一个虚拟线程。但多个虚拟线程可以交替执行，当一个虚拟线程遇到阻塞（如等待 IO）时，它会 yield()，让 Carrier Thread 去执行其他虚拟线程。
+
+### 2.2 协作式调度 vs 抢占式调度
+
+这是理解虚拟线程的关键。
+
+**传统 OS 调度**：抢占式。OS 可以随时打断任何线程，强制进行上下文切换。优点是公平，缺点是切换成本高，且对 Java 应用的 IO 特性一无所知。
+
+**虚拟线程调度**：协作式。虚拟线程主动让出执行权（yield），而不是被 OS 强制剥夺。
+
+```java
+// 虚拟线程的 yield 发生在什么时候？
+
+Thread.sleep(1000);           // 阻塞 → yield
+socket.read(buffer);          // 等待数据 → yield
+lock.lock();                   // 等待锁 → yield
+awaitComplete(future);        // 等待异步 → yield
+```
+
+这些常见的阻塞操作，在虚拟线程中不会真正阻塞 OS 线程，而是触发 yield，让 Carrier Thread 去执行其他虚拟线程。
+
+### 2.3 Continuation 的挂起与恢复
+
+Continuation 是虚拟线程的执行单元，它的核心是两个操作：**yield** 和 **run**。
+
+```java
+// 伪代码：Continuation 的工作原理
+class Continuation {
+    private final Runnable target;
+    private Stack stack;  // 虚拟线程的栈数据
+    
+    // 挂起：保存当前执行状态
+    void yield() {
+        // 1. 保存寄存器状态到 stack
+        saveRegistersToStack();
+        
+        // 2. 保存程序计数器
+        saveProgramCounter();
+        
+        // 3. 将 continuation 从 Carrier Thread 移除
+        unmount();
+        
+        // 4. Carrier Thread 可以执行其他 continuation
+    }
+    
+    // 恢复：从上次停止的地方继续执行
+    void run() {
+        // 1. 挂载到 Carrier Thread
+        mount();
+        
+        // 2. 恢复寄存器状态
+        restoreRegistersFromStack();
+        
+        // 3. 恢复程序计数器
+        restoreProgramCounter();
+        
+        // 4. 继续执行
+    }
+}
+```
+
+当虚拟线程 yield 时，它会：
+1. 把当前的执行状态（寄存器、程序计数器）保存到堆上的一个「虚拟栈」
+2. 从 Carrier Thread 上「卸载」自己
+3. Carrier Thread 此时可以去执行其他虚拟线程
+
+当虚拟线程恢复时：
+1. 把保存的状态从堆上的「虚拟栈」恢复到寄存器
+2. 恢复程序计数器，从上次停止的地方继续执行
+
+:::tip 虚拟栈 vs 物理栈
+
+传统线程的栈是连续的内存区域，由 OS 分配和管理。
+虚拟线程的「栈」实际上是保存在堆上的普通 Java 对象，可以按需扩展和压缩。
+
+这使得虚拟线程可以：
+- 按需分配内存，不用预分配
+- 挂起时释放内存（栈数据压缩）
+- 支持比物理线程多得多的虚拟线程
+
+:::
+
+### 2.4 挂起点的检测
+
+虚拟线程的挂起不是自动的，需要 JDK 在特定位置插入检测代码。
+
+JDK 在以下操作中检测是否需要挂起：
+
+```java
+// java.util.concurrent.LockSupport
+public static void parkNanos(Object blocker, long nanos) {
+    // 检测虚拟线程是否需要 yield
+    if (Thread.currentThread().isVirtual()) {
+        // 虚拟线程 park，不阻塞 Carrier Thread
+        VThreadLookup.park(blocker, nanos);
+    } else {
+        // 传统线程 park，真正阻塞 OS 线程
+        nativePark(blocker, nanos);
+    }
+}
+
+// java.net.SocketInputStream
+private int socketRead(byte[] b, int off, int len, int timeout) {
+    // 读操作
+    if (timeout == 0) {
+        while (isRemaining()) {
+            int n = socketRead0(fd, b, off + count, len - count);
+            if (n > 0) {
+                // 读到数据，继续执行
+            }
+            // 虚拟线程在这里 yield
+            park(this, timeout);
+        }
+    }
+}
+```
+
+JDK 的核心类（`java.util.concurrent`、`java.net`、`java.nio` 等）已经过修改，会自动适配虚拟线程。
+
+## 三、虚拟线程 vs 传统线程：深度对比
+
+### 3.1 内存占用对比
+
+| 维度 | 传统线程 | 虚拟线程 |
+|---|---|---|
+| 默认栈大小 | 1MB（预分配） | 按需增长，上限约 1MB |
+| 最小内存占用 | 几百 KB（实际使用量） | 只有堆上的 Continuation 对象 |
+| 100万并发线程 | 需要 ~1TB 内存 | 需要约几 GB 内存 |
+| 内存弹性 | 固定，无法动态调整 | 按需分配，灵活 |
+
+```java
+// 虚拟线程的栈大小配置
+Thread.ofVirtual()
+    .name("worker-")
+    .stackSize(256 * 1024)  // 256KB
+    .start(() -> {});
+```
+
+### 3.2 调度方式对比
+
+| 维度 | 传统线程 | 虚拟线程 |
+|---|---|---|
+| 调度器 | OS 抢占式调度 | JVM 协作式调度 |
+| 调度粒度 | CPU 时间片 | 阻塞点（yield） |
+| 上下文切换 | 保存/恢复完整 CPU 上下文 | 只保存/恢复虚拟栈 |
+| 切换成本 | 高（需要 OS 介入） | 低（纯 Java 层面） |
+| 响应延迟 | 取决于 OS 调度器 | 即时（遇到阻塞立即 yield） |
+
+### 3.3 阻塞处理对比
+
+```java
+// 场景：1000个并发任务，每个等待1秒后返回
+
+// 传统线程模式
+ExecutorService executor = Executors.newFixedThreadPool(100);  // 最多100个线程
+// 每个任务阻塞1秒，100个线程同时处理
+// 总耗时约 10 秒（1000/100 * 1）
+
+// 虚拟线程模式
+ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+// 1000个虚拟线程同时运行
+// 每个任务阻塞1秒
+// 总耗时约 1 秒
+```
+
+虚拟线程的「阻塞」不会真正阻塞 OS 线程，所以理论上可以同时运行百万级的虚拟线程。
+
+### 3.4 性能测试对比
+
+```java
+// 性能测试：10万个并发 HTTP 请求
+
+// 传统线程模式
+// - 需要 1000 个 OS 线程
+// - 每个线程栈 1MB
+// - 内存占用：约 1GB
+// - 吞吐量：约 5万 QPS
+
+// 虚拟线程模式
+// - 只需要约 100 个 Carrier Thread
+// - 内存占用：约 500MB
+// - 吞吐量：约 10万 QPS（取决于 IO 能力）
+```
+
+:::tip 为什么虚拟线程吞吐量更高？
+
+1. **更少的 OS 线程**：100个 Carrier Thread 比 1000个 OS 线程的调度开销小得多
+2. **更低的上下文切换成本**：虚拟线程的 yield/restore 在 Java 层面完成
+3. **更好的 IO 复用**：IO 阻塞时不占用 OS 资源
+4. **更少的锁竞争**：Carrier Thread 数量少，共享资源竞争也少
+
+:::
+
+## 四、虚拟线程的使用方式
+
+### 4.1 基本创建方式
+
+JDK 21 提供了三种创建虚拟线程的方式：
+
+```java
+// 方式一：Thread.ofVirtual() 工厂方法
+Thread vThread = Thread.ofVirtual()
+    .name("worker-", 0)
+    .start(() -> {
+        System.out.println("Running in virtual thread");
+    });
+
+// 方式二：Executors.newVirtualThreadPerTaskExecutor()
+ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+Future<String> future = executor.submit(() -> {
+    Thread.sleep(Duration.ofSeconds(1));
+    return "Done";
+});
+
+// 方式三：Executors.newSingleThreadExecutor() 返回的是平台线程
+// 注意区分！
+ExecutorService platformExecutor = Executors.newSingleThreadExecutor();  // 平台线程
+ExecutorService virtualExecutor = Executors.newSingleThreadExecutor();  // 如果是虚拟线程
+```
+
+### 4.2 虚拟线程 ExecutorService
+
+最常用的方式是 `Executors.newVirtualThreadPerTaskExecutor()`：
+
+```java
+try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+    List<Future<String>> futures = IntStream.range(0, 10000)
+        .mapToObj(i -> executor.submit(() -> {
+            // 模拟 IO 操作
+            Thread.sleep(Duration.ofMillis(100));
+            return "Task " + i;
+        }))
+        .toList();
+    
+    // 等待所有任务完成
+    for (Future<String> future : futures) {
+        String result = future.get();
+    }
+}
+```
+
+每个提交的任务都会在一个新的虚拟线程中执行。
+
+### 4.3 与现有框架集成
+
+Spring Boot 3.2+ 已经支持虚拟线程：
+
+```yaml
+# application.yml
+spring:
+  threads:
+    virtual:
+      enabled: true
+```
+
+```java
+// Spring Boot 3.2+ 自动使用虚拟线程
+// RestTemplate、WebClient 等会自动适配
+
+@RestController
+public class UserController {
+    
+    @GetMapping("/users/{id}")
+    public User getUser(@PathVariable Long id) {
+        // 这个方法会在虚拟线程中执行
+        return userService.findById(id);
+    }
+}
+```
+
+Tomcat 10+（Jakarta EE 9+）也支持虚拟线程：
+
+```xml
+<!-- tomcat/conf/server.xml -->
+<Executor name="virtualThreadExecutor"
+          maxThreads="1000"
+          minSpareThreads="10"
+          threadFactoryClass="org.apache.catalina.core.VirtualThreadExecutorFactory"
+          namePrefix="vt-"/>
+```
+
+## 五、虚拟线程的适用场景
+
+### 5.1 适合虚拟线程的场景
+
+| 场景 | 原因 | 示例 |
+|---|---|---|
+| **IO 密集型任务** | 大量时间在等待网络、数据库响应 | HTTP 客户端、微服务调用 |
+| **高并发短任务** | 每个任务耗时不长，但并发量高 | API 网关、实时查询 |
+| **同步-异步混合代码** | 需要改造遗留同步代码为异步 | 老系统迁移 |
+| **轻量级并发任务** | 每个任务栈需求小 | 数据处理流水线 |
+
+```java
+// 典型适用场景：批量 HTTP 请求
+ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+
+List<URL> urls = loadUrls();  // 10万个 URL
+
+List<String> results = urls.parallelStream()
+    .map(url -> {
+        try (InputStream in = url.openStream()) {
+            // 等待响应时 yield，让 Carrier Thread 处理其他任务
+            return new String(in.readAllBytes());
+        } catch (IOException e) {
+            return "";
+        }
+    })
+    .toList();
+```
+
+### 5.2 不适合虚拟线程的场景
+
+| 场景 | 原因 | 替代方案 |
+|---|---|---|
+| **CPU 密集型任务** | 虚拟线程的协作式调度无法提升 CPU 效率 | 进程数 = CPU 核数的线程池 |
+| **长时间计算** | 没有真正的并行提升，反而增加调度开销 | 多线程 + 分片 |
+| **深度递归** | 需要大量栈空间，可能触发栈溢出 | 尾递归优化/循环替代 |
+| **对延迟极敏感的实时系统** | 协作式调度可能有不可预期的延迟 | 专用实时线程 |
+
+```java
+// 不适合虚拟线程的场景：CPU 密集型计算
+// 斐波那契数列（递归版本）
+public long fibonacci(long n) {
+    if (n <= 1) return n;
+    return fibonacci(n - 1) + fibonacci(n - 2);  // CPU 密集，无法 yield
+}
+
+// 虚拟线程不会加速这个计算
+// 正确做法：使用 CPU 核心数的平台线程池
+ExecutorService executor = Executors.newFixedThreadPool(
+    Runtime.getRuntime().availableProcessors()
+);
+```
+
+### 5.3 场景选择决策树
+
+```
+任务类型判断
+       |
+       v
+是否 IO 密集型？
+       |
+   是 ─┴─ 是
+       |
+       v
+是否对延迟极敏感（毫秒级）？
+       |
+   否 ─┴─ 是
+       |
+       v
+虚拟线程是否完全适合
+       |
+       v
+选择虚拟线程
+       |
+       v
+```
+
+## 六、虚拟线程与 ThreadLocal
+
+### 6.1 ThreadLocal 在虚拟线程中的行为
+
+好消息：ThreadLocal 在虚拟线程中**完全兼容**，行为与平台线程一致。
+
+```java
+ThreadLocal<String> context = new ThreadLocal<>();
+context.set("Hello");
+
+Thread.ofVirtual().start(() -> {
+    // 每个虚拟线程都有自己独立的 ThreadLocal
+    System.out.println(context.get());  // null（因为是新线程）
+    context.set("World");
+    System.out.println(context.get());  // "World"
+});
+```
+
+### 6.2 InheritableThreadLocal 的问题
+
+`InheritableThreadLocal` 在虚拟线程中有一些**陷阱**：
+
+```java
+InheritableThreadLocal<String> itl = new InheritableThreadLocal<>();
+
+// 父线程设置值
+itl.set("Parent Value");
+
+// 虚拟线程继承父线程的值
+Thread.ofVirtual().start(() -> {
+    System.out.println(itl.get());  // "Parent Value"
+});
+```
+
+**问题在于**：如果虚拟线程被挂起后恢复，或者在不同的 Carrier Thread 上运行，InheritableThreadLocal 的值是否会变化？
+
+```java
+// 场景：模拟 InheritableThreadLocal 的潜在问题
+InheritableThreadLocal<List<String>> itl = new InheritableThreadLocal<>();
+
+Thread.ofVirtual().start(() -> {
+    itl.set(new ArrayList<>());  // 每个虚拟线程有自己的 List
+    
+    itl.get().add("Item");  // 添加数据
+    
+    // 模拟某个操作释放了虚拟线程的 Carrier
+    // ...
+    
+    // 虚拟线程恢复时，可能在不同的 Carrier Thread 上运行
+    System.out.println(itl.get().size());  // 仍然是 1
+});
+```
+
+实际上，InheritableThreadLocal 的值是在虚拟线程**创建时复制**的，之后就是独立的副本，不存在这个问题。
+
+### 6.3 TransmittableThreadLocal：跨线程传递的完整方案
+
+Alibaba 的 `TransmittableThreadLocal` 在虚拟线程场景下仍然有用：
+
+```java
+// TransmittableThreadLocal 可以在虚拟线程之间传递值
+TransmittableThreadLocal<String> ttl = new TransmittableThreadLocal<>();
+ttl.set("Main");
+
+try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+    executor.submit(() -> {
+        // 可以访问父线程的值
+        System.out.println(ttl.get());  // "Main"
+    });
+}
+```
+
+但对于简单的场景，普通的 ThreadLocal 配合显式参数传递是更好的设计。
+
+## 七、虚拟线程与 synchronized
+
+### 7.1 虚拟线程中的 synchronized 不再是噩梦
+
+在传统线程模型中，`synchronized` 在获取锁时会阻塞 OS 线程，导致上下文切换和用户态/内核态切换。JDK 6 之前这是性能问题，JDK 6+ 做了大量优化（偏向锁、轻量级锁、重量级锁升级），但重量级锁（OSMutex）仍然有较高开销。
+
+在虚拟线程中，情况发生了变化。
+
+```java
+// 虚拟线程中的 synchronized
+Object lock = new Object();
+
+synchronized (lock) {
+    // 虚拟线程在这里等待锁
+    // 但不会阻塞 Carrier Thread！
+    // Carrier Thread 会去执行其他虚拟线程
+}
+```
+
+虚拟线程中的 `synchronized` 实现做了优化：**当虚拟线程在 synchronized 代码块中等待锁时，它会 yield 而不是阻塞 Carrier Thread**。
+
+### 7.1 Object.wait() 的行为变化
+
+```java
+synchronized (lock) {
+    while (condition not met) {
+        lock.wait();  // 虚拟线程 yield，Carrier Thread 去执行其他任务
+    }
+    // 继续执行
+}
+```
+
+在虚拟线程中，`Object.wait()` 会让虚拟线程挂起（yield），Carrier Thread 可以执行其他虚拟线程。当其他线程调用 `notify()` 或 `notifyAll()` 后，被挂起的虚拟线程会恢复。
+
+### 7.3 虚拟线程中的锁优化
+
+| 锁场景 | 传统线程 | 虚拟线程 |
+|---|---|---|
+| synchronized 争用 | 阻塞 OS 线程 | yield Carrier Thread |
+| ReentrantLock | 阻塞 OS 线程 | yield Carrier Thread |
+| Object.wait() | 阻塞 OS 线程 | yield Carrier Thread |
+| CAS 操作 | 无阻塞 | 无阻塞 |
+
+:::tip 虚拟线程让 synchronized 变快了吗？
+
+严格来说，synchronized 的语义没有变化。但在虚拟线程场景下，由于锁的等待不会阻塞 Carrier Thread，整体吞吐量会提升。
+
+对于频繁同步的场景，仍然建议：
+- 减少锁的粒度
+- 使用 CopyOnWriteArrayList 等并发替代品
+- 考虑无锁数据结构
+
+:::
+
+## 八、常见陷阱与最佳实践
+
+### 8.1 陷阱一：不要在线程池中提交虚拟线程
+
+```java
+// 错误示例
+ExecutorService virtualExecutor = Executors.newVirtualThreadPerTaskExecutor();
+
+virtualExecutor.submit(() -> {
+    // 这个任务本身是虚拟线程
+    virtualExecutor.submit(() -> {
+        // 再次提交到同一个虚拟线程池
+        // 这是错误的！可能造成死锁或其他问题
+    });
+});
+```
+
+**正确做法**：创建新任务时，应该直接提交到原始任务，而不是在虚拟线程中创建新的虚拟线程池。
+
+### 8.2 陷阱二：不要在线程池中提交虚拟线程
+
+这是另一个形式的陷阱：
+
+```java
+// 错误示例
+try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+    Future<Void> future = executor.submit(() -> {
+        // 虚拟线程
+        executor.submit(() -> {
+            // 不要在任务中向同一个 executor 提交新任务！
+        });
+    });
+}
+```
+
+这可能导致死锁：所有虚拟线程都在等待提交新任务，但提交新任务也需要虚拟线程。
+
+### 8.3 陷阱三：Thread.stop()、Thread.suspend() 等废弃方法
+
+**永远不要在虚拟线程中使用这些废弃方法**：
+
+```java
+// 绝对不要这样做
+Thread vThread = Thread.ofVirtual().start(() -> {
+    while (true) {
+        // 任务
+    }
+});
+
+vThread.stop();   // 危险！会导致数据不一致
+vThread.suspend(); // 危险！可能永久挂起
+vThread.resume();  // 危险！
+```
+
+正确的中断方式是使用 `Thread.interrupt()`：
+
+```java
+vThread.interrupt();  // 设置中断标志
+
+// 在虚拟线程中检查中断标志
+while (!Thread.currentThread().isInterrupted()) {
+    // 处理任务
+}
+```
+
+### 8.4 最佳实践
+
+```java
+// 实践一：使用 try-with-resources 管理 ExecutorService
+try (ExecutorService executor = 
+        Executors.newVirtualThreadPerTaskExecutor()) {
+    // 任务
+}
+
+// 实践二：为虚拟线程设置有意义的名称
+Thread.ofVirtual()
+    .name("http-worker-", 0)
+    .start(task);
+
+// 实践三：不要在虚拟线程中混用同步和异步代码
+// 虚拟线程的优势是简化异步代码，不要混用 CompletableFuture
+
+// 实践四：监控虚拟线程
+MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
+ObjectName name = new ObjectName(
+    "java.lang:type=Threading,name=VirtualThreads");
+ThreadInfo info = (ThreadInfo) mbs.getObjectInstance(name);
+```
+
+## 九、面试追问预判
+
+### 追问一：虚拟线程的调度器是什么？可以自定义吗？
+
+标准答案：
+
+> 虚拟线程的调度器是 JDK 内部的 ForkJoinPool，默认使用 `ForkJoinPool.commonPool()`。这个调度器使用了「work-stealing」算法，Carrier Thread 会尝试「偷取」其他 Carrier Thread 的任务。
+>
+> 可以自定义调度器：
+> ```java
+> ExecutorService customScheduler = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors());
+> 
+> Thread.Builder.OfVirtual virtualBuilder = Thread.ofVirtual()
+>     .scheduler(customScheduler);
+> ```
+>
+> 但一般不需要自定义，默认调度器已经针对 IO 密集型场景做了优化。
+
+### 追问二：虚拟线程如何与现有的性能监控工具集成？
+
+标准答案：
+
+> 虚拟线程对 APM 工具（如 SkyWalking、Pinpoint）基本透明，因为：
+>
+> 1. **Thread.getName()** 返回虚拟线程的名称，可以通过名称过滤
+> 2. **Thread.getId()** 仍然是唯一的
+> 3. **ThreadLocal** 语义不变
+>
+> 但有一些需要注意的地方：
+> - 线程堆栈中的「虚拟栈」是保存在堆上的，dump 时会看到与平台线程不同的栈结构
+> - Java Flight Recorder（JFR）已经支持虚拟线程事件
+> - 部分监控工具可能需要升级到支持虚拟线程的版本
+
+### 追问三：虚拟线程与 Project Loom 是什么关系？
+
+标准答案：
+
+> Project Loom 是虚拟线程的研发项目代号，JEP 444 是 Loom 项目的核心成果。
+>
+> Loom 项目包含多个相关 JEP：
+> - JEP 444：虚拟线程（Virtual Threads）
+> - JEP 456：Easy-Text Blocks（字符串模板预览版）
+> - JEP 459：String Templates（字符串模板第二预览版）
+> - JEP 460：Vector API（向量计算 API）
+>
+> 所以「虚拟线程」是 Loom 项目的产物，现在已经 GA（General Availability）。
+
+### 追问四：为什么说虚拟线程让 Reactive 编程过时了？
+
+标准答案：
+
+> 这个说法有些夸张，但有道理。
+>
+> 传统的 Reactive 编程（如 RxJava、Project Reactor、CompletableFuture）是为了解决回调地狱和并发性能问题。通过声明式的异步操作，Reactive 可以在少量线程上处理大量并发。
+>
+> 虚拟线程提供了另一种解法：用同步的方式写异步代码。不需要回调地狱，不需要复杂的 Reactive 操作符，代码看起来就像同步的：
+>
+> ```java
+> // Reactive 方式
+> webClient.get()
+>     .uri("/user/{id}", id)
+>     .retrieve()
+>     .bodyToMono(User.class)
+>     .map(user -> process(user));
+>
+> // 虚拟线程方式：看起来像同步代码
+> User user = httpClient.get("/user/" + id, User.class);
+> return process(user);
+> ```
+>
+> 但 Reactive 不会完全过时，因为：
+> - 背压（Backpressure）能力虚拟线程没有
+> - 声明式的数据流处理仍然是强项
+> - 已经有大量 Reactive 代码库不会消失
+
+---
+
+## 十、留给你的思考题
+
+### 题目一：虚拟线程的协作式调度 vs OS 的抢占式调度
+
+思考一下：协作式调度有什么缺点？在什么情况下，协作式调度可能导致问题？比如，一个虚拟线程长时间不 yield（执行纯 CPU 计算），会发生什么？
+
+### 题目二：设计一个支持虚拟线程的连接池
+
+传统的数据库连接池（如 HikariCP）是为平台线程设计的，每个线程获取一个连接。如果迁移到虚拟线程，连接池需要做哪些改动？虚拟线程 yield 时，持有的连接应该如何处理？
+
+### 题目三：虚拟线程与容器（Docker/Kubernetes）的配合
+
+在 Docker 容器中，CPU 资源是有限制的。如果在容器中运行大量虚拟线程，它们如何感知容器的 CPU 限制？如果容器 CPU 是 2 核，应该配置多少个 Carrier Thread？
+
+---
+
+虚拟线程不是银弹，但它确实解决了一个困扰 Java 多年 的问题：用同步的代码风格写高性能的并发程序。这是 Java 诞生以来线程模型最大的一次变革，值得每个 Java 工程师深入理解。

@@ -1,0 +1,888 @@
+# 消息可靠投递：持久化、消费确认与补偿机制
+
+import { Badge } from '@rspress/core/theme';
+
+> [!WARNING]
+> 前置知识：本篇文章涉及 Kafka、RabbitMQ、RocketMQ 等消息队列的原理，建议先掌握消息队列的基本概念和架构。
+
+---
+
+凌晨三点，你被急促的报警铃声惊醒。
+
+监控系统显示：过去一小时内，有 347 条订单支付成功的消息丢失了。用户的钱已经扣了，但订单状态始终停留在「待确认」——钱进了口袋，货却没着落。
+
+这不是孤例。根据我接触过的大量生产故障案例，消息丢失是消息队列使用过程中最常见、也是最致命的问题之一。
+
+问题出在哪？消息从生产者到消费者，要经过三个环节：生产者到 Broker、Broker 自身存储、Broker 到消费者。每个环节都可能丢消息，每个环节都需要精心设计才能保证可靠。
+
+这一讲，我们来彻底解决消息可靠投递的问题。
+
+---
+
+## 一、消息可靠投递的三个环节
+
+消息从诞生到被消费，需要经过完整的生命周期：
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                          消息可靠投递全链路                           │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  生产者 ──────────> Broker ──────────> 消费者                        │
+│      │               │               │                              │
+│      │               │               │                              │
+│      ▼               ▼               ▼                              │
+│  发送确认      持久化存储       消费确认                             │
+│  重试机制      副本机制         幂等处理                             │
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  环节一：生产者到 Broker（网络抖动、Broker 宕机都可能丢消息）  │   │
+│  │  环节二：Broker 自身（刷盘策略、刷盘失败导致消息丢失）          │   │
+│  │  环节三：Broker 到消费者（自动确认模式下，消息可能被重复消费）  │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+三个环节，缺一不可。任何一环出问题，消息都可能「消失」。接下来，我们逐个环节分析。
+
+---
+
+## 二、生产者到 Broker 的可靠性
+
+### 2.1 为什么生产者会丢消息
+
+生产者在发送消息时，可能遇到以下情况导致消息丢失：
+
+- **网络抖动**：消息发送到 Broker 的过程中网络中断
+- **Broker 宕机**：消息到达 Broker 前，Broker 已经挂了
+- **消息队列内部错误**：Broker 拒绝了消息（队列满了、权限不足等）
+
+这些问题在生产环境中非常常见。解决办法是**发送确认 + 重试机制**。
+
+### 2.2 Kafka 的 acks 配置
+
+Kafka 通过 `acks` 参数控制生产者的确认机制：
+
+```java
+Properties props = new Properties();
+props.put("bootstrap.servers", "localhost:9092");
+props.put("key.serializer", "org.apache.kafka.common.serialization.StringSerializer");
+props.put("value.serializer", "org.apache.kafka.common.serialization.StringSerializer");
+
+// acks 配置：决定需要多少副本确认后才算发送成功
+props.put("acks", "all");        // 所有副本确认
+props.put("retries", 3);         // 重试次数
+props.put("enable.idempotence", true);  // 开启幂等
+```
+
+`acks` 有三个取值，分别对应不同的可靠性等级：
+
+| acks 值 | 说明 | 可靠性 | 性能 | 适用场景 |
+|---|---|---|---|---|
+| `acks=0` | 生产者不等待 Broker 确认 | 最低 | 最高 | 允许少量丢消息的日志采集 |
+| `acks=1` | Leader 副本确认后返回 | 中等 | 较高 | 一般业务场景 |
+| `acks=all`（或 `-1`） | 所有 ISR 副本确认后返回 | 最高 | 较低 | 关键业务、不能丢消息 |
+
+**acks=0 的风险**：
+
+```text
+生产者 ──发送消息──> Broker（Leader）
+       <──不等待─── 返回成功
+
+问题：如果 Leader 在写入后宕机，消息丢失
+适用：允许少量丢失的监控日志、用户行为埋点
+```
+
+**acks=1 的风险**：
+
+```text
+生产者 ──发送消息──> Broker（Leader 写入成功）
+       <──确认─── 返回成功
+                        │
+                        │ 异步复制到 Follower
+                        ▼
+                   Follower（可能还没同步完成）
+
+问题：如果 Leader 宕机且 Follower 还没同步，消息丢失
+适用：对一致性要求不高的业务
+```
+
+**acks=all 的保证**：
+
+```text
+生产者 ──发送消息──> Broker（Leader 写入）
+                        │
+                        │ 同步到所有 ISR 副本
+                        ▼
+                   Follower 1 ──确认──┐
+                   Follower 2 ──确认──┼──> Leader 返回成功
+                                      │
+                                      ▼
+                               生产者收到确认
+
+问题：需要等待所有 ISR 副本确认，延迟较高
+适用：金融支付、订单处理等关键业务
+```
+
+### 2.3 RabbitMQ 的 confirms 机制
+
+RabbitMQ 提供了两种确认机制：**publisher confirms** 和 **consumer acknowledgements**。
+
+**Publisher Confirms（发布确认）**：
+
+```java
+// 开启 publisher confirm
+channel.confirmSelect();
+
+String message = "Hello RabbitMQ";
+
+// 异步监听确认结果
+channel.addConfirmListener((deliveryTag, multiple) -> {
+    // 消息成功到达 Broker
+    System.out.println("消息确认：" + deliveryTag);
+}, (deliveryTag, multiple) -> {
+    // 消息发送失败
+    System.out.println("消息失败：" + deliveryTag);
+    // 这里需要重试或记录日志
+});
+
+// 发送消息
+channel.basicPublish("exchange", "routingKey", MessageProperties.PERSISTENT_TEXT_PLAIN,
+    message.getBytes());
+```
+
+**同步等待确认**：
+
+```java
+// 开启 confirm
+channel.confirmSelect();
+
+// 发送消息
+channel.basicPublish("exchange", "routingKey", MessageProperties.PERSISTENT_TEXT_PLAIN,
+    message.getBytes());
+
+// 等待确认，最多等待 5 秒
+boolean confirmed = channel.waitForConfirms(5000);
+if (!confirmed) {
+    // 确认失败，需要重试
+    System.out.println("消息发送失败，需要重试");
+}
+```
+
+### 2.4 RocketMQ 的发送确认
+
+RocketMQ 提供了同步发送和异步发送两种方式：
+
+```java
+// 同步发送：等待 Broker 确认
+SendResult result = producer.send(message);
+System.out.println("发送状态：" + result.getSendStatus());
+
+// 异步发送：回调确认
+producer.send(message, new SendCallback() {
+    @Override
+    public void onSuccess(SendResult sendResult) {
+        System.out.println("发送成功：" + sendResult.getMsgId());
+    }
+
+    @Override
+    public void onException(Throwable e) {
+        System.out.println("发送失败，需要重试");
+        // 重试逻辑
+    }
+});
+```
+
+**事务消息**是 RocketMQ 保证发送可靠性的高级特性，我们稍后会详细讲解。
+
+### 2.5 重试机制的配置
+
+除了确认机制，重试也是保证可靠性的关键：
+
+```java
+// Kafka 重试配置
+props.put("retries", 3);                      // 重试次数
+props.put("retry.backoff.ms", 100);           // 重试间隔
+props.put("max.in.flight.requests.per.connection", 5);  // 单连接未确认请求数
+
+// 注意：需要配合幂等性使用，否则重试可能导致重复
+props.put("enable.idempotence", true);
+```
+
+```java
+// RabbitMQ 重试配置
+// application.yml
+spring:
+  rabbitmq:
+    listener:
+      simple:
+        retry:
+          enabled: true
+          initial-interval: 1000ms
+          max-attempts: 3
+          max-interval: 10000ms
+          multiplier: 2.0
+```
+
+重试不是万能的，需要注意**重试风暴**问题：如果所有生产者同时重试，可能把 Broker 打挂。建议使用**指数退避**策略，并设置最大重试次数。
+
+---
+
+## 三、Broker 的持久化策略
+
+### 3.1 为什么持久化也会丢消息
+
+Broker 收到消息后，需要将消息写入磁盘。如果在这个过程中出问题：
+
+- **异步刷盘**：消息写入 Page Cache，异步刷盘。如果断电，Page Cache 中的数据丢失
+- **副本未同步**：消息写入 Leader 副本，但还没同步到 Follower，Leader 宕机后消息丢失
+- **磁盘故障**：物理磁盘损坏，数据永久丢失
+
+### 3.2 Kafka 的刷盘策略
+
+Kafka 默认使用**异步刷盘**，性能高但有丢消息风险：
+
+```properties
+# server.properties
+
+# 刷盘策略：每 N 条消息强制刷盘一次（性能差，安全性高）
+flush.messages=1
+
+# 刷盘策略：每隔 N 毫秒强制刷盘一次
+flush.ms=1000
+```
+
+| 配置组合 | 安全性 | 性能 | 适用场景 |
+|---|---|---|---|
+| `flush.messages=1, flush.ms=1000` | 最高 | 最低 | 关键业务，不能丢消息 |
+| `flush.messages=10000, flush.ms=5000` | 中等 | 中等 | 一般业务 |
+| `flush.messages=100000, flush.ms=60000` | 较低 | 最高 | 日志采集，允许少量丢失 |
+
+**刷盘间隔 vs 刷盘消息数**：两个条件满足任一都会触发刷盘。`flush.messages=1` 意味着每条消息都刷盘，性能会大幅下降，但安全性最高。
+
+### 3.3 Kafka 的副本机制
+
+Kafka 通过副本机制保证数据不丢失：
+
+```properties
+# 副本因子：每个 Partition 有几个副本
+replication.factor=3
+
+# 最小同步副本数：必须有多少个副本同步成功才算写入成功
+min.insync.replicas=2
+```
+
+```
+Topic: orders, Partition: 0, Replication Factor: 3
+
+Broker 1: Leader（接收读写）
+Broker 2: Follower（同步中） ─┐
+Broker 3: Follower（同步中） ─┴──> ISR 列表
+
+min.insync.replicas=2 表示：
+- 必须有至少 2 个副本（Leader + 1个 Follower）同步成功
+- 如果只有 1 个副本可写，会拒绝写入（NotEnoughReplicasException）
+```
+
+**ISR（In-Sync Replicas）**：
+
+- 与 Leader 保持同步的副本集合
+- 如果 Follower 落后太多（超过 `replica.lag.time.max.ms`），会被踢出 ISR
+- 只有 ISR 中的副本才算数
+
+### 3.4 RocketMQ 的刷盘策略
+
+RocketMQ 支持**同步刷盘**和**异步刷盘**两种模式：
+
+```java
+// 同步刷盘：消息写入内存后，立即刷到磁盘
+// BROKER_COMMONSERIAL = SYNC_FLUSH
+producer.setFlushDiskType(FlushDiskType.SYNC_FLUSH);
+
+// 异步刷盘：消息写入内存后，返回成功，后台异步刷盘
+producer.setFlushDiskType(FlushDiskType.ASYNC_FLUSH);
+```
+
+| 刷盘模式 | 说明 | 可靠性 | 性能 | 适用场景 |
+|---|---|---|---|---|
+| 同步刷盘 | 等待刷盘完成才返回 | 高 | 低 | 金融支付、订单处理 |
+| 异步刷盘 | 写入内存即返回 | 中 | 高 | 一般业务、日志 |
+
+Broker 配置：
+
+```properties
+# flushDiskType = SYNC_FLUSH / ASYNC_FLUSH
+flushDiskType = SYNC_FLUSH
+
+# 异步刷盘线程数
+flushCommitLogTherads = 16
+```
+
+### 3.5 RabbitMQ 的持久化
+
+RabbitMQ 的持久化包括三个层面：
+
+| 层面 | 配置 | 说明 |
+|---|---|---|
+| Exchange 持久化 | `durable=true` | 交换机持久化 |
+| Queue 持久化 | `durable=true` | 队列持久化 |
+| Message 持久化 | `MessageProperties.PERSISTENT_TEXT_PLAIN` | 消息持久化 |
+
+```java
+// 定义持久化队列
+channel.queueDeclare("order.queue", true, false, false, null);
+
+// 定义持久化交换机
+channel.exchangeDeclare("order.exchange", "direct", true);
+
+// 发送持久化消息
+channel.basicPublish("order.exchange", "order.key",
+    MessageProperties.PERSISTENT_TEXT_PLAIN,  // 持久化消息
+    message.getBytes());
+```
+
+**重要**：必须三个层面都设置为持久化，才能保证消息不丢失。如果只设置了队列持久化而消息不持久化，队列恢复时消息仍然是空的。
+
+---
+
+## 四、消费者到应用的安全消费
+
+### 4.1 消费者丢消息的原因
+
+消费者丢消息通常是因为**过早确认**：
+
+- 自动确认模式下，消息被消费者拉取后，立即从 Broker 删除
+- 如果消费者在处理过程中宕机，消息就丢了
+
+### 4.2 Kafka 的手动提交 offset
+
+```java
+// 关闭自动提交
+props.put("enable.auto.commit", false);
+
+KafkaConsumer<String, String> consumer = new KafkaConsumer<>(props);
+consumer.subscribe(Arrays.asList("orders"));
+
+while (true) {
+    ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(1000));
+
+    for (ConsumerRecord<String, String> record : records) {
+        try {
+            // 1. 业务处理
+            processOrder(record);
+
+            // 2. 处理成功后，手动提交 offset
+            consumer.commitSync();
+
+        } catch (Exception e) {
+            // 3. 处理失败，不提交 offset，消息会被重新消费
+            log.error("处理失败，需要重试", e);
+        }
+    }
+}
+```
+
+**手动提交 vs 自动提交**：
+
+| 模式 | 优点 | 缺点 | 适用场景 |
+|---|---|---|---|
+| 自动提交 | 简单 | 可能丢消息 | 允许少量重复的业务 |
+| 手动提交 | 可靠 | 需要额外代码 | 关键业务 |
+
+### 4.3 RabbitMQ 的手动确认
+
+```java
+// 开启手动确认
+channel.basicQos(10);  // 每次最多处理 10 条消息
+
+DeliverCallback deliverCallback = (consumerTag, delivery) -> {
+    String message = new String(delivery.getBody());
+
+    try {
+        // 1. 业务处理
+        processOrder(message);
+
+        // 2. 确认消息
+        channel.basicAck(delivery.getEnvelope().getDeliveryTag(), false);
+
+    } catch (Exception e) {
+        // 3. 处理失败，拒绝消息（requeue=true 会重新入队）
+        channel.basicNack(delivery.getEnvelope().getDeliveryTag(), false, true);
+    }
+};
+
+channel.basicConsume("order.queue", false, deliverCallback, consumerTag -> {});
+```
+
+**确认模式详解**：
+
+```java
+// 确认当前消息
+channel.basicAck(deliveryTag, false);
+
+// 确认当前及之前所有消息
+channel.basicAck(deliveryTag, true);
+
+// 拒绝当前消息，不重新入队（会进入死信队列）
+channel.basicNack(deliveryTag, false, false);
+
+// 拒绝当前消息，重新入队
+channel.basicNack(deliveryTag, false, true);
+```
+
+### 4.4 消费幂等性保证
+
+即使做到了不丢消息，重试机制可能导致消息被重复消费。幂等性是解决这个问题的关键。
+
+**方案一：数据库唯一键**
+
+```java
+public void processOrder(ConsumerRecord<String, String> record) {
+    OrderMessage message = JSON.parseObject(record.value(), OrderMessage.class);
+
+    // 使用订单号作为唯一键，防止重复处理
+    try {
+        orderService.createOrder(message);
+    } catch (DuplicateKeyException e) {
+        // 订单已存在，说明是重复消息，直接忽略
+        log.info("订单已存在，忽略重复消息: {}", message.getOrderId());
+    }
+}
+```
+
+```sql
+-- 订单表添加唯一索引
+CREATE UNIQUE INDEX idx_order_no ON orders(order_no);
+```
+
+**方案二：Redis 去重**
+
+```java
+public void processOrder(ConsumerRecord<String, String> record) {
+    OrderMessage message = JSON.parseObject(record.value(), OrderMessage.class);
+    String key = "processed:order:" + message.getOrderId();
+
+    // 使用 SETNX 检查是否已处理
+    Boolean processed = redisTemplate.opsForValue().setIfAbsent(key, "1",
+        30, TimeUnit.MINUTES);
+
+    if (Boolean.FALSE.equals(processed)) {
+        log.info("订单已处理，忽略重复消息: {}", message.getOrderId());
+        return;
+    }
+
+    // 业务处理
+    orderService.createOrder(message);
+}
+```
+
+**方案三：消息 ID 记录表**
+
+```java
+public void processOrder(ConsumerRecord<String, String> record) {
+    String messageId = record.key();
+
+    // 检查消息是否已处理
+    MessageProcessed processed = messageLogDao.findByMessageId(messageId);
+    if (processed != null) {
+        log.info("消息已处理: {}", messageId);
+        return;
+    }
+
+    // 业务处理
+    orderService.createOrder(record.value());
+
+    // 记录消息处理日志
+    messageLogDao.save(MessageProcessed.builder()
+        .messageId(messageId)
+        .processedAt(new Date())
+        .status("SUCCESS")
+        .build());
+}
+```
+
+---
+
+## 五、消息补偿机制
+
+### 5.1 为什么需要补偿机制
+
+即使做了发送确认、持久化、消费确认，仍然可能有消息丢失或消息无法被正确处理：
+
+- 消费者在处理过程中宕机，消息状态未知
+- 网络抖动导致消息状态不一致
+- 业务逻辑错误导致消息被错误处理
+
+这时候需要**消息补偿机制**来兜底。
+
+### 5.2 定时对账
+
+定期比对消息状态，发现不一致时进行处理：
+
+```java
+@Scheduled(cron = "0 */5 * * * ?")  // 每 5 分钟执行一次
+public void reconcileOrderStatus() {
+    // 查询状态为"待确认"但超过 30 分钟的订单
+    List<Order> pendingOrders = orderDao.findPendingOrdersOlderThan(30, TimeUnit.MINUTES);
+
+    for (Order order : pendingOrders) {
+        // 1. 查询消息队列中的消息状态
+        MessageStatus status = queryMessageStatus(order.getMessageId());
+
+        if (status == MessageStatus.CONSUMED) {
+            // 消息已被消费，但订单状态未更新，说明处理失败了
+            log.warn("订单状态不一致，需要修复: {}", order.getOrderId());
+            orderService.repairOrder(order.getOrderId());
+        } else if (status == MessageStatus.SENT) {
+            // 消息已发送但未消费，可能是消费者挂了
+            log.warn("消息未消费，重新投递: {}", order.getMessageId());
+            retryMessage(order.getMessageId());
+        }
+    }
+}
+```
+
+### 5.3 消息状态表
+
+维护一个消息状态表，记录每条消息的处理状态：
+
+```sql
+-- 消息状态表
+CREATE TABLE message_status (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    message_id VARCHAR(64) NOT NULL UNIQUE,
+    status VARCHAR(20) NOT NULL,  -- SENT, CONSUMING, CONSUMED, FAILED
+    retry_count INT DEFAULT 0,
+    created_at DATETIME NOT NULL,
+    updated_at DATETIME NOT NULL,
+    INDEX idx_status (status),
+    INDEX idx_created_at (created_at)
+);
+```
+
+```java
+public class OrderMessageProcessor {
+
+    @Autowired
+    private MessageStatusDao messageStatusDao;
+
+    public void processOrder(String messageId, String content) {
+        // 1. 更新状态为"处理中"
+        messageStatusDao.updateStatus(messageId, "CONSUMING");
+
+        try {
+            OrderMessage message = JSON.parseObject(content, OrderMessage.class);
+
+            // 2. 业务处理
+            orderService.createOrder(message);
+
+            // 3. 更新状态为"已消费"
+            messageStatusDao.updateStatus(messageId, "CONSUMED");
+
+        } catch (Exception e) {
+            // 4. 更新状态为"失败"，并记录重试次数
+            messageStatusDao.updateStatus(messageId, "FAILED");
+            messageStatusDao.incrementRetryCount(messageId);
+
+            // 如果重试次数超过阈值，告警
+            if (messageStatusDao.getRetryCount(messageId) > 3) {
+                alertService.alert("消息处理失败超过 3 次", messageId);
+            }
+        }
+    }
+}
+```
+
+### 5.4 定时扫描处理失败的消息
+
+```java
+@Scheduled(cron = "0 */10 * * * ?")  // 每 10 分钟执行一次
+public void retryFailedMessages() {
+    // 查询状态为"失败"且重试次数小于阈值的消息
+    List<MessageStatus> failedMessages = messageStatusDao.findFailedMessages(3);
+
+    for (MessageStatus msg : failedMessages) {
+        // 重新投递消息
+        kafkaTemplate.send("order-topic", msg.getMessageId(),
+            loadMessageContent(msg.getMessageId()));
+
+        // 更新状态为"处理中"
+        messageStatusDao.updateStatus(msg.getMessageId(), "CONSUMING");
+    }
+}
+```
+
+---
+
+## 六、RocketMQ 事务消息
+
+### 6.1 事务消息要解决的问题
+
+RocketMQ 的事务消息解决了**本地事务与消息发送的一致性**问题：
+
+```text
+传统模式下的问题：
+1. 更新数据库成功
+2. 发送消息失败
+结果：数据库是新数据，消息丢了
+
+事务消息的解决方案：
+1. 开启事务
+2. 执行本地事务（更新数据库）
+3. 发送半消息（prepare）
+4. 本地事务提交成功，提交消息
+5. 本地事务失败，回滚消息
+```
+
+### 6.2 事务消息的实现流程
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        RocketMQ 事务消息流程                          │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  生产者                          Broker                            │
+│    │                              │                                 │
+│    │ ──1. 发送半消息──────────────>│                                 │
+│    │<──返回 OK───────────────────│                                 │
+│    │                              │                                 │
+│    │ 2. 执行本地事务               │                                 │
+│    │ ┌─────────────────────┐      │                                 │
+│    │ │ BEGIN TRANSACTION   │      │                                 │
+│    │ │ UPDATE orders...    │      │                                 │
+│    │ │ COMMIT / ROLLBACK   │      │                                 │
+│    │ └─────────────────────┘      │                                 │
+│    │                              │                                 │
+│    │ ──3. 提交/回滚───────────────>│                                 │
+│    │    (commit or rollback)      │                                 │
+│    │                              │                                 │
+│    │                              │                                 │
+│    │              4. 如果 Commit：投递消息给消费者                    │
+│    │                              │                                 │
+│    │              5. 如果超时未确认：Broker 回查                     │
+│    │<────────────────────────────│                                 │
+│    │ ──6. 返回事务状态────────────>│                                 │
+│    │                              │                                 │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 6.3 代码实现
+
+```java
+// 事务消息生产者
+public class OrderTransactionProducer {
+
+    private TransactionMQProducer producer;
+
+    public void sendOrderTransaction(Order order) {
+        try {
+            // 1. 创建消息
+            Message message = new Message("order-topic",
+                "order-create",
+                order.getOrderId(),
+                JSON.toJSONString(order).getBytes());
+
+            // 2. 发送事务消息
+            // 回调函数处理本地事务和回查
+            producer.sendMessageInTransaction(message, new TransactionListener() {
+
+                @Override
+                public LocalTransactionState executeLocalTransaction(Message msg, Object arg) {
+                    // 执行本地事务
+                    try {
+                        // BEGIN
+                        orderService.createOrder(order);
+
+                        // COMMIT
+                        return LocalTransactionState.COMMIT_MESSAGE;
+
+                    } catch (Exception e) {
+                        // ROLLBACK
+                        return LocalTransactionState.ROLLBACK_MESSAGE;
+                    }
+                }
+
+                @Override
+                public LocalTransactionState checkLocalTransaction(MessageExt msg) {
+                    // Broker 回查：检查本地事务是否执行成功
+                    String orderId = msg.getKeys();
+
+                    Order order = orderService.findByOrderId(orderId);
+
+                    if (order != null) {
+                        // 订单存在，说明事务执行成功
+                        return LocalTransactionState.COMMIT_MESSAGE;
+                    } else {
+                        // 订单不存在，说明事务未执行
+                        return LocalTransactionState.ROLLBACK_MESSAGE;
+                    }
+                }
+            }, null);
+
+        } catch (MQClientException e) {
+            // 处理异常，可能需要重试
+        }
+    }
+}
+```
+
+### 6.4 事务消息的配置
+
+```properties
+# Broker 配置
+transactionCheckInterval=30000    # Broker 回查消费者间隔
+transactionTimeOut=6000          # 事务超时时间
+transactionCheckMax=15           # 最大回查次数
+```
+
+**重要**：事务消息的性能较低，因为需要两阶段提交和可能的回查。只在**本地事务与消息必须一致**的场景使用。
+
+---
+
+## 七、消息丢失的排查与定位
+
+### 7.1 排查思路
+
+当发现消息丢失时，按以下顺序排查：
+
+```
+1. 生产者端检查
+   ├── 发送是否成功（是否有异常）
+   ├── acks 配置是否正确
+   ├── 是否有网络问题
+
+2. Broker 端检查
+   ├── 消息是否写入磁盘
+   ├── 副本是否同步成功
+   ├── 是否有磁盘故障
+
+3. 消费者端检查
+   ├── 消息是否被消费
+   ├── offset 是否正确提交
+   ├── 是否有业务异常被吞掉
+```
+
+### 7.2 Kafka 消息丢失排查
+
+```bash
+# 查看 Consumer Group 的消费进度
+bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
+    --group order-consumer-group \
+    --describe
+
+# 输出示例
+GROUP                TOPIC           PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG
+order-consumer-group order-topic     0          1000            1200            200
+
+# LAG > 0 表示有消息未被消费
+# LAG 持续增长表示消费能力不足
+```
+
+```bash
+# 查看副本同步状态
+bin/kafka-topics.sh --describe --topic order-topic \
+    --bootstrap-server localhost:9092
+
+# 输出示例
+Topic: order-topic    PartitionCount: 3    ReplicationFactor: 3
+Topic: order-topic    Partition: 0    Leader: 1    Replicas: 1,2,3    Isr: 1,2
+Topic: order-topic    Partition: 1    Leader: 2    Replicas: 2,3,1    Isr: 2,3,1
+Topic: order-topic    Partition: 2    Leader: 3    Replicas: 3,1,2    Isr: 3,1,2
+
+# Replicas: 所有副本
+# Isr: 同步中的副本
+# 如果 Isr < Replicas，说明有副本落后
+```
+
+### 7.3 RabbitMQ 消息丢失排查
+
+```bash
+# 查看队列状态
+rabbitmqctl list_queues name messages messages_ready messages_unacked
+
+# 输出示例
+name                messages  messages_ready  messages_unacked
+order.queue         100       50              50
+
+# messages_unacked > 0 表示有消息被消费但未确认
+# 如果消费者挂了，这些消息会重新投递给其他消费者
+```
+
+---
+
+## 八、总结：消息可靠投递 Checklist
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        消息可靠投递 Checklist                        │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  【生产者端】                                                         │
+│  □ Kafka: acks=all，确保所有副本确认                                 │
+│  □ Kafka: enable.idempotence=true，防止幂等性问题                    │
+│  □ Kafka: retries >= 3，网络抖动时自动重试                           │
+│  □ RabbitMQ: 开启 publisher confirms                                │
+│  □ RocketMQ: 使用事务消息处理本地事务与消息的一致性                    │
+│                                                                     │
+│  【Broker 端】                                                        │
+│  □ Kafka: replication.factor >= 3，多副本冗余                       │
+│  □ Kafka: min.insync.replicas >= 2，确保最小同步副本数               │
+│  □ Kafka: 合理配置 flush 参数（根据业务权衡安全和性能）                │
+│  □ RabbitMQ: 交换机、队列、消息都设置为持久化                        │
+│  □ RocketMQ: 关键业务使用同步刷盘                                     │
+│                                                                     │
+│  【消费者端】                                                         │
+│  □ Kafka: enable.auto.commit=false，使用手动提交                    │
+│  □ RabbitMQ: 使用手动 ack，不用自动 ack                             │
+│  □ 业务处理成功后再提交 offset/ack                                   │
+│  □ 实现幂等性，防止重复消费                                           │
+│  □ 添加异常捕获，处理失败时不确认                                      │
+│                                                                     │
+│  【监控告警】                                                         │
+│  □ 监控消息发送失败率                                                 │
+│  □ 监控消费者 LAG（Kafka）或 unacked 数量（RabbitMQ）                │
+│  □ 监控消息处理失败率和重试次数                                        │
+│  □ 配置定时对账，发现不一致及时告警                                   │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 面试追问预判
+
+### 追问一：Kafka 和 RocketMQ 的事务消息有什么区别？
+
+RocketMQ 的事务消息是**半消息**机制，需要本地事务成功后手动提交。Kafka 的事务消息（0.11+）则是通过** Exactly-Once 语义**实现，在 Kafka 内部保证写入和 offset 提交的原子性。
+
+| 特性 | RocketMQ 事务消息 | Kafka 事务 |
+|---|---|---|
+| 原理 | 半消息 + 本地事务 + 回查 | 幂等生产者 + 事务隔离 |
+| 使用复杂度 | 高（需要回查接口） | 中 |
+| 性能 | 中 | 高 |
+| 适用场景 | 本地事务与消息一致 | Exactly-Once 消费 |
+
+### 追问二：如何设计一个消息补偿系统？
+
+核心思路是**记录消息状态 + 定时扫描 + 补偿处理**：
+
+1. **消息状态表**：记录每条消息的当前状态（已发送、已消费、失败）
+2. **定时扫描**：定期扫描超时未处理的消息
+3. **补偿策略**：
+   - 状态为「已发送」但超时的：重新投递
+   - 状态为「处理中」但超时的：查询业务状态后决定
+   - 状态为「失败」且重试次数超限的：告警 + 人工介入
+
+### 追问三：如何保证消息的顺序性同时保证可靠性？
+
+这是一个 trade-off：
+
+- **顺序保证**：需要使用单分区或单消费者
+- **可靠性保证**：需要 acks=all + 手动提交
+- **两者兼顾**：单分区 + acks=all + 手动提交 + 幂等处理
+
+---
+
+> [!TIP]
+> **延伸思考**：如果让你设计一个消息可靠性监控平台，你会关注哪些核心指标？如何做到提前预警而不是事后告警？

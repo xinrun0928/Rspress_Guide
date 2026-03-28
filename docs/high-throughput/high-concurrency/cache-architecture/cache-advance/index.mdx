@@ -1,0 +1,321 @@
+import { Badge } from '@rspress/core/theme';
+
+# 缓存进阶：Redis 的深层能力
+
+> [!WARNING]
+> 前置知识：本篇文章是缓存进阶的入口，涵盖 Redis 淘汰策略、过期策略、数据类型、Lua 脚本等内容。适合有一定 Redis 基础的同学深入学习。
+
+---
+
+大多数人对 Redis 的理解，停留在「set/get」层面。
+
+但如果你去问一个 Redis 进阶工程师，他会告诉你：
+
+- Redis 的内存满了，不是简单的「报错拒绝」，而是有 8 种淘汰策略可以选择
+- Redis 的 key 过期了，不一定立刻被删除，惰性删除 + 定期删除才是真相
+- Redis 的管道和 Lua 脚本都能减少网络往返，但适用场景完全不同
+- Redis 的 9 种数据类型，每一种都有独特的性能特征和使用场景
+
+这些内容，才是 Redis 在生产环境中真正发挥作用的部分。
+
+这一讲，我们来深入 Redis 的底层机制。
+
+---
+
+## 一、知识版图：缓存进阶全景
+
+```text
+┌─────────────────────────────────────────────────────────────────┐
+│                       缓存进阶                                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌─────────────────┐  ┌─────────────────┐                       │
+│  │   Redis 淘汰策略 │  │  Redis 过期策略  │                       │
+│  │                 │  │                 │                       │
+│  │  LRU / LFU     │  │  惰性删除        │                       │
+│  │  TTL / Random  │  │  定期删除        │                       │
+│  │  noeviction    │  │  混合策略        │                       │
+│  └────────┬────────┘  └────────┬────────┘                       │
+│           │                     │                                 │
+│  ┌────────▼─────────────────────▼────────┐                       │
+│  │          Redis 内存管理与性能          │                       │
+│  │                                        │                       │
+│  │    maxmemory → 淘汰策略 → 内存碎片     │                       │
+│  └─────────────────────┬──────────────────┘                       │
+│                        │                                          │
+│  ┌─────────────────────▼──────────────────┐                       │
+│  │        Redis 数据类型与性能              │                       │
+│  │                                        │                       │
+│  │    String · Hash · List · Set · ZSet  │                       │
+│  │    Bitmap · HyperLogLog · GEO · Stream  │                       │
+│  └─────────────────────┬──────────────────┘                       │
+│                        │                                          │
+│  ┌─────────────────────▼──────────────────┐                       │
+│  │      Redis 管道 · 事务 · Lua 脚本        │                       │
+│  │                                        │                       │
+│  │    批量操作：管道 vs 脚本 vs 事务        │                       │
+│  └────────────────────────────────────────┘                       │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 二、Redis 淘汰策略：内存满了怎么办
+
+当 Redis 内存达到上限（`maxmemory`）时，需要淘汰数据。Redis 提供了 8 种淘汰策略：
+
+### 淘汰策略速查表
+
+| 策略 | 淘汰范围 | 淘汰方式 | 适用场景 |
+|---|---|---|---|
+| noeviction | 不淘汰 | 拒绝写入 | 数据必须持久化的场景 |
+| allkeys-lru | 所有 key | LRU 算法 | 通用场景，热点数据优先保留 |
+| allkeys-random | 所有 key | 随机淘汰 | 缓存数据无明显热点 |
+| volatile-lru | 带过期时间的 key | LRU 算法 | 想保留部分永久数据的场景 |
+| volatile-random | 带过期时间的 key | 随机淘汰 | — |
+| volatile-ttl | 带过期时间的 key | TTL 最短优先 | 优先淘汰即将过期的数据 |
+| allkeys-lfu | 所有 key | LFU 算法 | 访问频率差异明显的场景 |
+| volatile-lfu | 带过期时间的 key | LFU 算法 | — |
+
+### LRU vs LFU：如何选择
+
+**LRU（Least Recently Used）**：按最近访问时间淘汰，最久未访问的先淘汰。
+
+```bash
+# LRU 适合的场景：数据访问有明显的「冷热」趋势
+# 例如：新闻列表、热门商品（访问过的数据更可能再次访问）
+CONFIG SET maxmemory-policy allkeys-lru
+```
+
+**LFU（Least Frequently Used）**：按访问频率淘汰，访问次数最少的先淘汰。
+
+```bash
+# LFU 适合的场景：数据访问频率差异明显
+# 例如：VIP 用户数据（高频用户持续高频访问）
+CONFIG SET maxmemory-policy allkeys-lfu
+```
+
+### LRU 的真相：近似 LRU
+
+Redis 的 LRU 不是精确的「全量排序」，而是**抽样淘汰**：
+
+```c
+// Redis 源码中的近似 LRU 实现
+dictEntry *dictGetRandomKey(dict *d) {
+    // 只随机抽样 16 个元素
+    // 在抽样中选择最近访问时间最早的
+}
+```
+
+这意味着 Redis 的 LRU 有一定的误判率，但性能远高于精确 LRU。在大多数场景下，这个误判率是可以接受的。
+
+> [!TIP]
+> 如果需要精确 LRU，可以考虑使用 `OBJECT IDLETIME` 命令手动实现，或者使用 `Latency Queue` 策略。
+
+---
+
+## 三、Redis 过期策略：key 是怎么被删除的
+
+Redis 有两种过期 key 的删除策略：**惰性删除**和**定期删除**。
+
+### 惰性删除：访问时才检查
+
+```text
+GET key
+  │
+  ▼
+检查 key 是否过期？
+  │      │
+  │ 是   │ 否
+  ▼      ▼
+删除key   返回value
+返回null
+```
+
+**优点**：不消耗额外资源，只有访问时才检查。
+**缺点**：过期 key 可能长时间不被删除，占用内存。
+
+### 定期删除：定时扫描
+
+Redis 每隔一段时间（默认 100ms），随机检查一部分 key：
+
+```bash
+# 配置定期删除的频率
+hz 10  # 每秒执行 10 次定期删除（每次 100ms）
+```
+
+**优点**：及时删除过期的 key，释放内存。
+**缺点**：需要消耗 CPU 资源，高负载下可能影响性能。
+
+### 混合策略：生产环境推荐
+
+Redis 使用的是**惰性删除 + 定期删除**的组合：
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│                    Redis 过期删除流程                        │
+│                                                              │
+│  惰性删除：每次访问 key 时检查，过期则删除                    │
+│                     +                                        │
+│  定期删除：每秒执行 hz次，扫描 expires 字典中的 key           │
+│                                                              │
+│  当 CPU 空闲时，增加删除比例                                  │
+│  当 CPU 繁忙时，减少删除比例                                  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 大量 key 同时过期的坑
+
+如果大量 key 设置了相同的过期时间，它们会在同一时刻大量过期：
+
+```bash
+# 错误写法：所有 key 都在同一时刻过期
+SET product:1 "..."
+EXPIRE product:1 3600  # 1小时后过期
+SET product:2 "..."
+EXPIRE product:2 3600  # 也是1小时后过期
+# ... 1小时后，10000个key同时过期
+
+# 正确写法：过期时间加上随机偏移
+TTL = 3600 + rand(0, 300)  # 1小时 ~ 1小时05分之间随机
+```
+
+---
+
+## 四、Redis 数据类型：选对类型是关键
+
+### 九种数据类型速查
+
+| 类型 | 底层实现 | 适用场景 | 性能特征 |
+|---|---|---|---|
+| String | SDS（简单动态字符串） | 简单值、计数器、缓存序列化对象 | 最高 |
+| Hash | 压缩列表 / 哈希表 | 对象存储（字段较多时） | 中 |
+| List | 双向链表 / 压缩列表 | 队列、消息流 | 高 |
+| Set | 哈希表 / 整数集合 | 去重、标签、好友关系 | 高 |
+| ZSet | 跳跃表 + 哈希表 | 排行榜、有序集合 | 中 |
+| Bitmap | 位图 | 签到、在线状态、布隆过滤器 | 极高 |
+| HyperLogLog | 基数估算 | UV 统计（百万级精度） | 极高 |
+| GEO | 有序集合 | 附近的人、LBS | 高 |
+| Stream | RadixTree | 消息队列、事件流 | 中 |
+
+### String 的性能秘密
+
+String 是 Redis 最常用的类型，也是性能最高的类型：
+
+```bash
+# String 的 GET/SET 是 O(1) 复杂度
+GET key       # O(1)
+SET key value # O(1)
+INCR counter  # O(1)
+
+# 但批量操作时要注意
+MGET key1 key2 key3 ...  # O(N)，N 为 key 数量
+```
+
+### ZSet 的排行榜实现
+
+```java
+// 使用 ZSet 实现实时排行榜
+public void recordScore(String userId, long score) {
+    redisTemplate.opsForZSet().add("leaderboard", userId, score);
+}
+
+// 获取 TOP N
+public List<String> getTopN(int n) {
+    return redisTemplate.opsForZSet()
+        .reverseRange("leaderboard", 0, n - 1)
+        .stream()
+        .collect(Collectors.toList());
+}
+
+// 获取用户排名
+public Long getRank(String userId) {
+    Long rank = redisTemplate.opsForZSet().reverseRank("leaderboard", userId);
+    return rank != null ? rank + 1 : null;  // Redis 排名从 0 开始
+}
+```
+
+---
+
+## 五、Redis 管道、事务与 Lua 脚本
+
+### 三者的对比
+
+| 特性 | 管道（Pipeline） | 事务（MULTI/EXEC） | Lua 脚本 |
+|---|---|---|---|
+| 原子性 | 否（各自独立） | 是 | 是 |
+| 网络往返 | 1 次（N 条命令打包） | N 次（RTT） | 1 次 |
+| 执行失败处理 | 无 | 支持 DISCARD | 无 |
+| 适用场景 | 批量读写、无依赖 | 批量操作、原子性要求 | 复杂逻辑、原子性要求 |
+
+### 管道：减少网络往返
+
+```java
+// 普通方式：N 次网络往返
+for (int i = 0; i < 100; i++) {
+    redisTemplate.opsForValue().increment("counter:" + i);
+}
+
+// 管道：1 次网络往返
+redisTemplate.executePipelined((RedisCallback<Object>) connection -> {
+    for (int i = 0; i < 100; i++) {
+        connection.stringCommands().incr("counter:" + i);
+    }
+    return null;
+});
+```
+
+### Lua 脚本：原子性 + 复杂逻辑
+
+```lua
+-- 扣减库存的 Lua 脚本
+local stock = redis.call('GET', KEYS[1])
+if stock == false then
+    return -1  -- 库存 key 不存在
+end
+if tonumber(stock) < tonumber(ARGV[1]) then
+    return -2  -- 库存不足
+end
+redis.call('DECRBY', KEYS[1], ARGV[1])
+return tonumber(stock) - tonumber(ARGV[1])  -- 返回扣减后的库存
+
+-- 使用
+redisTemplate.execute(
+    new DefaultRedisScript<>(script, Long.class),
+    Collections.singletonList("stock:product:1001"),
+    "10"
+);
+```
+
+> [!TIP]
+> Lua 脚本的优势是**原子性 + 减少网络往返 + 复杂逻辑支持**。如果你的操作需要「读-判断-写」逻辑，用 Lua 脚本是最优选择。
+
+---
+
+## 六、复习路径建议
+
+### 第一阶段：理解内存管理
+
+1. 重点掌握 LRU 和 LFU 的区别和适用场景
+2. 理解惰性删除和定期删除的混合策略
+
+### 第二阶段：掌握数据类型
+
+1. 重点掌握 String 和 ZSet 的使用
+2. 了解其他数据类型的典型场景
+
+### 第三阶段：精通性能优化
+
+1. 掌握管道和 Lua 脚本的使用场景
+2. 理解批量操作的性能差异
+
+---
+
+## 延伸思考
+
+Redis 的进阶，本质上是对「数据结构和算法」的理解。
+
+淘汰策略是对内存的管理，过期策略是对时间的处理，数据类型是对业务场景的抽象。每一种设计，都是在特定约束下找到的最优解。
+
+下次使用 Redis 之前，先问自己：**我的数据适合哪种类型？内存满了应该淘汰哪些？key 过期后应该如何处理？**

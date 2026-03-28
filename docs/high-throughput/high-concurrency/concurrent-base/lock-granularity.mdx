@@ -1,0 +1,670 @@
+import { Badge } from '@rspress/core/theme';
+
+# 减少锁粒度：分段锁、ConcurrentHashMap 源码解析
+
+高并发场景下，一个简单的 HashMap 操作可能成为系统的瓶颈。
+
+不是 HashMap 慢，而是**所有线程都在抢同一把锁**。
+
+想象一下：1000个线程同时访问一个 HashMap，每个线程都要先获取同一把锁。CPU 在线程切换、锁等待中消耗了大量资源，真正用于业务计算的时间少得可怜。
+
+这就是「锁粒度」的问题。
+
+## 一、锁粒度的基本概念
+
+### 1.1 什么是锁粒度？
+
+锁粒度是指锁保护的「范围大小」。
+
+- **粗锁**：一把锁保护整个数据结构。简单但并发度低。
+- **细锁**：多个锁分别保护数据结构的不同部分。复杂但并发度高。
+
+```
+粗锁：整个 Map 用一把锁
+┌─────────────────────────────────────┐
+│              HashMap                 │
+│  ┌─────┬─────┬─────┬─────┬─────┐   │
+│  │  0  │  1  │  2  │  3  │ ... │   │
+│  └──┬──┴──┬──┴──┬──┴──┬──┴─────┘   │
+│     └─────┴─────┴─────┴─────┘        │
+│              🔒 (唯一锁)              │
+└─────────────────────────────────────┘
+
+细锁：每个桶用独立的锁
+┌─────────────────────────────────────┐
+│              HashMap                 │
+│  ┌─────┬─────┬─────┬─────┬─────┐   │
+│  │  0  │  1  │  2  │  3  │ ... │   │
+│  └──┬──┴──┬──┴──┬──┴──┬──┴─────┘   │
+│     🔒    🔒    🔒    🔒    🔒       │
+│    (多个锁，并发访问)                  │
+└─────────────────────────────────────┘
+```
+
+### 1.2 粗锁 vs 细锁的权衡
+
+| 维度 | 粗锁 | 细锁 |
+|---|---|---|
+| 实现复杂度 | 低 | 高 |
+| 并发度 | 低 | 高 |
+| 内存开销 | 低（一个锁对象） | 高（多个锁对象） |
+| 适用场景 | 低并发、数据量小 | 高并发、数据量大 |
+| 锁竞争 | 激烈 | 分散 |
+
+## 二、ConcurrentHashMap 的演进
+
+### 2.1 JDK7 的分段锁设计
+
+JDK 7 的 `ConcurrentHashMap` 采用了「分段锁」设计：用 `Segment` 数组来管理锁，每个 Segment 守护一个或多个桶。
+
+```java
+// ConcurrentHashMap JDK 7 结构
+public class ConcurrentHashMap<K, V> extends AbstractMap<K, V> {
+    
+    // Segment 数组，类似 HashMap 的桶数组
+    final Segment<K, V>[] segments;
+    
+    // Segment 继承自 ReentrantLock
+    static final class Segment<K, V> extends ReentrantLock {
+        transient volatile HashEntry<K, V>[] table;
+        transient int count;           // 元素数量
+        transient int modCount;        // 修改计数
+        transient int threshold;       // 扩容阈值
+    }
+    
+    // HashEntry 类似 HashMap 的 Node
+    static final class HashEntry<K, V> {
+        final int hash;
+        final K key;
+        volatile V value;
+        volatile HashEntry<K, V> next;
+    }
+}
+```
+
+### 2.2 JDK 7 分段锁的工作原理
+
+```java
+// JDK 7: put 方法核心逻辑
+public V put(K key, V value) {
+    // 1. 计算 key 的 hash
+    int hash = hash(key);
+    
+    // 2. 根据 hash 计算 Segment 索引
+    int segmentIndex = (hash >>> 28) % segments.length;
+    
+    // 3. 获取或创建 Segment
+    Segment<K, V> segment = ensureSegment(segmentIndex);
+    
+    // 4. 对 Segment 加锁（分段锁的核心）
+    synchronized (segment) {
+        // 5. 在 Segment 内部进行 HashMap 操作
+        HashEntry<K, V>[] tab = segment.table;
+        int index = (hash >>> 16) & (tab.length - 1);
+        HashEntry<K, V> first = tab[index];
+        
+        // 遍历链表查找或插入
+        for (HashEntry<K, V> e = first; e != null; e = e.next) {
+            if (e.hash == hash && key.equals(e.key)) {
+                V oldValue = e.value;
+                e.value = value;
+                return oldValue;
+            }
+        }
+        
+        // 插入新节点
+        HashEntry<K, V> newEntry = new HashEntry<>(hash, key, value, first);
+        tab[index] = newEntry;
+        segment.count++;
+        return null;
+    }
+}
+```
+
+### 2.3 为什么用 Segment 而不是直接锁数组？
+
+这里有一个精妙的设计：**Segment 继承自 ReentrantLock**。
+
+```java
+static final class Segment<K, V> extends ReentrantLock {
+    // Segment 本身就是锁
+    // 每个 Segment 有自己的锁，可以独立加锁
+}
+```
+
+这意味着：
+- Segment 可以被多个线程同时持有（可重入）
+- 锁的公平性等特性可以复用 ReentrantLock 的实现
+- Segment 内部可以继续使用 synchronized（如果需要）
+
+### 2.4 JDK 7 的并发度分析
+
+```java
+// 默认配置
+public ConcurrentHashMap() {
+    // 默认分段数 16
+    this.segmentShift = 32 - 3;  // 32 - log2(16)
+    this.segmentMask = 0xF;       // 15
+    this.segments = createSegmentArray(16);  // 16 个 Segment
+}
+```
+
+理论上，JDK 7 的 `ConcurrentHashMap` 最多支持 **16 个线程同时进行写操作**（每个 Segment 一把锁）。
+
+但这只是理论值。实际情况取决于数据的分布——如果所有 key 都落在同一个 Segment 里，并发度会退化到 1。
+
+## 三、JDK 8 的CAS + synchronized 实现
+
+### 3.1 为什么放弃分段锁？
+
+JDK 8 完全重写了 `ConcurrentHashMap`，放弃了分段锁设计，原因如下：
+
+1. **内存开销大**：每个 Segment 都是一个独立的 ReentrantLock 对象，还要维护数组。16 个 Segment 加上每个 Segment 内部的数组，内存开销不小。
+
+2. **哈希冲突严重时并发度退化**：如果大量 key 哈希到同一个 Segment，性能会退化到接近 Hashtable。
+
+3. **实现复杂度高**：分段锁需要两层寻址（Segment → HashEntry），代码复杂。
+
+### 3.2 JDK 8 的全新结构
+
+```java
+// ConcurrentHashMap JDK 8 结构
+public class ConcurrentHashMap<K, V> extends AbstractMap<K, V> {
+    
+    // 桶数组（volatile，保证可见性）
+    transient volatile Node<K, V>[] table;
+    
+    // 控制变量：负数表示正在初始化或扩容
+    private transient volatile int sizeCtl;
+    
+    // Node：链表或红黑树的节点
+    static class Node<K, V> implements Map.Entry<K, V> {
+        final int hash;
+        final K key;
+        volatile V value;
+        volatile Node<K, V> next;
+    }
+    
+    // TreeNode：红黑树节点（JDK 8 新增）
+    static final class TreeNode<K, V> extends Node<K, V> {
+        TreeNode<K, V> parent;
+        TreeNode<K, V> left;
+        TreeNode<K, V> right;
+        TreeNode<K, V> prev;  // 用于删除时快速定位
+        boolean red;
+    }
+    
+    // TreeBin：红黑树的根节点
+    static final class TreeBin<K, V> extends Node<K, V> {
+        TreeNode<K, V> root;
+        TreeNode<K, V> first;
+        WLocker lock;
+        int size;
+    }
+}
+```
+
+### 3.3 JDK 8 的 put 逻辑详解
+
+```java
+public V put(K key, V value) {
+    return putVal(key, value, false);
+}
+
+final V putVal(K key, V value, boolean onlyIfAbsent) {
+    if (key == null || value == null) throw new NullPointerException();
+    
+    // 1. 计算 hash
+    int hash = spread(key.hashCode());
+    
+    // 2. 遍历桶数组，记录链表长度
+    int binCount = 0;
+    
+    for (Node<K, V>[] tab = table; ; ) {
+        Node<K, V> f;
+        int n, i, fh;
+        
+        // 3. 初始化桶数组（懒初始化）
+        if (tab == null || (n = tab.length) == 0) {
+            tab = initTable();
+        }
+        // 4. 该位置为空，直接 CAS 插入
+        else if ((f = tabAt(tab, i = (n - 1) & hash)) == null) {
+            if (casTabAt(tab, i, null, new Node<K, V>(hash, key, value, null)))
+                break;
+        }
+        // 5. 该位置正在扩容，协助扩容
+        else if ((fh = f.hash) == MOVED) {
+            tab = helpTransfer(tab, f);
+        }
+        // 6. 正常情况：对该桶加锁（synchronized）
+        else {
+            V oldVal = null;
+            synchronized (f) {  // 锁住头节点
+                if (tabAt(tab, i) == f) {  // 双重检查
+                    if (fh >= 0) {  // 普通链表
+                        binCount = 1;
+                        for (Node<K, V> e = f; ; ++binCount) {
+                            if (e.hash == hash && key.equals(e.key)) {
+                                oldVal = e.value;
+                                if (!onlyIfAbsent)
+                                    e.value = value;
+                                break;
+                            }
+                            Node<K, V> pred = e;
+                            if ((e = e.next) == null) {
+                                pred.next = new Node<K, V>(hash, key, value, null);
+                                break;
+                            }
+                        }
+                    }
+                    else if (f instanceof TreeBin) {  // 红黑树
+                        binCount = 2;
+                        TreeBin<K, V> t = (TreeBin<K, V>) f;
+                        TreeNode<K, V> root = t.putTreeVal(hash, key, value);
+                        if (!onlyIfAbsent && root != null) {
+                            oldVal = root.getValue();
+                            root.setValue(value);
+                        }
+                    }
+                }
+            }
+            
+            // 7. 检查是否需要树化或扩容
+            if (binCount != 0) {
+                if (binCount >= TREEIFY_THRESHOLD)
+                    treeifyBin(tab, i);
+                if (oldVal != null)
+                    return oldVal;
+                break;
+            }
+        }
+    }
+    
+    // 8. 增加计数器（用于 size()）
+    addCount(1L, binCount);
+    return null;
+}
+```
+
+### 3.4 JDK 8 的并发机制分析
+
+| 操作 | 机制 | 说明 |
+|---|---|---|
+| 桶为空 | CAS | 只有一个线程能成功插入 |
+| 桶有元素 | synchronized + 头节点 | 锁粒度细化到桶级别 |
+| 链表超过8个 | 红黑树 | 查找从 O(n) 优化到 O(log n) |
+| 扩容 | 多线程协助 | 避免阻塞，提高并发度 |
+
+### 3.5 为什么 JDK 8 用 synchronized 而不是 Lock？
+
+1. **JVM 内置支持**：`synchronized` 是 JVM 原生关键字，JVM 可以进行更多优化（如锁消除、锁粗化）。
+
+2. **轻量级锁集成**：JDK 6 之后，synchronized 经历了大量优化，在大多数场景下性能与 Lock 相当。
+
+3. **内存开销小**：`synchronized` 的锁对象（Monitor）是在对象头中，不需要额外分配内存。
+
+4. **可重入**：`synchronized` 支持可重入，简化了实现。
+
+## 四、为什么 JDK 8 放弃了分段锁
+
+### 4.1 内存开销对比
+
+```java
+// JDK 7 分段锁的内存开销
+// 每个 Segment 包含：
+// - 锁对象（ReentrantLock）
+// - HashEntry 数组
+// - 其他控制变量
+
+// 假设 Segment 数 = 16，桶数 = 16 * 16 = 256
+// 内存开销 = 16 * Segment对象 + 256 * HashEntry指针
+
+// JDK 8 CAS + synchronized 的内存开销
+// - 只有一层 Node 数组
+// - 不需要额外的 Segment 对象
+// - Node 对象包含 value 的 volatile 引用（内存优化）
+```
+
+### 4.2 并发度对比
+
+```java
+// JDK 7 分段锁
+// 并发度 = Segment 数（固定，一般为 16）
+// 问题：如果数据倾斜，很多 Segment 空闲
+
+// JDK 8 CAS + synchronized
+// 并发度 = 桶数（动态，初始 16，可扩容）
+// 扩容后并发度翻倍
+// 极端情况下，并发度可以接近线程数
+```
+
+### 4.3 哈希冲突处理对比
+
+```java
+// JDK 7
+// Segment 内部采用链表解决冲突
+// 同一个 Segment 内的操作串行化
+// 如果某个桶的链表很长，锁竞争会加剧
+
+// JDK 8
+// 链表超过阈值（8）转为红黑树
+// 查找从 O(n) 优化到 O(log n)
+// 减少锁持有时间
+```
+
+## 五、size() 方法的并发处理
+
+### 5.1 JDK 7 的 size() 实现
+
+```java
+// JDK 7: 遍历所有 Segment，累加 count
+public int size() {
+    final Segment<K, V>[] segments = this.segments;
+    long sum = 0;
+    int cap = 0;
+    
+    for (Segment<K, V> seg : segments) {
+        seg.lock();  // 加锁，保证可见性
+        try {
+            sum += seg.count;
+            cap += seg.table.length;
+        } finally {
+            seg.unlock();
+        }
+    }
+    
+    // 计算总元素数量
+    if (sum > Integer.MAX_VALUE) {
+        return Integer.MAX_VALUE;
+    }
+    return (int) sum;
+}
+```
+
+问题：每次调用 `size()` 都要锁住所有 Segment，性能很差。
+
+### 5.2 JDK 8 的 size() 实现
+
+```java
+// JDK 8: 使用 CounterCell 数组 + CAS
+// 核心思想：分段计数，减少竞争
+
+// CounterCell 数组（分段计数器）
+transient volatile CounterCell[] counterCells;
+
+// addCount: 增加计数
+private final void addCount(long x, int binCount) {
+    CounterCell[] as;
+    long b, v;
+    int m;
+    CounterCell a;
+    
+    // 1. 尝试直接修改 baseCount（高并发时失败）
+    if ((as = counterCells) != null ||
+        !U.compareAndSwapLong(this, BASECOUNT, b = baseCount, b + x)) {
+        
+        CounterCell[] a = as;
+        boolean wasUncontended = true;
+        
+        // 2. CAS 失败，尝试 CAS 到某个 CounterCell
+        if (as == null || (m = as.length - 1) < 0 ||
+            (a = as[ThreadLocalRandom.getProbe() & m]) == null ||
+            !(wasUncontended = U.compareAndSwapLong(a, CELLVALUE, v = a.value, v + x))) {
+            
+            // 3. CAS 失败，调用 fullAddCount
+            fullAddCount(x, wasUncontended);
+        }
+    }
+}
+
+// sumCount: 累加计数
+final long sumCount() {
+    CounterCell[] as = counterCells;
+    long sum = baseCount;
+    if (as != null) {
+        for (CounterCell a : as) {
+            if (a != null) {
+                sum += a.value;
+            }
+        }
+    }
+    return sum;
+}
+```
+
+**JDK 8 的优化思路**：使用 `CounterCell[]` 数组分段计数，每个线程 CAS 修改自己对应的 CounterCell，减少竞争。最后调用 `sumCount()` 时遍历累加即可。
+
+## 六、ConcurrentHashMap 的 key 和 value 不能为 null
+
+这是一个经常被问到的问题。
+
+### 6.1 为什么 value 不能为 null？
+
+`ConcurrentHashMap` 的 value 不能为 null，是为了与并发语义保持一致。
+
+考虑这个场景：
+
+```java
+ConcurrentHashMap<String, User> map = new ConcurrentHashMap<>();
+
+// 线程 A
+User user = map.get("张三");
+if (user != null) {  // 如果 user 为 null，无法区分「不存在」还是「值为 null」
+    // 处理业务
+}
+
+// 问题：如果 value 可以为 null，这行代码的含义就变了
+// 是 key 不存在？还是 value 本身就是 null？
+```
+
+### 6.2 为什么 key 不能为 null？
+
+同样是为了并发安全。
+
+```java
+// 线程 A
+if (map.containsKey("李四")) {  // containsKey 返回 true
+    // 此时线程 B 删除了 "李四"
+    User user = map.get("李四");  // 返回 null
+    // 问题：线程 A 的判断逻辑被破坏了
+}
+```
+
+如果允许 null key，`containsKey()` 和 `get()` 的结果可能不一致，破坏并发程序的安全性。
+
+### 6.3 对比其他 Map
+
+| Map 类型 | key 是否能为 null | value 是否能为 null | 线程安全 |
+|---|---|---|---|
+| HashMap | 是 | 是 | 否 |
+| Hashtable | 否 | 否 | 是（方法级 synchronized） |
+| ConcurrentHashMap | 否 | 否 | 是（分段锁/CAS） |
+| TreeMap | key 否（ Comparable） | 是 | 否 |
+| Collections.synchronizedMap | 是 | 是 | 是（包装了 synchronized） |
+
+## 七、分段锁的通用设计模式
+
+`ConcurrentHashMap` 的分段锁思想可以应用到其他场景。
+
+### 7.1 分段锁的通用结构
+
+```java
+// 通用分段锁实现
+public class SegmentLock<K> {
+    
+    // 分段数（建议为 2 的幂）
+    private final int segmentCount;
+    private final Object[] locks;
+    
+    public SegmentLock(int segmentCount) {
+        this.segmentCount = segmentCount;
+        this.locks = new Object[segmentCount];
+        for (int i = 0; i < segmentCount; i++) {
+            locks[i] = new Object();
+        }
+    }
+    
+    // 获取 key 对应的锁
+    private Object getLock(Object key) {
+        int hash = spread(key.hashCode());
+        return locks[hash & (segmentCount - 1)];
+    }
+    
+    // 在锁保护下执行操作
+    public void doWithLock(Object key, Runnable action) {
+        synchronized (getLock(key)) {
+            action.run();
+        }
+    }
+    
+    // 计算 hash（与 ConcurrentHashMap 一致）
+    private int spread(int h) {
+        return (h ^ (h >>> 16)) & Integer.MAX_VALUE;
+    }
+}
+```
+
+### 7.2 应用场景
+
+| 场景 | 分段锁应用 |
+|---|---|
+| 计数器 | LongAdder：base + cells[] |
+| 缓存 | 分段缓存：不同 key 路由到不同段 |
+| 连接池 | HikariCP：分段的 FastList |
+| 任务队列 | 分段队列：不同线程操作不同队列 |
+
+## 八、LongAdder vs AtomicLong 的分段锁思想
+
+`LongAdder` 是 JDK 8 引入的高并发计数器，完全借鉴了 `ConcurrentHashMap` 的分段锁思想。
+
+### 8.1 AtomicLong 的问题
+
+```java
+// AtomicLong: 所有线程竞争同一个 value 的 CAS
+public class AtomicLong extends Number {
+    private volatile long value;
+    
+    public final long incrementAndGet() {
+        return U.compareAndSwapLong(this, VALUE, value + 1, value + 1) 
+            ? value + 1 
+            : get();
+    }
+}
+```
+
+问题：在高并发下，所有线程都在竞争同一个 `value` 的 CAS，大量线程会自旋失败，CPU 空转。
+
+### 8.2 LongAdder 的分段设计
+
+```java
+// LongAdder: base + cells[] 分段计数
+public class LongAdder extends Striped64 {
+    
+    // 基础值（无竞争时使用）
+    transient volatile long base;
+    
+    // 分段数组（高竞争时使用）
+    transient volatile Cell[] cells;
+    
+    public void increment() {
+        add(1);
+    }
+    
+    public void add(long x) {
+        Cell[] as;
+        long b, v;
+        int m;
+        Cell a;
+        
+        // 1. 尝试 CAS 修改 base（无竞争时成功）
+        if ((as = cells) == null ||
+            !U.compareAndSwapLong(this, BASE, b = base, b + x)) {
+            
+            // 2. CAS 失败，进入分段计数
+            boolean uncontended = true;
+            if (as == null || (m = as.length - 1) < 0 ||
+                (a = as[threadProbe & m]) == null ||
+                !(uncontended = U.compareAndSwapLong(a, CELLVALUE, v = a.value, v + x))) {
+                // 3. 再次失败，调用 cellsOccupied
+                longAccumulate(x, null, uncontended);
+            }
+        }
+    }
+}
+```
+
+### 8.3 性能对比
+
+```java
+// JMH 基准测试（简化）
+@Benchmark
+public void atomicLongIncrement(Blackhole bh) {
+    for (int i = 0; i < 1000000; i++) {
+        atomicLong.incrementAndGet();  // 单点 CAS
+    }
+}
+
+@Benchmark
+public void longAdderIncrement(Blackhole bh) {
+    for (int i = 0; i < 1000000; i++) {
+        longAdder.increment();  // 分段 CAS
+    }
+}
+```
+
+在高并发场景下（100+ 线程）：
+
+| 指标 | AtomicLong | LongAdder |
+|---|---|---|
+| QPS | ~50万 | ~200万 |
+| CPU 利用率 | 高（大量 CAS 重试） | 较低 |
+| 内存开销 | 低 | 略高（Cell 数组） |
+| 适用场景 | 低并发 | 高并发 |
+
+**LongAdder 的空间换时间策略**：使用多个 Cell 分摊竞争，每个 Cell 维护一个部分计数。求和时累加 base 和所有 Cell 的值。
+
+## 九、总结与实战建议
+
+分段锁是一种重要的并发设计思想，其核心是：
+
+1. **锁粒度细化**：将一把锁拆成多把锁，减少竞争
+2. **分段路由**：根据 key 的 hash 选择对应的锁
+3. **空间换时间**：增加内存开销，换取更高的并发度
+
+在实际工作中：
+- 如果数据量小、并发度低，用普通 `HashMap` + `synchronized`
+- 如果数据量大、并发度高，用 `ConcurrentHashMap`
+- 如果只需要计数器，用 `LongAdder` 而不是 `AtomicLong`
+
+---
+
+## 面试追问预判
+
+### 场景模拟
+
+**面试官**：`ConcurrentHashMap` 在 JDK 7 和 JDK 8 有什么区别？
+
+**你**：JDK 7 用的是分段锁设计，用 Segment 数组管理锁，每个 Segment 继承自 ReentrantLock...JDK 8 改成了 CAS + synchronized...
+
+**面试官**：JDK 8 为什么放弃了分段锁？
+
+**你**：主要三个原因：内存开销大、哈希冲突严重时并发度退化、实现复杂度高...
+
+**面试官**：JDK 8 的 put 操作是如何加锁的？
+
+**你**：对桶的头节点加 synchronized，而不是对整个方法加锁，这样锁粒度更细...
+
+**面试官**：`ConcurrentHashMap` 的 key 和 value 为什么不能为 null？
+
+**你**：这是为了避免并发语义混淆。如果 value 可以为 null，就无法区分「key 不存在」和「value 是 null」...
+
+---
+
+## 留给你的思考题
+
+1. `ConcurrentHashMap` 在扩容时，get 操作能正常进行吗？会不会读到旧数据？
+
+2. `LongAdder.sum()` 和 `LongAdder.sumThenReset()` 有什么区别？各有什么风险？
+
+3. 如果让你设计一个分段锁的 LRU 缓存，你会怎么做？

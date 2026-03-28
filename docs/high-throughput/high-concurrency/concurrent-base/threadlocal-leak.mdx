@@ -1,0 +1,652 @@
+import { Badge } from '@rspress/core/theme';
+
+# ThreadLocal 内存泄漏与优化使用
+
+你用过 |ThreadLocal| 吗？用过。好，你用完之后 remove() 了吗？
+
+这个问题，我在面试中问过很多人。能答上来的，不超过三成。
+
+很多人知道 ThreadLocal 有内存泄漏的风险，也知道用完要 remove()，但问到**为什么会有内存泄漏**、**JDK 为什么要用弱引用设计**、**在线程池场景下会有什么特殊问题**——就答不上来了。
+
+今天，我们把 ThreadLocal 的内存泄漏问题彻底讲透。
+
+## 一、ThreadLocal 的基本原理
+
+在分析内存泄漏之前，我们需要先理解 ThreadLocal 的实现原理。
+
+### 1.1 ThreadLocal 的核心结构
+
+ThreadLocal 本身并不存储数据，它只是一个工具类。真正存储数据的地方，是每个线程持有 的 `ThreadLocalMap`。
+
+```java
+public class ThreadLocal<T> {
+    public void set(T value) {
+        Thread t = Thread.currentThread();
+        ThreadLocalMap map = getMap(t);
+        if (map != null) {
+            map.set(this, value);
+        } else {
+            createMap(t, value);
+        }
+    }
+    
+    ThreadLocalMap getMap(Thread t) {
+        return t.threadLocals;
+    }
+}
+```
+
+每个 Thread 对象内部都有一个 `threadLocals` 字段，类型是 `ThreadLocalMap`。当你调用 `threadLocal.set(value)` 时，实际上是把数据存到了当前线程的 ThreadLocalMap 里。
+
+### 1.2 ThreadLocalMap 的内部结构
+
+ThreadLocalMap 是 ThreadLocal 自己实现的一个简化版 HashMap。它的核心数据结构是一个 Entry 数组：
+
+```java
+static class ThreadLocalMap {
+    static class Entry extends WeakReference<ThreadLocal<?>> {
+        Object value;
+        
+        Entry(ThreadLocal<?> k, Object v) {
+            super(k);
+            value = v;
+        }
+    }
+    
+    private Entry[] table;
+}
+```
+
+这里有一个关键点：**Entry 继承自 `WeakReference` `ThreadLocal<?>`，并且把 `ThreadLocal` 对象作为弱引用的 Referent。**
+
+这就是 ThreadLocal 内存泄漏问题的根源，也是 JDK 设计中一个精妙的权衡。
+
+### 1.3 为什么 Entry 对 ThreadLocal 是弱引用？
+
+在回答这个问题之前，我们先思考一个设计问题：
+
+> 如果 Entry 对 ThreadLocal 是**强引用**，会发生什么？
+
+想象一下这样的代码：
+
+```java
+ThreadLocal<User> userHolder = new ThreadLocal<>();
+userHolder.set(user);
+
+// 用完了
+userHolder = null; // 置为空
+```
+
+如果 Entry 对 ThreadLocal 是强引用，那么即使 `userHolder` 被置为空，ThreadLocalMap 中的 Entry 仍然持有对 ThreadLocal 对象的强引用。只要线程还活着，ThreadLocal 对象就永远无法被 GC 回收——这就造成了 ThreadLocal 对象的泄漏。
+
+所以，JDK 选择用**弱引用**来持有 ThreadLocal 对象。这样，当 ThreadLocal 变量被置为空时，由于只有弱引用指向它，GC 运行时就会把这个 ThreadLocal 对象回收掉。
+
+但是，问题才刚刚开始。
+
+## 二、内存泄漏的完整链路
+
+### 2.1 弱引用能解决所有问题吗？
+
+当 ThreadLocal 对象被 GC 回收后，Entry 就变成了这样：
+
+```java
+Entry {
+    referent = null;  // ThreadLocal 对象已被 GC 回收
+    value = 用户数据;  // value 仍然存在！
+}
+```
+
+此时，Entry 的 referent 是 null，但 **value 仍然被 Entry 强引用着**。
+
+而 ThreadLocalMap 的结构是：
+
+```java
+private Entry[] table;
+// ...
+private Entry getEntry(ThreadLocal<?> key) {
+    int i = key.threadLocalHashCode & (table.length - 1);
+    Entry e = table[i];
+    if (e != null && e.get() == key)
+        return e;
+    // ...
+}
+```
+
+当你调用 `threadLocal.get()` 时，代码会检查 `e.get() == key`，即弱引用的 referent 是否等于当前 ThreadLocal。如果 referent 已经被 GC 回收，`e.get()` 返回 null，代码会调用 `getEntryAfterMiss` 处理这种情况：
+
+```java
+private Entry getEntryAfterMiss(ThreadLocal<?> key, int i, Entry e) {
+    Entry[] tab = table;
+    int len = tab.length;
+
+    while (e != null) {
+        ThreadLocal<?> k = e.get();
+        if (k == key)
+            return e;
+        if (k == null) {
+            // 关键点：清理已被回收的 Entry
+            expungeStaleEntry(i);
+        }
+        e = tab[i = nextIndex(i, len)];
+    }
+    return null;
+}
+```
+
+这里有一个 `expungeStaleEntry()` 方法，它会清理 referent 为 null 的 Entry，并释放其 value。
+
+**看起来 JDK 已经在 get() 时处理了这种情况，那为什么还说 ThreadLocal 会内存泄漏？**
+
+### 2.2 内存泄漏的真实场景
+
+问题在于：**你可能根本不会调用 get()**。
+
+一个典型的使用场景是：在请求处理开始时设置 ThreadLocal，在请求结束时没有清理。如果这个请求之后再也没有触发 get() 操作，那么 value 就会一直留在 ThreadLocalMap 中。
+
+```java
+public class UserContext {
+    private static final ThreadLocal<User> currentUser = new ThreadLocal<>();
+    
+    public static void setUser(User user) {
+        currentUser.set(user);
+    }
+    
+    public static User getUser() {
+        return currentUser.get();
+    }
+    
+    // 很多同学忘了写这个
+    public static void clear() {
+        currentUser.remove();
+    }
+}
+
+// 在 Filter 中
+public void doFilter(...) {
+    try {
+        UserContext.setUser(parseToken(token));
+        chain.doFilter(request, response);
+    } finally {
+        // 忘了调用 UserContext.clear()
+    }
+}
+```
+
+### 2.3 线程复用：内存泄漏的加速器
+
+在线程池场景下，内存泄漏会更加严重。
+
+普通线程执行完任务后会销毁，线程持有的 ThreadLocalMap 也会被垃圾回收。但如果使用的是线程池，线程会被复用：
+
+```java
+ExecutorService executor = Executors.newFixedThreadPool(4);
+
+executor.submit(() -> {
+    userHolder.set(userData);
+    // 任务结束，线程不销毁
+});
+
+executor.submit(() -> {
+    // 新任务复用同一线程
+    // 但 userHolder 的 value 可能还在！
+});
+```
+
+线程池中的线程存活时间很长，只要线程还活着，`threadLocals` 就会一直存在。如果每个任务都往 ThreadLocalMap 中添加数据而不清理，这些数据就会一直积累。
+
+:::warning 线程池 + ThreadLocal = 内存泄漏高发场景
+
+在 Web 服务中，几乎所有请求都是通过线程池处理的。每个请求可能会设置 ThreadLocal，如果不及时清理，这些数据就会随着请求量的增加而不断积累，最终导致内存泄漏。
+
+:::
+
+### 2.4 内存泄漏的完整链路图
+
+让我们用一张图来描述内存泄漏的完整链路：
+
+```
+线程生命周期开始
+       |
+       v
+ThreadLocalMap 被创建
+       |
+       v
+threadLocal.set(value)
+       |
+       v
+threadLocal = null (强引用断开)
+       |
+       v
+ThreadLocal 对象被 GC 回收 (弱引用断开)
+       |
+       v
+Entry.referent = null, 但 Entry.value 仍然存在
+       |
+       v
+[如果调用 get()，会触发 expungeStaleEntry 清理]
+       |
+       v
+[如果只调用 set() 但不调用 get()，value 持续存在]
+       |
+       v
+随着任务执行，越来越多无效 Entry 积累
+       |
+       v
+内存泄漏
+```
+
+关键点在于：**弱引用解决了 ThreadLocal 对象的泄漏，但 value 的泄漏需要手动清理来避免。**
+
+## 三、为什么 JDK 要这样设计？
+
+这是一个经典的面试追问。JDK 的设计者们当然知道弱引用会带来 value 泄漏的问题，那为什么要这样设计？
+
+### 3.1 设计权衡
+
+JDK 的选择是：**宁愿泄漏 value，也要避免泄漏 ThreadLocal 对象本身。**
+
+原因如下：
+
+1. **ThreadLocal 对象相对较小**：一个 ThreadLocal 变量本身只占用几十个字节，而 value 可能是大对象（如 User 对象、Connection 对象、LargeBuffer 等）。
+
+2. **ThreadLocal 变量通常与业务代码绑定**：每个线程持有的是不同的 ThreadLocal 对象。如果用强引用，线程持有的 ThreadLocalMap 会持有所有曾经使用过的 ThreadLocal 对象，导致大量 ThreadLocal 对象无法回收。
+
+3. **主动清理的职责交给开发者**：JDK 认为，使用 ThreadLocal 的开发者应该负责在适当的时候清理。这是一个「谁创建谁释放」的原则。
+
+### 3.2 JDK 的补偿措施
+
+为了减轻开发者的负担，JDK 在以下时机会自动清理无效 Entry：
+
+| 操作 | 是否清理 |
+|---|---|
+| `ThreadLocal.get()` | 会清理失效 Entry |
+| `ThreadLocal.set()` | 会清理失效 Entry |
+| `ThreadLocal.remove()` | 直接删除 Entry |
+| 无任何操作 | **不会清理，内存泄漏持续** |
+
+所以，JDK 的设计是：**在正常使用的路径上（get/set）尽可能清理无效 Entry，但如果长时间不调用这些方法，就可能积累无效 Entry。**
+
+:::tip 最佳实践
+
+无论 JDK 提供了多少保护措施，用完 ThreadLocal 后**一定要手动调用 remove()**。这是最可靠的避免内存泄漏的方式。
+
+:::
+
+## 四、正确的使用方式
+
+### 4.1 标准用法：try-finally 模式
+
+```java
+ThreadLocal<User> userHolder = new ThreadLocal<>();
+
+try {
+    userHolder.set(user);
+    // 业务逻辑
+    doSomething();
+} finally {
+    userHolder.remove();
+}
+```
+
+这种方式确保无论业务逻辑是否抛出异常，ThreadLocal 都会被清理。
+
+### 4.2 在 Filter/Interceptor 中的使用
+
+在 Web 应用中，推荐在 Filter 或 Interceptor 中统一处理：
+
+```java
+@WebFilter(urlPatterns = "/*")
+public class UserContextFilter implements Filter {
+    
+    @Override
+    public void doFilter(ServletRequest request, ServletResponse response,
+                         FilterChain chain) throws IOException, ServletException {
+        try {
+            HttpServletRequest httpRequest = (HttpServletRequest) request;
+            String token = httpRequest.getHeader("Authorization");
+            if (token != null) {
+                User user = authService.validateToken(token);
+                UserContext.setUser(user);
+            }
+            chain.doFilter(request, response);
+        } finally {
+            UserContext.clear();  // 统一清理
+        }
+    }
+}
+```
+
+### 4.3 使用框架提供的工具类
+
+很多框架已经帮我们处理了这个问题，比如 Spring 的 `RequestContextHolder`：
+
+```java
+// Spring 内部实现（简化版）
+public abstract class RequestContextHolder {
+    
+    private static final ThreadLocal<RequestAttributes> requestAttributesHolder =
+        new ThreadLocal<>();
+
+    public static void setRequestAttributes(RequestAttributes attributes) {
+        requestAttributesHolder.set(attributes);
+    }
+
+    public static RequestAttributes currentRequestAttributes() {
+        RequestAttributes attributes = requestAttributesHolder.get();
+        // Spring 在 ServletRequestListener 中清理
+        return attributes;
+    }
+}
+
+// web.xml 或 @WebListener 配置
+public class RequestContextCleanupListener implements ServletRequestListener {
+    @Override
+    public void requestDestroyed(ServletRequestEvent event) {
+        RequestContextHolder.resetRequestAttributes();
+    }
+}
+```
+
+Spring 通过 `ServletRequestListener` 在请求结束时自动清理，所以使用 Spring MVC 时一般不需要手动清理 Controller 中的 ThreadLocal。
+
+### 4.4 使用 static ThreadLocal 是否有问题？
+
+```java
+public class UserContext {
+    // static ThreadLocal
+    private static final ThreadLocal<User> currentUser = new ThreadLocal<>();
+}
+```
+
+static ThreadLocal 的问题是：ThreadLocal 对象本身是 static 的，永远不会被 GC 回收。但这本身不是问题，因为 Entry 对 ThreadLocal 是弱引用。
+
+真正的问题是：**如果忘记 remove()，value 会一直泄漏**。static ThreadLocal 只是让这个问题更容易被忽视。
+
+## 五、ThreadLocal 共享导致的线程安全问题
+
+除了内存泄漏，ThreadLocal 还有另一个容易被忽视的问题：**线程安全问题**。
+
+### 5.1 场景一：线程复用导致数据串台
+
+```java
+public class OrderService {
+    private static final ThreadLocal<Order> currentOrder = new ThreadLocal<>();
+    
+    public void processOrder(Order order) {
+        currentOrder.set(order);
+        // 异步处理
+        CompletableFuture.runAsync(() -> {
+            // 这里拿到的可能不是期望的 order
+            Order orderInAsync = currentOrder.get();
+        });
+    }
+}
+```
+
+`CompletableFuture.runAsync()` 默认使用 ForkJoinPool 的公共线程池，这个线程池中的线程可能会被多个任务复用。如果第一个任务的 order 还没被清理，第二个任务就可能读到脏数据。
+
+### 5.2 场景二：线程池配置不当
+
+```java
+// 错误的做法
+ThreadPoolExecutor executor = new ThreadPoolExecutor(
+    4, 4, 0, TimeUnit.SECONDS, 
+    new LinkedBlockingQueue<>()
+);
+
+executor.submit(() -> {
+    userHolder.set(userA);
+    // 业务逻辑
+});
+executor.submit(() -> {
+    // 如果复用线程，可能读到 userA
+});
+```
+
+### 5.3 解决方案
+
+**方案一：确保每次使用后清理**
+
+```java
+CompletableFuture.runAsync(() -> {
+    try {
+        userHolder.set(user);
+        // 业务逻辑
+    } finally {
+        userHolder.remove();
+    }
+});
+```
+
+**方案二：使用父子线程传递**
+
+如果需要在子线程中访问父线程的 ThreadLocal 值，可以使用 `InheritableThreadLocal`：
+
+```java
+// InheritableThreadLocal 在线程创建时会复制父线程的值
+InheritableThreadLocal<User> userHolder = new InheritableThreadLocal<>();
+```
+
+:::warning InheritableThreadLocal 的局限性
+
+1. **只在线程创建时复制一次**：如果父线程之后修改了值，子线程不会感知到
+2. **在线程池中使用仍有风险**：线程复用后，新任务拿到的可能是旧任务的值
+3. **虚拟线程场景下行为不同**（详见《虚拟线程》章节）
+
+:::
+
+## 六、Tomcat 等容器中的特殊问题
+
+在 Tomcat、Jetty 等 Servlet 容器中，ThreadLocal 内存泄漏问题更加突出。
+
+### 6.1 场景：Web 应用热部署
+
+当使用热部署（Hot Deployment）时：
+
+```
+Tomcat 启动，加载 Web 应用
+    |
+    v
+应用创建 ThreadLocal 并设置数据
+    |
+    v
+ThreadLocal 持有对 Web 应用中对象的引用
+    |
+    v
+应用被卸载（Undeploy）
+    |
+    v
+应用类被卸载
+    |
+    v
+但 Tomcat 线程（持有 ThreadLocalMap）还在运行
+    |
+    v
+ThreadLocalMap 中存在对已卸载应用对象的引用
+    |
+    v
+已卸载应用的类加载器无法被回收
+    |
+    v
+所有由该类加载器加载的类无法被卸载
+    |
+    v
+PermGen/Metaspace OOM (JDK 7/8)
+```
+
+这就是著名的 **ThreadLocal 内存泄漏导致的 OOM 问题**，在旧版 Tomcat 中尤为常见。
+
+### 6.2 Tomcat 的解决方案
+
+Tomcat 从 7.0.25 开始，提供了 `ThreadLocalLeakPreventionListener` 来处理这个问题：
+
+```xml
+<Listener className="org.apache.catalina.core.ThreadLocalLeakPreventionListener" />
+```
+
+这个 Listener 的作用是：在应用被卸载前，主动清理与该应用相关的 ThreadLocal。
+
+此外，Tomcat 还做了以下优化：
+
+1. **在拒绝请求时清理 ThreadLocal**：当一个应用即将被卸载时，Tomcat 会拒绝新请求，并尝试清理相关 ThreadLocal
+2. **使用独立的线程池**：减少线程复用带来的问题
+3. **警告机制**：检测到潜在的内存泄漏时输出警告日志
+
+### 6.3 业务代码中的预防措施
+
+```java
+public class MyFilter implements Filter {
+    
+    @Override
+    public void init(FilterConfig filterConfig) throws ServletException {
+        // 初始化
+    }
+    
+    @Override
+    public void doFilter(ServletRequest request, ServletResponse response,
+                        FilterChain chain) throws IOException, ServletException {
+        try {
+            // 业务逻辑
+        } finally {
+            // 关键：在 filter 中清理所有 ThreadLocal
+            UserContext.clear();
+            TransactionContext.clear();
+            // ... 其他清理
+        }
+    }
+    
+    @Override
+    public void destroy() {
+        // 在 filter 销毁时清理
+    }
+}
+```
+
+## 七、ThreadLocal 在 JDK 核心类中的应用
+
+理解 ThreadLocal 的原理后，我们来看看 JDK 核心类是如何使用它的。
+
+### 7.1 SimpleDateFormat 的线程安全问题
+
+`SimpleDateFormat` 不是线程安全的，常见解决方案是使用 ThreadLocal：
+
+```java
+public class DateUtil {
+    private static final ThreadLocal<SimpleDateFormat> dateFormat =
+        ThreadLocal.withInitial(() -> new SimpleDateFormat("yyyy-MM-dd"));
+    
+    public static String format(Date date) {
+        return dateFormat.get().format(date);
+    }
+}
+```
+
+这样每个线程都有自己独立的 SimpleDateFormat 实例，避免了线程安全问题。
+
+### 7.2 Random 的线程安全问题与 ThreadLocalRandom
+
+`Random` 在多线程下性能很差，因为 CAS 竞争激烈。JDK 7 引入了 `ThreadLocalRandom`：
+
+```java
+public class ThreadLocalRandom {
+    // 每个线程独立的 Random 实例
+    private final long threadLocalRandomSeed;
+    
+    public static ThreadLocalRandom current() {
+        return localRandom.get();
+    }
+    
+    public int nextInt(int bound) {
+        // 使用 threadLocalRandomSeed 计算，避免 CAS 竞争
+    }
+}
+```
+
+### 7.3 InheritableThreadLocal
+
+`InheritableThreadLocal` 是 ThreadLocal 的变体，它会自动将值传递给子线程：
+
+```java
+InheritableThreadLocal<Integer> parentValue = new InheritableThreadLocal<>();
+parentValue.set(100);
+
+// 在子线程中
+Thread child = new Thread(() -> {
+    System.out.println(parentValue.get()); // 输出 100
+});
+child.start();
+```
+
+实现原理是在 `Thread.init()` 时复制父线程的 `inheritableThreadLocals`：
+
+```java
+// Thread 类
+private void init(ThreadGroup g, Runnable target, String name,
+                  long stackSize, AccessControlContext acc,
+                  boolean inheritThreadLocals) {
+    // ...
+    if (inheritThreadLocals && parent.inheritableThreadLocals != null)
+        this.inheritableThreadLocals =
+            ThreadLocal.createInheritedMap(parent.inheritableThreadLocals);
+}
+```
+
+## 八、面试追问预判
+
+### 追问一：ThreadLocal 的内存泄漏问题，JDK 为什么不设计成自动清理？
+
+标准答案：
+
+> JDK 在 get() 和 set() 时会清理失效 Entry，但这不能覆盖所有场景。如果一个线程只设置值但从不读取，或者读取的频率很低，失效 Entry 就会积累。JDK 选择弱引用是为了避免 ThreadLocal 对象本身的泄漏，而 value 的清理职责交给开发者，这是「谁创建谁释放」的原则体现。
+
+### 追问二：InheritableThreadLocal 和 ThreadLocal 的区别是什么？有什么坑？
+
+标准答案：
+
+> InheritableThreadLocal 在创建子线程时会复制父线程的值，适合父子线程需要共享数据的场景。但有两个坑：
+>
+> 第一，只在创建时复制一次，之后父线程的修改不会传递给已创建的子线程。
+>
+> 第二，在线程池场景下复用线程时，子线程拿到的是上一个任务的值，而不是新任务的父线程的值，需要特别注意清理。
+
+### 追问三：如何排查 ThreadLocal 导致的内存泄漏？
+
+标准答案：
+
+> 可以通过以下方式：
+>
+> 1. 使用 MAT 分析堆内存 dump，找出持有大量对象的 ThreadLocalMap
+> 2. 通过 `jmap -histo:live` 查看存活对象，找出可疑的大对象
+> 3. 在代码中埋点，记录 ThreadLocal 的 set 和 remove 调用
+> 4. 使用 AspectJ 在 set/remove 方法处添加切面，统一记录日志
+> 5. 开启 Tomcat 的 ThreadLocal 泄漏警告（默认在请求拒绝时输出）
+
+### 追问四：ThreadLocal 在分布式环境下能用吗？
+
+标准答案：
+
+> 不能直接用。ThreadLocal 绑定到 JVM 线程，每个 JVM 实例只有自己的 ThreadLocal，无法跨 JVM 共享。如果需要跨线程或跨进程传递数据，需要使用：
+>
+> - 显式传递参数
+> - 使用 ThreadLocal 的替代品如 Alibaba 的 `TransmittableThreadLocal`
+> - 使用分布式上下文传递如 SkyWalking 的 `ContextCarrier`
+
+---
+
+## 九、留给你的思考题
+
+### 题目一：弱引用 vs 强引用的权衡
+
+如果 ThreadLocalMap 对 Entry 使用的是强引用，而不是 Entry 对 ThreadLocal 的弱引用，会发生什么？ThreadLocal 对象会泄漏吗？value 呢？画出这两种设计下的内存引用链，对比分析。
+
+### 题目二：线程池 + InheritableThreadLocal 的陷阱
+
+假设有一个线程池，配置了 InheritableThreadLocal。在提交第一个任务时设置了用户信息，第二个任务是否能访问到第一个任务设置的用户信息？为什么？如果换成普通 ThreadLocal，结果会不同吗？
+
+### 题目三：自定义线程池的清理时机
+
+如果自己实现一个线程池，在任务执行前后添加 hook 来清理 ThreadLocal，hook 应该放在什么位置？为什么 Runnable#run() 的前后不行？
+
+---
+
+ThreadLocal 看似简单，实际上涉及 JVM 弱引用、线程生命周期、内存泄漏检测等多个知识点。面试中问 ThreadLocal，不只是问你怎么用，更想看你对底层原理的理解程度。

@@ -1,0 +1,604 @@
+import { Badge } from '@rspress/core/theme';
+
+# Redis 内存淘汰策略：LRU、LFU、TTL 与内存管理
+
+> [!WARNING]
+> 前置知识：本篇文章涉及 Redis 内存管理、数据结构、算法复杂度等知识，建议先掌握 Redis 基础数据类型和 Redis 线程模型。
+
+---
+
+双十一零点，运营同学突然发现活动页面白屏了。一查原因，Redis 内存使用率达到了 98%，大量 key 被强制淘汰，热卖商品的缓存数据全没了。用户请求直接穿透到数据库，数据库被打挂。
+
+这是一个典型的**缓存雪崩**场景。但问题的根源不是热点 key 过期，而是 Redis 内存不足导致的数据淘汰。
+
+当 Redis 内存达到配置的上限（`maxmemory`）时，必须淘汰一部分数据来腾出空间。选择淘汰哪些数据，就是 Redis 的**内存淘汰策略**。
+
+这一讲，我们深入解析 Redis 的内存淘汰机制，理解 LRU、LFU、TTL 的实现原理，以及如何在生产环境中合理配置淘汰策略。
+
+---
+
+## 一、Redis 内存管理基础
+
+### 1.1 maxmemory 配置
+
+Redis 的内存上限通过 `maxmemory` 配置：
+
+```bash
+# 设置 Redis 最大内存为 4GB
+maxmemory 4gb
+
+# 设置 Redis 最大内存为可用内存的 70%
+maxmemory 70%
+```
+
+如果 `maxmemory` 设置为 0，表示不限制内存（仅受物理内存限制）。但在实际生产环境中，**必须设置 `maxmemory`**，否则 Redis 会持续占用内存直到系统崩溃。
+
+:::tip 建议
+生产环境的 `maxmemory` 配置为物理内存的 70-80%，留出部分内存给系统和其他进程使用。
+:::
+
+### 1.2 内存淘汰的触发时机
+
+Redis 不是在内存满了之后才淘汰数据，而是在每次写入数据时检查内存是否足够。如果不够，才会触发淘汰流程：
+
+```text
+执行 SET/HGET/HSET 等命令
+        ↓
+检查已使用内存是否 >= maxmemory？
+        ↓
+      ┌───┴───┐
+     Yes      No
+      ↓        ↓
+  触发淘汰    执行命令
+      ↓
+  淘汰成功？
+      ↓
+    ┌─┴─┐
+   Yes  No
+    ↓    ↓
+执行命令  返回OOM错误
+```
+
+这就是说，**Redis 的内存淘汰是同步的**，发生在命令执行过程中。如果淘汰策略选择不当，可能导致命令执行变慢。
+
+### 1.3 八种淘汰策略概览
+
+Redis 6.2 提供了 8 种淘汰策略：
+
+| 策略 | 淘汰范围 | 淘汰依据 | 说明 |
+|---|---|---|---|
+| noeviction | 不淘汰 | — | 内存满时返回错误（默认） |
+| volatile-lru | 仅带过期时间的 key | LRU 算法 | 删除最近最少使用的 |
+| allkeys-lru | 所有 key | LRU 算法 | 删除最近最少使用的 |
+| volatile-lfu | 仅带过期时间的 key | LFU 算法 | 删除访问频率最低的 |
+| allkeys-lfu | 所有 key | LFU 算法 | 删除访问频率最低的 |
+| volatile-random | 仅带过期时间的 key | 随机 | 随机删除 |
+| allkeys-random | 所有 key | 随机 | 随机删除 |
+| volatile-ttl | 仅带过期时间的 key | TTL 值 | 删除最快过期的 |
+
+选择淘汰策略时，需要考虑两个维度：
+
+1. **是否只针对带过期时间的 key**：如果是，可以选择 volatile 系列；否则选择 allkeys 系列
+2. **淘汰依据**：LRU 适合「热点数据明显」的场景，LFU 适合「访问频率稳定」的场景，TTL 适合「有时间敏感」的场景
+
+---
+
+## 二、LRU 算法在 Redis 中的实现
+
+### 2.1 精确 LRU vs 近似 LRU
+
+LRU（Least Recently Used，最近最少使用）的核心思想是：**淘汰最久没有被访问的数据**。
+
+标准的 LRU 算法需要维护一个有序链表，每次访问数据时，将数据移动到链表头部；淘汰时，从链表尾部删除数据。这种实现的时间复杂度是 O(1)，但空间复杂度较高。
+
+Redis 没有采用精确 LRU，而是实现了**近似 LRU**（Approximate LRU）。原因有两个：
+
+1. **精确 LRU 需要额外的内存开销**：有序链表本身就需要占用大量内存
+2. **Redis 的访问模式不适合精确 LRU**：Redis 是单线程的，不能在每次访问时都维护有序链表
+
+### 2.2 Redis LRU 的实现原理
+
+Redis 在每个 key 的对象头中，记录了一个 `lru` 字段，存储的是**最近一次访问时间**（精确到秒）：
+
+```c
+typedef struct redisObject {
+    unsigned type:4;        // 对象类型
+    unsigned encoding:4;    // 编码方式
+    unsigned lru:LRU_BITS;  // 最近访问时间或 LFU 信息
+    int refcount;           // 引用计数
+    void *ptr;              // 指向实际数据的指针
+} robj;
+```
+
+`LRU_BITS` 在 Redis 4.0 之前是 24 位（秒级精度），可以记录约 194 天；Redis 4.0+ 可以配置为 LRU 模式（24 位）或 LFU 模式（24 位）。
+
+近似 LRU 算法的核心是**抽样**：
+
+```c
+// Redis 源码中的淘汰抽样逻辑
+#define MAXMEMORY_EVICTIONS_PER_CALL 16
+
+while (server.dirty < maxmemory_evictions) {
+    // 随机选择一个 key
+    robj *key = selectRandomKey();
+    
+    // 获取该 key 的 lru 值
+    unsigned long key_lru = getLRU(key);
+    
+    // 如果当前没有淘汰对象，或者该 key 更"旧"，则淘汰它
+    if (eviction_pool == NULL || key_lru < oldest_lru) {
+        // 加入淘汰池
+        addKeyToEvictionPool(key, key_lru);
+    }
+}
+```
+
+Redis 默认每次淘汰抽样 5 个 key（可通过 `maxmemory-samples` 配置）。抽样数量越大，越接近精确 LRU，但消耗的 CPU 也越多：
+
+```bash
+# 配置 LRU 抽样数量
+maxmemory-samples 5      # 默认
+maxmemory-samples 10     # 更精确，但更慢
+```
+
+### 2.3 LRU 的退化问题
+
+近似 LRU 有一个容易被忽视的问题——**突发流量导致的误淘汰**。
+
+考虑这个场景：一个数据在 10 天前被访问过一次（假设），在 1 秒前被访问过一次。精确 LRU 会保留这个数据（因为最近访问了），但近似 LRU 可能抽样到的是「10 天前」那个时间点。
+
+这会导致**新加入的热点数据被误淘汰**。
+
+解决方案：
+
+1. **增大 `maxmemory-samples`**：从 5 增加到 10 或更多，减少误判概率
+2. **使用 LFU 替代 LRU**：LFU 基于访问频率而非访问时间，更适合处理突发流量
+3. **设置合理的过期时间**：避免大量 key 同时过期导致雪崩
+
+---
+
+## 三、LFU 算法在 Redis 4.0+ 的实现
+
+### 3.1 为什么需要 LFU
+
+LRU 的问题是只看「最近」，不看「频率」。一个偶发性热点 key（只被访问一次，但在最近）会保留下来，而一个持续热点 key（被访问 1000 次，但在稍早）可能被淘汰。
+
+LFU（Least Frequently Used，最不经常使用）的核心思想是：**淘汰访问频率最低的数据**。
+
+但 LFU 有两个实现难点：
+
+1. **频率衰减**：一个曾经热门的 key 很久没被访问了，应该降低其频率权重
+2. **访问计数增长**：首次访问的 key 应该快速增长频率，而不是从 0 开始
+
+Redis 4.0 对 LFU 进行了精心设计，解决了这两个问题。
+
+### 3.2 Redis LFU 的计数器设计
+
+Redis 的 LFU 使用 8 位（0-255）存储访问频率，并将其嵌入到 `lru` 字段中：
+
+```c
+typedef struct redisObject {
+    unsigned type:4;
+    unsigned encoding:4;
+    unsigned lru:LRU_BITS;  // LFU 模式下存储访问频率信息
+    int refcount;
+    void *ptr;
+} robj;
+```
+
+LFU 模式下，Redis 使用以下字段记录频率信息：
+
+```c
+// LFU 频率信息结构（24位，分为两部分）
+typedef struct {
+    uint8_t counter;      // 访问次数（0-255）
+    time_t lastDecreasedTime;  // 上次衰减时间
+} lfuCounter;
+```
+
+### 3.3 频率衰减机制
+
+LFU 的频率衰减解决了「曾经的热点 key 不再热了」的问题。
+
+Redis 的衰减逻辑是：**每经过一定时间（默认 1 分钟），所有 key 的访问频率都会衰减**。衰减公式：
+
+```c
+// 衰减公式
+double r = 1.0 / (server.lfu_decay_time + 1);
+new_counter = (uint8_t)(counter * r);
+```
+
+`lfu_decay_time` 是衰减时间参数（单位：分钟）：
+
+- `lfu_decay_time = 1`：每分钟衰减一次，频率翻倍时间 = 1 分钟
+- `lfu_decay_time = 10`：每 10 分钟衰减一次，频率翻倍时间 = 10 分钟
+
+```bash
+# 配置 LFU 衰减时间（默认 1 分钟）
+lfu-decay-time 1
+```
+
+假设一个 key 的访问频率是 100，`lfu_decay_time = 1`：
+
+- 1 分钟后，频率变为 50
+- 2 分钟后，频率变为 25
+- 3 分钟后，频率变为 12
+- N 分钟后，频率 = 100 / 2^N
+
+这样，**曾经的热点数据会逐渐冷却**，被新热点替代。
+
+### 3.4 访问频率的增长逻辑
+
+新 key 的频率增长也不能太慢。Redis 使用了**概率增长**算法：
+
+```c
+// 访问频率增长逻辑
+double probability = 1.0 / (server.lfu_log_factor + 1);
+
+if (rand() < probability) {
+    // 只有一定概率增长频率
+    if (counter < 255) {
+        counter++;
+    }
+}
+```
+
+`lfu_log_factor` 控制增长曲线的陡峭程度：
+
+| lfu_log_factor | 访问 100 次后的频率 | 访问 1M 次后的频率 |
+|---|---|---|
+| 0 | 每次访问都增长 | 255（立即饱和） |
+| 1 | 26 | 255 |
+| 5 | 100 | 238 |
+| 10 | 117 | 255 |
+
+```bash
+# 配置 LFU 增长系数（默认 10）
+lfu-log-factor 10
+```
+
+这个设计的巧妙之处在于：
+
+- **短期热点增长慢**：一个 key 被访问 10 次，频率约 4，不会立即成为「热门」
+- **长期热点增长快**：一个 key 被访问 10000 次，频率接近 255，成为真正的「热门」
+- **避免频率爆炸**：即使一个 key 被访问无限次，频率上限是 255
+
+### 3.5 LRU vs LFU 实战对比
+
+| 场景 | LRU | LFU |
+|---|---|---|
+| 持续热点（一直访问） | 保留 | 保留 |
+| 突发热点（短时间大量访问） | 保留（基于最近） | 快速上升（基于频率） |
+| 偶发热点（偶尔访问） | 可能保留 | 容易被淘汰 |
+| 曾经的热点（不再访问） | 保留直到过期 | 逐渐衰减 |
+| 大量新数据加入 | 新数据可能被误淘汰 | 相对稳定 |
+
+**选择建议**：
+
+- **读多写少的缓存场景**：优先选择 `allkeys-lru` 或 `volatile-lru`
+- **访问模式稳定的场景**：如排行榜、计数器，选择 `allkeys-lfu`
+- **不确定场景**：先用 `allkeys-lru`，因为 LRU 是 Redis 默认的淘汰策略
+
+---
+
+## 四、TTL 淘汰策略详解
+
+### 4.1 volatile-ttl 的工作方式
+
+TTL 淘汰策略（volatile-ttl）会优先淘汰**最快过期**的 key。
+
+Redis 在每个 key 中记录了过期时间点。在淘汰时，Redis 会抽样选择 TTL 值最小（最近过期）的 key 进行淘汰。
+
+```bash
+# 效果：优先淘汰离过期时间最近的 key
+maxmemory-policy volatile-ttl
+```
+
+这个策略适合的场景：
+
+- **限时优惠**：促销商品设置较短的 TTL，过期后自动淘汰
+- **会话数据**：用户会话设置 TTL，过期后自动清理
+- **缓存降级**：当内存不足时，优先淘汰「即将过期」的数据
+
+### 4.2 TTL 的精度问题
+
+需要注意的是，Redis 的 key 过期检查不是精确到毫秒的。Redis 使用两种策略检查 key 是否过期：
+
+1. **惰性删除**：只有访问到某个 key 时，才检查它是否过期
+2. **定期删除**：每隔一段时间，扫描部分 key，清除过期的
+
+这意味着，如果一个 key 已经过期但没有被访问，它不会被立即删除。只有当内存不足、TTL 策略被触发时，这个过期的 key 才可能被淘汰。
+
+---
+
+## 五、近似 LRU/LFU 的性能优化
+
+### 5.1 淘汰池机制
+
+Redis 使用**淘汰池**（Eviction Pool）来管理待淘汰的 key：
+
+```c
+typedef struct {
+    void *key;           // key 指针
+    unsigned long idle;   // 空闲时间（LRU）或频率倒数（LFU）
+    int dbid;            // 数据库编号
+} evictionPoolEntry;
+
+// 淘汰池大小
+#define EVICTION_POOL_SIZE 16
+```
+
+淘汰池是一个有序数组，按 `idle` 值从大到小排列。每次抽样时：
+
+1. 从抽样中选出 `idle` 值最大的 key
+2. 如果淘汰池未满，加入淘汰池并保持有序
+3. 如果淘汰池已满，且当前 key 的 `idle` 值大于池中最小的，则替换
+
+淘汰池的作用是**在抽样中找出真正最应该淘汰的 key**。
+
+### 5.2 淘汰过程的阻塞问题
+
+Redis 的内存淘汰是在主线程中执行的（因为需要访问 key 的元数据）。这意味着，当淘汰策略触发时，可能导致命令执行延迟。
+
+```text
+普通命令执行：
+客户端 → Redis → 返回结果
+        ↑
+      单线程
+
+淘汰触发时：
+客户端 → Redis（触发淘汰）→ 执行命令 → 返回结果
+                  ↑
+              阻塞等待淘汰完成
+```
+
+如果内存占用极高，淘汰过程可能需要扫描大量 key，导致 Redis 卡顿。
+
+**优化方案**：
+
+1. **避免内存使用率达到 100%**：设置合理的 `maxmemory`，建议保留 20% 余量
+2. **使用合理的淘汰策略**：`volatile-ttl` 和 `volatile-lru` 只扫描带过期时间的 key，性能优于 `allkeys-*`
+3. **配置合理的抽样数量**：`maxmemory-samples` 不是越大越好，需要权衡
+
+---
+
+## 六、随机淘汰策略
+
+### 6.1 volatile-random 和 allkeys-random
+
+随机淘汰是最简单的策略，不维护任何状态，直接随机选择要淘汰的 key。
+
+```bash
+# 随机淘汰所有 key
+maxmemory-policy allkeys-random
+
+# 随机淘汰带过期时间的 key
+maxmemory-policy volatile-random
+```
+
+随机策略的优点是**零开销**，不需要维护 LRU/LFU 信息。缺点是**无法保留热点数据**，可能导致热点数据被淘汰。
+
+### 6.2 随机策略的适用场景
+
+随机策略适合以下场景：
+
+- **数据价值均等**：所有数据重要性相同，不需要区分热点
+- **作为兜底策略**：在 LRU/LFU 失效时的降级方案
+- **内存充足**：内存使用率不高，随机淘汰的影响较小
+
+---
+
+## 七、noeviction 策略与 OOM 保护
+
+### 7.1 noeviction 的行为
+
+当 `maxmemory-policy` 设置为 `noeviction` 时，Redis 不会淘汰任何数据。当内存满时，写入命令会返回错误：
+
+```bash
+(error) OOM command not allowed when used memory > 'maxmemory'
+```
+
+读取命令（GET、HSCAN 等）仍然可以正常执行。
+
+### 7.2 noeviction 的适用场景
+
+`noeviction` 适合以下场景：
+
+- **只读缓存**：数据从数据库加载到 Redis，Redis 作为纯缓存
+- **内存充足**：正常情况下内存不会满，只作为安全保护
+- **数据重要**：不允许任何数据被意外淘汰
+
+```bash
+# 配置 noeviction
+maxmemory-policy noeviction
+maxmemory 8gb
+```
+
+### 7.3 监控内存使用
+
+无论选择哪种淘汰策略，都需要监控 Redis 的内存使用：
+
+```bash
+# 查看 Redis 内存状态
+INFO memory
+
+# 关键指标
+used_memory: 4294967296        # 已使用内存（字节）
+used_memory_human: 4.00G      # 人类可读格式
+used_memory_rss: 4617089024   # 物理内存占用（含碎片）
+maxmemory: 4294967296         # 最大内存配置
+maxmemory_human: 4.00G        # 人类可读格式
+mem_fragmentation_ratio: 1.07  # 内存碎片率
+evicted_keys: 0               # 被淘汰的 key 数量
+```
+
+重点关注 `evicted_keys` 指标：
+
+- `evicted_keys > 0`：说明存在内存压力，正在淘汰数据
+- 如果持续很高，说明 `maxmemory` 设置过小，需要扩容或调整策略
+
+---
+
+## 八、内存碎片与整理
+
+### 8.1 内存碎片产生的原因
+
+Redis 的内存碎片率（`mem_fragmentation_ratio`）是 `used_memory_rss / used_memory` 的比值：
+
+- **碎片率 > 1.5**：内存碎片严重，需要整理
+- **碎片率 = 1.0~1.5**：正常范围
+- **碎片率 < 1.0**：Redis 内存使用超过了物理内存（可能触发 OOM）
+
+内存碎片产生的原因：
+
+1. **频繁的键值修改**：SET 操作可能改变 value 大小，导致内存重分配
+2. **键值删除**：删除 key 后，释放的内存可能无法被其他 key 重用
+3. **过期 key 未及时清理**：过期的 key 占用的内存不会立即归还系统
+
+### 8.2 主动内存整理
+
+Redis 提供了两种内存整理机制：
+
+**activedefrag：主动去碎片化**
+
+```bash
+# 开启主动去碎片化
+activedefrag yes
+
+# 触发去碎片化的碎片率阈值
+active-defrag-ignore-bytes 100mb
+
+# 碎片率达到此值时开始整理
+active-defrag-threshold-lower 100
+
+# 碎片率低于此值时停止整理
+active-defrag-threshold-upper 100
+```
+
+**lazyfree：惰性释放**
+
+当删除大量 key 时，Redis 可以选择「惰性释放」——不立即清理内存，而是在后台线程中逐步释放：
+
+```bash
+# 异步删除大 key
+lazyfree-lazy-eviction yes
+lazyfree-lazy-expire yes
+lazyfree-lazy-server-del yes
+```
+
+### 8.3 内存碎片监控
+
+```bash
+# 定期检查内存碎片率
+redis-cli INFO memory | grep -E "mem_fragmentation_ratio|used_memory_rss"
+
+# 如果碎片率过高，手动触发内存整理
+redis-cli MEMORY PURGE
+```
+
+---
+
+## 九、淘汰策略对业务的影响
+
+### 9.1 热数据被淘汰的后果
+
+如果淘汰策略配置不当，可能导致：
+
+**缓存穿透加剧**
+
+热点数据被淘汰后，大量请求直接穿透到数据库。如果数据库扛不住，系统可能崩溃。
+
+**缓存雪崩**
+
+大量 key 恰好在同一时间过期（或被淘汰），导致大量请求同时击穿到数据库。
+
+**业务数据不一致**
+
+被淘汰的数据如果是正在使用的业务数据，可能导致脏读、错误计算等问题。
+
+### 9.2 如何减少淘汰对业务的影响
+
+**方案一：设置合理的内存上限**
+
+不要让 Redis 运行在内存满的边缘。保留 20-30% 的余量，给淘汰过程足够的空间。
+
+```bash
+# 假设物理内存 16GB
+maxmemory 12gb
+```
+
+**方案二：使用 volatile 策略 + 合理的过期时间**
+
+只淘汰带过期时间的 key，避免淘汰持久化数据。同时，给 key 设置合理的过期时间，不要让大量 key 同时过期。
+
+```bash
+# 设置随机过期时间（300-600秒之间）
+SET product:100 '{"id":100,"name":"商品"}' EX $((300 + RANDOM % 300))
+```
+
+**方案三：监控淘汰指标，及时告警**
+
+```bash
+# 监控脚本
+#!/bin/bash
+evicted=$(redis-cli INFO stats | grep evicted_keys | cut -d: -f2)
+memory_used=$(redis-cli INFO memory | grep used_memory | cut -d: -f2)
+memory_max=$(redis-cli INFO memory | grep maxmemory | cut -d: -f2)
+usage=$(echo "scale=2; $memory_used / $memory_max" | bc)
+
+if [ $evicted -gt 0 ] || (( $(echo "$usage > 0.9" | bc -l) )); then
+    echo "ALERT: Redis memory pressure detected"
+    # 发送告警
+fi
+```
+
+**方案四：多级缓存兜底**
+
+即使 Redis 缓存失效，还有本地缓存（Caffeine/Guava Cache）作为兜底。本地缓存基于 LRU/LFU 淘汰，不会向 Redis 那样产生网络开销。
+
+---
+
+## 十、总结
+
+Redis 的内存淘汰策略是一套完整的体系，涉及 LRU/LFU 算法、抽样机制、频率衰减等多个方面。
+
+| 策略 | 适用场景 | 特点 |
+|---|---|---|
+| noeviction | 只读缓存、内存充足场景 | 不淘汰，可能 OOM |
+| allkeys-lru | 读多写少、热点明显 | 保留热点，可能误杀偶发热 |
+| allkeys-lfu | 访问频率稳定 | 保留高频，偶发热点易被淘汰 |
+| volatile-lru | 希望保留持久化数据 | 只淘汰带过期时间的 key |
+| volatile-lfu | 希望保留持久化数据 | 只淘汰带过期时间的 key |
+| volatile-ttl | 有时间敏感数据 | 优先淘汰快过期的 key |
+| allkeys-random | 数据价值均等 | 简单粗暴，可能淘汰热点 |
+| volatile-random | 希望保留持久化数据 | 只淘汰带过期时间的 key |
+
+**选择建议**：
+
+- **通用场景**：`allkeys-lru` + `maxmemory-samples 10`
+- **访问模式稳定**：`allkeys-lfu` + `lfu-decay-time 1`
+- **希望保留持久化数据**：`volatile-lru` 或 `volatile-lfu`
+- **只读缓存**：`noeviction`
+
+---
+
+## 面试追问预判
+
+**面试官可能追问的方向：**
+
+1. **LRU 和 LFU 的算法复杂度**：精确 LRU 的插入和删除复杂度是多少？Redis 的近似 LRU 复杂度是多少？
+
+2. **为什么 Redis 用近似 LRU 而不是精确 LRU**：精确 LRU 需要维护有序链表，对 Redis 单线程模型有什么影响？
+
+3. **LFU 的频率衰减公式**：为什么使用 `counter * (1 / (lfu_decay_time + 1))` 而不是其他公式？这个公式的特点是什么？
+
+4. **内存碎片整理**：activedefrag 的工作原理是什么？它会影响 Redis 的性能吗？
+
+5. **大量过期 key 的处理**：如果 Redis 中有 1000 万个 key 同时过期，会发生什么？如何避免？
+
+这些问题深入到了 Redis 的实现细节。如果你能回答清楚，说明你对 Redis 内存管理有深入的理解。
+
+---
+
+> [!TIP]
+> **延伸思考**：如果让你设计一个 Redis 集群的内存淘汰协调方案，你会怎么做？多个 Redis 节点如何协调淘汰策略，避免某些节点淘汰过多导致数据不均匀？

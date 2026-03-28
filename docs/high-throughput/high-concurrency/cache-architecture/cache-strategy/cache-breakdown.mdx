@@ -1,0 +1,655 @@
+# 缓存击穿：互斥锁、逻辑过期双检、永久不过期策略
+
+双十一零点，购物车页面打开的瞬间，你的心跳开始加速——每秒订单量突破十万，系统稳如老狗。
+
+但就在 0 点 0 分 30 秒，一款爆款商品突然无法访问。页面转圈、接口超时、数据库报警……你赶紧登录后台，发现这款商品的缓存刚刚过期，大量请求同时涌入查询，瞬间把数据库打爆。
+
+这就是**缓存击穿**——一个热点 key 过期，瞬间大量请求击穿缓存打到数据库。和穿透不同，击穿的数据是真实存在的，只是缓存过期了。
+
+---
+
+## 一、什么是缓存击穿？
+
+### 1.1 定义
+
+|缓存击穿|是指一个**热点 key 过期**后，大量的并发请求同时发现缓存不存在，都去查询数据库，导致数据库压力瞬间飙升的现象。
+
+核心特征：
+
+- **存在热点 key**：只有少数 key 被大量并发访问
+- **key 恰好过期**：缓存失效时间到了
+- **大量并发**：多个请求同时发现缓存不存在
+
+### 1.2 危害
+
+缓存击穿的危害是**瞬时数据库压力过大**：
+
+- 数据库 CPU 飙升，响应时间急剧增加
+- 数据库连接被占满
+- 业务接口出现超时、熔断
+- 用户体验急剧下降，可能引发用户恐慌性刷新，进一步恶化
+
+### 1.3 与穿透、雪崩的区别
+
+|问题|缓存中|数据库中|影响范围|
+|---|---|---|---|
+|缓存穿透|不存在|不存在|所有不存在的 key|
+|缓存击穿|不存在（过期）|存在|单个或少数热点 key|
+|缓存雪崩|大量不存在/过期|存在|大量 key|
+
+三者的关系可以用一句话总结：
+
+- **穿透**：本来就没有（数据库也没有）
+- **击穿**：本来有，现在过期了（数据库有）
+- **雪崩**：成片成片过期了（数据库有，但扛不住）
+
+---
+
+## 二、解决方案一：互斥锁
+
+### 2.1 原理
+
+|互斥锁|的核心思想是：**只有一个线程去查数据库，其他线程等待**。
+
+```text
+请求 A → 发现缓存不存在 → 加锁 → 查数据库 → 回填缓存 → 释放锁
+请求 B → 发现缓存不存在 → 等锁...
+请求 C → 发现缓存不存在 → 等锁...
+请求 D → 发现缓存不存在 → 等锁...
+                      ↓
+            请求 A 释放锁后，缓存已有数据
+                      ↓
+            所有等待的请求 → 命中缓存 → 直接返回
+```
+
+这样保证了只有一个线程去查数据库，其他线程串行等待，数据库压力可控。
+
+### 2.2 Redis 实现互斥锁
+
+Redis 实现互斥锁有两种方式：
+
+**方式一：SETNX + EXPIRE**
+
+```java
+public String getProduct(Long productId) {
+    String cacheKey = "product:" + productId;
+
+    // 1. 先查缓存
+    String product = redis.get(cacheKey);
+    if (product != null) {
+        return product;
+    }
+
+    // 2. 缓存未命中，尝试加锁
+    String lockKey = "lock:product:" + productId;
+    String lockValue = UUID.randomUUID().toString();
+
+    // 加锁成功
+    if (redis.setnx(lockKey, lockValue)) {
+        try {
+            // 双重检查：可能其他线程已经回填了
+            product = redis.get(cacheKey);
+            if (product != null) {
+                return product;
+            }
+
+            // 查数据库
+            product = db.query(productId);
+
+            // 回填缓存
+            redis.setex(cacheKey, 3600, product);
+
+            return product;
+        } finally {
+            // 释放锁
+            redis.del(lockKey);
+        }
+    } else {
+        // 加锁失败，短暂等待后重试
+        try {
+            Thread.sleep(50);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        return getProduct(productId); // 递归重试
+    }
+}
+```
+
+**方式二：SET NX EX（推荐）**
+
+```java
+public String getProduct(Long productId) {
+    String cacheKey = "product:" + productId;
+    String lockKey = "lock:product:" + productId;
+
+    // 1. 先查缓存
+    String product = redis.get(cacheKey);
+    if (product != null) {
+        return product;
+    }
+
+    // 2. 尝试获取锁（SET NX EX 原子操作）
+    String lockValue = UUID.randomUUID().toString();
+    Boolean acquired = redis.set(lockKey, lockValue, 10, TimeUnit.SECONDS);
+
+    if (Boolean.TRUE.equals(acquired)) {
+        try {
+            // 双重检查
+            product = redis.get(cacheKey);
+            if (product != null) {
+                return product;
+            }
+
+            // 查数据库
+            product = db.query(productId);
+
+            // 回填缓存
+            redis.setex(cacheKey, 3600, product);
+
+            return product;
+        } finally {
+            // 释放锁（使用 Lua 脚本保证原子性）
+            String script = "if redis.call('get', KEYS[1]) == ARGV[1] then " +
+                           "return redis.call('del', KEYS[1]) else return 0 end";
+            redis.eval(script, lockKey, lockValue);
+        }
+    } else {
+        // 获取锁失败，等待后重试
+        return getProductWithRetry(productId, 3);
+    }
+}
+
+private String getProductWithRetry(Long productId, int retries) {
+    for (int i = 0; i < retries; i++) {
+        try {
+            Thread.sleep(100);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return null;
+        }
+
+        String product = redis.get("product:" + productId);
+        if (product != null) {
+            return product;
+        }
+    }
+    // 重试次数用完，直接查库（兜底）
+    return db.query(productId);
+}
+```
+
+### 2.3 Redisson 实现互斥锁
+
+Redisson 是 Java 中最流行的 Redis 客户端之一，提供了丰富的分布式锁功能：
+
+```java
+@Resource
+private RedissonClient redissonClient;
+
+public String getProduct(Long productId) {
+    String cacheKey = "product:" + productId;
+
+    // 1. 先查缓存
+    String product = redis.get(cacheKey);
+    if (product != null) {
+        return product;
+    }
+
+    // 2. 获取分布式锁
+    String lockKey = "lock:product:" + productId;
+    RLock lock = redissonClient.getLock(lockKey);
+
+    try {
+        // 尝试加锁，最多等待 3 秒，锁自动过期时间 10 秒
+        boolean locked = lock.tryLock(3, 10, TimeUnit.SECONDS);
+
+        if (locked) {
+            try {
+                // 双重检查
+                product = redis.get(cacheKey);
+                if (product != null) {
+                    return product;
+                }
+
+                // 查数据库
+                product = db.query(productId);
+
+                // 回填缓存
+                redis.setex(cacheKey, 3600, product);
+
+                return product;
+            } finally {
+                // 释放锁
+                lock.unlock();
+            }
+        } else {
+            // 获取锁失败，短暂等待后重试
+            Thread.sleep(50);
+            return getProduct(productId);
+        }
+    } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        return db.query(productId); // 兜底
+    }
+}
+```
+
+### 2.4 互斥锁的优缺点
+
+|优点|缺点|
+|---|---|
+|保证数据库不会被压垮|性能有所下降（等待锁）|
+|实现简单|锁获取失败时需要重试，增加复杂度|
+|数据一致性高|锁粒度控制不当可能导致死锁|
+
+---
+
+## 三、解决方案二：逻辑过期双检
+
+### 3.1 原理
+
+|逻辑过期|的核心思想是：**缓存永远不过期，但数据中存储一个「逻辑过期时间」**。
+
+```text
+数据格式：
+{
+    "product": {...},
+    "logicalExpireTime": 1704067200000  // 逻辑过期时间
+}
+```
+
+流程：
+
+```text
+请求 A → 查缓存 → 发现逻辑过期
+                   ↓
+              加锁 → 开启异步线程查数据库 → 回填新数据
+              释放锁
+                   ↓
+              返回旧数据（给用户先用着）
+
+请求 B → 查缓存 → 发现逻辑过期
+                   ↓
+              尝试加锁 → 失败
+                         ↓
+                    返回旧数据
+
+请求 C → ...同请求 B
+```
+
+这样即使用户获取的是「过期」数据，也能正常访问，而后台异步更新数据。
+
+### 3.2 实现
+
+```java
+@Data
+public class CacheData<T> {
+    private T data;
+    private Long logicalExpireTime;
+}
+
+public String getProduct(Long productId) {
+    String cacheKey = "product:" + productId;
+
+    // 1. 先查缓存
+    CacheData<Product> cacheData = redis.get(cacheKey);
+
+    if (cacheData != null) {
+        // 2. 检查逻辑过期时间
+        if (cacheData.getLogicalExpireTime() > System.currentTimeMillis()) {
+            // 未过期，直接返回
+            return JSON.toJSONString(cacheData.getData());
+        } else {
+            // 已逻辑过期，尝试刷新
+            String lockKey = "lock:refresh:product:" + productId;
+            String lockValue = UUID.randomUUID().toString();
+
+            // 尝试加锁
+            Boolean acquired = redis.set(lockKey, lockValue, 10, TimeUnit.SECONDS);
+
+            if (Boolean.TRUE.equals(acquired)) {
+                // 加锁成功，开启异步线程刷新
+                CompletableFuture.runAsync(() -> {
+                    try {
+                        // 查数据库
+                        Product product = db.query(productId);
+
+                        // 构造新缓存数据，逻辑过期时间设为 30 分钟后
+                        CacheData<Product> newCacheData = new CacheData<>();
+                        newCacheData.setData(product);
+                        newCacheData.setLogicalExpireTime(
+                            System.currentTimeMillis() + 30 * 60 * 1000
+                        );
+
+                        // 回填缓存
+                        redis.setex(cacheKey, 31 * 60, JSON.toJSONString(newCacheData));
+                    } finally {
+                        redis.del(lockKey);
+                    }
+                });
+
+                // 返回旧数据（不等刷新完成）
+                return JSON.toJSONString(cacheData.getData());
+            } else {
+                // 获取锁失败，返回旧数据
+                return JSON.toJSONString(cacheData.getData());
+            }
+        }
+    }
+
+    // 缓存不存在，查数据库
+    Product product = db.query(productId);
+
+    // 构造缓存数据，逻辑过期时间设为 30 分钟后
+    CacheData<Product> newCacheData = new CacheData<>();
+    newCacheData.setData(product);
+    newCacheData.setLogicalExpireTime(
+        System.currentTimeMillis() + 30 * 60 * 1000
+    );
+
+    // 回填缓存（物理过期时间要长一些，比如 35 分钟）
+    redis.setex(cacheKey, 35 * 60, JSON.toJSONString(newCacheData));
+
+    return JSON.toJSONString(product);
+}
+```
+
+### 3.3 逻辑过期的优缺点
+
+|优点|缺点|
+|---|---|
+|用户体验好，始终能获取数据|返回的是旧数据，存在不一致|
+|数据库压力小（只有一个线程刷新）|实现复杂度高|
+|性能高，不需要等待锁|需要维护额外的逻辑过期字段|
+
+---
+
+## 四、解决方案三：热点数据永不过期
+
+### 4.1 原理
+
+这个方案更简单粗暴：**对热点数据，直接设置超长的过期时间甚至永不过期**，然后通过定时任务定期更新缓存。
+
+```java
+// 缓存永不过期
+redis.set("hot:product:100", product, Duration.ofDays(30));
+
+// 定时任务每天凌晨刷新热点数据
+@Scheduled(cron = "0 0 3 * * ?")
+public void refreshHotProducts() {
+    List<Long> hotProductIds = hotProductService.getHotProductIds();
+    for (Long productId : hotProductIds) {
+        Product product = db.query(productId);
+        redis.set("hot:product:" + productId, product);
+    }
+}
+```
+
+### 4.2 问题
+
+这个方案有一个致命问题：**数据不一致**。
+
+如果在数据库更新时，没有同步更新缓存，用户会长时间看到旧数据。这在实际业务中往往是不可接受的。
+
+### 4.3 改进：读写分离
+
+```java
+// 读：读缓存
+public String getProduct(Long productId) {
+    String product = redis.get("hot:product:" + productId);
+    if (product == null) {
+        product = db.query(productId);
+        redis.set("hot:product:" + productId, product);
+    }
+    return product;
+}
+
+// 写：更新数据库 + 删除缓存
+public void updateProduct(Product product) {
+    db.update(product);
+    redis.del("hot:product:" + product.getId()); // 删除缓存，下次读取会回填新数据
+}
+```
+
+但这样改完后，实际上就退化成了 Cache Aside 模式，热点数据永不过期的优势就不明显了。
+
+---
+
+## 五、方案对比与选择
+
+### 5.1 三种方案对比
+
+|方案|一致性|性能|实现复杂度|适用场景|
+|---|---|---|---|---|
+|互斥锁|高（始终返回最新）|中等（有等待）|中|一致性要求高的场景|
+|逻辑过期|低（可能返回旧）|高（无等待）|高|允许短暂延迟的场景|
+|永不过期|低（定时刷新有延迟）|高|低|数据更新不频繁的场景|
+
+### 5.2 选择决策树
+
+```
+选择击穿解决方案
+├── 一致性要求极高（如库存、价格）
+│   └── 互斥锁
+│
+├── 允许短暂延迟，且数据更新频繁
+│   └── 逻辑过期双检
+│
+├── 数据基本不变
+│   └── 永不过期 + 定时刷新
+│
+└── 大多数场景
+    └── 互斥锁（首选，稳妥）
+```
+
+### 5.3 实战建议
+
+对于大多数业务场景，我的建议是：
+
+1. **默认选互斥锁**。虽然有等待，但数据一致性有保障，实现也相对简单
+2. **用 Redisson 简化实现**。Redisson 的分布式锁封装得很完善，比自己手写要可靠
+3. **如果性能是关键，考虑逻辑过期**。比如商品详情页，用户对短暂延迟不敏感
+4. **热点数据预热**。在缓存过期前主动刷新，避免击穿发生
+
+---
+
+## 六、实战：完整的商品查询实现
+
+结合前面的知识，来看看一个完整的、防御击穿的商品查询实现：
+
+```java
+@Service
+public class ProductService {
+
+    private static final String CACHE_KEY_PREFIX = "product:";
+    private static final String LOCK_KEY_PREFIX = "lock:product:";
+    private static final long CACHE_TTL = 30 * 60; // 30 分钟
+    private static final long LOCK_TTL = 10; // 10 秒
+
+    @Autowired
+    private RedisTemplate<String, Product> redisTemplate;
+
+    @Autowired
+    private RedissonClient redissonClient;
+
+    @Autowired
+    private ProductMapper productMapper;
+
+    public Product getProduct(Long productId) {
+        String cacheKey = CACHE_KEY_PREFIX + productId;
+
+        // 1. 先查缓存
+        Product product = redisTemplate.opsForValue().get(cacheKey);
+        if (product != null) {
+            return product;
+        }
+
+        // 2. 缓存未命中，获取分布式锁
+        String lockKey = LOCK_KEY_PREFIX + productId;
+        RLock lock = redissonClient.getLock(lockKey);
+
+        try {
+            // 尝试获取锁，最多等待 3 秒，锁自动过期时间 10 秒
+            boolean locked = lock.tryLock(3, LOCK_TTL, TimeUnit.SECONDS);
+
+            if (locked) {
+                try {
+                    // 双重检查：可能其他线程已经回填了
+                    product = redisTemplate.opsForValue().get(cacheKey);
+                    if (product != null) {
+                        return product;
+                    }
+
+                    // 查数据库
+                    product = productMapper.selectById(productId);
+                    if (product == null) {
+                        return null;
+                    }
+
+                    // 回填缓存
+                    redisTemplate.opsForValue().set(cacheKey, product,
+                        CACHE_TTL, TimeUnit.SECONDS);
+
+                    return product;
+                } finally {
+                    lock.unlock();
+                }
+            } else {
+                // 获取锁失败，短暂等待后递归重试
+                Thread.sleep(100);
+                return getProduct(productId);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            // 获取锁失败，直接查库（兜底）
+            return productMapper.selectById(productId);
+        }
+    }
+
+    public void updateProduct(Product product) {
+        // 1. 更新数据库
+        productMapper.updateById(product);
+
+        // 2. 删除缓存
+        String cacheKey = CACHE_KEY_PREFIX + product.getId();
+        redisTemplate.delete(cacheKey);
+    }
+}
+```
+
+### 六步流程总结
+
+1. **查缓存**：快速路径，高命中直接返回
+2. **未命中，获取锁**：保证只有一个线程查库
+3. **双重检查**：防止其他线程已经回填
+4. **查数据库**：唯一的数据源
+5. **回填缓存**：让后续请求命中缓存
+6. **释放锁**：让其他等待的线程继续
+
+---
+
+## 七、击穿问题的预防
+
+比解决击穿更好的策略是**预防击穿**。
+
+### 7.1 热点数据识别
+
+```java
+// 使用 Redis ZSet 记录访问频率
+public void recordAccess(Long productId) {
+    String key = "hot:products:access";
+    redis.opsForZSet().incrementScore(key, productId.toString(), 1);
+}
+
+// 获取 Top N 热点
+public List<Long> getHotProducts(int topN) {
+    String key = "hot:products:access";
+    Set<ZSetOperations.TypedTuple<String>> tuples =
+        redis.opsForZSet().reverseRangeWithScores(key, 0, topN - 1);
+
+    return tuples.stream()
+        .map(tuple -> Long.parseLong(tuple.getValue()))
+        .collect(Collectors.toList());
+}
+```
+
+### 7.2 热点数据预热
+
+```java
+@PostConstruct
+public void preheatHotProducts() {
+    List<Long> hotProductIds = getHotProducts(100);
+    for (Long productId : hotProductIds) {
+        Product product = productMapper.selectById(productId);
+        redisTemplate.opsForValue().set(
+            CACHE_KEY_PREFIX + productId,
+            product,
+            CACHE_TTL,
+            TimeUnit.SECONDS
+        );
+    }
+}
+```
+
+### 7.3 主动刷新
+
+```java
+@Scheduled(fixedRate = 60000) // 每分钟执行
+public void refreshHotProducts() {
+    List<Long> hotProductIds = getHotProducts(100);
+    for (Long productId : hotProductIds) {
+        try {
+            Product product = productMapper.selectById(productId);
+            redisTemplate.opsForValue().set(
+                CACHE_KEY_PREFIX + productId,
+                product,
+                CACHE_TTL,
+                TimeUnit.SECONDS
+            );
+        } catch (Exception e) {
+            log.error("刷新热点商品失败: productId={}", productId, e);
+        }
+    }
+}
+```
+
+---
+
+## 总结
+
+缓存击穿是热点数据场景下的典型问题，核心矛盾是「**一个 key 的高并发 vs 数据库的承受能力**」。
+
+三种解决方案各有优劣：
+
+- **互斥锁**：用锁串行化请求，保证数据一致，但有等待延迟
+- **逻辑过期**：让用户无感知地使用旧数据，但数据可能不一致
+- **永不过期**：性能最好，但数据一致性问题最大
+
+实战中，**互斥锁是首选**，它足够简单、足够可靠。如果对性能要求极高且能容忍短暂不一致，再考虑逻辑过期。
+
+预防胜于治疗，做好热点数据识别和预热，能从根本上减少击穿的发生。
+
+---
+
+## 面试追问预判
+
+**Q1：互斥锁方案中，为什么要做双重检查？**
+
+A：双重检查是为了避免重复查询数据库。假设不做检查：线程 A 获取锁、查库、回填、释放锁；线程 B 已经在锁外等待；线程 A 释放锁后，线程 B 获取锁进入，如果没有双重检查，线程 B 会再次查库。双重检查让线程 B 在进入锁后先查缓存，如果已有数据就直接返回，避免浪费。
+
+**Q2：互斥锁方案中，锁的过期时间如何设置？**
+
+A：锁过期时间应该设置得「足够长」以完成查库 + 回填操作，又「足够短」以防止死锁影响范围扩大。通常设置为 10-30 秒比较合理。如果查库操作较慢，可以适当延长，或者使用看门狗（Watchdog）机制自动续期。Redisson 默认使用看门狗，锁会自动续期。
+
+**Q3：逻辑过期方案中，为什么返回的是旧数据而不是等待新数据？**
+
+A：这是设计权衡。如果要等待新数据，就会退化成互斥锁——用户需要等待，体验差。逻辑过期的设计哲学是「让用户先跑起来」，后台异步更新数据。对于大多数业务场景，用户看到稍微旧一点的数据比看到超时页面好得多。
+
+**Q4：逻辑过期方案中，如何保证异步刷新不出问题？**
+
+A：主要风险是异步任务失败或丢失。解决方案包括：（1）异步任务加异常捕获和日志记录；（2）使用消息队列确保任务可靠执行；（3）设置物理过期时间兜底（比如逻辑过期 30 分钟，物理过期 35 分钟），即使异步失败，最多 5 分钟后也会重新触发。
+
+**Q5：热点数据预热应该什么时候执行？**
+
+A：热点数据预热应该在缓存集中过期之前完成。比如缓存 TTL 是 30 分钟，可以设置定时任务每 20 分钟刷新一次，或者在系统低峰期（如凌晨）全量预热。同时，业务上也可以在缓存即将过期前主动触发刷新，而不是等过期后再处理。

@@ -1,0 +1,625 @@
+import { Badge } from '@rspress/core/theme';
+
+# Redis 过期策略：定期删除与惰性删除的深度解析
+
+> [!WARNING]
+> 前置知识：本篇文章涉及 Redis 数据过期机制、内存管理、主从复制等知识，建议先掌握 Redis 数据类型和 Redis 主从复制原理。
+
+---
+
+双十一零点，你提前做了充分准备：Redis 缓存预热完成，数据库连接池调优过，限流熔断都配置妥当。压测显示系统能扛住 10 万 QPS，你信心满满。
+
+零点零一分，系统开始出现大量数据库连接超时。
+
+你查了一圈，发现 Redis 内存使用率不高，CPU 也不高，但慢查询日志里全是 `HGET` 命令的延迟。再一看 Redis 监控——内存中堆积了大量过期的 key，它们没有被及时清理，占用了宝贵的内存空间。
+
+这不是你准备不充分，而是 Redis 的过期策略比你想象的更复杂。
+
+Redis 的 key 过期机制，看似简单——设置一个过期时间，到期自动删除。但这个「自动删除」的背后，隐藏着两个核心策略：**惰性删除**和**定期删除**。这两个策略的组合，造就了 Redis 过期机制的各种「坑」。
+
+这一讲，我们彻底搞清楚 Redis 的过期策略。
+
+---
+
+## 一、为什么 Redis 需要过期策略
+
+### 1.1 内存有限，数据无限
+
+Redis 是基于内存的存储，数据存储在 RAM 中，读写速度极快。但 RAM 是有限的，而业务数据是无限的。
+
+如果 Redis 中的 key 永远不清理，内存会持续增长，最终耗尽系统内存，导致 OOM 或系统崩溃。
+
+因此，Redis 提供了 key 的过期机制，让业务可以控制数据的生命周期：
+
+```bash
+# 设置 key 在 1 小时后过期
+SET product:100 '{"name":"iPhone"}' EX 3600
+
+# 或等价于
+SETEX product:100 3600 '{"name":"iPhone"}'
+
+# 或使用 TTL 相关命令
+EXPIRE product:100 3600
+PEXPIRE product:100 3600000  # 毫秒
+```
+
+### 1.2 数据时效性的业务需求
+
+除了内存限制，业务本身也有时效性需求：
+
+- **验证码/Token**：5 分钟有效期，过期后必须重新获取
+- **分布式锁**：30 秒锁超时，过期后自动释放
+- **缓存数据**：1 小时有效期，防止数据陈旧
+- **排行榜**：每日排行榜，过期后自动清理
+
+这些场景都依赖 Redis 的过期机制。
+
+### 1.3 过期时间的精度
+
+Redis 支持毫秒级精度的过期时间：
+
+```bash
+# 毫秒精度过期
+SET key value PX 1000        # 1秒后过期
+SET key value PXAT 1609459200000  # 在指定时间戳过期
+
+# 查看 key 的 TTL（秒）
+TTL key        # 返回 -2 表示不存在，-1 表示永不过期
+
+# 查看 key 的 TTL（毫秒）
+PTTL key
+```
+
+但需要注意的是，**Redis 的过期检查不是精确到毫秒的**。这会在后续章节详细讨论。
+
+---
+
+## 二、惰性删除：Lazy Expires 的原理
+
+### 2.1 什么是惰性删除
+
+惰性删除是 Redis 最简单的过期策略：**只有当访问某个 key 时，才检查它是否过期；如果过期，就删除它**。
+
+```text
+客户端发送 GET product:100
+        ↓
+Redis 检查 product:100 是否存在
+        ↓
+检查是否设置了过期时间？
+        ↓
+        ┌───┴───┐
+       Yes      No
+        ↓        ↓
+    过期了吗？   返回 value
+        ↓
+    ┌─┴─┐
+   Yes  No
+    ↓    ↓
+ 删除   返回
+ 返回
+ NULL
+```
+
+惰性删除的代码逻辑（简化版）：
+
+```c
+robj *lookupKey(redisDb *db, robj *key, int flags) {
+    // 检查 key 是否存在
+    if (expireIfNeeded(db, key) == 1) {
+        // key 已过期，删除它
+        return NULL;
+    }
+    // 返回 key 的值
+    return db->dict->lookup(key);
+}
+```
+
+### 2.2 惰性删除的实现细节
+
+`expireIfNeeded` 函数是惰性删除的核心：
+
+```c
+int expireIfNeeded(redisDb *db, robj *key) {
+    // 获取 key 的过期时间
+    long long when = getExpire(db, key);
+    
+    // 如果没有设置过期时间
+    if (when < 0) return 0;
+    
+    // 如果 Redis 正在加载 RDB/AOF，不处理
+    if (server.loading) return 0;
+    
+    // 如果是 SLAVE，不主动删除（由 MASTER 处理）
+    if (server.masterhost != NULL) return 0;
+    
+    // 检查是否过期
+    if (server.unixtime > when) {
+        // 过期了，删除 key
+        deleteKey(db, key);
+        return 1;
+    }
+    
+    return 0;
+}
+```
+
+注意这个细节：**如果当前 Redis 是从节点，它不会主动删除过期的 key**。这是为了保证主从一致性，下文会详细讨论。
+
+### 2.3 惰性删除的优缺点
+
+**惰性删除的优点**：
+
+1. **CPU 友好**：不需要额外开销，只有在访问 key 时才检查过期
+2. **精确**：每次访问都会检查，不会漏掉任何一个过期的 key
+3. **实现简单**：只需要在访问时增加一个时间检查
+
+**惰性删除的缺点**：
+
+1. **内存不友好**：如果大量 key 过期但没有被访问，它们会一直占用内存
+2. **无法主动清理**：对于「永不被访问」的过期 key，只能等到内存满时通过淘汰策略清理
+3. **延迟峰值**：当访问一个过期 key 时，需要执行删除操作，可能导致延迟尖刺
+
+---
+
+## 三、定期删除：Active Expires 的原理
+
+### 3.1 什么是定期删除
+
+惰性删除的问题是：如果一个 key 过期了，但永远没有人访问它，它就永远不会从内存中消失。
+
+定期删除就是来解决这个问题的：**每隔一段时间，Redis 会主动扫描部分 key，删除过期的 key**。
+
+Redis 每 100ms（可配置）会执行一次 `activeExpireCycle` 函数，检查过期的 key：
+
+```bash
+# 配置定期删除的频率（默认 100ms）
+hz 10
+```
+
+### 3.2 定期删除的扫描逻辑
+
+`activeExpireCycle` 的核心逻辑：
+
+```c
+void activeExpireCycle(int type) {
+    // 遍历所有数据库
+    for (j = 0; j < server.dbnum; j++) {
+        redisDb *db = server.db[j];
+        
+        // 遍历数据库中的过期哈希表
+        while (expired.count < ACTIVE_EXPIRE_CYCLE_SAMPLES) {
+            // 随机选择一个带过期时间的 key
+            dictEntry *de = dictGetRandomKey(db->expires);
+            
+            // 检查是否过期
+            if (expireIfNeeded(db, dictGetKey(de))) {
+                expired.count++;
+            }
+            
+            // 检查是否超时（每次执行不超过 25% 的 CPU 时间）
+            if (stopped) break;
+        }
+    }
+}
+```
+
+关键点：
+
+1. **不是扫描整个数据库**：每次只抽样检查一部分 key（`ACTIVE_EXPIRE_CYCLE_SAMPLES` 个）
+2. **有时间限制**：每次执行不超过 25ms，避免影响正常请求
+3. **分批执行**：遍历所有数据库，但每个数据库有采样限制
+
+### 3.3 过期哈希表的优化
+
+Redis 为每个数据库维护了两个字典：
+
+```c
+typedef struct redisDb {
+    dict *dict;        // key-value 字典
+    dict *expires;     // key-过期时间 字典
+    // ...
+} redisDb;
+```
+
+`expires` 字典只存储带过期时间的 key，key 是实际 key 的指针，value 是过期时间戳。
+
+这样设计的好处是：**定期删除只需要扫描 `expires` 字典，而不是整个 `dict`**。如果一个 key 没有设置过期时间，就不会被扫描。
+
+### 3.4 定期删除的配置参数
+
+```bash
+# hz: 定时任务的执行频率（10-500）
+# hz 10 表示每 100ms 执行一次
+hz 10
+
+# activerehashing: 是否在定时任务中重哈希
+# yes 表示执行，no 表示不执行
+activerehashing yes
+```
+
+`hz` 的取值影响 Redis 的行为：
+
+| hz 值 | 执行间隔 | 特点 |
+|---|---|---|
+| 10（默认） | 100ms | 平衡模式，CPU 开销适中 |
+| 100 | 10ms | 激进模式，CPU 开销大，清理更及时 |
+| 500 | 2ms | 极端模式，CPU 开销极大，不推荐 |
+
+---
+
+## 四、惰性删除 + 定期删除的组合策略
+
+### 4.1 为什么需要两种策略
+
+惰性删除和定期删除各有优缺点，它们组合使用才能达到最佳效果：
+
+| 策略 | 优点 | 缺点 | 适用场景 |
+|---|---|---|---|
+| 惰性删除 | CPU 友好、精确 | 内存不友好 | 高访问频率的 key |
+| 定期删除 | 主动清理内存 | 可能有延迟尖刺 | 低访问频率的 key |
+
+两种策略组合后：
+
+- **惰性删除**：保证所有被访问的 key 都能正确过期
+- **定期删除**：清理那些「永不被访问」的过期 key，释放内存
+
+### 4.2 组合策略的执行时序
+
+```text
+时间轴
+│
+├─ 0ms: 客户端访问 key:A → 惰性删除检查 → 未过期 → 返回
+│
+├─ 50ms: 定期删除执行 → 扫描 expires → 发现 key:B 过期 → 删除
+│
+├─ 100ms: 客户端访问 key:B → 惰性删除检查 → 已过期 → 删除 → 返回 NULL
+│
+├─ 150ms: 定期删除执行 → 继续扫描 → 发现 key:C 过期 → 删除
+│
+└─ 200ms: 客户端访问 key:C → 惰性删除检查 → 已过期 → 删除 → 返回 NULL
+```
+
+### 4.3 实际效果
+
+在正常情况下，惰性删除 + 定期删除的组合能够：
+
+1. **及时清理被访问的过期 key**：惰性删除保证精度
+2. **定期释放不被访问的过期 key**：定期删除保证内存效率
+3. **不占用过多 CPU**：两种策略都是轻量级的
+
+但这个组合也有一些边界情况需要注意，下文会详细讨论。
+
+---
+
+## 五、Redis 7.x 过期策略的改进
+
+### 5.1 过期精度问题
+
+Redis 的过期检查是**秒级精度**的（Redis 7.0 之前）。这意味着：
+
+```bash
+# 设置 key 在 1.5 秒后过期
+SET key value PX 1500
+
+# 但 Redis 只保证「1秒后一定会过期」
+# 实际上可能在 1~2 秒之间的任意时刻过期
+```
+
+这个问题在 Redis 7.0 中得到了改进：
+
+```bash
+# Redis 7.0+ 支持更精确的过期时间
+EXPIREAT key 1609459201.500  # 毫秒精度
+```
+
+### 5.2 内存碎片与过期 key
+
+当大量 key 过期后被删除，内存中可能产生碎片。Redis 7.0 改进了内存碎片整理机制：
+
+```bash
+# 开启主动内存整理
+activedefrag yes
+active-defrag-ignore-bytes 100mb
+active-defrag-threshold-lower 100
+```
+
+---
+
+## 六、过期 key 对 RDB/AOF 的影响
+
+### 6.1 RDB 持久化与过期 key
+
+RDB 持久化时，过期 key 的处理方式：
+
+- **RDB 保存时**：过期 key 不会被写入 RDB 文件
+- **RDB 加载时**：主节点加载时过滤过期 key；从节点加载时不过滤（由主节点同步删除）
+
+```text
+RDB 保存流程：
+Redis 内存 → 遍历所有 key → 过滤过期 → 写入 RDB 文件
+                              ↑
+                         过期 key 跳过
+```
+
+### 6.2 AOF 持久化与过期 key
+
+AOF 持久化时，过期 key 的处理方式：
+
+- **AOF 重写时**：过期 key 不会被写入 AOF 文件
+- **AOF 写入时**：即使 key 过期，删除操作也会被记录到 AOF
+
+```text
+AOF 写入流程：
+客户端 DEL key:A → 写入 AOF buffer → 刷新到磁盘
+                                  ↑
+                             删除操作被记录
+```
+
+### 6.3 混合持久化与过期 key
+
+Redis 4.0+ 支持混合持久化（RDB + AOF）：
+
+```bash
+aof-use-rdb-preamble yes
+```
+
+混合持久化时：
+
+- AOF 文件前半部分是 RDB 格式（不含过期 key）
+- 后半部分是 AOF 格式（记录增量修改）
+
+---
+
+## 七、过期 key 对主从复制的影响
+
+### 7.1 主从复制的关键问题
+
+主从复制场景下，过期 key 的处理有一个关键问题：**从节点不会主动删除过期的 key**。
+
+```c
+// lookupKey 函数中的处理
+if (server.masterhost != NULL) {
+    // 如果是 SLAVE，不主动删除过期 key
+    // 因为 MASTER 会同步删除操作
+    return ...;
+}
+```
+
+这是因为：
+
+1. 从节点依赖主节点的删除命令来保持数据一致
+2. 如果从节点先删除了过期 key，主节点还没来得及同步，会导致数据不一致
+
+### 7.2 主节点删除时的同步机制
+
+当主节点删除一个 key 时，会向所有从节点同步删除命令：
+
+```text
+主节点执行 DEL key:A
+        ↓
+主节点内存删除 key:A
+        ↓
+主节点向从节点发送 DEL 命令
+        ↓
+从节点收到 DEL 命令
+        ↓
+从节点删除 key:A
+```
+
+这个机制保证了主从数据的一致性。
+
+### 7.3 主从不一致的风险
+
+但这个机制有一个风险：**如果主节点崩溃，从节点升级为主节点，从节点上的过期 key 不会被清理**。
+
+```text
+场景：主节点崩溃，从节点升级为主节点
+
+原主节点：key:A 已过期（已删除）
+          ↓
+原从节点：key:A 已过期（但未删除，因为是从节点）
+          ↓
+原从节点升级为主节点
+          ↓
+key:A 仍然存在，但已过期
+```
+
+Redis 3.2+ 解决了这个问题：**当从节点升级为主节点后，会开启惰性删除**，立即清理过期 key。
+
+---
+
+## 八、大量过期 key 带来的性能问题
+
+### 8.1 定时过期的危害
+
+如果在业务代码中使用了定时过期（如零点清空昨天的缓存），会产生**大量 key 同时过期**：
+
+```java
+// 错误示例：所有 key 在同一时间过期
+for (int i = 0; i < 100000; i++) {
+    redis.set("daily:data:" + i, value, 86400, TimeUnit.SECONDS);
+}
+// 所有 key 在 24 小时后的同一秒过期 ← 危险！
+```
+
+大量 key 同时过期的后果：
+
+1. **内存突增**：过期的 key 还没被清理，占用内存
+2. **CPU 尖刺**：定期删除会尝试清理这些 key，消耗 CPU
+3. **数据库压力**：这些 key 穿透到数据库的瞬间，造成数据库压力
+
+### 8.2 正确做法：随机过期时间
+
+```java
+// 正确示例：过期时间加上随机值
+int baseExpireSeconds = 86400;  // 24小时
+int randomExpireSeconds = baseExpireSeconds + ThreadLocalRandom.current().nextInt(3600);
+
+for (int i = 0; i < 100000; i++) {
+    redis.set("daily:data:" + i, value, randomExpireSeconds, TimeUnit.SECONDS);
+}
+// key 在 24~25 小时之间的不同时间过期 ← 安全！
+```
+
+### 8.3 使用 Redis 过期事件
+
+Redis 2.8+ 支持 keyspace notifications，可以监听 key 的过期事件：
+
+```bash
+# 开启过期事件通知
+notify-keyspace-events Ex
+
+# 订阅过期事件
+SUBSCRIBE __keyevent@0__:expired
+```
+
+```java title="Spring Boot 监听 Redis 过期事件"
+@Bean
+public RedisMessageListenerContainer redisMessageListenerContainer(
+        RedisConnectionFactory connectionFactory) {
+    RedisMessageListenerContainer container = new RedisMessageListenerContainer();
+    container.setConnectionFactory(connectionFactory);
+    
+    // 监听过期事件
+    container.addMessageListener((message, pattern) -> {
+        String expiredKey = new String(message.getBody());
+        System.out.println("Key 过期：" + expiredKey);
+        
+        // 可以在此处做一些补偿操作，如重新缓存
+    }, new PatternTopic("__keyevent@*__:expired"));
+    
+    return container;
+}
+```
+
+### 8.4 大量过期 key 的处理策略
+
+如果已经产生了大量过期 key，可以分批清理：
+
+```bash
+# 使用 SCAN 遍历，然后删除
+redis-cli --scan --pattern "old:keys:*" | xargs -n 100 redis-cli DEL
+```
+
+或者在业务低峰期手动触发定期删除：
+
+```bash
+# 增大 hz 值，让定期删除更频繁（临时调整）
+CONFIG SET hz 100
+
+# 观察内存下降后，恢复默认值
+CONFIG SET hz 10
+```
+
+---
+
+## 九、TTL 命令与 EXPIRE 命令的细节
+
+### 9.1 EXPIRE 命令的行为
+
+```bash
+# 设置 TTL 为 100 秒
+EXPIRE key 100
+
+# 返回 1 表示设置成功
+# 返回 0 表示 key 不存在
+```
+
+EXPIRE 命令的行为：
+
+1. 如果 key 不存在，返回 0（设置失败）
+2. 如果 key 存在，设置过期时间
+3. EXPIRE 命令会**清除 key 的已有 TTL**（如果有）
+
+```bash
+# 先设置 TTL
+SET key value EX 1000
+TTL key  # 返回 1000
+
+# 再次设置 TTL，会覆盖
+EXPIRE key 200
+TTL key  # 返回 200
+```
+
+### 9.2 PERSIST 命令
+
+PERSIST 命令可以**移除 key 的过期时间**，使 key 永不过期：
+
+```bash
+# 移除过期时间
+PERSIST key
+
+# 查看 TTL
+TTL key  # 返回 -1（永不过期）
+```
+
+### 9.3 EXPIREAT 命令
+
+EXPIREAT 设置的是**绝对时间戳**（Unix timestamp）：
+
+```bash
+# 在 2026-01-01 00:00:00 UTC 过期
+EXPIREAT key 1735689600
+
+# 查看过期时间
+TTL key  # 返回距离过期时间的秒数
+```
+
+### 9.4 TTL 与 PTTL 的区别
+
+```bash
+# TTL 返回秒（整数）
+TTL key  # 返回 99
+
+# PTTL 返回毫秒
+PTTL key  # 返回 99234
+```
+
+---
+
+## 十、总结
+
+Redis 的过期策略是惰性删除和定期删除的组合，两者互补，缺一不可。
+
+| 策略 | 触发时机 | 优点 | 缺点 |
+|---|---|---|---|
+| 惰性删除 | 访问 key 时 | CPU 友好、精确 | 内存不友好 |
+| 定期删除 | 每 100ms | 主动释放内存 | 可能延迟尖刺 |
+| 淘汰策略 | 内存满时 | 兜底保护 | 可能淘汰非过期数据 |
+
+**理解过期策略的关键点**：
+
+1. **惰性删除保证精度**：每次访问都会检查，不会有漏网之鱼
+2. **定期删除保证内存**：定期扫描，防止过期 key 占用内存
+3. **从节点不主动删除**：主从复制场景下，从节点依赖主节点的同步删除
+4. **避免同时过期**：使用随机过期时间，防止大量 key 同时过期造成压力
+
+**生产环境建议**：
+
+1. 不要在代码中集中设置相同的过期时间
+2. 监控 Redis 内存和过期 key 数量
+3. 如果有过期 key 清理需求，使用 keyspace notifications
+4. 定期检查 Redis 慢查询，看是否有过期 key 清理相关的延迟
+
+---
+
+## 面试追问预判
+
+**面试官可能追问的方向：**
+
+1. **惰性删除的实现**：为什么从节点不执行惰性删除？这和主从复制的一致性有什么关系？
+
+2. **定期删除的 CPU 限制**：为什么每次定期删除只执行 25ms？次数多了会有什么后果？
+
+3. **过期 key 的删除延迟**：如果 Redis 有 1000 万个 key 同时过期，会发生什么？如何避免？
+
+4. **TTL 和 EXPIRE 的原子性**：`EXPIRE` 命令和 `SET` 命令是原子的吗？Redis 如何保证？
+
+5. **内存满时的过期 key**：`maxmemory` 达到上限时，过期 key 和非过期 key 的淘汰顺序是什么？
+
+这些问题深入到了 Redis 过期机制的实现细节。如果你能回答清楚，说明你对 Redis 的内存管理有深入的理解。
+
+---
+
+> [!TIP]
+> **延伸思考**：如果你发现 Redis 内存中存在大量过期的 key，但定期删除没有及时清理，可能是什么原因？应该如何排查和解决？

@@ -1,0 +1,1103 @@
+# Redis 9 种数据类型与性能深度对比
+
+import { Badge } from '@rspress/core/theme';
+
+> [!WARNING]
+> 前置知识：本篇文章涉及 Redis 数据结构、算法复杂度、位运算等知识，建议先掌握基本的数据结构和算法知识。
+
+---
+
+双十一零点，运营团队突然发现系统报警：Redis 内存使用率超过 90%。一查原因，发现是一个开发同学把用户签到数据存成了 `STRING` 类型——一年 365 天每天一条 key，100 万用户就是 3.65 亿条 `STRING`。
+
+如果换成 `BITMAP`，3.65 亿条数据只需要约 46MB 内存，差距高达 **100 倍**。
+
+这就是数据类型选择的重要性。同样是存储数据，选择正确的数据结构可以让内存使用降低 90%，性能提升 10 倍。
+
+这一讲，我们深入解析 Redis 的 9 种数据类型，从底层实现到应用场景，让你真正理解「什么时候用什么」。
+
+---
+
+## 一、Redis 数据类型总览
+
+Redis 提供了 9 种数据类型，分为两大类：
+
+| 分类 | 类型 | 说明 |
+|---|---|---|
+| **五种基本类型** | `STRING` | 字符串，最基础的数据类型 |
+| | `HASH` | 哈希表，适合存储对象 |
+| | `LIST` | 列表，链表结构 |
+| | `SET` | 集合，无序不重复 |
+| | `ZSET` | 有序集合，带分数排序 |
+| **四种特殊类型** | `BITMAP` | 位图，适合标志位存储 |
+| | `HYPERLOGLOG` | 基数统计，内存高效计数 |
+| | `GEOSPATIAL` | 地理位置，附近的人功能 |
+| | `STREAM` | 流，消息队列场景 |
+
+---
+
+## 二、STRING 类型的底层实现
+
+### 2.1 SDS 的诞生
+
+在 C 语言中，字符串是用 `char[]` 实现的，使用空字符 `\0` 表示结束。Redis 没有直接使用 C 字符串，而是设计了自己的数据结构——**SDS（Simple Dynamic String，简单动态字符串）**。
+
+```c
+// SDS 结构定义（Redis 6.2）
+struct __attribute__ ((__packed__)) sdshdr8 {
+    uint8_t len;         // 已使用的字节数
+    uint8_t alloc;       // 分配的字节数（不含头部和终止符）
+    unsigned char flags;  // 标志位
+    char buf[];           // 柔性数组，存储实际数据
+};
+```
+
+SDS 相比 C 字符串的优势：
+
+| 特性 | C 字符串 | SDS |
+|---|---|---|
+| 长度获取 | O(n)，需要遍历 | O(1)，`len` 字段直接存储 |
+| 缓冲区溢出 | 容易发生 | 自动扩容，不会溢出 |
+| 内存重分配 | 每次修改都可能重分配 | 空间预分配、惰性释放 |
+| 二进制安全 | 不支持 | 支持，`\0` 只作为分隔符 |
+
+### 2.2 SDS 的空间预分配
+
+当 SDS 增长时，Redis 不是按需分配内存，而是预分配更多空间：
+
+```c
+// 预分配策略
+if (newlen <= 1024 * 1024) {
+    // 小于1MB，预分配 2 倍空间
+    newlen *= 2;
+} else {
+    // 大于1MB，预分配 1MB
+    newlen += 1024 * 1024;
+}
+```
+
+这样做的好处是：**N 次字符串增长操作只需要 O(N) 次内存重分配，而不是 O(N²)**。
+
+### 2.3 SDS 的惰性释放
+
+当 SDS 缩短时，Redis 不立即释放多余的空间，而是保留在 `alloc` 中：
+
+```bash
+# 例如：SET key "hello" -> SET key "hi"
+# 内存不会立即释放
+```
+
+惰性释放的好处是：下次增长时，如果预分配的空间够用，就不需要再重分配内存。如果确实需要释放，可以通过 `SDSTrim` 或 `SDSRemoveFreeSpace` 手动触发。
+
+### 2.4 STRING 类型的应用场景
+
+```java title="STRING 常见应用场景"
+// 1. 缓存序列化对象（最常见）
+redisTemplate.opsForValue().set("user:100", userObject);
+// 设置过期时间
+redisTemplate.opsForValue().set("user:100", userObject, 1, TimeUnit.HOURS);
+
+// 2. 分布式锁
+redisTemplate.opsForValue().setIfAbsent("lock:order:123", 
+    threadId, 30, TimeUnit.SECONDS);
+
+// 3. 计数器
+redisTemplate.opsForValue().increment("article:views:20231028");
+// 原子减
+redisTemplate.opsForValue().decrement("stock:product:100");
+
+// 4. 分布式 session
+redisTemplate.opsForValue().set("session:abc123", sessionJson, 30, TimeUnit.MINUTES);
+
+// 5. 简单缓存（HTML片段、JSON）
+redisTemplate.opsForValue().set("html:footer", footerHtml, 1, TimeUnit.DAYS);
+```
+
+---
+
+## 三、HASH 类型的底层实现
+
+### 3.1 两种编码方式
+
+Redis HASH 的底层实现有两种编码方式：
+
+| 编码 | 底层结构 | 适用场景 |
+|---|---|---|
+| `ziplist`（压缩列表） | 紧凑连续内存 | 字段少、值小 |
+| `hashtable`（哈希表） | 数组 + 链表 | 字段多、值大 |
+
+`ziplist` 是一种为节省内存设计的紧凑结构，将所有字段和值连续存储在内存中：
+
+```text
+[zlbytes|zltail|zllen|entry1|entry2|...|zlend]
+```
+
+当满足以下任一条件时，HASH 会从 `ziplist` 转换为 `hashtable`：
+
+| 条件 | 默认值（可配置） |
+|---|---|
+| 字段数量超过阈值 | `hash-max-ziplist-entries = 512` |
+| 任意字段值长度超过阈值 | `hash-max-ziplist-value = 64` 字节 |
+
+### 3.2 HASH vs STRING 存储对象
+
+存储用户对象时，有两种方式：
+
+```java title="HASH vs STRING 存储对象"
+// STRING 方式：每个字段一个 key
+redisTemplate.opsForValue().set("user:100:name", "张三");
+redisTemplate.opsForValue().set("user:100:age", "28");
+redisTemplate.opsForValue().set("user:100:city", "北京");
+
+// HASH 方式：一个 key 包含所有字段
+redisTemplate.opsForHash().putAll("user:100", Map.of(
+    "name", "张三",
+    "age", "28",
+    "city", "北京"
+));
+```
+
+| 特性 | STRING | HASH |
+|---|---|---|
+| 内存占用 | 字段越多，key 越多，开销大 | 紧凑，内存效率高 |
+| 操作原子性 | 每个 key 独立，可部分更新 | 整个 HASH 操作原子 |
+| 批量读取 | 需要多次网络往返 | `HGETALL` 一次获取 |
+| 过期设置 | 每个 key 独立设置 | 只能设置整个 key |
+
+**选择建议**：
+
+- 对象字段固定、经常需要整体读取 → **HASH**
+- 字段经常单独访问、对象结构不固定 → **STRING**
+
+### 3.3 HASH 的应用场景
+
+```java title="HASH 常见应用场景"
+// 1. 存储对象
+redisTemplate.opsForHash().putAll("product:SKU123", Map.of(
+    "name", "iPhone 15",
+    "price", "5999",
+    "stock", "100",
+    "brand", "Apple"
+));
+// 单独更新某个字段
+redisTemplate.opsForHash().increment("product:SKU123", "sales", 1);
+
+// 2. 存储购物车
+redisTemplate.opsForHash().put("cart:user:100", "SKU001", "2");  // 2件
+redisTemplate.opsForHash().put("cart:user:100", "SKU002", "1");  // 1件
+// 获取购物车所有商品
+Map<Object, Object> cart = redisTemplate.opsForHash().entries("cart:user:100");
+
+// 3. 计数器聚合
+redisTemplate.opsForHash().increment("stats:article:20231028", "views", 1);
+redisTemplate.opsForHash().increment("stats:article:20231028", "likes", 1);
+
+// 4. 实时排行（结合 ZSET 更强大）
+redisTemplate.opsForHash().put("leaderboard:game:001", "playerA", "5000");
+redisTemplate.opsForHash().put("leaderboard:game:001", "playerB", "4800");
+```
+
+---
+
+## 四、LIST 类型的底层实现
+
+### 4.1 三种编码方式
+
+Redis 3.2 之前，LIST 有 `ziplist` 和 `linkedlist` 两种编码；之后统一为 **quicklist**。
+
+```text
+quicklist = ziplist + linkedlist 的结合体
+
+┌─────────────────────────────────────────────────┐
+│ quicklist                                       │
+├─────────────┬─────────────┬─────────────┬────────┤
+│   ziplist   │   ziplist   │   ziplist   │  ...   │
+│  (node 0)   │  (node 1)   │  (node 2)   │        │
+└─────────────┴─────────────┴─────────────┴────────┘
+```
+
+`quicklist` 的每个节点是一个 `ziplist`，通过配置 `list-max-ziplist-size` 控制每个 `ziplist` 的节点数：
+
+- 正数：节点数上限
+- 负数：节点字节数上限（-5 到 -1）
+
+| 值 | 含义 |
+|---|---|
+| -5 | 每个 ziplist 最大 64KB |
+| -4 | 每个 ziplist 最大 32KB |
+| -3 | 每个 ziplist 最大 16KB |
+| -2 | 每个 ziplist 最大 8KB（默认） |
+| -1 | 每个 ziplist 最大 4KB |
+
+### 4.2 LIST 的操作特性
+
+```java title="LIST 基本操作"
+// LPUSH/RPUSH：从左/右插入
+redisTemplate.opsForList().leftPush("queue:tasks", task1);
+redisTemplate.opsForList().rightPush("queue:tasks", task2);
+
+// LPOP/RPOP：从左/右弹出
+String task = redisTemplate.opsForList().leftPop("queue:tasks");
+
+// LRANGE：范围获取
+List<Object> tasks = redisTemplate.opsForList().range("queue:tasks", 0, 9);
+
+// LLEN：获取长度
+Long size = redisTemplate.opsForList().size("queue:tasks");
+
+// LTRIM：裁剪列表
+redisTemplate.opsForList().trim("queue:tasks", 0, 99);  // 只保留前100个
+```
+
+**时间复杂度**：
+
+| 操作 | 时间复杂度 | 说明 |
+|---|---|---|
+| LPUSH/RPUSH | O(1) | 头尾插入极快 |
+| LPOP/RPOP | O(1) | 头尾弹出极快 |
+| LINDEX | O(n) | 按索引获取，效率低 |
+| LRANGE | O(n) | 范围越大越慢 |
+| LINSERT | O(n) | 指定位置插入 |
+
+### 4.3 LIST vs ZSET
+
+LIST 和 ZSET 都可以实现队列，区别在于：
+
+| 特性 | LIST | ZSET |
+|---|---|---|
+| 排序 | 插入顺序 | 按分数排序 |
+| 去重 | 不去重 | 自动去重 |
+| 查中间元素 | O(n) | O(log n) |
+| 分数范围查询 | 不支持 | 支持 |
+
+**选择建议**：
+
+- 简单队列、消息队列 → **LIST**
+- 排行榜、需要范围查询 → **ZSET**
+
+### 4.4 LIST 的应用场景
+
+```java title="LIST 常见应用场景"
+// 1. 消息队列（简单场景）
+redisTemplate.opsForList().rightPush("mq:orders", orderJson);
+String order = redisTemplate.opsForList().leftPop("mq:orders");
+
+// 2. 最新评论列表（微博、朋友圈）
+redisTemplate.opsForList().leftPush("comments:post:100", commentJson);
+redisTemplate.opsForList().trim("comments:post:100", 0, 99);  // 只保留100条
+
+// 3. 分页获取（feed 流）
+int pageSize = 10;
+int offset = page * pageSize;
+List<Object> items = redisTemplate.opsForList()
+    .range("feed:user:100", offset, offset + pageSize - 1);
+
+// 4. 栈结构（最新浏览记录）
+redisTemplate.opsForList().leftPush("history:user:100", pageId);
+redisTemplate.opsForList().trim("history:user:100", 0, 49);  // 保留最近50条
+```
+
+---
+
+## 五、SET 类型的底层实现
+
+### 5.1 两种编码方式
+
+| 编码 | 底层结构 | 适用场景 |
+|---|---|---|
+| `intset`（整数集合） | 紧凑数组，存储整数 | 元素全为整数、且数量少 |
+| `hashtable`（哈希表） | 数组 + 链表 | 元素非整数、数量大 |
+
+当满足以下条件时，SET 使用 `intset`：
+
+- 所有元素都是整数
+- 元素数量不超过 `set-max-intset-entries`（默认 512）
+
+```bash
+# intset 存储示例
+[encoding|length|entry1|entry2|...]
+```
+
+`intset` 的优势是内存极度紧凑——每个整数只占 2/4/8 字节（根据数值大小选择编码），比 `hashtable` 节省大量内存。
+
+### 5.2 SET 的集合运算
+
+SET 最强大的特性是支持集合运算：
+
+```java title="SET 集合运算"
+// SADD：添加元素（自动去重）
+redisTemplate.opsForSet().add("tags:article:100", "Java", "Redis", "高并发");
+
+// SINTER：交集（共同好友）
+Set<Object> mutualFriends = redisTemplate.opsForSet()
+    .intersect("friends:user:A", "friends:user:B");
+
+// SUNION：并集（合并标签）
+Set<Object> allTags = redisTemplate.opsForSet()
+    .union("tags:article:100", "tags:article:101");
+
+// SDIFF：差集（A有B没有）
+Set<Object> onlyInA = redisTemplate.opsForSet()
+    .difference("friends:user:A", "friends:user:B");
+
+// 交集结果存储到新 key
+redisTemplate.opsForSet().intersectAndStore(
+    "friends:user:A", "friends:user:B", "mutual:user:A:B");
+```
+
+### 5.3 SET 的应用场景
+
+```java title="SET 常见应用场景"
+// 1. 标签系统
+redisTemplate.opsForSet().add("tags:article:100", "Java", "Redis", "缓存");
+redisTemplate.opsForSet().add("tags:article:101", "Redis", "高并发");
+
+// 查询同时有 Java 和 Redis 标签的文章
+Set<Object> javaAndRedis = redisTemplate.opsForSet()
+    .intersect("tags:article:100", "tags:article:101");
+
+// 2. 黑名单/白名单
+redisTemplate.opsForSet().add("blacklist:ip", "192.168.1.100", "192.168.1.101");
+boolean isBlocked = redisTemplate.opsForSet().isMember("blacklist:ip", "192.168.1.100");
+
+// 3. UV 统计（需要精确去重）
+redisTemplate.opsForSet().add("uv:daily:20231028", userId1, userId2, userId3);
+Long uv = redisTemplate.opsForSet().size("uv:daily:20231028");
+
+// 4. 抽奖（随机获取）
+// 随机抽取3个中奖者
+List<Object> winners = redisTemplate.opsForSet()
+    .randomMembers("participants:lottery:001", 3);
+
+// SPOP：随机移除并返回（抽取后移除）
+Object winner = redisTemplate.opsForSet().pop("participants:lottery:001");
+```
+
+---
+
+## 六、ZSET 类型的底层实现
+
+### 6.1 有序集合的秘密
+
+ZSET（Sorted Set）是 Redis 最复杂的数据类型，底层由 **ziplist** 或 **skiplist + hashtable** 实现。
+
+```text
+┌──────────────────────────────────────────────┐
+│           ZSET (skiplist + hashtable)        │
+├──────────────────────────────────────────────┤
+│  skiplist: 有序链表，O(log n) 范围查询      │
+│  hashtable: O(1) 成员查找                    │
+│                                              │
+│  每个元素同时存在于两个结构中                 │
+└──────────────────────────────────────────────┘
+```
+
+为什么同时使用两种结构？
+
+- **skiplist**：支持按分数排序、范围查询
+- **hashtable**：支持 O(1) 复杂度的 `ZSCORE` 操作
+
+ZSET 从 `ziplist` 转换为 `skiplist` 的条件：
+
+| 条件 | 默认值 |
+|---|---|
+| 元素数量超过 | `zset-max-ziplist-entries = 128` |
+| 任意元素 member 长度超过 | `zset-max-ziplist-value = 64` 字节 |
+
+### 6.2 ZSET 的核心操作
+
+```java title="ZSET 基本操作"
+// ZADD：添加元素（带分数）
+redisTemplate.opsForZSet().add("leaderboard:game:001", "playerA", 5000);
+redisTemplate.opsForZSet().add("leaderboard:game:001", "playerB", 4800);
+
+// ZINCRBY：增加分数
+redisTemplate.opsForZSet().incrementScore("leaderboard:game:001", "playerA", 100);
+
+// ZRANGE：按分数升序获取
+Set<ZSetOperations.TypedTuple<Object>> top10 = 
+    redisTemplate.opsForZSet().reverseRangeWithScores(
+        "leaderboard:game:001", 0, 9);
+
+// ZRANK：获取排名（0 = 第一名）
+Long rank = redisTemplate.opsForZSet().rank("leaderboard:game:001", "playerA");
+
+// ZSCORE：获取分数
+Double score = redisTemplate.opsForZSet().score("leaderboard:game:001", "playerA");
+
+// ZRANGEBYSCORE：按分数范围查询
+Set<Object> between1000And5000 = redisTemplate.opsForZSet()
+    .rangeByScore("leaderboard:game:001", 1000, 5000);
+
+// ZCARD：获取元素数量
+Long size = redisTemplate.opsForZSet().size("leaderboard:game:001");
+```
+
+### 6.3 ZSET 的应用场景
+
+```java title="ZSET 高级应用场景"
+
+// 1. 排行榜系统
+public class LeaderboardService {
+    
+    public void recordScore(String gameId, String playerId, int score) {
+        String key = "leaderboard:game:" + gameId;
+        redisTemplate.opsForZSet().add(key, playerId, score);
+    }
+    
+    public List<Player> getTopN(String gameId, int n) {
+        String key = "leaderboard:game:" + gameId;
+        Set<ZSetOperations.TypedTuple<Object>> topN = 
+            redisTemplate.opsForZSet().reverseRangeWithScores(key, 0, n - 1);
+        
+        return topN.stream()
+            .map(tuple -> new Player(
+                (String) tuple.getValue(),
+                tuple.getScore().intValue()))
+            .collect(Collectors.toList());
+    }
+    
+    public Long getRank(String gameId, String playerId) {
+        String key = "leaderboard:game:" + gameId;
+        Long rank = redisTemplate.opsForZSet().reverseRank(key, playerId);
+        return rank != null ? rank + 1 : null;
+    }
+}
+
+// 2. 延时队列
+public class DelayQueueService {
+    
+    // 添加延时任务（分数为执行时间戳）
+    public void addTask(String taskId, long delaySeconds) {
+        long executeTime = System.currentTimeMillis() / 1000 + delaySeconds;
+        redisTemplate.opsForZSet().add("delay:queue", taskId, executeTime);
+    }
+    
+    // 获取到期任务
+    public List<String> getDueTasks() {
+        long now = System.currentTimeMillis() / 1000;
+        return new ArrayList<>(
+            redisTemplate.opsForZSet().rangeByScore("delay:queue", 0, now));
+    }
+    
+    // 移除已完成任务
+    public void removeTask(String taskId) {
+        redisTemplate.opsForZSet().remove("delay:queue", taskId);
+    }
+}
+
+// 3. 时间窗口去重
+public class TimeWindowDeduplicationService {
+    
+    // 一分钟内相同行为去重
+    public boolean isDuplicated(String userId, String action) {
+        String key = "action:" + action + ":" + (System.currentTimeMillis() / 60000);
+        Long added = redisTemplate.opsForZSet().add(key, userId, System.currentTimeMillis());
+        
+        if (added == 0) {
+            return true;  // 已存在
+        }
+        
+        // 设置1分钟过期
+        redisTemplate.expire(key, 2, TimeUnit.MINUTES);
+        return false;
+    }
+}
+```
+
+---
+
+## 七、BITMAP 的应用
+
+### 7.1 位图的核心概念
+
+BITMAP 并不是独立的数据类型，而是基于 STRING 实现的位操作。Redis 提供了丰富的位操作命令。
+
+```bash
+# SETBIT：设置某一位的值
+SETBIT user:sign:100:202310 0 1  # 2023年10月，用户100第0天签到
+
+# GETBIT：获取某一位的值
+GETBIT user:sign:100:202310 0   # 获取第0天是否签到
+
+# BITCOUNT：统计1的个数
+BITCOUNT user:sign:100:202310   # 统计本月签到天数
+```
+
+BITMAP 的内存计算公式：`offset / 8 / 1024 / 1024` MB
+
+```java title="BITMAP 内存计算"
+public class BitmapMemoryDemo {
+    
+    public static void main(String[] args) {
+        // 1亿用户，1年的签到数据
+        long users = 100_000_000;
+        long days = 365;
+        
+        // BITMAP 内存
+        long bitmapBytes = users * days / 8;  // 4.6GB
+        
+        // STRING 方式内存（假设每个key 50字节）
+        long stringBytes = users * days * 50L;  // 182.5GB
+        
+        System.out.println("BITMAP: " + bitmapBytes / 1024 / 1024 + " MB");
+        System.out.println("STRING: " + stringBytes / 1024 / 1024 + " MB");
+        System.out.println("节省内存: " + (stringBytes - bitmapBytes) / stringBytes * 100 + "%");
+        // 输出：
+        // BITMAP: 4577 MB
+        // STRING: 178222 MB
+        // 节省内存: 97%
+    }
+}
+```
+
+### 7.2 BITCOUNT 的性能问题
+
+`BITCOUNT` 默认是 O(n) 操作，对整个 bitmap 计数。如果 bitmap 很大，性能会很差。
+
+Redis 4.0 引入了 `BITFIELD` 命令，支持指定范围计数：
+
+```bash
+# 使用 BITFIELD 优化范围计数
+BITFIELD user:sign:100:202310 GET u10 0  # 获取前10天的签到情况
+```
+
+### 7.3 BITMAP 的应用场景
+
+```java title="BITMAP 应用场景"
+@Service
+public class SignInService {
+    
+    private static final String SIGN_KEY_PREFIX = "sign:user:";
+    
+    // 用户签到
+    public void signIn(Long userId, int dayOfMonth) {
+        String key = SIGN_KEY_PREFIX + userId + ":" + getCurrentMonth();
+        redisTemplate.opsForValue().setBit(key, dayOfMonth - 1, true);
+    }
+    
+    // 统计月签到天数
+    public long getSignInDays(Long userId) {
+        String key = SIGN_KEY_PREFIX + userId + ":" + getCurrentMonth();
+        return redisTemplate.opsForValue().getBitCount(key);
+    }
+    
+    // 检查是否签到
+    public boolean hasSignedIn(Long userId, int dayOfMonth) {
+        String key = SIGN_KEY_PREFIX + userId + ":" + getCurrentMonth();
+        return Boolean.TRUE.equals(
+            redisTemplate.opsForValue().getBit(key, dayOfMonth - 1));
+    }
+}
+
+@Service
+public class ActiveUserService {
+    
+    // 记录活跃用户（每天一个 BITMAP）
+    public void markActive(String date, Long userId) {
+        String key = "active:users:" + date;
+        // 假设 userId 最大 1 亿
+        redisTemplate.opsForValue().setBit(key, userId, true);
+    }
+    
+    // 统计 DAU
+    public long getDAU(String date) {
+        String key = "active:users:" + date;
+        return redisTemplate.opsForValue().getBitCount(key);
+    }
+    
+    // 统计 DAU 增量（新增用户数）
+    public long getNewUsers(String today, String yesterday) {
+        // BITOP AND 计算交集
+        redisTemplate.getConnectionFactory().getConnection()
+            .bitOp(
+                RedisStringCommands.BitOperation.AND,
+                "temp:intersection".getBytes(),
+                ("active:users:" + today).getBytes(),
+                ("active:users:" + yesterday).getBytes());
+        
+        long intersectionSize = redisTemplate.opsForValue()
+            .getBitCount("temp:intersection");
+        long todaySize = getDAU(today);
+        
+        return todaySize - intersectionSize;
+    }
+}
+```
+
+---
+
+## 八、HYPERLOGLOG 的应用
+
+### 8.1 基数统计的问题
+
+统计 UV（独立访客数）是常见需求：
+
+| 方案 | 精确度 | 内存占用 | 说明 |
+|---|---|---|---|
+| SET | 100% | 高 | 每个访问存一个成员 |
+| BITMAP | 100% | 高 | 按 user_id 分桶 |
+| HYPERLOGLOG | ~0.81% 误差 | 极低 | 概率算法 |
+
+HYPERLOGLOG 只需要 **12KB** 内存，就可以统计 2^64 个独立元素，误差率约 0.81%。
+
+### 8.2 HYPERLOGLOG 的使用
+
+```java title="HYPERLOGLOG 基本操作"
+// PFADD：添加元素
+redisTemplate.opsForHyperLogLog().add("uv:daily:20231028", userId1);
+redisTemplate.opsForHyperLogLog().add("uv:daily:20231028", userId2);
+// 一次添加多个
+redisTemplate.opsForHyperLogLog().add("uv:daily:20231028", userId1, userId2, userId3);
+
+// PFCOUNT：获取基数估计
+long uv = redisTemplate.opsForHyperLogLog().size("uv:daily:20231028");
+
+// PFMERGE：合并多个 HLL
+redisTemplate.opsForHyperLogLog().union("uv:weekly", 
+    "uv:daily:20231028",
+    "uv:daily:20231029",
+    "uv:daily:20231030",
+    "uv:daily:20231031",
+    "uv:daily:20231101",
+    "uv:daily:20231102",
+    "uv:daily:20231103");
+```
+
+### 8.3 为什么不直接用 SET
+
+HYPERLOGLOG 的内存效率是 SET 的万分之一：
+
+```java title="内存对比"
+public class HLLMemoryDemo {
+    
+    public static void main(String[] args) {
+        long elements = 10_000_000;  // 1000万
+        
+        // SET 内存（假设每个元素 50 字节）
+        long setBytes = elements * 50L;
+        
+        // HLL 内存（固定 12KB）
+        long hllBytes = 12 * 1024;
+        
+        System.out.println("SET: " + setBytes / 1024 / 1024 + " MB");
+        System.out.println("HLL: " + hllBytes / 1024 + " KB");
+        System.out.println("节省内存: " + (setBytes - hllBytes) * 100 / setBytes + "%");
+        
+        // 精度对比
+        Set<String> set = new HashSet<>();
+        for (int i = 0; i < elements; i++) {
+            set.add(UUID.randomUUID().toString());
+        }
+        // 精确值
+        long exact = set.size();
+        
+        // HLL 估计值（实际需要 Redis）
+        double estimate = elements * 0.99;  // 假设误差 1%
+        
+        System.out.println("精确值: " + exact);
+        System.out.println("估计值: " + (long) estimate);
+        System.out.println("误差率: " + Math.abs(exact - estimate) * 100 / exact + "%");
+    }
+}
+```
+
+### 8.4 HYPERLOGLOG 的应用场景
+
+```java title="HYPERLOGLOG 典型应用"
+@Service
+public class UVStatisticsService {
+    
+    // 记录页面 UV
+    public void recordPageView(String pageId, String userId) {
+        String key = "uv:page:" + pageId + ":" + getCurrentDate();
+        redisTemplate.opsForHyperLogLog().add(key, userId);
+    }
+    
+    // 获取页面 UV
+    public long getPageUV(String pageId, String date) {
+        String key = "uv:page:" + pageId + ":" + date;
+        return redisTemplate.opsForHyperLogLog().size(key);
+    }
+    
+    // 获取网站总 UV（合并所有页面）
+    public long getSiteUV(String date) {
+        String key = "uv:site:" + date;
+        // 先清空
+        redisTemplate.delete(key);
+        
+        // 获取所有页面 key
+        Set<String> pageKeys = redisTemplate.keys("uv:page:*:" + date);
+        
+        if (pageKeys != null && !pageKeys.isEmpty()) {
+            redisTemplate.opsForHyperLogLog().union(key, pageKeys.toArray(new String[0]));
+        }
+        
+        return redisTemplate.opsForHyperLogLog().size(key);
+    }
+    
+    // 实时 UV 监控
+    @Scheduled(fixedRate = 60000)  // 每分钟
+    public void monitorUV() {
+        String date = getCurrentDate();
+        String key = "uv:site:" + date;
+        long uv = redisTemplate.opsForHyperLogLog().size(key);
+        
+        // 发送到监控系统
+        metricsService.record("site.uv", uv);
+    }
+}
+```
+
+---
+
+## 九、GEOSPATIAL 的应用
+
+### 9.1 地理位置存储
+
+Redis 的 GEO 命令基于 **zset** 实现，存储经纬度信息：
+
+```java title="GEO 基本操作"
+// GEOADD：添加地理位置
+redisTemplate.opsForGeo().add("stores", 
+    new Point(116.404, 39.915), "store:001");  // 北京王府井
+redisTemplate.opsForGeo().add("stores", 
+    new Point(121.473, 31.230), "store:002");  // 上海外滩
+
+// GEOPOS：获取位置
+List<Point> positions = redisTemplate.opsForGeo().position("stores", "store:001");
+
+// GEODIST：计算距离
+Distance distance = redisTemplate.opsForGeo().distance(
+    "stores", "store:001", "store:002", Metrics.KILOMETERS);
+System.out.println("距离：" + distance.getValue() + " 公里");
+
+// GEORADIUS：查询附近的人（5公里内）
+GeoResults<RedisGeoCommands.GeoLocation<Object>> nearby = 
+    redisTemplate.opsForGeo().radius("stores",
+        new Circle(new Point(116.404, 39.915), 
+            new Distance(5, Metrics.KILOMETERS)),
+        RedisGeoCommands.GeoRadiusCommandArgs.newGeoRadiusArgs()
+            .includeDistance()
+            .sortAscending()
+            .limit(10));
+
+for (GeoResult<RedisGeoCommands.GeoLocation<Object>> result : nearby) {
+    System.out.println("门店：" + result.getContent().getName() + 
+        "，距离：" + result.getDistance().getValue() + "公里");
+}
+
+// GEORADIUSBYMEMBER：基于已有成员查询
+GeoResults<RedisGeoCommands.GeoLocation<Object>> nearbyStores = 
+    redisTemplate.opsForGeo().radius("stores",
+        "store:001",
+        new Distance(10, Metrics.KILOMETERS),
+        RedisGeoCommands.GeoRadiusCommandArgs.newGeoRadiusArgs()
+            .includeDistance());
+```
+
+### 9.2 GEO 的实现原理
+
+GEO 底层使用 zset 存储，每个元素是 `member`，分数是 **geohash 编码**：
+
+```bash
+GEOADD cities 116.404 39.915 "北京"
+# 实际上执行的是
+ZADD cities <geohash("北京")> "北京"
+```
+
+geohash 是一种将二维经纬度编码为一维分数的算法，相邻位置的 geohash 值也相邻，这样可以方便地利用 zset 的范围查询。
+
+### 9.3 GEO 的应用场景
+
+```java title="GEO 典型应用"
+@Service
+public class StoreLocatorService {
+    
+    // 添加门店
+    public void addStore(String storeId, double longitude, double latitude) {
+        redisTemplate.opsForGeo().add("stores", 
+            new Point(longitude, latitude), storeId);
+    }
+    
+    // 查询附近门店（带距离）
+    public List<StoreInfo> findNearbyStores(double longitude, double latitude, 
+            double radiusKm, int limit) {
+        
+        GeoResults<RedisGeoCommands.GeoLocation<Object>> results = 
+            redisTemplate.opsForGeo().radius(
+                "stores",
+                new Circle(new Point(longitude, latitude), 
+                    new Distance(radiusKm, Metrics.KILOMETERS)),
+                RedisGeoCommands.GeoRadiusCommandArgs.newGeoRadiusArgs()
+                    .includeDistance()
+                    .sortAscending()
+                    .limit(limit));
+        
+        if (results == null) {
+            return Collections.emptyList();
+        }
+        
+        return results.getContent().stream()
+            .map(r -> new StoreInfo(
+                (String) r.getContent().getName(),
+                r.getDistance().getValue()))
+            .collect(Collectors.toList());
+    }
+    
+    // 计算配送距离
+    public double calculateDeliveryDistance(String storeId, double userLon, double userLat) {
+        // 用户位置
+        String userKey = "temp:user:" + UUID.randomUUID();
+        redisTemplate.opsForGeo().add(userKey, 
+            new Point(userLon, userLat), "user");
+        
+        try {
+            Distance distance = redisTemplate.opsForGeo().distance(
+                userKey, "user", storeId, Metrics.KILOMETERS);
+            return distance != null ? distance.getValue() : -1;
+        } finally {
+            redisTemplate.delete(userKey);
+        }
+    }
+}
+```
+
+---
+
+## 十、STREAM 类型的应用
+
+### 10.1 为什么需要 STREAM
+
+在 Redis 5.0 之前，消息队列通常用 LIST 实现。但 LIST 没有消费组概念，无法支持多个消费者负载均衡消费。
+
+STREAM 是 Redis 实现的消息队列，支持：
+
+| 特性 | LIST | STREAM |
+|---|---|---|
+| 消费组 | 不支持 | 支持 |
+| 消息持久化 | AOF/RDB | AOF/RDB |
+| 消息确认 | 手动实现 | 内置 ACK |
+| 消息 ID | 顺序整数 | 自动生成的时间戳 ID |
+| 阻塞读 | LPOP/BRPOP | XREAD/XREADGROUP |
+
+### 10.2 STREAM 的基本操作
+
+```java title="STREAM 基本操作"
+@Service
+public class MessageQueueService {
+    
+    // 生产消息
+    public String produce(String stream, Map<String, String> message) {
+        return redisTemplate.opsForStream().add(
+            StreamRecords.newRecord()
+                .in(stream)
+                .ofMap(message));
+    }
+    
+    // 消费消息（XREADGROUP）
+    public List<MapRecord<String, Object, Object>> consume(String group, 
+            String consumer, String stream, int count) {
+        
+        // 创建消费组（如果不存在）
+        try {
+            redisTemplate.opsForStream().createGroup(stream, ReadOffset.from("0"), group);
+        } catch (Exception e) {
+            // 消费组已存在
+        }
+        
+        // 读取消息
+        List<MapRecord<String, Object, Object>> records = redisTemplate.opsForStream()
+            .read(StreamReadOptions.empty().count(count).block(Duration.ofSeconds(2)),
+                StreamOffset.create(stream, ReadOffset.lastConsumed()));
+        
+        return records != null ? records : Collections.emptyList();
+    }
+    
+    // 确认消息
+    public void ack(String stream, String group, String messageId) {
+        redisTemplate.opsForStream().acknowledge(stream, group, messageId);
+    }
+    
+    // 消费者心跳（保持消费组活跃）
+    public void consumerHeartbeat(String stream, String group, String consumerId) {
+        redisTemplate.opsForStream().setConsumerAutoAcknowledge(
+            stream, group, consumerId, true);
+    }
+}
+```
+
+### 10.3 消费组的工作原理
+
+```text
+STREAM: orders
+┌────────────────────────────────────────────────┐
+│ 1553045353522-0  → {user: "A", amount: "100"}  │
+│ 1553045353522-1  → {user: "B", amount: "200"}  │
+│ 1553045353522-2  → {user: "C", amount: "300"}  │
+└────────────────────────────────────────────────┘
+        ↑
+   StreamRecords (不可变)
+
+消费组 A (consumer1, consumer2):
+┌────────────────────────────────────────────────┐
+│ consumer1: 1553045353522-0 (pending)          │
+│ consumer2: 1553045353522-1 (pending)          │
+└────────────────────────────────────────────────┘
+        ↑
+   PEL (Pending Entries List)
+```
+
+### 10.4 STREAM vs 其他消息队列
+
+| 特性 | Redis STREAM | Kafka | RabbitMQ |
+|---|---|---|---|
+| 吞吐量 | 中等 | 极高 | 中等 |
+| 延迟 | 低 | 低 | 低 |
+| 持久化 | AOF/RDB | 文件 | 内存+磁盘 |
+| 消费组 | 支持 | 支持 | 支持 |
+| 消息回溯 | 部分 | 支持 | 不支持 |
+| 集群 | Redis Cluster | 原生支持 | 复杂 |
+
+**选择建议**：
+
+- 简单队列、临时消息 → **Redis STREAM**
+- 大数据量、需要回溯 → **Kafka**
+- 企业级、复杂路由 → **RabbitMQ**
+
+---
+
+## 十一、各数据类型性能对比与选择建议
+
+### 11.1 性能对比表
+
+| 类型 | 单次操作复杂度 | 内存效率 | 适用规模 |
+|---|---|---|---|
+| STRING | O(1) | 低 | 小数据 |
+| HASH | O(1) per field | 中 | 对象存储 |
+| LIST | O(1) head/tail | 中 | 队列 |
+| SET | O(1) | 中 | 去重集合 |
+| ZSET | O(log N) | 中 | 排序场景 |
+| BITMAP | O(1) | 极高 | 标志位 |
+| HYPERLOGLOG | O(1) | 极高 | 基数统计 |
+| GEO | O(log N) | 中 | 位置服务 |
+| STREAM | O(log N) | 中 | 消息队列 |
+
+### 11.2 选择决策树
+
+```text
+需要存储的数据是什么类型？
+│
+├─ 简单字符串/对象 → STRING
+│   └─ 需要二进制安全 → STRING (SDS)
+│   └─ 需要过期功能 → STRING
+│
+├─ 键值对集合 → HASH
+│   └─ 字段固定、经常整体读取 → HASH
+│
+├─ 有序集合 → ZSET
+│   └─ 需要排序/排名 → ZSET
+│   └─ 需要范围查询 → ZSET
+│
+├─ 无序集合 → SET
+│   └─ 需要去重 → SET
+│   └─ 需要交集/并集/差集 → SET
+│
+├─ 队列/栈 → LIST
+│   └─ 简单队列 → LIST
+│   └─ 需要消息队列特性 → STREAM
+│
+├─ 位操作 → BITMAP
+│   └─ 签到、状态位 → BITMAP
+│   └─ UV 统计（精确） → BITMAP
+│
+├─ 基数统计 → HYPERLOGLOG
+│   └─ UV 统计（可容忍误差） → HYPERLOGLOG
+│
+├─ 地理位置 → GEO
+│   └─ 附近的人 → GEO
+│
+└─ 消息队列 → STREAM
+    └─ 简单队列 → LIST
+    └─ 需要消费组 → STREAM
+```
+
+### 11.3 常见错误与最佳实践
+
+**错误一：用 STRING 存储大量布尔标志**
+
+```java
+// 错误：1亿用户，每天一个key，365个key
+for (int day = 1; day <= 365; day++) {
+    redisTemplate.opsForValue().set("signin:" + userId + ":" + day, "1");
+}
+
+// 正确：BITMAP
+redisTemplate.opsForValue().setBit("signin:" + userId + ":2023", day, true);
+```
+
+**错误二：用 SET 存储精确 UV**
+
+```java
+// 错误：1000万 UV 需要约 500MB 内存
+for (String userId : userIds) {
+    redisTemplate.opsForSet().add("uv:daily:" + date, userId);
+}
+
+// 正确：HYPERLOGLOG
+for (String userId : userIds) {
+    redisTemplate.opsForHyperLogLog().add("uv:daily:" + date, userId);
+}
+// 只用 12KB 内存
+```
+
+**错误三：频繁遍历大 LIST**
+
+```java
+// 错误：LINDEX 是 O(n)，大列表性能很差
+for (int i = 0; i < listSize; i++) {
+    Object item = redisTemplate.opsForList().index("biglist", i);
+}
+
+// 正确：使用 LRANGE 分页
+List<Object> page = redisTemplate.opsForList().range("biglist", offset, offset + pageSize);
+```
+
+---
+
+## 十二、总结
+
+Redis 的 9 种数据类型，每一种都是为特定场景设计的。
+
+| 类型 | 核心价值 | 一句话总结 |
+|---|---|---|
+| STRING | 基础存储 | 万金油，但要注意内存 |
+| HASH | 对象存储 | 结构化数据首选 |
+| LIST | 队列/栈 | 简单队列够用 |
+| SET | 去重集合 | 标签、黑名单 |
+| ZSET | 排序集合 | 排行榜、延时队列 |
+| BITMAP | 位操作 | 签到、状态位 |
+| HYPERLOGLOG | 基数统计 | UV 统计神器 |
+| GEO | 地理位置 | 附近的人 |
+| STREAM | 消息队列 | Redis 原生 MQ |
+
+**选择数据类型的本质是**：根据数据特征和访问模式，选择最合适的存储结构。
+
+---
+
+## 面试追问预判
+
+**面试官可能追问的方向：**
+
+1. **SDS 的空间预分配**：为什么要分 1MB 作为分界线？预分配策略的数学依据是什么？
+
+2. **ZSET 为什么用 skiplist 而不是红黑树**：skiplist 的插入、删除、查询复杂度是多少？和红黑树相比有什么优劣？
+
+3. **HYPERLOGLOG 的误差率**：为什么是 0.81%？这个数字是怎么计算出来的？
+
+4. **GEO 的 geohash 编码**：geohash 是如何将二维坐标编码为一维分数的？为什么相邻位置编码也相邻？
+
+5. **STREAM 的消费组实现**：PEL（Pending Entries List）的作用是什么？如何实现消息不丢失？
+
+6. **BITMAP 的边界情况**：如果 user_id 不连续怎么办？比如 user_id 是 UUID？
+
+这些追问深入到了数据结构的底层实现和数学原理。建议读者阅读 Redis 源码，进一步理解这些设计决策背后的考量。

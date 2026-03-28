@@ -1,0 +1,872 @@
+# CDN 缓存与静态资源加速
+
+一个 10 万用户的电商网站准备搞双十一大促。你告诉运营团队：「首页、商品详情页都加了 CDN 缓存，全国用户访问都能就近取到内容，放心吧！」结果零点一过，CDN 节点开始疯狂回源，带宽费用暴涨 20 倍，源站服务器直接被打挂——**问题出在哪？你的 CDN 配置，根本没考虑「缓存命中率」这个核心问题。**
+
+CDN 不是简单地把资源丢到边缘节点就完事了。从 DNS 解析、缓存策略、刷新机制到 HTTPS 配置，每一个环节都可能成为性能的瓶颈或者保障。这篇文章，我们来彻底搞懂 CDN。
+
+## CDN 的工作原理
+
+### 什么是 CDN
+
+CDN（Content Delivery Network，内容分发网络）的核心目标是：**让用户就近获取内容，减少骨干网络传输，提升访问速度**。
+
+没有 CDN 的访问路径：
+
+```
+用户（北京）→ 跨省骨干网 → 源站（上海）→ 响应内容
+         │
+         └───────────────── 100ms+
+```
+
+有 CDN 的访问路径：
+
+```
+用户（北京）→ CDN 边缘节点（北京）→ 命中缓存 → 响应内容
+                     │
+                     └─ 未命中 → 回源 → 上海源站 → 返回内容并缓存
+```
+
+### DNS 解析与就近访问
+
+CDN 的第一步是 DNS 解析，决定用户访问哪个边缘节点。这个过程比你想象的复杂：
+
+```yaml
+# DNS 解析流程
+1. 用户访问 www.example.com
+2. 浏览器查询 local DNS（通常是 ISP 提供）
+3. local DNS 向权威 DNS 请求域名解析
+4. 权威 DNS 返回 CDN 的调度地址（根据用户 IP 地理位置返回不同地址）
+5. local DNS 缓存结果并返回给浏览器
+6. 浏览器访问最近的 CDN 节点
+```
+
+**DNS 调度策略**：
+
+| 调度方式 | 说明 | 优点 | 缺点 |
+|---|---|---|---|
+| 地理位置 | 根据用户 IP 返回最近的节点 | 简单有效 | 无法感知节点负载 |
+| 轮询 | 轮流返回不同节点 IP | 负载均衡 | 无法就近访问 |
+| 最低延迟 | 主动探测，选择延迟最低的节点 | 实时最优 | 探测有开销 |
+| 最少连接 | 选择连接数最少的节点 | 动态平衡 | 实现复杂 |
+
+**Anycast 技术**：大型 CDN（如 Cloudflare、Akamai）在多个机房部署相同的 IP 地址，骨干网自动把用户路由到最近的机房。这种方式对用户完全透明。
+
+### CDN 缓存的工作流程
+
+```java
+// CDN 节点处理请求的简化逻辑
+public Response handleRequest(Request request) {
+    String uri = request.getUri();
+    String cacheKey = generateCacheKey(uri);
+    
+    // 1. 查找缓存
+    CacheEntry entry = cache.get(cacheKey);
+    
+    if (entry != null && !entry.isExpired()) {
+        // 2. 命中缓存，直接返回
+        return buildResponse(entry.getContent());
+    }
+    
+    // 3. 未命中，回源获取
+    Response originResponse = fetchFromOrigin(request);
+    
+    if (originResponse.isSuccess()) {
+        // 4. 缓存新内容
+        String cacheControl = originResponse.getHeader("Cache-Control");
+        int ttl = parseTtl(cacheControl, originResponse);
+        cache.put(cacheKey, originResponse.getBody(), ttl);
+        
+        // 5. 返回给用户
+        return buildResponse(originResponse.getBody());
+    }
+    
+    // 6. 源站错误
+    return buildErrorResponse(originResponse.getStatus());
+}
+```
+
+**CDN 节点内部结构**：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      CDN Edge Node                          │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐        │
+│  │   Router    │  │   Cache     │  │   Origin    │        │
+│  │  (流量入口)  │→ │  (热点资源) │  │  (回源代理)  │        │
+│  └─────────────┘  └──────┬──────┘  └──────┬──────┘        │
+│                           │                │                │
+│                           ▼                ▼                │
+│                    ┌─────────────┐  ┌─────────────┐        │
+│                    │   Storage   │  │   Network   │        │
+│                    │  (SSD/内存)  │  │  (HTTP/TCP) │        │
+│                    └─────────────┘  └─────────────┘        │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## CDN 的缓存层次
+
+CDN 不是只有一个节点，而是一套分层架构。从用户到源站，可能经过多层缓存。
+
+### 三级缓存架构
+
+```
+用户浏览器
+    │
+    ▼
+┌───────────────────┐
+│   边缘节点 (POP)   │ ← 距离用户最近的节点，缓存静态资源
+│  数量：1000+      │   覆盖全国/全球
+│  存储：SSD + 内存  │   命中率：80-95%
+└─────────┬─────────┘
+          │ 缓存未命中
+          ▼
+┌───────────────────┐
+│   区域节点 (RS)    │ ← 省级数据中心，汇总多个边缘节点的回源请求
+│  数量：数十个      │   减少回源带宽
+│  存储：SSD        │   命中率：60-80%
+└─────────┬─────────┘
+          │ 缓存未命中
+          ▼
+┌───────────────────┐
+│   中心节点 (OC)    │ ← 核心机房，连接多个区域节点
+│  数量：几个-十几个 │   缓存更多资源
+│  存储：大容量磁盘   │   命中率：40-60%
+└─────────┬─────────┘
+          │ 缓存未命中
+          ▼
+┌───────────────────┐
+│      源站          │ ← 真正的内容服务器
+│   (应用服务器)     │
+└───────────────────┘
+```
+
+**各层级的职责**：
+
+| 层级 | 名称 | 位置 | 命中率 | 响应时间 |
+|---|---|---|---|---|
+| L1 | 边缘节点 | 离用户最近 | 80-95% | < 10ms |
+| L2 | 区域节点 | 省级/城市 | 60-80% | 10-50ms |
+| L3 | 中心节点 | 核心机房 | 40-60% | 50-100ms |
+| L4 | 源站 | 源服务器 | 0% | > 100ms |
+
+### 多层缓存的协同
+
+多层缓存的设计是为了平衡「命中率」和「存储成本」。越靠近用户的节点，存储成本越高（SSD 内存），但命中率也越高。
+
+```yaml
+# 缓存层级配置示例
+edge:
+  storage: memory + SSD
+  max_size: 100GB
+  ttl: 7d
+  hit_ratio: 85%
+
+region:
+  storage: SSD
+  max_size: 1TB
+  ttl: 14d
+  hit_ratio: 70%
+
+origin:
+  storage: disk
+  max_size: 10TB
+  ttl: 30d
+  hit_ratio: 50%
+```
+
+:::tip 缓存层级优化
+边缘节点的命中率是关键指标。如果边缘节点命中率低，说明大量请求穿透到了区域节点甚至源站，需要检查缓存策略是否合理。
+:::
+
+## CDN 缓存策略
+
+CDN 的核心是缓存策略。配置得当，80% 的请求在边缘节点消化；配置不当，每次都要回源，CDN 形同虚设。
+
+### HTTP 缓存控制头
+
+CDN 的缓存行为由 HTTP 响应头决定：
+
+| 响应头 | 说明 | 示例 |
+|---|---|---|
+| `Cache-Control` | 缓存指令，最权威的控制方式 | `max-age=3600, public` |
+| `Expires` | 过期时间（绝对时间） | `Expires: Wed, 21 Oct 2026 07:28:00 GMT` |
+| `Last-Modified` | 资源最后修改时间 | `Last-Modified: Wed, 21 Oct 2026 07:28:00 GMT` |
+| `ETag` | 资源唯一标识 | `ETag: "33a64df551425fcc55e4d42a148795d9"` |
+| `Age` | 资源在 CDN 节点缓存的秒数 | `Age: 3600` |
+| `Vary` | 缓存的变维度 | `Vary: Accept-Encoding` |
+
+### Cache-Control 的关键指令
+
+```http
+# 最常见的配置：缓存 1 天
+Cache-Control: max-age=86400
+
+# 缓存但必须经过验证
+Cache-Control: no-cache
+# 用户每次访问都会向源站验证，304 Not Modified 则使用缓存
+
+# 完全不缓存
+Cache-Control: no-store
+# 敏感数据，如用户个人信息
+
+# 公共缓存（可被 CDN、代理服务器缓存）
+Cache-Control: public
+
+# 私有缓存（只允许浏览器缓存）
+Cache-Control: private
+# 用户个性化内容
+```
+
+**最佳实践**：
+
+```http
+# 静态资源（图片、CSS、JS）- 长缓存 + 版本化
+Cache-Control: public, max-age=31536000, immutable
+
+# HTML 页面 - 短缓存或 no-cache
+Cache-Control: no-cache, max-age=0, must-revalidate
+
+# API 响应 - 不缓存或短缓存
+Cache-Control: no-store
+# 或
+Cache-Control: private, max-age=0, must-revalidate
+```
+
+:::warning Cache-Control vs Expires
+两者都用于控制缓存过期，但 `Cache-Control` 优先级更高。如果同时存在，CDN 会忽略 `Expires`。推荐使用 `Cache-Control`，它支持相对时间（`max-age`），更灵活。
+:::
+
+### 条件请求与缓存验证
+
+当缓存过期时，CDN 可以用「条件请求」避免重新下载整个资源：
+
+```http
+# 首次请求，CDN 缓存响应
+HTTP/1.1 200 OK
+Last-Modified: Wed, 21 Oct 2026 07:28:00 GMT
+ETag: "33a64df551425fcc55e4d42a148795d9"
+
+# 下次请求（缓存过期后）
+GET /static/app.js HTTP/1.1
+If-Modified-Since: Wed, 21 Oct 2026 07:28:00 GMT
+If-None-Match: "33a64df551425fcc55e4d42a148795d9"
+
+# 源站检查后，发现资源未变化
+HTTP/1.1 304 Not Modified
+# CDN 返回 304，节省带宽
+```
+
+**Last-Modified vs ETag**：
+
+| 特性 | Last-Modified | ETag |
+|---|---|---|
+| 精度 | 秒级 | 精确到内容哈希 |
+| 性能 | 较快（只需比较时间） | 较慢（需要计算哈希） |
+| 分布式问题 | 可能不一致 | 理论上也可能不一致 |
+| 推荐场景 | 静态资源 | 频繁变化的内容 |
+
+### Vary 头与缓存变体
+
+当同一 URL 的响应内容不同时，需要使用 `Vary` 头告诉 CDN「这个响应取决于某些请求头」：
+
+```http
+# 根据 Accept-Encoding 缓存不同版本
+Vary: Accept-Encoding
+# 压缩过的内容和未压缩的内容，是不同的缓存条目
+
+# 根据 User-Agent 缓存不同版本（响应式设计）
+Vary: User-Agent
+
+# 组合多个维度
+Vary: Accept-Encoding, Accept-Language
+```
+
+:::warning Vary 头的性能影响
+`Vary` 头会导致缓存条目增加。如果配置不当，可能导致缓存命中率大幅下降。只在确实需要时才添加 `Vary`。
+:::
+
+## 回源机制与回源率优化
+
+回源是 CDN 向源站请求内容的行为。回源率越高，源站压力越大，访问延迟也越高。优化回源率是 CDN 配置的核心目标。
+
+### 回源的触发条件
+
+```java
+// CDN 节点决定是否回源的逻辑
+public boolean shouldFetchFromOrigin(Request request, CacheEntry existing) {
+    // 1. 缓存不存在
+    if (existing == null) {
+        return true;
+    }
+    
+    // 2. 缓存已过期
+    if (existing.isExpired()) {
+        // 3. 检查 Cache-Control
+        if (request.getHeader("Cache-Control").contains("no-cache")) {
+            return true;  // 强制回源
+        }
+        if (existing.getMaxAge() == 0) {
+            return true;  // max-age=0，立即过期
+        }
+        // 4. 允许返回过期内容，同时异步回源（stale-while-revalidate）
+        if (existing.supportsStale()) {
+            return false;  // 返回旧内容，后台回源
+        }
+        return true;
+    }
+    
+    return false;
+}
+```
+
+### 回源策略配置
+
+```yaml
+# CDN 回源策略配置示例
+origin:
+  # 1. 优先返回过期缓存，同时后台回源（推荐）
+  # 适合：变化不频繁的内容
+  stale_while_revalidate: 86400  # 过期后 1 天内仍可返回旧内容
+  
+  # 2. 过期后回源，但返回旧内容
+  # 适合：不能容忍服务中断的场景
+  stale_if_error: 3600  # 源站故障时，返回过期内容 1 小时
+  
+  # 3. 错误时回源
+  # 适合：源站可能故障，但需要保证服务
+  error_ttl: 300  # 源站错误时，缓存错误页面 5 分钟
+```
+
+### 回源率优化实战
+
+**场景 1：首页资源缓存失效**
+
+```http
+# 问题：首页 index.html 设置了 short-cache，用户每次访问都回源
+Cache-Control: no-cache
+# 每次 10000 个并发用户 = 10000 次回源！
+
+# 解决：给 index.html 设置合理缓存，同时使用版本化
+Cache-Control: max-age=60, must-revalidate
+# 配合 HTML 内嵌版本号：<script src="/app.js?v=1.0.1"></script>
+```
+
+**场景 2：图片 URL 带时间戳参数**
+
+```html
+<!-- 问题：每次请求 URL 不同，缓存完全失效 -->
+<img src="/logo.png?t=1699999999" />  <!-- 时间戳导致无法缓存 -->
+
+<!-- 解决：使用内容哈希作为版本标识 -->
+<img src="/logo.a3f5c9d8.png" />
+<!-- 文件名包含哈希，URL 不变时缓存命中 -->
+```
+
+**场景 3：防止浏览器缓存干扰**
+
+```http
+# 在 CDN 响应中添加，防止浏览器强制刷新回源
+Cache-Control: public, max-age=31536000, immutable
+# immutable 表示资源永不过期（配合版本化 URL 使用）
+# 用户强制刷新时，浏览器仍使用缓存，不会回源
+```
+
+:::tip 回源率的监控指标
+- **回源请求数**：CDN 向源站发起多少次请求
+- **回源带宽**：回源产生的流量
+- **回源成功率**：回源请求中，成功获取内容的比例
+- **回源延迟**：回源的平均响应时间
+
+建议设置告警：回源率 > 20% 时需要排查。
+:::
+
+## CDN 的内容预热与刷新
+
+CDN 的默认策略是「懒加载」——资源被第一次访问时才缓存。但在某些场景下，我们需要提前把内容推送到 CDN 节点。
+
+### 预热（Preload）
+
+**适用场景**：
+
+- 大促前把秒杀商品图片预热到 CDN
+- 发布新版本前把静态资源推送到边缘节点
+- 重大活动预计会有大量访问
+
+**预热方式**：
+
+```bash
+# 方式 1：通过 CDN 控制台手动预热
+# 输入 URL 列表，CDN 主动回源拉取内容
+
+# 方式 2：通过 API 预热
+curl -X POST "https://cdn.example.com/v2/purge" \
+  -H "Authorization: Bearer $API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "urls": [
+      "https://www.example.com/static/app.js",
+      "https://www.example.com/images/banner.jpg"
+    ]
+  }'
+
+# 方式 3：批量预热（全路径扫描）
+curl -X POST "https://cdn.example.com/v2/purge" \
+  -d '{
+    "dirs": [
+      "/static/v2.1.0/*",
+      "/images/products/*"
+    ]
+  }'
+```
+
+**预热的注意事项**：
+
+```yaml
+# 预热的限制
+preload:
+  # 1. 预热有带宽成本
+  # CDN 需要从源站拉取所有内容，源站带宽需要足够
+  
+  # 2. 预热有时间成本
+  # 1000 个 URL 可能需要 10-30 分钟才能全部推送到所有节点
+  
+  # 3. 预热不能替代缓存配置
+  # 预热后如果 TTL 太短，内容很快又会失效
+```
+
+### 刷新（Purge）
+
+**适用场景**：
+
+- 资源更新后，需要立即生效
+- 发现错误内容，需要紧急下架
+- 敏感内容泄露，需要立即清除
+
+**刷新类型**：
+
+| 类型 | 说明 | 效果 |
+|---|---|---|
+| URL 刷新 | 指定具体 URL | 只清除该 URL 的缓存 |
+| 目录刷新 | 指定目录前缀 | 清除该目录下所有 URL 的缓存 |
+| 全部刷新 | 清除所有缓存 | 谨慎使用，会导致回源激增 |
+
+```bash
+# URL 刷新（清除单个 URL 的缓存）
+curl -X DELETE "https://cdn.example.com/v2/purge" \
+  -d '{
+    "urls": ["https://www.example.com/static/app.js"]
+  }'
+
+# 目录刷新（清除整个目录的缓存）
+curl -X DELETE "https://cdn.example.com/v2/purge" \
+  -d '{
+    "dirs": ["/static/v2.1.0/*"]
+  }'
+```
+
+:::warning 刷新的风险
+全量刷新会导致大量请求直接打到源站，可能引发源站故障。建议使用灰度刷新或 URL 刷新，优先刷新关键资源。
+:::
+
+## CDN 的 HTTPS 配置与性能影响
+
+### HTTPS 对 CDN 的必要性
+
+现代互联网，**HTTPS 是必须的**：
+
+1. **安全性**：防止内容被篡改、防止中间人攻击
+2. **SEO**：Google、百度等搜索引擎优先收录 HTTPS 站点
+3. **浏览器支持**：Chrome 等浏览器会对 HTTP 站点显示不安全警告
+4. **HTTP/2**：现代浏览器只支持在 HTTPS 上启用 HTTP/2
+
+### HTTPS 配置流程
+
+```yaml
+# CDN HTTPS 配置步骤
+1. 准备 SSL 证书
+   - 自签名证书（测试环境）
+   - CA 证书（生产环境）
+   - 泛域名证书（*.example.com）
+
+2. 上传证书到 CDN
+   - 支持直接上传证书
+   - 或通过 DNS 验证自动获取（Let's Encrypt）
+
+3. 配置 HTTPS 监听
+   - 端口：443
+   - 协议：TLS 1.2 / TLS 1.3
+   - 证书：选择上传的证书
+
+4. 配置 HTTP → HTTPS 重定向（可选）
+   - 提升安全性
+   - 但会增加一次重定向
+```
+
+### HTTPS 对性能的影响
+
+**延迟增加**：
+
+```
+HTTP 请求：
+Client → SYN → Server → SYN-ACK → Client → ACK → 请求 → 响应
+         │                                      │
+         └──────── 1 RTT（连接建立） ────────────┘
+
+HTTPS 请求：
+Client → SYN → Server → SYN-ACK → Client → ACK → 
+→ Client Hello → Server Hello → 证书 → 密钥协商 → 加密请求 → 加密响应
+         │                                                    │
+         └──────── 2-3 RTT（TLS 握手 + 连接建立） ────────────┘
+```
+
+**性能优化手段**：
+
+```yaml
+# 1. 使用 TLS 1.3（1-RTT 握手，比 1.2 减少一次 RTT）
+tls_config:
+  min_version: "TLSv1.3"
+  # TLS 1.3 是 2018 年发布的，目前主流浏览器都已支持
+
+# 2. 启用 TLS Session Resumption
+# 复用之前协商的密钥，避免完整握手
+tls_session_cache:
+  enabled: true
+  timeout: 3600  # 会话缓存超时 1 小时
+
+# 3. 启用 OCSP Stapling
+# 证书状态检查在握手时一起完成，减少一次 DNS 查询 + HTTP 请求
+ocsp_stapling:
+  enabled: true
+
+# 4. 使用 HTTP/2 多路复用
+# 一个连接并行传输多个请求
+http2:
+  enabled: true
+```
+
+:::tip HTTPS 性能建议
+TLS 1.3 + OCSP Stapling + HTTP/2 的组合，可以把 HTTPS 的性能损失降到最低。对于大多数场景，这个损失（< 10ms）是可接受的。
+:::
+
+## CDN 在高并发场景中的位置
+
+### 缓存架构的全景图
+
+CDN 位于用户请求的最外层，是高并发系统的第一道防线：
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                         用户请求                                  │
+│                         ↓                                        │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │                     CDN 边缘节点                            │   │
+│  │  命中率：80-95%                                            │   │
+│  │  延迟：< 10ms                                              │   │
+│  │  带宽成本：最低                                            │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                         ↓ 5-10% 回源                            │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │                    应用服务器                              │   │
+│  │  ┌────────────┐  ┌────────────┐  ┌────────────┐          │   │
+│  │  │ Nginx 缓存 │  │ 本地缓存   │  │ 业务逻辑   │          │   │
+│  │  │ (L1)      │  │ Caffeine   │  │           │          │   │
+│  │  └────────────┘  └────────────┘  └────────────┘          │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                         ↓ 1-5% 穿透                            │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │                  分布式缓存 Redis                           │   │
+│  │  命中率：95-99%                                            │   │
+│  │  延迟：1-5ms                                               │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                         ↓ < 1% 穿透                            │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │                     数据库                                 │   │
+│  │  QPS：1000-10000（取决于硬件和优化）                        │   │
+│  └──────────────────────────────────────────────────────────┘   │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### 高并发场景的 CDN 配置
+
+**场景：双十一秒杀**
+
+```yaml
+# CDN 配置
+cache:
+  # 1. 静态资源长缓存
+  static_assets:
+    pattern: "/static/*"
+    cache_control: "public, max-age=31536000, immutable"
+    # immutable 防止强制刷新回源
+  
+  # 2. 秒杀页面缓存（动态内容）
+  seckill_page:
+    pattern: "/seckill/*"
+    cache_control: "no-cache"  # 不缓存，每次都回源
+    # 但配合 Last-Modified + ETag，可以减少数据传输
+  
+  # 3. 秒杀结果查询（实时数据）
+  seckill_result:
+    pattern: "/api/seckill/result/*"
+    cache_control: "no-store"  # 绝对不缓存
+    origin_policy: "no-cache"  # 每次都回源验证
+
+# 限流配置
+rate_limit:
+  enabled: true
+  threshold: 1000  # 单 IP 每秒最多 1000 请求
+  burst: 2000      # 允许突发流量
+```
+
+## 动静分离的架构设计
+
+### 什么是动静分离
+
+动静分离的核心思想是：**把不变的内容（静态资源）和变化的内容（动态页面）分开处理**。
+
+| 类型 | 内容 | 缓存策略 | 存储位置 |
+|---|---|---|---|
+| 静态资源 | JS、CSS、图片、视频 | 长期缓存 | CDN |
+| 动态页面 | HTML、JSP、Thymeleaf | 短期或不缓存 | 应用服务器 |
+| API 响应 | JSON、XML | 按业务需求 | Redis / 应用服务器 |
+| 用户数据 | Session、个人信息 | 不缓存 | 数据库 |
+
+### 动静分离的实现
+
+**方案一：域名分离**
+
+```yaml
+# 静态资源使用独立域名
+静态资源域名：static.example.com → CDN
+动态页面域名：www.example.com → 应用服务器
+
+# 好处：
+# 1. 浏览器可以并行加载（不同域名的连接数限制独立）
+# 2. 静态资源可以配置更激进的缓存策略
+# 3. 减少 Cookie 传输（static.example.com 不需要 Cookie）
+```
+
+```html
+<!-- HTML 模板 -->
+<!DOCTYPE html>
+<html>
+<head>
+    <!-- 使用独立域名的静态资源 -->
+    <link rel="stylesheet" href="https://static.example.com/css/app.css">
+    <script src="https://static.example.com/js/app.js"></script>
+</head>
+<body>
+    <!-- 动态内容 -->
+    <div>Welcome, {{ username }}</div>
+</body>
+</html>
+```
+
+**方案二：路径分离**
+
+```nginx
+# Nginx 配置：按路径区分动静资源
+server {
+    # 静态资源
+    location /static/ {
+        proxy_pass https://cdn.example.com/;
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+    }
+    
+    # 动态页面
+    location / {
+        proxy_pass http://app_server/;
+        add_header Cache-Control "no-cache";
+    }
+    
+    # API
+    location /api/ {
+        proxy_pass http://app_server/;
+        add_header Cache-Control "no-store";
+    }
+}
+```
+
+### 动静分离的注意事项
+
+```java
+// ❌ 错误：动态页面内嵌静态资源 URL
+// 如果域名变了，所有页面都要改
+String html = "<img src='https://www.example.com/static/logo.png'/>";
+
+// ✅ 正确：使用相对路径或配置中心管理域名
+// 静态资源域名从配置中心获取
+String staticDomain = configService.getStaticDomain();
+String html = "<img src='" + staticDomain + "/logo.png'/>";
+
+// ✅ 更好的方式：使用标签或组件
+// Thymeleaf: <img th:src="@{/static/logo.png}"/>
+// React: <img src={process.env.PUBLIC_URL + '/logo.png'}/>
+```
+
+## 静态资源的版本化
+
+### 版本化的重要性
+
+静态资源版本化是实现「**长缓存 + 即时更新**」的关键：
+
+- **长缓存**：提高命中率，减少回源
+- **即时更新**：发布新版本后，用户立即获取最新内容
+
+### 版本化的三种方式
+
+**方式一：查询参数**
+
+```html
+<!-- 简单但不推荐：查询参数会被浏览器忽略（某些 CDN 也会忽略） -->
+<script src="/app.js?v=1.0.0"></script>
+
+<!-- 问题：v=1.0.0 和 v=1.0.1 是同一个 URL -->
+<!-- CDN 缓存了第一个版本，第二个版本永远不会生效 -->
+```
+
+**方式二：文件路径（推荐）**
+
+```html
+<!-- 文件名包含版本哈希 -->
+<script src="/app.a3f5c9d8.js"></script>
+
+<!-- HTML 由后端渲染时嵌入正确版本 -->
+<script src="<%= assetUrl('app.js') %>"></script>
+<!-- 输出: <script src="/app.a3f5c9d8.js"></script> -->
+```
+
+```javascript
+// 构建工具（Webpack）自动生成带哈希的文件名
+// webpack.config.js
+{
+  output: {
+    filename: '[name].[contenthash].js',
+    // 输出：app.a3f5c9d8.js
+  }
+}
+```
+
+**方式三：版本目录**
+
+```html
+<!-- URL 路径包含版本号 -->
+<script src="/v2.1.0/js/app.js"></script>
+
+<!-- CDN 配置缓存策略 -->
+<!-- 优点：便于批量刷新整个版本 -->
+<!-- 缺点：旧版本占用 CDN 空间 -->
+```
+
+:::tip 版本化最佳实践
+使用 **文件内容哈希** 作为版本标识，这是最可靠的方式。文件名变了，说明内容变了，CDN 会缓存新文件；文件名没变，说明内容没变，可以继续使用缓存。
+:::
+
+## CDN 与前端缓存的配合
+
+### 浏览器缓存 + CDN 缓存的完整链路
+
+```
+用户首次访问：
+浏览器 → CDN 边缘节点 → CDN 区域节点 → 源站
+         ↓                              ↓
+    缓存到 CDN                     返回内容
+         ↓
+    缓存到浏览器
+
+用户再次访问：
+浏览器（检查缓存）→ CDN 边缘节点（检查缓存）→ 返回缓存内容
+```
+
+### 缓存层级与优先级
+
+```http
+# 1. 浏览器检查自身缓存（根据 Cache-Control）
+Cache-Control: max-age=31536000
+# 浏览器缓存未过期，直接使用，不会发请求
+
+# 2. 浏览器发起条件请求（已过期但支持验证）
+If-Modified-Since: Wed, 21 Oct 2026 07:28:00 GMT
+If-None-Match: "33a64df551425fcc55e4d42a148795d9"
+# CDN / 源站返回 304，继续使用缓存；或返回新内容
+
+# 3. 强制回源（Cache-Control: no-cache 或用户刷新）
+# 浏览器绕过缓存，直接请求 CDN
+```
+
+### 完整缓存策略配置示例
+
+```yaml
+# CDN 配置：静态资源
+cache_rules:
+  - path: "/static/*"
+    cache_control: "public, max-age=31536000, immutable"
+    # 说明：
+    # public：允许 CDN 缓存
+    # max-age=31536000：缓存 1 年
+    # immutable：内容不会变化（配合版本化 URL）
+  
+  - path: "/images/*"
+    cache_control: "public, max-age=86400"
+    # 每天刷新一次
+  
+  - path: "*.html"
+    cache_control: "no-cache, must-revalidate"
+    # 每次访问验证，304 则使用缓存
+  
+  - path: "/api/*"
+    cache_control: "no-store"
+    # 绝对不缓存，保证数据实时性
+
+# Nginx 配置：配合 CDN
+location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg)$ {
+    # 添加 Last-Modified 和 ETag
+    etag on;
+    last_modified on;
+    
+    # 设置长缓存
+    expires 1y;
+    add_header Cache-Control "public, immutable";
+    
+    # CORS 配置
+    add_header Access-Control-Allow-Origin "*";
+}
+```
+
+## 总结
+
+CDN 是高并发系统的第一道防线，合理配置可以让 80-90% 的请求在边缘节点消化，大幅降低源站压力。
+
+**核心配置要点**：
+
+1. **动静分离**：静态资源使用独立域名，配合 CDN 长缓存
+2. **版本化 URL**：文件名包含内容哈希，实现长缓存 + 即时更新
+3. **合理的 TTL**：静态资源长缓存，动态内容短缓存或不缓存
+4. **预热 + 刷新**：大促前预热，更新后刷新
+5. **HTTPS + HTTP/2**：安全且高性能
+
+**CDN 不是银弹**：
+
+- 缓存命中率低 = CDN 形同虚设
+- 源站容量 = CDN 带宽上限（回源时）
+- 动态内容无法缓存，需要其他手段优化
+
+## 面试追问预判
+
+**面试官可能会问：**
+
+1. **CDN 的回源率过高怎么排查和优化？**
+   答：检查缓存策略配置是否合理（TTL 是否太短）、URL 是否有动态参数导致无法缓存、是否使用了版本化 URL。另外监控回源请求的具体 URL，找出高频回源的热点资源。
+
+2. **CDN 和 Nginx 本地缓存如何选择？**
+   答：Nginx 本地缓存适合单机房、高流量、需要快速响应但不方便接入 CDN 的场景。CDN 适合多地域用户访问、需要就近访问的场景。两者可以叠加使用：CDN 在外层，Nginx 在内层。
+
+3. **静态资源使用了长缓存，如何保证用户及时更新？**
+   答：使用版本化 URL（文件名包含哈希），发布新版本时 URL 变化，浏览器会请求新内容。同时可以配置 `Cache-Control: immutable`，防止用户强制刷新导致回源。
+
+4. **CDN 的 304 状态码和直接返回缓存有什么区别？**
+   答：304 需要一次完整的 HTTP 请求/响应交互（虽然 body 为空），会增加延迟。CDN 可以配置直接返回缓存内容，不发请求到源站（如 `Age: 0` + 缓存新鲜）。
+
+5. **CDN 的故障会导致所有用户无法访问吗？**
+   答：如果域名直接指向 CDN IP，会。但如果配置了回源或者 DNS 切换，CDN 故障时可以切换到备份 CDN 或直接回源。关键是做好监控和应急预案。
