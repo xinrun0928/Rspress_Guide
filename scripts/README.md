@@ -53,6 +53,122 @@ node scripts/md-to-mdx.js ./docs
 
 ---
 
+## scan_sidebar.py
+
+递归扫描 `docs` 目录下所有子模块的 `_meta.json`，将侧边栏配置展开为完整的 JSON 层级结构，按模块分别输出到 `theme_config/sidebar/` 目录。
+
+### 基本用法
+
+```bash
+python3 scripts/scan_sidebar.py [docs_path] [options]
+```
+
+示例：
+
+```bash
+# 扫描 docs 目录（默认）
+python3 scripts/scan_sidebar.py
+
+# 指定 docs 目录
+python3 scripts/scan_sidebar.py ./docs
+
+# 指定输出目录
+python3 scripts/scan_sidebar.py --output ./theme_config/sidebar
+```
+
+### 参数说明
+
+| 参数 | 说明 |
+|---|---|
+| `docs_path` | `docs` 目录路径，默认为 `docs` |
+| `--output` / `-o` | 输出目录，默认为 `theme_config/sidebar` |
+| `--indent` / `-i` | JSON 缩进空格数，默认为 `2` |
+| `--no-summary` | 不打印模块概览 |
+
+### 工作逻辑
+
+1. 扫描 `docs/` 下所有一级子目录（视为一级模块）
+2. 对每个子目录读取其 `_meta.json`
+3. 递归展开 `dir`、`dir-section-header` 类型的嵌套条目
+4. 自动从 `index.mdx` 或同名 `.mdx` 的 frontmatter / 首行标题中提取模块 label
+5. 每个模块输出为一个独立的 JSON 文件，同时输出一份 `all_modules.json` 汇总
+
+### 输出文件
+
+假设 `docs/java/_meta.json` 存在，脚本运行后生成：
+
+```
+theme_config/sidebar/
+├── java.json        # java 模块的完整侧边栏树
+├── spring.json       # spring 模块的完整侧边栏树
+├── ...
+└── all_modules.json  # 所有模块汇总（all-in-one）
+```
+
+### 输出示例
+
+```
+文档目录：/path/to/Guide/docs
+输出目录：/path/to/Guide/theme_config/sidebar
+
+正在处理模块：java
+正在处理模块：spring
+正在处理模块：jvm
+  ✓ 已保存：/path/to/Guide/theme_config/sidebar/java.json
+  ✓ 已保存：/path/to/Guide/theme_config/sidebar/spring.json
+  ✓ 已保存：/path/to/Guide/theme_config/sidebar/jvm.json
+  ✓ 已保存：/path/to/Guide/theme_config/sidebar/all_modules.json
+
+========== 模块概览 ==========
+  • java  (Java 核心)  — 共 42 个条目
+  • spring  (Spring 框架)  — 共 28 个条目
+  • jvm  (JVM 原理)  — 共 15 个条目
+
+共扫描到 3 个模块
+总计 85 个导航条目
+```
+
+### 输出 JSON 结构
+
+生成的 JSON 文件结构如下：
+
+```json
+{
+  "module": "java",
+  "label": "Java 核心",
+  "children": [
+    {
+      "type": "file",
+      "name": "getting-started",
+      "label": "getting started"
+    },
+    {
+      "type": "dir",
+      "name": "collection",
+      "label": "集合框架",
+      "collapsible": true,
+      "collapsed": false,
+      "children": [
+        {
+          "type": "file",
+          "name": "hashmap",
+          "label": "HashMap"
+        }
+      ]
+    }
+  ]
+}
+```
+
+### 注意事项
+
+- 脚本仅读取和重组数据，**不会修改** `docs` 目录下的任何文件
+- 只有包含 `_meta.json` 的目录才会被识别为模块
+- `--no-summary` 适合在 CI/CD 流水线中抑制非必要输出
+- JSON 中的 `label` 字段优先级：`index.mdx` frontmatter `title` > frontmatter `label` > 首行 `# 标题` > 目录名
+
+---
+
 ## count.py
 
 统计目录下文件的行数、字数、字符数。
