@@ -1,0 +1,506 @@
+# Redis 热点 key 问题：发现与解决方案
+
+「双十一」零点的那一刻，你盯着监控大屏，看着 Redis 集群的 QPS 曲线突然垂直攀升——不是整体上涨，而是集中在某一个节点的某个分片上。整个集群还有大把资源没用，单节点却开始告警了。
+
+这不是内存不够，不是 CPU 打满，而是经典的**热点 key 问题**：同一个 key 被成千上万次访问，所有流量挤在同一台机器的同一个槽位上，单节点成了系统的「卡脖子」环节。
+
+热点 key 和大 key 是 Redis 性能问题的两个极端。大 key 是「一个 key 太大」，导致单次操作耗时过长；热点 key 是「一个 key 被访问太多次」，导致请求集中在单机节点。两者叠加，就是最棘手的场景——今天这篇文章，我们聚焦热点 key。
+
+## 一、什么是热点 key
+
+### 1.1 热点 key 的定义
+
+热点 key 是指在 Redis 集群或单机场景下，被高频访问的单个 key。这种 key 通常对应业务中的「热门数据」：
+
+- 电商系统中的**热门商品详情**（如 iPhone 15 的商品信息）
+- 社交系统中的**明星用户信息**（如某顶流的个人资料）
+- 活动系统中的**秒杀奖品库存**（库存为 0 前的热门商品）
+- 配置中心的**全局开关**（全员推送的配置项）
+
+这些 key 的访问频率远高于普通数据，可能是平均值的成百上千倍。
+
+### 1.2 热点 key 的危害
+
+为什么热点 key 是问题？因为 Redis Cluster 的数据分布机制决定了**同一个 slot 的请求会路由到同一个节点**。
+
+当一个 key 成为热点时，所有请求都会命中同一个 slot，同一个节点。这个节点承受的压力可能是其他节点的几十倍甚至上百倍，而集群整体的资源利用率却很低。
+
+具体危害包括：
+
+**单节点过载**。单个节点的 CPU 和网络带宽首先达到瓶颈，请求开始排队，RT 急剧上升。
+
+**访问倾斜**。Redis Cluster 的负载不均衡热点 key 所在的节点处理大量请求，其他节点却闲置。
+
+**连接池耗尽**。热点 key 导致单个节点的连接数飙升，连接等待时间增加，甚至出现「too many connections」错误。
+
+**级联故障**。热点 key 节点过载后响应变慢或超时，上游服务的连接池等待耗尽，引发整体雪崩。
+
+:::tip 一个简单的数字
+
+假设 Redis 集群有 10 个节点，平均每个节点 QPS 是 1 万。但某天出现了一个热点 key，全部流量集中在 1 个节点上——这个节点的实际 QPS 是 10 万，其他 9 个节点却只有几千。
+
+**这就是热点 key 的本质：负载不均衡，而非整体资源不足。**
+:::
+
+### 1.3 热点 key 与大 key 的区别
+
+很多人容易把热点 key 和大 key 搞混，它们是两类不同的问题：
+
+| 特征 | 热点 key | 大 key |
+|------|----------|--------|
+| 问题本质 | 单 key 访问频率过高 | 单 key 存储体积过大 |
+| 影响 | 请求集中在单节点 | 单次操作耗时过长 |
+| 表现 | 单节点 CPU/带宽打满 | 执行阻塞、网络卡顿 |
+| 发现方式 | 访问频率统计 | `MEMORY USAGE`、扫描分析 |
+| 解决思路 | 分散访问、缓存、多副本 | 拆分、压缩、删除 |
+
+两者也可能同时出现——**热点大 key** 是最糟糕的情况：同一个 key 既被海量访问，又是存储大佬。一次 `GET` 操作可能触发多次网络往返，单节点的卡顿会放大到极致。
+
+---
+
+## 二、如何发现热点 key
+
+解决热点 key 的第一步，是发现它。难点在于：Redis 本身不提供热点 key 的直接统计，需要借助外部手段。
+
+### 2.1 客户端埋点统计
+
+最直接的方式，是在 Redis 客户端代码中统计每个 key 的访问频率。这种方式的好处是**精确、可定制**，坏处是**需要业务代码配合**。
+
+```java title="RedisClientKeyStats.java"
+@Component
+public class RedisClientKeyStats {
+
+    private final Map<String, AtomicLong> keyAccessCount = new ConcurrentHashMap<>();
+    private final ScheduledExecutorService scheduler = ScheduledExecutors.newSingleThreadScheduledExecutor();
+
+    @PostConstruct
+    public void init() {
+        // 每分钟输出一次热点 key 报告
+        scheduler.scheduleAtFixedRate(this::printHotKeys, 1, 1, TimeUnit.MINUTES);
+    }
+
+    public String get(String key) {
+        keyAccessCount.computeIfAbsent(key, k -> new AtomicLong()).incrementAndGet();
+        return redisTemplate.opsForValue().get(key);
+    }
+
+    private void printHotKeys() {
+        keyAccessCount.entrySet().stream()
+            .filter(e -> e.getValue().get() > threshold)
+            .sorted(Map.Entry.<String, AtomicLong>comparingByValue().reversed())
+            .limit(10)
+            .forEach(e -> System.out.println("Hot key: " + e.getKey() + ", count: " + e.getValue().get()));
+    }
+}
+```
+
+生产环境中，建议使用框架自带的统计功能（如 Jedis 的 `ClientStats`、Lettuce 的指标导出），避免自己造轮子。
+
+### 2.2 `redis-cli --hotkeys` 命令
+
+Redis 4.0 之后提供了 `redis-cli --hotkeys` 命令，基于 **LFU（Least Frequently Used）** 采样发现热点 key。
+
+```bash
+redis-cli --hotkeys
+
+# 输出示例
+# Scanning the keyspace to find biggest keys...
+# 0.00% | 789123 keys | 1 biggest keys |热点 key 类型 | 总 key 数 | 最大 key
+# Key name: product:detail:10086
+# Type: string
+# LFULogLog: 0xc0, normalized: 254
+# LFU accesses: 1234567
+```
+
+原理：Redis 会在 key 的内部结构中记录 LFU 信息（访问频率的对数概率），`redis-cli` 扫描采样的 key，根据 LFU 估算访问热度。
+
+:::warning 注意事项
+
+1. `--hotkeys` 基于采样，不是全量统计，可能漏掉低频但瞬时爆发的热点
+2. 需要确认 Redis 配置中 `maxmemory-policy` 不是 `noeviction` 以外且禁用了 LFU（LFU 是 4.0+ 的功能）
+3. 生产环境大 keyspace（如上亿 key）扫描耗时较长，建议在凌晨低峰期执行
+:::
+
+### 2.3 `MONITOR` 命令抓取
+
+`MONITOR` 命令可以实时输出 Redis 接收到的所有命令，是最全的抓取方式，但**生产环境慎用**。
+
+```bash
+# 在 Redis CLI 中执行
+redis-cli MONITOR | grep -E "GET|SET" | awk '{print $2}' | sort | uniq -c | sort -rn | head -20
+
+# 输出示例
+# 1234567 "GET product:detail:10086"
+#  876543 "GET user:profile:888888"
+```
+
+`MONITOR` 的问题是开销极大，会显著降低 Redis 性能（最高可能降低 50%）。正确做法：
+
+1. 在**从节点**执行 `MONITOR`，不影响主节点
+2. 只在**短时间内**抓取（如 30 秒），高峰期抓取效果最好
+3. 抓取后立即停止，避免长时间影响
+
+### 2.4 Redis 集群下的热点发现方案
+
+在 Redis Cluster 环境中，每个节点只管理部分 key，单节点的 `MONITOR` 只能看到本节点请求。需要专门的热点发现组件：
+
+**方案一：代理层统计。** 如果使用了 Twemproxy、Codis 等代理，所有请求经过代理，代理层天然可以做全局统计。
+
+**方案二：客户端 SDK 收集。** 热点 key 通常集中在某个业务域，在对应服务的客户端 SDK 中统计访问频率，定期上报。
+
+**方案三：独立抓包分析。** 在 Redis 集群前部署网络抓包工具（如 `tcpdump`），分析所有 Redis 请求的 key 分布。优点是对业务代码无侵入，缺点是部署复杂。
+
+### 2.5 主动预判热点 key
+
+不是所有热点 key 都需要靠工具发现，**业务逻辑本身就告诉了答案**。
+
+- **大促活动**：提前预知哪些商品会参与秒杀，根据商品 ID 预判热点
+- **明星事件**：社交产品中，某些用户本身就是热点（粉丝量大）
+- **配置下发**：全局配置开关天然是热点，应该在设计时就考虑到
+
+主动预判的好处是可以在流量到来之前做**预热**和**预案**，而不是被动等监控告警。
+
+:::tip 热点 key 发现方法对比
+
+| 方法 | 精确度 | 侵入性 | 性能影响 | 适用场景 |
+|------|--------|--------|----------|----------|
+| 客户端埋点 | 高 | 高 | 低 | 有代码改造条件 |
+| `redis-cli --hotkeys` | 中（采样） | 无 | 低 | 日常巡检 |
+| `MONITOR` 抓取 | 最高（全量） | 无 | 高 | 临时排查 |
+| 代理层统计 | 高 | 低 | 低 | 有代理层架构 |
+| 主动预判 | — | 无 | 无 | 大促、事件场景 |
+:::
+
+---
+
+## 三、热点 key 的解决方案
+
+发现了热点 key 之后，接下来是解决。核心思路是：**让热点 key 的请求分散开，而不是集中在单机节点。**
+
+### 3.1 本地缓存：热点 key 的第一道防线
+
+最简单有效的方案是**本地缓存**。热点 key 缓存在应用端内存中，大幅减少 Redis 请求。
+
+```java title="LocalCacheExample.java"
+@Service
+public class ProductService {
+
+    // 使用 Caffeine 作为本地缓存
+    private final Cache<String, Product> localCache = Caffeine.newBuilder()
+        .maximumSize(10000)           // 最多缓存 1 万个商品
+        .expireAfterWrite(10, TimeUnit.MINUTES)  // 写后 10 分钟过期
+        .build();
+
+    public Product getProductDetail(String productId) {
+        String cacheKey = "product:detail:" + productId;
+
+        // 先查本地缓存
+        Product product = localCache.getIfPresent(cacheKey);
+        if (product != null) {
+            return product;
+        }
+
+        // 本地缓存未命中，查 Redis
+        product = redisTemplate.opsForValue().get(cacheKey);
+        if (product != null) {
+            // 写入本地缓存
+            localCache.put(cacheKey, product);
+        }
+        return product;
+    }
+}
+```
+
+本地缓存的优势：**零网络开销**，直接从堆内存返回，RT 降低到微秒级。
+
+但本地缓存引入了新问题：**数据一致性**。如果商品信息更新了，本地缓存还是旧数据怎么办？
+
+:::tip 本地缓存的一致性策略
+
+1. **短过期时间**：设置较短的 TTL（如 30 秒），牺牲一点实时性换取一致性
+2. **更新时主动失效**：商品服务更新数据时，广播失效消息，各节点删除本地缓存
+3. **版本号机制**：key 带上版本号，本地缓存比对版本，过期则主动查 Redis
+4. **不可变数据优先**：对于商品详情这类变化不频繁的数据，本地缓存效果最好
+
+对于商品详情、用户资料这类「读多写少」且**对实时性要求不高**的数据，本地缓存是首选。
+:::
+
+### 3.2 热 key 复制：多副本分散压力
+
+本地缓存解决了应用端的问题，但如果 Redis 单节点压力仍然过大，需要从 Redis 层面解决。
+
+**热 key 复制**的思路是：把热点 key 的数据复制多份，放到不同的节点上。客户端访问时，随机选择一个副本，分散单节点压力。
+
+Redis Cluster 本身不直接支持热 key 复制（因为 slot 分配是固定的），需要借助**中间件**或**业务层实现**：
+
+**方案一：代理层实现。** 在 Twemproxy/Codis 中，代理层维护热点 key 的多个副本，请求来时随机选择。
+
+**方案二：客户端实现。** 客户端 SDK 感知热点 key 后，自动维护多个副本的连接池。
+
+**方案三：京东 hotkey 实现。** 京东开源的 hotkey 组件，专门解决热点 key 问题，支持**探测 + 推送 + 本地缓存**的全链路方案。
+
+```java title="使用 hotkey 组件示例"
+// 引入依赖
+// <dependency>
+//     <groupId>com.jd.platform</groupId>
+//     <artifactId>hotkey</artifactId>
+// </dependency>
+
+// 注册为热点 key
+hotKeyClient.add("product:detail:10086");
+
+// 获取值，内部自动处理热点 key 的多副本
+Product product = hotKeyClient.get("product:detail:10086", Product.class);
+```
+
+hotkey 的工作原理：各节点部署 agent，agent 统计 key 访问频率，发现热点后通知所有节点，同时把热点 key 推送到本地缓存。热点 key 的访问完全在本地处理，Redis 压力归零。
+
+### 3.3 Hash Tag：聚合相关热点
+
+在 Redis Cluster 中，**hash tag** 是一个聚合多个 key 到同一个 slot 的技巧。利用 hash tag，可以让相关联的热点 key 落在同一个节点，方便批量操作。
+
+```bash
+# 不使用 hash tag，product:detail:10086 和 product:detail:10087 可能落在不同节点
+GET product:detail:10086
+GET product:detail:10087
+
+# 使用 hash tag，强制落在同一个 slot（假设 slot = 1024）
+GET product:{detail}:10086
+GET product:{detail}:10087
+```
+
+Hash tag 的应用场景：**批量获取热点 key**。比如用户浏览商品详情页，一次性需要获取商品信息、库存、价格等多个字段，如果这些 key 分散在不同节点，批量操作会触发多次网络往返。
+
+```java title="Hash Tag 批量操作示例"
+// 将商品详情的所有字段聚合到一个 hash 中
+redisTemplate.opsForHash().put("product:{10086}", "info", productJson);
+redisTemplate.opsForHash().put("product:{10086}", "stock", stockCount);
+redisTemplate.opsForHash().put("product:{10086}", "price", price);
+
+// 一次性获取所有字段，避免多次网络往返
+Map<Object, Object> productData = redisTemplate.opsForHash().entries("product:{10086}");
+```
+
+:::warning Hash Tag 的陷阱
+
+Hash tag 能聚合 key，但也会导致**热点集中**。如果所有热点 key 都用了相同的 hash tag，反而会把压力集中到同一个节点。
+
+正确做法：用 hash tag 聚合「应该在一起」的热点 key（如同一商品的不同字段），避免强制聚合完全不相关的热点 key。
+:::
+
+### 3.4 读写分离：读多写少场景的利器
+
+对于「**读多写少**」的热点 key，读写分离是自然的解决方案。Redis 主从架构下，所有写请求走主节点，读请求可以分散到从节点。
+
+```yaml title="application.yml"
+spring:
+  redis:
+    cluster:
+      nodes:
+        - 192.168.1.1:6379  # master
+        - 192.168.1.2:6379  # slave1
+        - 192.168.1.3:6379  # slave2
+    lettuce:
+      pool:
+        # 配置读写分离
+        read-from: REPLICA_PREFERRED  # 优先从副本读
+```
+
+:::tip 读写分离的延迟问题
+
+从节点的数据同步是**异步**的，存在一定延迟（通常毫秒级）。对于商品库存、余额这类**强一致性要求**的数据，不适合走从节点读取。
+
+适合走从节点的场景：商品详情、用户资料、排行榜等，允许短暂的不一致（几秒内）。
+:::
+
+### 3.5 热点 key 熔断：极端场景的兜底
+
+如果热点 key 已经导致 Redis 开始告警，正常的缓存策略已经来不及生效，需要**熔断降级**。
+
+熔断的核心思路：**识别热点 key，直接在应用层返回缓存值，跳过 Redis 调用。**
+
+```java title="HotKeyCircuitBreaker.java"
+@Service
+public class HotKeyCircuitBreaker {
+
+    // 热点 key 的本地缓存（永久缓存，视为「可信数据」）
+    private final Map<String, Object> hotKeyCache = new ConcurrentHashMap<>();
+
+    // 热点 key 阈值：每秒访问超过 10000 次
+    private static final int HOT_KEY_THRESHOLD = 10000;
+
+    // 计数器（滑动窗口实现）
+    private final Map<String, LongAdder> accessCounters = new ConcurrentHashMap<>();
+
+    public Object get(String key) {
+        // 如果命中热点 key 本地缓存，直接返回
+        if (hotKeyCache.containsKey(key)) {
+            return hotKeyCache.get(key);
+        }
+
+        // 记录访问
+        accessCounters.computeIfAbsent(key, k -> new LongAdder()).increment();
+
+        // 查 Redis
+        Object value = redisTemplate.opsForValue().get(key);
+
+        // 如果访问频率超过阈值，加入热点 key 缓存
+        if (accessCounters.get(key).sum() > HOT_KEY_THRESHOLD) {
+            hotKeyCache.put(key, value);
+        }
+
+        return value;
+    }
+
+    // 定时重置计数器
+    @Scheduled(fixedRate = 1000)
+    public void resetCounters() {
+        accessCounters.clear();
+    }
+}
+```
+
+热点 key 熔断的注意点：
+
+1. **缓存值可能是过期的**：热点 key 熔断期间，Redis 中的数据可能已经更新，本地缓存返回的是旧值
+2. **需要监控和自动恢复**：热点 key 缓存应该有最大内存限制，避免占用过多堆内存
+3. **配合降级方案使用**：熔断后应该返回兜底数据（如默认值、空数据），而不是 null
+
+---
+
+## 四、热点 key 与大 key 的双重陷阱
+
+最棘手的场景不是单独的热点 key 或大 key，而是**热点大 key**——同一个 key 既被海量访问，又是存储大佬。
+
+### 4.1 为什么热点大 key 最危险
+
+假设商品详情 key 是一个热点 key，同时也是一个大 key（商品信息包含大量图片 URL、属性列表）：
+
+```bash
+# 假设 product:detail:10086 是一个 10MB 的大 key
+GET product:detail:10086
+# 返回耗时：假设网络带宽 100MB/s，10MB 数据需要 100ms
+```
+
+每次 GET 请求需要 100ms 来传输数据，假设 QPS 是 1 万——这个 key 本身占用了单机 Redis 的全部带宽，后面排队的请求全都在等待。
+
+更糟糕的是，**热点 key 的多副本方案在这里失效了**：如果把 10MB 的数据复制 3 份，内存占用翻 3 倍；如果在本地缓存 10MB 的数据，每个节点都要承担这个内存开销。
+
+### 4.2 热点大 key 的解决思路
+
+**思路一：拆分大 key。** 不要把整个商品详情存为一个大的 string，而是拆分成多个 hash 或多个 key：
+
+```java title="拆分热点大 key 示例"
+// 原来：一个 key 存整个商品详情（可能是大 key）
+SET product:detail:10086 "{整个商品 JSON，10MB}"
+
+// 拆分后：按字段类型拆分
+HSET product:info:10086 base_info "{基础信息}"          # 1KB
+HSET product:info:10086 images "{图片 URL 列表}"        # 8MB
+HSET product:info:10086 attributes "{属性列表}"         # 1MB
+```
+
+热点字段和不热点字段分开存储，热点字段（基础信息）可以独立缓存、复制，8MB 的图片列表不需要参与热点逻辑。
+
+**思路二：懒加载 + 按需获取。** 对于大 key，不要一次性获取全部数据，只获取必要的字段：
+
+```java title="按需获取热点字段示例"
+public ProductBaseInfo getProductBaseInfo(String productId) {
+    // 只获取基础信息（热点字段），不获取图片等大字段
+    return redisTemplate.opsForHash().get("product:info:" + productId, "base_info");
+}
+```
+
+前端渲染商品列表时只需要基础信息（名称、价格），详情页再懒加载图片和属性列表。
+
+**思路三：热点预热 + 多级缓存。** 在大促开始前，提前把热点 key 加载到本地缓存和多级缓存体系，避免流量高峰时的冷启动问题。
+
+---
+
+## 五、面试实战
+
+### 5.1 场景一：热点 key 发现与处理
+
+**面试官问**：「线上 Redis 集群突然有一个节点 CPU 告警，怎么排查？」
+
+这道题考察的是问题排查思路。回答应该从「假设不是这个节点本身的问题，而是访问倾斜」出发：
+
+> 首先确认是单机问题还是集群问题。如果集群只有这一个节点告警，其他节点正常，很可能是**热点 key 问题**。
+>
+> 排查步骤：
+>
+> 1. 用 `redis-cli --hotkeys` 或者在从节点短时间执行 `MONITOR` 抓取请求，找到访问频率最高的 key
+> 2. 分析这个 key 的业务含义，确认是否是正常热点（如大促商品）还是异常热点（如被刷接口）
+> 3. 如果是正常热点，启用热 key 复制或本地缓存方案
+> 4. 如果是被刷，接口层增加限流逻辑
+>
+> 根本原因是：Redis Cluster 天然会把同一 slot 的请求路由到同一节点，如果业务存在热点 key，这个 key 所在的节点就会成为瓶颈。
+
+### 5.2 场景二：本地缓存与数据一致性
+
+**面试官问**：「热点 key 放在本地缓存，如何保证数据一致性？」
+
+这道题考察的是对缓存一致性的理解：
+
+> 这是一个经典问题。我的思路是「按业务场景选择策略」。
+>
+> **对于商品详情这类读多写少、允许短暂不一致的数据**，常用策略是：
+>
+> 1. **短 TTL**：本地缓存设置较短的过期时间（如 30 秒），自动过期接近一致性
+> 2. **主动失效**：商品服务更新时，通过 MQ 或广播通知所有节点失效本地缓存
+> 3. **版本号**：key 带上版本号，本地缓存比对版本，过期则主动查 Redis
+>
+> **对于库存、余额这类强一致性要求的数据**，本地缓存方案本身就不适用，应该走 Redis 直接读取，或者用分布式锁保护。
+>
+> 本质上，一致性和性能是 tradeoff。没有完美的方案，只有适合业务场景的方案。
+
+### 5.3 场景三：热点 key 熔断的实现
+
+**面试官问**：「如果热点 key 导致 Redis 开始超时，你会怎么做？」
+
+> 首先要确认是突发热点还是持续热点。如果是突发热点（瞬时流量），正常的缓存策略可能来不及生效，需要熔断兜底。
+>
+> 熔断的实现逻辑：
+>
+> 1. 在应用层维护一个热点 key 的本地缓存，用滑动窗口计数器统计每个 key 的访问频率
+> 2. 如果某个 key 在一秒内访问超过阈值（如 1 万次），把它标记为热点 key，加入本地永久缓存
+> 3. 后续对这个 key 的访问，直接从本地缓存返回，跳过 Redis 调用
+> 4. 本地热点缓存有最大内存限制，超出后按 LRU 淘汰
+>
+> 熔断是极端场景下的兜底方案。更好的做法是提前预判热点 key，做好预热和预案。
+
+---
+
+## 六、留给你的思考题
+
+### 题目一：热点 key 与缓存穿透的区别
+
+热点 key 和缓存穿透都会导致 Redis 请求量激增，但本质不同：
+
+- **热点 key**：key 存在，被大量访问，单节点压力过大
+- **缓存穿透**：key 不存在，请求穿透到数据库，数据库压力过大
+
+如果一个不存在的 key 被大量访问（如恶意刷接口），是热点 key 问题还是缓存穿透问题？应该用热点 key 方案还是缓存穿透方案解决？
+
+### 题目二：热点 key 预判的边界
+
+文章提到可以「主动预判热点 key」，但预判本身也有代价：
+
+- 如果预判错了（预判为热点的 key 实际不热），会造成资源浪费
+- 如果预判漏了（没预判到的 key 突然变热），会措手不及
+
+思考：如何在「预判准确性」和「预案完备性」之间找平衡？有没有不需要预判也能优雅处理热点 key 的方案？
+
+---
+
+## 总结
+
+热点 key 是 Redis 高并发场景下的经典问题，核心是**请求分布不均衡**。
+
+发现热点 key 的方法：客户端埋点（精确但侵入）、`redis-cli --hotkeys`（采样但无侵入）、`MONITOR` 抓取（全面但开销大）、代理层统计（无侵入但需架构支持）。
+
+解决热点 key 的思路：本地缓存（减少 Redis 请求）、热 key 复制（分散单节点压力）、hash tag（聚合相关热点）、读写分离（读多写少场景）、热点熔断（极端场景兜底）。
+
+最危险的是热点大 key——热点集中 + 单次操作耗时长 + 多副本成本高。解决思路是拆分大 key、懒加载按需获取、热点预热配合多级缓存。
+
+理解了热点 key 的发现与处理，你就掌握了 Redis 高并发场景下的「流量分片」核心思想——这不是 Redis 独有的问题，而是所有缓存系统、分布式系统都会遇到的挑战。
