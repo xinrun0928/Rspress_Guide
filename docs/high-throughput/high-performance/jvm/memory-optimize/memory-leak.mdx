@@ -1,0 +1,616 @@
+# 内存泄漏：慢性毒药的诊断与治疗
+
+本地测试一周没问题，灰度发布到线上，一切正常。
+
+第三天，报警来了：内存使用率持续上升，Full GC 越来越频繁。
+
+你排查了半天，没有死循环，没有大对象频繁创建。问题指向一个方向——**内存泄漏**。
+
+内存泄漏是慢性毒药。它不像 OOM 那样立刻崩溃，而是慢慢侵蚀，直到系统无法正常服务。本地测试之所以发现不了，是因为测试环境流量小、运行时间短，泄漏速度赶不上测试结束的速度。
+
+今天，我们来系统性地解决内存泄漏问题。
+
+---
+
+## 一、内存泄漏 vs 内存溢出
+
+很多人分不清这两个概念，先来明确一下：
+
+| 概念 | 定义 | 特点 |
+|---|---|---|
+| 内存泄漏（Memory Leak） | 对象无法被 GC 回收，但已不再使用 | 慢性，占用持续增长 |
+| 内存溢出（OOM） | 无法分配足够的内存 | 急性，直接导致服务崩溃 |
+
+**关系**：内存泄漏是内存溢出的前兆。持续泄漏 → 内存耗尽 → OOM。
+
+```java
+// 内存泄漏示例
+Map<String, Object> cache = new HashMap<>();
+
+// 每秒插入一个新对象
+public void addToCache(String key, Object value) {
+    cache.put(key, value);  // 永远不删除，越来越大
+}
+
+// 运行一段时间后
+// cache.size() = 86400 * 7 = 604800
+// 内存耗尽 → OOM
+```
+
+---
+
+## 二、内存泄漏分类
+
+### 2.1 堆内存泄漏
+
+最常见的类型。大量对象创建后无法被 GC 回收。
+
+典型特征：
+
+- `jstat -gcutil` 显示老年代 `FGC`（Full GC）次数持续增长
+- `jstat -gc` 显示 `OC`（Old区used）持续增长
+- `jmap -histo` 能看到某个类的实例数持续增长
+
+### 2.2 直接内存泄漏
+
+详见《直接内存溢出》章节。`DirectByteBuffer` 对象泄漏导致 native 内存无法回收。
+
+典型特征：
+
+- 进程物理内存持续增长
+- JVM 堆内存正常
+- NMT 显示 `Direct` 区域持续增长
+
+### 2.3 元空间泄漏
+
+元空间（Metaspace）存储类元数据。元空间泄漏通常是动态类加载失控导致的。
+
+典型特征：
+
+- `jstat -gc` 显示 `MC`（Metaspace used）持续增长
+- `jstat -gc` 显示 `MCS`（Metaspace Capacity）持续增长
+- 最终 `Metaspace OOM`
+
+```java
+// 元空间泄漏示例：动态类加载
+public class HotDeploymentLoader extends ClassLoader {
+    @Override
+    protected Class<?> loadClass(String name, boolean resolve) {
+        // 每次都创建新的 ClassLoader
+        // 旧 ClassLoader 无法被 GC（因为可能被引用）
+        ClassLoader newLoader = new ClassLoader(this);
+        return newLoader.loadClass(name);
+    }
+}
+```
+
+---
+
+## 三、典型内存泄漏代码模式
+
+### 3.1 静态集合类持有对象引用
+
+这是最常见的内存泄漏原因。静态集合会贯穿整个应用生命周期，如果不断往里添加对象，从不清理，内存就会持续增长。
+
+```java
+// 错误示例：静态 Map 永不清理
+public class UserService {
+    // 静态集合，生命周期 = 应用生命周期
+    private static Map<String, User> userCache = new HashMap<>();
+
+    public User getUser(String userId) {
+        User user = userCache.get(userId);
+        if (user == null) {
+            user = loadFromDB(userId);
+            userCache.put(userId, user);  // 只添加，不删除
+        }
+        return user;
+    }
+}
+
+// 正确示例：使用 LRU 缓存或设置上限
+public class UserService {
+    // 使用 LRU 缓存，自动淘汰最久未使用的
+    private static Map<String, User> userCache =
+        new LinkedHashMap<>(1000, 0.75f, true) {
+            @Override
+            protected boolean removeEldestEntry(Map.Entry eldest) {
+                return size() > 10000;  // 超过 10000 条时淘汰
+            }
+        };
+}
+```
+
+### 3.2 内部类持有外部类引用
+
+非静态内部类会隐式持有外部类引用。如果内部类被长期持有，外部类也无法被 GC。
+
+```java
+// 错误示例：非静态内部类导致外部类泄漏
+public class OuterService {
+    private byte[] bigData = new byte[10 * 1024 * 1024];  // 10MB
+
+    public Runnable createTask() {
+        // 非静态内部类 Runnable 持有 OuterService 引用
+        return new Runnable() {
+            @Override
+            public void run() {
+                // 使用了 bigData
+                System.out.println(bigData.length);
+            }
+        };
+    }
+}
+
+// 正确示例：使用静态内部类
+public class OuterService {
+    private byte[] bigData = new byte[10 * 1024 * 1024];
+
+    public Runnable createTask() {
+        // 静态内部类不持有外部类引用
+        return new StaticTask.create(bigData);
+    }
+
+    // 静态内部类，接收外部数据的副本
+    private static class StaticTask implements Runnable {
+        private final byte[] data;
+
+        public StaticTask(byte[] data) {
+            this.data = data;  // 或直接使用传入的数据
+        }
+
+        @Override
+        public void run() {
+            System.out.println(data.length);
+        }
+    }
+}
+```
+
+### 3.3 ThreadLocal 未清理
+
+ThreadLocal 的设计初衷是每个线程独立存储数据。但问题是：**线程池复用了线程，ThreadLocal 的值也跟着复用**。
+
+```java
+// 错误示例：ThreadLocal 未清理
+public class UserContext {
+    private static final ThreadLocal<User> currentUser = new ThreadLocal<>();
+
+    public static void setUser(User user) {
+        currentUser.set(user);  // 设置后从不清理
+    }
+
+    public static User getUser() {
+        return currentUser.get();
+    }
+}
+
+// 调用方
+public void handleRequest(User user) {
+    UserContext.setUser(user);  // 设置当前用户
+    // ... 业务逻辑 ...
+    // 线程归还到池中，但 ThreadLocal.value 没有清理
+}
+
+// 正确示例：使用完必清理
+public class UserContext {
+    private static final ThreadLocal<User> currentUser = new ThreadLocal<>();
+
+    public static void setUser(User user) {
+        currentUser.set(user);
+    }
+
+    public static void clear() {
+        currentUser.remove();  // 显式清理
+    }
+
+    public static User getUser() {
+        return currentUser.get();
+    }
+}
+
+// 业务代码
+public void handleRequest(User user) {
+    try {
+        UserContext.setUser(user);
+        // ... 业务逻辑 ...
+    } finally {
+        UserContext.clear();  // finally 中清理
+    }
+}
+```
+
+### 3.4 资源未关闭
+
+流、连接等资源必须显式关闭，否则可能导致内存泄漏。
+
+```java
+// 错误示例：资源未关闭
+public String readFile(String path) throws IOException {
+    FileReader reader = new FileReader(path);
+    BufferedReader br = new BufferedReader(reader);
+    return br.readLine();  // 如果这里抛异常，reader 和 br 都不会关闭
+}
+
+// 正确示例：try-with-resources
+public String readFile(String path) throws IOException {
+    try (FileReader reader = new FileReader(path);
+         BufferedReader br = new BufferedReader(reader)) {
+        return br.readLine();  // 自动关闭
+    }
+}
+```
+
+### 3.5 监听器和回调未注销
+
+注册了监听器但从不注销，会导致监听器对象和被监听对象相互持有，无法回收。
+
+```java
+// 错误示例：监听器未注销
+public class EventManager {
+    private final List<Listener> listeners = new ArrayList<>();
+
+    public void addListener(Listener listener) {
+        listeners.add(listener);  // 只添加，不删除
+    }
+}
+
+// 正确示例：提供移除方法
+public class EventManager {
+    private final List<Listener> listeners = new CopyOnWriteArrayList<>();
+
+    public void addListener(Listener listener) {
+        listeners.add(listener);
+    }
+
+    public void removeListener(Listener listener) {
+        listeners.remove(listener);  // 显式移除
+    }
+
+    // 清理所有监听器
+    public void clear() {
+        listeners.clear();
+    }
+}
+```
+
+### 3.6 缓存使用不当
+
+缓存是内存泄漏的重灾区。缓存的对象越来越多，但从不清理。
+
+```java
+// 错误示例：无限制缓存
+public class DataService {
+    private Map<String, DataResult> cache = new ConcurrentHashMap<>();
+
+    public DataResult getData(String key) {
+        return cache.computeIfAbsent(key, k -> {
+            // 每次 miss 都缓存，从不清理
+            return fetchFromDB(k);
+        });
+    }
+}
+
+// 正确示例：使用带 TTL 的缓存
+public class DataService {
+    // Guava Cache
+    private LoadingCache<String, DataResult> cache = CacheBuilder.newBuilder()
+        .maximumSize(10000)           // 最多 10000 条
+        .expireAfterWrite(10, TimeUnit.MINUTES)  // 10 分钟过期
+        .build(new CacheLoader<>() {
+            @Override
+            public DataResult load(String key) {
+                return fetchFromDB(key);
+            }
+        });
+
+    public DataResult getData(String key) {
+        return cache.getUnchecked(key);
+    }
+}
+```
+
+---
+
+## 四、MAT 分析实战
+
+MAT（Memory Analyzer Tool）是分析堆转储文件的神器。它能帮助你找到内存泄漏的根源。
+
+### 4.1 核心概念
+
+在 MAT 中，有几个关键概念：
+
+**Shallow Heap**：对象本身占用的内存，不包括它引用的对象。
+
+**Retained Heap**：如果对象被回收，能释放的内存总量（包括它持有的所有引用对象）。
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                 Shallow Heap vs Retained Heap               │
+│                                                             │
+│  Object A 引用 Object B                                     │
+│                                                             │
+│  ┌─────────┐          ┌─────────┐                          │
+│  │ Object A│          │ Object B│                          │
+│  │shallow: │          │shallow: │                          │
+│  │  100B   │────────→ │  100B   │                          │
+│  │retained:│          │retained:│                          │
+│  │  100B   │          │  100B   │                          │
+│  └─────────┘          └─────────┘                          │
+│                                                             │
+│  A 的 retained = A.shallow + B.shallow = 200B               │
+│  A 回收时，B 也会被回收                                      │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**GC Roots**：垃圾回收的根节点。从 GC Roots 出发，能到达的对象是"活"的，无法到达的是"死"的。
+
+常见的 GC Roots：
+
+- JVM 栈（本地变量表）中的引用
+- 方法区中 static 静态属性
+- 本地方法栈中的引用
+- 活跃的 Java 线程
+
+### 4.2 生成堆转储
+
+```bash
+# 方式一：jmap（需要目标进程支持）
+jmap -dump:format=b,file=/tmp/heap.hprof <PID>
+
+# 方式二：jmap -F（强制生成，用于进程卡死时）
+jmap -F -dump:format=b,file=/tmp/heap.hprof <PID>
+
+# 方式三：JVM 参数自动生成
+-XX:+HeapDumpOnOutOfMemoryError
+-XX:HeapDumpPath=/tmp/heap.hprof
+
+# 方式四：Arthas
+heapdump /tmp/heap.hprof
+```
+
+### 4.3 MAT 核心功能
+
+#### 4.3.1 Leak Suspects（内存泄漏嫌疑人）
+
+打开堆转储文件后，MAT 会自动运行 Leak Suspects 分析。它会列出最可能的内存泄漏点。
+
+```
+Leak Suspects Summary:
+----------------------
+1. One instance of "java.util.HashMap" loaded by "sun.misc.Launcher$AppClassLoader"
+   occupies 524,288,000 (50.23%) bytes.
+   Key: java.lang.String @ 0x7c12345678
+   Value: com.example.User @ 0x7d23456789
+
+2. One instance of "com.example.CacheService" loaded by "sun.misc.Launcher$AppClassLoader"
+   occupies 256,000,000 (24.56%) bytes.
+```
+
+#### 4.3.2 Histogram（直方图）
+
+查看各类对象的实例数量和内存占用。
+
+```bash
+# 使用 jhat 或 MAT 查看
+# 在 MAT 中操作：
+# 1. 点击工具栏 "Histogram"
+# 2. 输入类名过滤（如 "HashMap"）
+# 3. 查看对象数量和内存占用
+```
+
+#### 4.3.3 Dominator Tree（支配树）
+
+查看哪些对象持有了大量内存。
+
+```bash
+# Dominator Tree 特点：
+# 1. 如果 A 支配 B，那么所有从 GC Roots 到 B 的路径都经过 A
+# 2. 支配关系是理解内存结构的好工具
+# 3. 找到顶层的大对象，通常就是泄漏源头
+```
+
+#### 4.3.4 Path to GC Roots（到 GC Roots 的路径）
+
+这是最关键的功能。选中一个对象，查看它的 GC Roots 路径。
+
+```bash
+# 在 MAT 中操作：
+# 1. 选中疑似泄漏的对象
+# 2. 右键 → "Path To GC Roots" → "with all references"
+# 3. 分析路径，找出为什么这个对象无法被回收
+```
+
+**分析示例**：
+
+假设 `HashMap` 有 50 万个对象无法回收。
+
+1. 在 Histogram 中找到 `HashMap`
+2. 右键 → "Path To GC Roots"
+3. 看到路径是：`HashMap` → `static CacheService.cache` → `CacheService`
+
+**结论**：`CacheService` 是一个静态单例，它的 `cache` 字段持有了一个不断增长的 `HashMap`。
+
+---
+
+## 五、OQL：对象查询语言
+
+OQL（Object Query Language）让你像查数据库一样查询堆转储。
+
+### 5.1 基础语法
+
+```sql
+-- 查询所有 String 对象
+SELECT * FROM java.lang.String
+
+-- 查询所有 HashMap
+SELECT * FROM java.util.HashMap
+
+-- 查询 userId 为 "admin" 的 User 对象
+SELECT * FROM com.example.User WHERE userId.value = "admin"
+```
+
+### 5.2 实用 OQL 示例
+
+```sql
+-- 查询所有大小超过 1MB 的 byte 数组
+SELECT p FROM byte[] p WHERE p.@length > 1048576
+
+-- 查询所有 HashMap 中 key 数量超过 10000 的
+SELECT s.@size FROM java.util.HashMap s WHERE s.@size > 10000
+
+-- 查询所有 ThreadLocalMap
+SELECT {thread: t.@name, map: m} FROM java.lang.Thread t, java.lang.ThreadLocal$ThreadLocalMap m
+WHERE t.threadLocals = m
+
+-- 查询所有 FileInputStream 且未关闭的
+SELECT p FROM java.io.FileInputStream p WHERE p.@closed = false
+```
+
+---
+
+## 六、解决方案汇总
+
+### 6.1 静态集合 → WeakHashMap
+
+如果集合中的对象应该被 GC 回收，使用 `WeakHashMap`。
+
+```java
+// WeakHashMap：当键不再被引用时，entry 会被自动清理
+WeakHashMap<String, Object> cache = new WeakHashMap<>();
+```
+
+:::warning 注意
+`WeakHashMap` 的 key 是弱引用。如果 key 只被 Map 持有，它会被 GC 回收。如果 value 持有 key 的引用，需要用 `WeakReference`。
+
+```java
+// 安全的写法
+WeakHashMap<String, WeakReference<Object>> cache = new WeakHashMap<>();
+```
+:::
+
+### 6.2 缓存 → 带 TTL 和大小限制
+
+```java
+// Guava Cache
+LoadingCache<Key, Graph> cache = CacheBuilder.newBuilder()
+    .maximumSize(10000)                    // 最多 10000 条
+    .expireAfterWrite(10, TimeUnit.MINUTES) // 写入后 10 分钟过期
+    .removalListener(notification -> {
+        // 移除通知
+    })
+    .build(CacheLoader.get(key));
+```
+
+### 6.3 资源关闭 → try-with-resources
+
+```java
+// JDK 7+
+try (Connection conn = dataSource.getConnection();
+     PreparedStatement stmt = conn.prepareStatement(sql)) {
+    // 使用资源
+}  // 自动关闭
+```
+
+### 6.4 ThreadLocal → remove()
+
+```java
+// 使用完必清理
+try {
+    UserContext.set(user);
+    // 业务逻辑
+} finally {
+    UserContext.clear();
+}
+```
+
+### 6.5 监听器 → 提供注销方法
+
+```java
+// 注册时保存引用
+Listener listener = event -> { ... };
+eventManager.addListener(listener);
+
+// 适当时机注销
+eventManager.removeListener(listener);
+
+// 或使用弱引用
+WeakReference<Listener> ref = new WeakReference<>(listener);
+```
+
+---
+
+## 七、面试实战
+
+### 面试题一：如何排查内存泄漏？
+
+**回答要点**：
+
+```
+内存泄漏排查分五步：
+
+第一步：确认是内存泄漏
+  - jstat -gcutil 观察 FGC 次数和 Old 区增长
+  - 如果 FGC 次数持续增长，说明有问题
+
+第二步：生成堆转储
+  - jmap -dump:format=b,file=/tmp/heap.hprof <PID>
+  - 或设置 -XX:+HeapDumpOnOutOfMemoryError
+
+第三步：分析堆转储
+  - 用 MAT 打开 .hprof 文件
+  - 运行 Leak Suspects
+  - 用 Histogram 查看对象数量
+
+第四步：定位泄漏源
+  - 找到占用内存最多的对象
+  - 用 Path to GC Roots 找到引用链
+
+第五步：分析代码
+  - 为什么这些对象无法被回收？
+  - 是集合没清理？是监听器没注销？
+```
+
+### 面试题二：ThreadLocal 为什么会内存泄漏？
+
+**回答要点**：
+
+```
+ThreadLocal 内存泄漏的原因在于它的实现机制：
+
+1. ThreadLocalMap 的 Entry 继承自 WeakReference<ThreadLocal>
+   - Entry 的 key（ThreadLocal）是弱引用
+   - 当 ThreadLocal 不再被外部引用时，会被 GC 回收
+
+2. 但 Entry 的 value 是强引用
+   - ThreadLocalMap -> Entry -> value（强引用）
+   - 即使 ThreadLocal key 被 GC 了，value 仍然被 Entry 持有
+
+3. Thread 是 GC Roots
+   - 线程对象是 GC Roots，不会被 GC
+   - ThreadLocalMap 作为线程的属性，无法被 GC
+   - Entry 不会被清理
+
+所以，如果不调用 remove()：
+- Thread 存活 → ThreadLocalMap 存活 → Entry 存活 → value 泄漏
+```
+
+**面试追问**：ThreadLocal 既然有 key 的弱引用，为什么还要手动 remove？
+
+**回答**：因为 key（弱引用）只保证 ThreadLocal 对象本身能被回收，但 value（强引用）还持有在 Entry 中。如果不手动清理，value 会一直存在。而且清理 value 还有一个额外问题：value 可能很大（几十 KB 的对象），不及时清理会很浪费。
+
+---
+
+## 八、总结
+
+内存泄漏是慢性毒药，但并非无迹可寻。
+
+核心要点：
+
+1. **静态集合、ThreadLocal、资源未关闭、缓存无限制**是最常见的泄漏原因
+2. **jstat 监控 GC 次数**，持续增长说明有问题
+3. **jmap 生成堆转储**，MAT 分析泄漏源
+4. **Path to GC Roots** 是定位泄漏链路的利器
+5. **WeakHashMap、TTL 缓存、try-with-resources** 是预防泄漏的有效手段
+
+> 下一步思考：内存泄漏修复后，如何设计监控指标来提前发现泄漏趋势？什么指标能作为泄漏的前兆？

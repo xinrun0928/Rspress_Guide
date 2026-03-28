@@ -1,0 +1,511 @@
+# G1 GC 专属参数详解
+
+G1（Garbage First）是 JDK 9+ 的默认垃圾收集器，设计目标是提供可预测的停顿时间。但要让 G1 发挥最佳性能，需要理解它的核心参数。
+
+这篇文章，深入讲解 G1 的关键参数、常见问题，以及推荐配置。
+
+---
+
+## 一、G1 参数全景
+
+### 1.1 G1 核心参数一览
+
+```
+G1 参数分类
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+基础配置
+├─ -XX:+UseG1GC                    启用 G1
+├─ -XX:MaxGCPauseMillis=200        目标停顿时间
+├─ -XX:G1HeapRegionSize=           Region 大小
+└─ -XX:InitialHeapSize=            初始堆大小
+
+并发周期参数
+├─ -XX:InitiatingHeapOccupancyPercent=45  开始并发周期阈值
+└─ -XX:G1ReservePercent=10         保留内存比例
+
+Mixed GC 参数
+├─ -XX:G1MixedGCLiveThresholdPercent=85  混合 GC 存活对象阈值
+├─ -XX:G1HeapWastePercent=5       堆废物百分比
+├─ -XX:G1OldCSetRegionThresholdPercent=10 老年代 CSet 区域阈值
+└─ -XX:G1MixedGCLiveThresholdPercent     混合 GC 存活阈值
+
+Humongous 对象参数
+└─ -XX:G1HeapRegionSize            Humongous 对象大小相关
+
+GC 线程参数
+├─ -XX:ParallelGCThreads           并行 GC 线程数
+└─ -XX:ConcGCThreads               并发 GC 线程数
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+### 1.2 G1 与其他收集器的参数差异
+
+G1 的参数设计理念与传统收集器不同：
+
+| 维度 | Parallel/CMS | G1 |
+|---|---|---|
+| 停顿控制 | 不可控 | 通过 MaxGCPauseMillis 可控 |
+| 内存结构 | 连续（新生代/老年代） | 离散（Region） |
+| 晋升策略 | 固定年龄 | 动态计算 |
+| Mixed GC | 无 | G1 独有 |
+
+---
+
+## 二、核心参数详解
+
+### 2.1 MaxGCPauseMillis：目标停顿时间
+
+这是 G1 最重要的参数，定义应用期望的最大 GC 停顿时间。
+
+```bash
+-XX:MaxGCPauseMillis=200   # 目标停顿时间 200ms
+```
+
+**重要特性**：
+
+1. **这是目标，不是保证**：G1 会尽力达到目标，但不保证每次都实现
+2. **动态调整**：G1 会根据实际停顿情况动态调整策略
+3. **设置过大或过小都有问题**：
+   - 设置太小（如 10ms）→ G1 无法有效工作，可能导致频繁 GC
+   - 设置太大（如 1s）→ G1 过于保守，GC 效率低
+
+**工作原理**：
+
+```
+G1 停顿时间控制机制
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+G1 在每次 Mixed GC 后评估是否达到目标
+
+情况 1：上次停顿 < MaxGCPauseMillis
+        → G1 认为可以承担更多工作
+        → 下次 Mixed GC 可能会回收更多老年代 Region
+
+情况 2：上次停顿 > MaxGCPauseMillis
+        → G1 降低承担的工作量
+        → 减少 Mixed GC 回收的 Region 数量
+
+情况 3：连续多次超过目标
+        → G1 增加年轻代大小
+        → 让对象在年轻代停留更长时间
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+### 2.2 G1HeapRegionSize：Region 大小
+
+G1 将堆划分为多个等大小的 Region，每个 Region 大小必须是 2 的幂。
+
+```bash
+# 自动选择（默认）
+-XX:G1HeapRegionSize=          # 不指定，由 JVM 自动选择
+
+# 手动指定（必须是 1MB, 2MB, 4MB, 8MB, 16MB, 32MB...）
+-XX:G1HeapRegionSize=4m        # 每个 Region 4MB
+```
+
+**自动选择规则**：
+
+- 最小 Region 大小：1MB
+- 最大 Region 大小：32MB
+- 堆大小 / 2048 = Region 大小（大约）
+- 例如：4GB 堆 → Region 大小约 2MB
+
+**建议**：
+
+| 堆大小 | 推荐 Region 大小 | 理由 |
+|---|---|---|
+| `<` 4GB | 自动（1-2MB） | 默认即可 |
+| 4-8GB | 2MB | 平衡停顿时间和效率 |
+| 8-32GB | 4MB | 减少 Region 数量，降低管理开销 |
+| `>` 32GB | 8MB 或更大 | 减少 Region 数量 |
+
+### 2.3 InitiatingHeapOccupancyPercent：并发周期阈值
+
+定义老年代占用率达到多少百分比时，启动并发标记周期。
+
+```bash
+-XX:InitiatingHeapOccupancyPercent=45   # 默认 45%
+```
+
+**取值范围**：0-100
+
+**默认值与建议**：
+
+| 场景 | 推荐值 | 说明 |
+|---|---|---|
+| 默认 | 45 | JVM 默认值 |
+| 对象分配率高 | 40-50 | 早点启动，留出足够时间 |
+| 对象分配率低 | 50-60 | 可以晚点启动，减少并发开销 |
+
+**触发动图**：
+
+```
+并发标记周期触发
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+老年代占用率
+    0%    25%    45%    50%    75%    100%
+     │      │      │      │      │      │
+     │      │      │      │      │      │
+     │      │      │      ▼      │      │
+     │      │      │  触发并发    │      │
+     │      │      │  标记周期    │      │
+     │      │      │      │      │      │
+     └──────┴──────┴──────┴──────┴──────┴────
+                ↑
+         InitiatingHeapOccupancyPercent
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+---
+
+## 三、Mixed GC 相关参数
+
+### 3.1 G1MixedGCLiveThresholdPercent：混合 GC 存活阈值
+
+定义 Region 中存活对象比例超过多少时，不纳入混合 GC。
+
+```bash
+-XX:G1MixedGCLiveThresholdPercent=85   # 默认 85%
+```
+
+**含义**：如果一个老年代 Region 中存活对象比例超过 85%，G1 认为回收价值低，不会将其加入 CSet（Collection Set）。
+
+**调整建议**：
+
+| 场景 | 推荐值 |
+|---|---|
+| 默认 | 85 |
+| 内存充足 | 90-95（更激进回收） |
+| 内存紧张 | 70-80（避免无价值回收） |
+
+### 3.2 G1HeapWastePercent：堆废物百分比
+
+定义混合 GC 后，允许残留的空闲空间比例。
+
+```bash
+-XX:G1HeapWastePercent=5   # 默认 5%
+```
+
+**工作原理**：
+
+```
+G1HeapWastePercent 作用
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+混合 GC 过程中：
+
+Step 1: G1 计算可以回收的空闲 Region
+Step 2: 如果空闲 Region 空间 < 堆大小 × HeapWastePercent
+         → 继续回收（认为值得）
+Step 3: 如果空闲 Region 空间 > 堆大小 × HeapWastePercent
+         → 停止回收（认为不值得）
+
+示例：
+堆大小 = 4GB，HeapWastePercent = 5%
+→ 允许残留最多 200MB 空闲空间
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+### 3.3 G1OldCSetRegionThresholdPercent：老年代 CSet 阈值
+
+定义单次混合 GC 中，最多回收多少比例的老年代 Region。
+
+```bash
+-XX:G1OldCSetRegionThresholdPercent=10   # 默认 10%
+```
+
+**取值**：1-100
+
+**调整建议**：
+
+| 场景 | 推荐值 | 说明 |
+|---|---|---|
+| 追求低延迟 | 5-10 | 减少每次 Mixed GC 的工作量 |
+| 追求高吞吐 | 15-20 | 增加每次 Mixed GC 的工作量 |
+
+---
+
+## 四、Humongous 对象处理
+
+### 4.1 什么是 Humongous 对象
+
+Humongous 对象是大于半个 Region 大小的对象。
+
+```
+Humongous 对象定义
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Region 大小 = 4MB
+
+Humongous 对象条件：对象大小 > Region 大小 / 2 = 2MB
+
+对象大小 1MB → 普通对象（Eden Region）
+对象大小 2MB → 普通对象（可能使用整个 Region）
+对象大小 3MB → Humongous 对象
+对象大小 4MB → Humongous 对象
+对象大小 8MB → Humongous 对象（需要 2 个连续 Region）
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+### 4.2 Humongous 对象的特殊性
+
+| 特性 | 说明 |
+|---|---|
+| 分配位置 | 直接分配在老年代的 Humongous Region |
+| 回收时机 | 只在 Full GC 或并发标记周期结束时回收 |
+| 碎片化风险 | 可能导致老年代碎片化（需要连续空间） |
+
+### 4.3 G1HeapRegionSize 与 Humongous 的关系
+
+Region 大小直接影响 Humongous 对象的判定：
+
+| Region 大小 | Humongous 阈值 | 适用场景 |
+|---|---|---|
+| 1MB | 512KB | 小对象多，Humongous 少 |
+| 2MB | 1MB | 默认 |
+| 4MB | 2MB | 大对象多，需要大 Region |
+| 8MB | 4MB | 超大堆，减少 Region 数量 |
+
+### 4.4 Humongous 优化建议
+
+```bash
+# 场景：大量使用大缓存对象（如 5MB 的 ByteBuffer）
+
+# 方案 1：调整 Region 大小
+-XX:G1HeapRegionSize=8m    # 5MB < 4MB，不算 Humongous
+
+# 方案 2：复用对象池
+ByteBuffer buffer = bufferPool.acquire();  // 复用已有缓冲区
+try {
+    // 使用缓冲区
+} finally {
+    bufferPool.release(buffer);
+}
+
+# 方案 3：使用堆外内存
+ByteBuffer buffer = ByteBuffer.allocateDirect(5 * 1024 * 1024);  // 堆外
+```
+
+---
+
+## 五、G1 常见问题与解决
+
+### 5.1 G1 频繁 Mixed GC
+
+**问题表现**：
+- Mixed GC 频率很高
+- 每次 Mixed GC 回收的老年代 Region 很少
+
+**可能原因**：
+
+1. **InitiatingHeapOccupancyPercent 设置过低** → 并发周期启动过早
+2. **G1MixedGCLiveThresholdPercent 设置过高** → 认为大多数 Region 回收价值低
+3. **对象分配率过高** → 老年代快速填满
+
+**解决方案**：
+
+```bash
+# 方案 1：调整 IHOP
+-XX:InitiatingHeapOccupancyPercent=60    # 提高阈值
+
+# 方案 2：调整 Mixed GC 阈值
+-XX:G1MixedGCLiveThresholdPercent=90    # 更激进回收
+
+# 方案 3：减少 Mixed GC 频率
+-XX:G1NewSizePercent=30                  # 增大年轻代，减少对象过快晋升
+```
+
+### 5.2 G1 Full GC
+
+**问题表现**：
+- G1 发生 Full GC（单线程，停顿时间长）
+- 通常是混合 GC 来不及回收
+
+**可能原因**：
+
+1. **元空间满** → Metaspace 不足
+2. **晋升失败** → 晋升时老年代空间不足
+3. **Humongous 对象过多** → 大量 Humongous 对象无法回收
+4. **G1ReservePercent 不足** → 保留空间不够
+
+**解决方案**：
+
+```bash
+# 方案 1：检查元空间
+-XX:MetaspaceSize=256m
+-XX:MaxMetaspaceSize=512m
+
+# 方案 2：增加保留空间
+-XX:G1ReservePercent=20    # 从默认 10% 提高到 20%
+
+# 方案 3：调整 Region 大小
+-XX:G1HeapRegionSize=4m    # 减少 Humongous 对象数量
+
+# 方案 4：切换到 ZGC（终极方案）
+-XX:+UseZGC
+```
+
+### 5.3 停顿时间不达标
+
+**问题表现**：
+- MaxGCPauseMillis 设置 200ms，但实际经常超过
+- GC 停顿影响业务响应
+
+**可能原因**：
+
+1. **目标过于激进** → 200ms 对于大多数应用可能太小
+2. **Region 大小不当** → Region 太大导致单次回收时间长
+3. **Mixed GC 工作量过大** → 每次 Mixed GC 回收太多 Region
+
+**解决方案**：
+
+```bash
+# 方案 1：合理设置目标
+-XX:MaxGCPauseMillis=500   # 放宽目标
+
+# 方案 2：调整 Region 大小
+-XX:G1HeapRegionSize=2m    # 减小 Region
+
+# 方案 3：减少 Mixed GC 工作量
+-XX:G1OldCSetRegionThresholdPercent=5  # 减少每次回收的 Region
+```
+
+---
+
+## 六、推荐配置模板
+
+### 6.1 通用微服务配置
+
+```bash
+# 基础配置
+-Xms2g -Xmx2g
+-XX:+UseG1GC
+
+# 停顿时间目标（根据业务调整）
+-XX:MaxGCPauseMillis=200
+
+# Region 大小（容器环境常用）
+-XX:G1HeapRegionSize=2m
+
+# 并发周期（默认值通常足够）
+-XX:InitiatingHeapOccupancyPercent=45
+
+# GC 日志
+-Xlog:gc*:file=/var/log/gc.log:time,uptime,level,tags:filecount=10,filesize=50M
+```
+
+### 6.2 低延迟交易系统配置
+
+```bash
+# 堆内存
+-Xms8g -Xmx8g
+-XX:+UseG1GC
+
+# 激进停顿时间目标
+-XX:MaxGCPauseMillis=30
+
+# 更大的 Region（减少管理开销）
+-XX:G1HeapRegionSize=4m
+
+# 调整 IHOP（让并发周期更早开始）
+-XX:InitiatingHeapOccupancyPercent=40
+
+# 更激进的 Mixed GC
+-XX:G1MixedGCLiveThresholdPercent=90
+-XX:G1HeapWastePercent=3
+
+# 字符串去重（JDK 11+）
+-XX:+UseStringDeduplication
+```
+
+### 6.3 超大堆配置
+
+```bash
+# 堆内存（64GB+）
+-Xms128g -Xmx128g
+-XX:+UseG1GC
+
+# 大 Region（减少 Region 数量）
+-XX:G1HeapRegionSize=8m
+
+# 放宽停顿目标（堆越大越难控制）
+-XX:MaxGCPauseMillis=500
+
+# 更高的 IHOP（给并发标记更多时间）
+-XX:InitiatingHeapOccupancyPercent=60
+
+# ZGC 作为备选（如果 G1 无法满足）
+# -XX:+UseZGC
+```
+
+---
+
+## 七、面试实战
+
+### 面试题一：G1 的 MaxGCPauseMillis 是硬性保证吗？
+
+**参考答案**：
+
+不是硬性保证，而是目标。G1 会尽最大努力达到目标停顿时间，但在以下情况下可能无法达成：
+
+1. **对象分配率过高**：年轻代快速填满，来不及回收
+2. **存活对象过多**：Survivor 区或老年代存活对象多，复制时间长
+3. **Region 大小不当**：Region 太大，单次回收时间长
+4. **Mixed GC 工作量过大**：一次 Mixed GC 承担太多 Region
+
+G1 通过动态调整来解决这个问题：如果连续多次超过目标，会增加年轻代大小或减少 Mixed GC 工作量。
+
+---
+
+### 面试题二：G1 的 Region 大小如何选择？
+
+**参考答案**：
+
+Region 大小的选择取决于多个因素：
+
+1. **堆大小**：堆越大，Region 数量越多，管理开销越大
+2. **对象大小**：避免大量 Humongous 对象
+3. **延迟要求**：Region 越大，单次回收时间越长
+
+**经验法则**：
+
+| 堆大小 | 推荐 Region 大小 |
+|---|---|
+| `<` 4GB | 自动（1-2MB） |
+| 4-16GB | 2-4MB |
+| 16-64GB | 4-8MB |
+| `>` 64GB | 8-16MB |
+
+---
+
+### 面试题三：G1 什么时候会发生 Full GC？
+
+**参考答案**：
+
+G1 正常情况下不应该发生 Full GC。Full GC 是 G1 退化的表现，通常发生在：
+
+1. **元空间满**：Metaspace 不足
+2. **晋升失败**：Mixed GC 来不及回收，对象晋升时老年代空间不足
+3. **Humongous 对象过多**：大量 Humongous 对象无法回收，导致空间碎片化
+4. **G1ReservePercent 不足**：保留空间不够，对象分配失败
+
+**解决方案**：增加元空间、调整 IHOP、切换到 ZGC 等。
+
+---
+
+## 八、思考题
+
+1. 如果 G1MixedGCLiveThresholdPercent 设置为 100%，会发生什么？
+
+2. G1ReservePercent 设置过大有什么副作用？
+
+3. 为什么 G1 需要 Humongous 对象的概念？直接用普通对象不行吗？
+
+4. 如果一个应用的对象分配率极高，应该如何调整 G1 参数？

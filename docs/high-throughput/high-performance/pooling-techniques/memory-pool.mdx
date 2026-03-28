@@ -1,0 +1,119 @@
+# 内存池与对象池：减少 GC 压力的秘密
+
+你有没有想过这个问题：JVM 的 GC 明明已经很强大了，为什么 Netty 还要自己实现 ByteBuf 池？为什么 Redis 不直接用 malloc/free，而要用 jemalloc？
+
+答案都在两个字里：**池化**。
+
+## 一、为什么需要内存池
+
+JVM 对象的创建和销毁都需要成本：
+
+- **对象创建**：分配内存 + 初始化字段 + 对象头设置
+- **对象回收**：对象变成垃圾后，被 GC 回收
+
+单个对象的成本不高，但如果对象创建/销毁的频率极高（如高并发网络处理），累积的成本就会显著影响性能。
+
+更重要的是：**GC 不是免费的**。大量对象的创建会触发频繁的 Minor GC，甚至 Full GC，导致 STW 停顿，影响接口 RT。
+
+### 内存池的核心思想
+
+```
+传统方式：分配 → 使用 → 释放给 OS
+内存池：   预分配 → 分配（从池中取）→ 归还（回到池中）→ 复用
+```
+
+## 二、JVM 的内存分配机制
+
+### 2.1 TLAB：线程本地分配缓冲
+
+TLAB（Thread Local Allocation Buffer）是 JVM 为每个线程在 Eden 区预分配的一块内存区域。线程在自己的 TLAB 中分配对象，不需要竞争全局锁。
+
+### 2.2 逃逸分析
+
+逃逸分析（Escape Analysis）是 JVM 判断对象是否「逃逸」出方法/线程的技术。如果对象不逃逸，可以做**锁消除**和**标量替换**优化。
+
+## 三、Netty ByteBuf 池化
+
+Netty 是 Java 网络通信中最常用的框架。ByteBuf 是 Netty 的字节容器，Netty 为它实现了池化。
+
+### 3.1 池化 ByteBuf vs 非池化 ByteBuf
+
+```java
+// 非池化：每次分配都向操作系统申请内存
+ByteBuf buf = Unpooled.buffer(1024);
+
+// 池化：从内存池获取，用完后归还
+ByteBuf buf = PooledByteBufAllocator.DEFAULT.buffer(1024);
+```
+
+### 3.2 Netty 内存池的架构
+
+Netty 的 PooledByteBufAllocator 采用 **Arena** 架构，每个 Arena 管理一块内存。线程通过**线程本地变量**绑定到某个 Arena，减少跨 Arena 竞争。
+
+Arena 内部使用 **Chunk**（默认 16MB）管理内存，每个 Chunk 划分为多个 **Page**（默认 8KB）。
+
+### 3.3 内存泄漏检测
+
+```bash
+# 禁用检测（生产环境）
+-Dio.netty.leakDetection.level=disabled
+
+# 简单模式：采样 1%（轻量级）
+-Dio.netty.leakDetection.level=simple
+
+# 偏执模式：检测所有
+-Dio.netty.leakDetection.level=paranoid
+```
+
+使用池化 ByteBuf 后，release() 是必须的：
+
+```java
+ByteBuf buf = ctx.alloc().buffer(1024);
+try {
+    // 使用 buf
+} finally {
+    buf.release();
+}
+```
+
+## 四、常见内存分配器
+
+| 分配器 | 特点 | 使用场景 |
+|---|---|---|
+| glibc ptmalloc2 | Linux 默认，多线程锁竞争严重 | 系统默认 |
+| jemalloc | 多线程无锁设计，内存碎片率低 | Redis、MongoDB |
+| tcmalloc | 性能优秀 | Chrome |
+
+## 五、调优参数
+
+```bash
+# 堆外内存池
+-Dio.netty.allocator.type=pooled
+
+# 直接内存上限
+-XX:MaxDirectMemorySize=4g
+```
+
+建议直接内存设置为堆大小的 1/4 到 1/2。
+
+---
+
+## 思考题
+
+### 题目一：池化的代价
+
+什么情况下池化反而不如非池化？
+
+### 题目二：ByteBuf 泄漏
+
+如果 ByteBuf 泄漏了，会发生什么？进程会 OOM 吗？
+
+---
+
+## 总结
+
+**核心记忆点**：
+- 池化的本质：以空间换时间，减少系统调用和 GC 压力
+- TLAB 是 JVM 在 Eden 区的线程本地分配优化
+- Netty ByteBuf 池化通过 Arena + Chunk + Page 架构实现高效内存管理
+- 使用池化 ByteBuf 后，release() 是必须的

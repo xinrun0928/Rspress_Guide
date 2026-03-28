@@ -1,0 +1,585 @@
+# HTTP Keep-Alive 与连接复用
+
+> [!TIP]
+> 理解 HTTP 连接进化史，就理解了 Web 性能优化的半壁江山
+
+---
+
+## 场景切入：你知道打开一个网页要建立多少个 TCP 连接吗？
+
+打开一个普通的新闻网站首页，用 Chrome DevTools 看一下 Network 面板：
+
+```
+html: 1 个连接
+css: 3 个连接（假设并行下载）
+js: 5 个连接
+图片: 10 个连接
+字体: 2 个连接
+...
+```
+
+粗略一算，一个页面加载下来可能需要 **20-30 个 TCP 连接**。
+
+如果每个连接都要三次握手，假设 RTT 是 50ms，光建立连接就要 1-1.5 秒——这还没算数据传输的时间。
+
+这就是 HTTP Keep-Alive 要解决的问题：**复用 TCP 连接，避免重复建立连接的开销**。
+
+---
+
+## 一、短连接的问题
+
+### HTTP/1.0 短连接
+
+HTTP/1.0 默认使用**短连接**，每个 HTTP 请求都要：
+
+```text
+TCP 三次握手 → HTTP 请求 → HTTP 响应 → TCP 四次挥手
+    ↓
+  重复以上步骤
+```
+
+**三次握手**：
+```
+Client ── SYN ────────────────────> Server
+Client <── SYN + ACK ────────────── Server
+Client ── ACK ────────────────────> Server
+```
+
+**四次挥手**：
+```
+Client ── FIN ────────────────────> Server
+Client <── ACK ──────────────────── Server
+Client <── FIN ──────────────────── Server
+Client ── ACK ────────────────────> Server
+```
+
+每次请求的连接成本：
+
+| 操作 | 时间 |
+|---|---|
+| DNS 解析 | 10-100ms |
+| TCP 三次握手 | 1-3 RTT |
+| TLS 握手（可选） | 2-3 RTT |
+| **总计** | **50-500ms** |
+
+### 短连接的致命问题
+
+```text
+请求1: ─────────────────────────────────────────>
+        ↓ 连接建立 50ms
+        ↓ 数据传输 10ms
+响应1: <────────────────────────────────────────
+
+请求2: ─────────────────────────────────────────>
+        ↓ 连接建立 50ms  ← 重复！
+        ↓ 数据传输 10ms
+响应2: <────────────────────────────────────────
+
+请求3: ─────────────────────────────────────────>
+        ↓ 连接建立 50ms  ← 重复！
+        ↓ 数据传输 10ms
+响应3: <────────────────────────────────────────
+```
+
+**50% 的时间花在了建立连接上！**
+
+---
+
+## 二、Keep-Alive 的诞生
+
+### HTTP/1.1 默认长连接
+
+1999 年，HTTP/1.1 标准发布，引入了一个关键特性：**Keep-Alive**（默认开启）。
+
+```
+TCP 连接建立（1次） → HTTP 请求1 → HTTP 响应1 → HTTP 请求2 → HTTP 响应2 → ...
+```
+
+```http
+# 请求头（HTTP/1.1 默认开启，无需声明）
+GET /api/users HTTP/1.1
+Host: api.example.com
+
+# HTTP/1.0 需要显式声明
+GET /api/users HTTP/1.0
+Connection: keep-alive
+
+# 响应头
+HTTP/1.1 200 OK
+Content-Type: application/json
+Connection: keep-alive
+
+{"users": [...]}
+```
+
+### Keep-Alive 的工作原理
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│                   HTTP Keep-Alive 原理                      │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  Client                        Server                        │
+│    │                             │                          │
+│    │─────── TCP 握手 ────────────>│                          │
+│    │                             │                          │
+│    │─────── HTTP 请求1 ─────────>│                          │
+│    │<────── HTTP 响应1 ─────────│                          │
+│    │                             │                          │
+│    │─────── HTTP 请求2 ─────────>│  ← 连接复用，无需握手     │
+│    │<────── HTTP 响应2 ─────────│                          │
+│    │                             │                          │
+│    │─────── HTTP 请求3 ─────────>│  ← 连接复用，无需握手     │
+│    │<────── HTTP 响应3 ─────────│                          │
+│    │                             │                          │
+│    │─────── TCP 挥手 ───────────>│  ← 超时或达到请求数上限  │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Keep-Alive 的配置
+
+**Nginx 配置**：
+
+```nginx title="nginx.conf"
+http {
+    # 连接保持时间（默认 75 秒）
+    keepalive_timeout 65;
+    
+    # 每个连接最多处理的请求数
+    keepalive_requests 1000;
+    
+    upstream backend {
+        server 127.0.0.1:8080;
+        # upstream 长连接数
+        keepalive 32;
+    }
+    
+    server {
+        location /api/ {
+            proxy_pass http://backend;
+            proxy_http_version 1.1;
+            # 清空 Connection 头，保持 upstream 长连接
+            proxy_set_header Connection "";
+        }
+    }
+}
+```
+
+**Tomcat 配置**：
+
+```xml title="server.xml"
+<Connector port="8080" protocol="HTTP/1.1"
+           connectionTimeout="20000"
+           redirectPort="8443"
+           # 最大长连接数
+           maxKeepAliveRequests="1000"
+           # 长连接超时（毫秒）
+           keepAliveTimeout="60000" />
+```
+
+:::tip 配置建议
+- `keepalive_timeout`：设置略大于正常请求间隔，避免过早关闭
+- `keepalive_requests`：设置足够大（1000+），避免频繁重建连接
+- `maxKeepAliveRequests`：设为 `-1` 表示不限制
+:::
+
+---
+
+## 三、HTTP/1.1 的队头阻塞
+
+### Keep-Alive 解决了什么？
+
+Keep-Alive 解决了**连接复用**问题：不需要每次请求都三次握手四次挥手。
+
+### 但新问题来了：队头阻塞
+
+HTTP/1.1 虽然复用了 TCP 连接，但**请求必须串行发送**：
+
+```text
+请求1 ──────────────────────────────────────────────────────>
+        ↓ 响应 50ms
+响应1 <─────────────────────────────────────────────────────
+
+请求2 ───────────>
+响应2 <──────────
+
+请求3 ───>
+响应3 <──
+
+       ↑
+    请求2、3 只能等请求1 完成后才能开始
+```
+
+这就是 **HTTP/1.1 队头阻塞**（Head-of-Line Blocking）：即使带宽足够，一个慢请求会阻塞后面所有请求。
+
+### 常见的绕过方案
+
+| 方案 | 原理 | 缺点 |
+|---|---|---|
+| **域名分片** | 不同资源用不同域名，增加并行连接数 | DNS 解析开销、浪费资源 |
+| **精灵图** | 多张小图合并为一张 | 缓存失效、更新麻烦 |
+| **内联资源** | CSS/JS 内嵌 HTML | 无法缓存、无法并行 |
+
+```html
+<!-- 域名分片示例 -->
+<link rel="stylesheet" href="http://css1.example.com/style.css">
+<link rel="stylesheet" href="http://css2.example.com/icon.css">
+<img src="http://img1.example.com/logo.png">
+<img src="http://img2.example.com/banner.png">
+```
+
+:::warning 域名分片的代价
+每个新域名都需要额外的 DNS 解析、TCP 握手（无 TLS）和 SSL/TLS 握手。通常建议最多 4-6 个域名。
+:::
+
+---
+
+## 四、HTTP/2 多路复用
+
+### 核心思想：在一个连接上并行传输多个 Stream
+
+HTTP/2 引入了 **Stream**（流）的概念：
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│                    HTTP/2 多路复用                          │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  TCP 连接（单一连接）                                         │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ Stream 1: 请求1 ───────────────────>                 │   │
+│  │ Stream 2: 请求2 ───────>                           │   │
+│  │ Stream 3: 请求3 ───>                               │   │
+│  │                                                     │   │
+│  │         <─────────────────── 响应1                 │   │
+│  │               <───────────── 响应2                 │   │
+│  │                     <───────── 响应3               │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+│  请求和响应交错传输，互不阻塞！                               │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### HTTP/2 的优势
+
+| 特性 | HTTP/1.1 | HTTP/2 |
+|---|---|---|
+| 并行传输 | 依赖多个连接 | 单连接多 Stream |
+| 队头阻塞 | 有 | 无 |
+| 头部压缩 | 无 | HPACK |
+| 服务器推送 | 无 | 有 |
+| 流控制 | 无 | 有 |
+
+### Nginx 配置 HTTP/2
+
+```nginx title="nginx.conf"
+server {
+    listen 443 ssl http2;
+    
+    ssl_certificate /path/to/cert.pem;
+    ssl_certificate_key /path/to/key.pem;
+    
+    # 开启 HTTP/2（需 TLS）
+    # 注意：HTTP/2 需要 HTTPS
+    
+    location / {
+        proxy_pass http://backend;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+    }
+}
+```
+
+```yaml title="Spring Boot 启用 HTTP/2"
+server:
+  http2:
+    enabled: true
+  ssl:
+    enabled: true
+    key-store: classpath:keystore.p12
+    key-store-password: changeit
+    key-store-type: PKCS12
+```
+
+---
+
+## 五、HTTP/3（QUIC）
+
+### HTTP/3 的革命
+
+HTTP/3 基于 **QUIC** 协议（运行在 UDP 上），彻底解决了 TCP 的队头阻塞：
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│                  HTTP/3 vs HTTP/2 对比                       │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  HTTP/2 (TCP):                                               │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ TCP ──────────────────────────────────────────────── │   │
+│  │  ├─ Stream 1: 请求 ───────────────────────────────> │   │
+│  │  ├─ Stream 2: 请求 ─────────>                       │   │
+│  │  └─ Stream 3: 请求 ───>                            │   │
+│  │          ↑                                           │   │
+│  │    Packet 丢失，所有 Stream 阻塞                     │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+│  HTTP/3 (QUIC/UDP):                                         │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ QUIC ────────────────────────────────────────────── │   │
+│  │  ├─ Stream 1: 请求 ───────────────────────────────> │   │
+│  │  ├─ Stream 2: 请求 ─────────>                       │   │
+│  │  └─ Stream 3: 请求 ───>                            │   │
+│  │          ↑                                           │   │
+│  │    Packet 丢失，只阻塞 Stream 1，其他 Stream 不受影响  │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### HTTP/3 的核心优势
+
+| 优势 | 说明 |
+|---|---|
+| **0-RTT 握手** | 首次连接 1-RTT，重连 0-RTT（比 TCP + TLS 快） |
+| **无队头阻塞** | 基于 UDP，丢包只影响单个 Stream |
+| **连接迁移** | IP 变化时连接 ID 不变，无需重建连接 |
+| **前向纠错** | 丢包可恢复，减少重传 |
+
+### HTTP/3 支持情况
+
+```nginx title="nginx.conf"
+# nginx 1.25+ 支持 HTTP/3
+server {
+    listen 443 ssl;
+    listen 443 quic reuseport;
+    
+    ssl_protocols TLSv1.3;
+    
+    # HTTP/3 相关头
+    add_header Alt-Svc 'h3=":443"; ma=86400';
+}
+```
+
+:::info 浏览器支持
+Chrome、Firefox、Edge、Safari 均已支持 HTTP/3。截至 2024 年，约 75% 的浏览器支持。
+:::
+
+---
+
+## 六、HPACK 头部压缩
+
+### 为什么需要头部压缩？
+
+HTTP 请求中，头部占比很大：
+
+```http
+GET /api/users HTTP/1.1
+Host: api.example.com
+Accept: application/json
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+User-Agent: Mozilla/5.0...
+Cookie: session_id=abc123; theme=dark; lang=zh-CN...
+```
+
+一个典型的 HTTP 请求头部可能 500-2000 字节，但 body 可能只有 100 字节。**头部成了传输的主要开销**。
+
+### HPACK 原理
+
+HTTP/2 使用 HPACK 压缩头部：
+
+1. **静态表**：常用头部有预定义的索引（0-61）
+2. **动态表**：会话中重复出现的头部动态添加
+3. **Huffman 编码**：常用字符用短编码
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│                     HPACK 编码示例                           │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  原始头部:                                                    │
+│  :method: GET                                                │
+│  :path: /api/users                                          │
+│  :scheme: https                                              │
+│  accept: application/json                                   │
+│                                                             │
+│  HPACK 编码后（假设使用索引）:                                 │
+│  0x82                    → :method: GET (静态表索引 2)        │
+│  0x86                    → :path: /api/users (静态表索引 6)   │
+│  0x87                    → :scheme: https (静态表索引 7)     │
+│  0x40 0x61 0x63 0x63 ... → accept: application/json (Huffman)│
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**压缩效果**：头部体积减少 **60-80%**。
+
+---
+
+## 七、生产环境协议选择
+
+### 选择建议
+
+| 场景 | 推荐协议 | 原因 |
+|---|---|---|
+| **对外 API（浏览器访问）** | HTTP/2 + HTTPS | 兼容性好，性能提升明显 |
+| **内部微服务** | HTTP/2 或 gRPC | 高性能，支持多语言 |
+| **移动端** | HTTP/2 | 省电，减少建立连接次数 |
+| **高性能场景** | HTTP/3 | 最新技术，极致性能 |
+| **兼容性优先** | HTTP/1.1 | 极少数老系统需要 |
+
+### Nginx 多协议配置
+
+```nginx title="nginx.conf"
+server {
+    # HTTP/1.1（兼容）
+    listen 80;
+    
+    # HTTP/2 + HTTPS（主流）
+    listen 443 ssl http2;
+    
+    # HTTP/3 + QUIC（前沿）
+    listen 443 quic reuseport;
+    
+    ssl_protocols TLSv1.2 TLSv1.3;
+    
+    # HTTP/3 提示
+    add_header Alt-Svc 'h3=":443"; ma=86400';
+}
+```
+
+### 客户端配置
+
+**OkHttp（支持 HTTP/2）**：
+
+```java
+OkHttpClient client = new OkHttpClient.Builder()
+    .protocols(Arrays.asList(
+        Protocol.HTTP_2,   // 优先 HTTP/2
+        Protocol.HTTP_1_1  // 降级
+    ))
+    .build();
+```
+
+**Apache HttpClient（支持 HTTP/2）**：
+
+```java
+// Apache HttpClient 5.x 支持 HTTP/2
+CloseableHttpClient client = HttpClients.custom()
+    .setProtocol UpgradeHandler.of(Http1UpgradeHandler.INSTANCE)
+    .build();
+```
+
+---
+
+## 八、连接复用监控
+
+### 关键监控指标
+
+```bash
+# 查看 TIME_WAIT 连接数（连接未复用）
+netstat -an | grep TIME_WAIT | wc -l
+
+# 查看 Established 连接数
+netstat -an | grep ESTABLISHED | wc -l
+
+# 查看每秒新建连接数
+ss -s
+
+# 查看连接状态分布
+ss -ant | awk '{print $1}' | sort | uniq -c
+```
+
+### Nginx 连接状态
+
+```nginx title="nginx.conf"
+server {
+    # 开启连接状态
+    server_tokens off;
+}
+
+# 查看连接状态
+location /nginx_status {
+    stub_status on;
+    allow 127.0.0.1;
+    deny all;
+}
+```
+
+```bash
+# 查看状态
+curl http://127.0.0.1/nginx_status
+
+# 输出示例：
+# Active connections: 291
+# server accepts handled requests
+#  16630948 16630948 31070465
+# Reading: 6 Writing: 179 Waiting: 106
+```
+
+:::tip 监控重点
+- `Waiting`：空闲长连接数，正常应该 > 0
+- `Reading + Writing`：正在处理的请求数
+- 如果 `Waiting` 一直是 0，说明长连接没有生效
+:::
+
+---
+
+## 面试实战
+
+### 面试题 1：HTTP/1.1 和 HTTP/2 的主要区别？
+
+**参考答案**：
+
+| 特性 | HTTP/1.1 | HTTP/2 |
+|---|---|---|
+| 连接模式 | 多连接串行 | 单连接多路复用 |
+| 队头阻塞 | 有 | 无（Stream 级别） |
+| 头部压缩 | 无 | HPACK（60-80% 压缩） |
+| 服务器推送 | 无 | 有 |
+| 二进制格式 | 文本 | 二进制帧 |
+| 流控制 | 无 | Stream 级别控制 |
+
+### 面试题 2：为什么 HTTP/2 可以解决队头阻塞？
+
+**参考答案**：
+
+HTTP/1.1 的队头阻塞是因为**请求必须串行发送**——在一个 TCP 连接上，第二个请求必须等第一个请求完全响应后才能发送。
+
+HTTP/2 引入 Stream 概念，**在一个 TCP 连接上并行传输多个请求/响应**：
+
+- 每个 Stream 有唯一的 ID
+- 帧（Frame）是最小传输单元
+- 不同 Stream 的帧可以交错传输
+- 丢包只影响单个 Stream，不影响其他 Stream
+
+### 面试题 3：HTTP/3 为什么基于 UDP 而不是 TCP？
+
+**参考答案**：
+
+TCP 虽然可靠，但有两个问题：
+
+1. **TCP 队头阻塞**：TCP 保证有序，丢包后所有数据都要等重传
+2. **TCP 建立连接慢**：三次握手 + TLS 握手需要 2-3 RTT
+
+HTTP/3 选择 UDP 是因为：
+
+1. UDP 无连接，可以避免 TCP 的队头阻塞
+2. QUIC 在应用层实现可靠传输，丢包只影响单个 Stream
+3. QUIC 支持 0-RTT 握手（TLS 1.3），减少连接建立时间
+4. QUIC 有连接迁移能力，IP 变化不会断开连接
+
+---
+
+## 思考题
+
+1. 如果一个 HTTP/2 连接上只有一个慢请求，会阻塞其他请求吗？为什么？
+2. HTTP/2 的多路复用和 HTTP/1.1 的 Keep-Alive，本质区别是什么？
+3. 在什么场景下，HTTP/1.1 的多连接可能比 HTTP/2 性能更好？
+
+---
+
+> [!TIP]
+> HTTP 协议的进化史，就是一部性能优化史。从短连接到长连接，从串行到并行，每一次进化都在解决前一代的痛点。理解历史，才能更好地选择未来。

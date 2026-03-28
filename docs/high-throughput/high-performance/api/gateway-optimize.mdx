@@ -1,0 +1,584 @@
+# API 网关优化与高可用
+
+> [!TIP]
+> 网关是流量的咽喉要道——它垮了，整个系统都不可用
+
+---
+
+## 场景切入：网关抖动的代价
+
+想象一下：凌晨两点，你的监控系统报警——API 网关 CPU 飙升，响应时间从 10ms 暴增到 5 秒，紧接着下游服务开始告警，数据库连接池耗尽，雪崩效应开始蔓延。
+
+你匆忙排查，发现问题根源是：**网关积压了大量请求，线程池耗尽**。
+
+这不是个例。API 网关是所有流量的入口，一旦出问题，影响范围是全站的。**网关的高可用，比任何一个微服务都重要**。
+
+这就是我们今天要聊的主题：如何设计一个高性能、高可用的 API 网关。
+
+---
+
+## 一、API 网关的核心职责
+
+### 网关是什么？
+
+API 网关是微服务架构中的「流量网关」，所有外部请求都经过它转发到内部服务：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      API 网关位置                            │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│   客户端 ──> [认证] ──> [限流] ──> [路由] ──> [日志] ──> 业务服务 │
+│                    ↓         ↓         ↓         ↓        │
+│                  身份验证   流量控制   负载均衡   全链路追踪    │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 网关的核心职责
+
+| 职责 | 说明 | 技术实现 |
+|---|---|---|
+| **路由转发** | 根据路径/参数转发到后端服务 | Nginx upstream、Spring Cloud Gateway |
+| **身份认证** | JWT Token 验证、签名校验 | OAuth2、JWT |
+| **限流熔断** | 保护后端服务不被冲垮 | 令牌桶、滑动窗口 |
+| **日志监控** | 请求日志、性能指标 | ELK、Prometheus |
+| **协议转换** | HTTP → gRPC、Dubbo | 协议适配层 |
+| **缓存处理** | 热点数据缓存 | Redis、内存缓存 |
+
+---
+
+## 二、主流网关对比
+
+### 三足鼎立
+
+| 网关 | 架构 | 性能 | 生态 | 学习成本 | 适用场景 |
+|---|---|---|---|---|---|
+| **Spring Cloud Gateway** | Java + Reactor | 高 | 丰富（Spring 生态） | 低 | Spring Cloud 项目 |
+| **Nginx + Kong** | Nginx + Lua | 极高 | 丰富（插件） | 中 | 高性能生产环境 |
+| **APISIX** | Nginx + Lua + etcd | 极高 | 丰富 | 中 | 云原生、动态配置 |
+
+### Spring Cloud Gateway：与 Spring 生态无缝集成
+
+```yaml title="application.yml"
+spring:
+  cloud:
+    gateway:
+      discovery:
+        locator:
+          enabled: true
+          lower-case-service-id: true
+      routes:
+        - id: user-service
+          uri: lb://user-service
+          predicates:
+            - Path=/api/users/**
+          filters:
+            - StripPrefix=1
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 100
+                redis-rate-limiter.burstCapacity: 200
+```
+
+```java title="自定义 Gateway Filter"
+@Component
+public class AuthFilter implements GlobalFilter {
+    
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        String token = exchange.getRequest().getHeaders().getFirst("Authorization");
+        
+        if (StringUtils.isBlank(token)) {
+            exchange.getResponse().setStatusCode(HttpStatus.UNAUTHORIZED);
+            return exchange.getResponse().setComplete();
+        }
+        
+        // JWT 验证逻辑
+        if (!jwtUtil.validate(token)) {
+            return unauthorized(exchange);
+        }
+        
+        // 传递用户信息到下游
+        exchange.getAttributes().put("userId", jwtUtil.getUserId(token));
+        
+        return chain.filter(exchange);
+    }
+}
+```
+
+### Kong：高性能生产首选
+
+```yaml title="kong.yml"
+_format_version: "3.0"
+services:
+  - name: user-service
+    url: http://user-service:8080
+    routes:
+      - name: user-route
+        paths:
+          - /api/users
+        strip_path: false
+    plugins:
+      - name: rate-limiting
+        config:
+          minute: 100
+          policy: redis
+          redis_host: redis
+      - name: jwt
+      - name: logging
+        config:
+          log_level: info
+
+consumers:
+  - username: app-client
+    jwt_secrets:
+      - key: app-key-1
+        secret: secret-1
+```
+
+:::tip 网关选型建议
+- Spring Cloud 项目：用 Spring Cloud Gateway（与现有生态集成最好）
+- 高性能要求：用 Kong 或 APISIX（基于 Nginx，性能更高）
+- 需要动态配置：用 APISIX（支持热更新，无需 reload）
+:::
+
+---
+
+## 三、网关性能优化
+
+### 优化一：连接复用
+
+**问题**：每次请求都建立新连接，连接建立开销大。
+
+**解决**：开启 upstream 长连接。
+
+```nginx title="nginx.conf"
+upstream backend {
+    server 127.0.0.1:8080;
+    keepalive 32;      # 保持 32 个空闲连接
+    keepalive_requests 1000;  # 每个连接最多处理 1000 请求
+    keepalive_timeout 60s;    # 空闲 60 秒后关闭
+}
+
+server {
+    location /api/ {
+        proxy_pass http://backend;
+        proxy_http_version 1.1;           # 必须用 HTTP/1.1
+        proxy_set_header Connection "";   # 清空 Connection 头
+    }
+}
+```
+
+### 优化二：异步转发
+
+**问题**：同步转发阻塞网关线程，请求排队。
+
+**解决**：使用异步非阻塞模式。
+
+```java title="Spring Cloud Gateway 异步配置"
+spring:
+  cloud:
+    gateway:
+      httpclient:
+        connect-timeout: 5000
+        response-timeout: 30s
+        pool:
+          type: elastic          # 连接池类型：fixed | elastic
+          max-idle-time: 30s    # 最大空闲时间
+          acquire-timeout: 60s  # 获取连接超时
+```
+
+```java title="WebClient 异步调用"
+@Service
+public class AsyncGatewayService {
+    
+    private final WebClient webClient;
+    
+    public AsyncGatewayService(WebClient.Builder builder) {
+        this.webClient = builder
+            .baseUrl("http://user-service")
+            .build();
+    }
+    
+    public Mono<String> callService(String path) {
+        return webClient.get()
+            .uri(path)
+            .retrieve()
+            .bodyToMono(String.class)
+            .timeout(Duration.ofSeconds(5))
+            .onErrorResume(e -> Mono.just("fallback"));
+    }
+}
+```
+
+### 优化三：减少 Header
+
+**问题**：不必要的请求头增加传输量。
+
+**解决**：过滤无用 Header。
+
+```nginx title="nginx.conf"
+server {
+    # 删除不必要的代理头
+    proxy_set_header Host $host;
+    # 保留必要的头，删除其他代理添加的头
+    proxy_hide_header X-Request-Id;  # 如果自己有
+}
+```
+
+### 优化四：响应缓存
+
+**问题**：热点数据重复查询后端，浪费资源。
+
+**解决**：网关层缓存。
+
+```java title="Spring Cloud Gateway 缓存 Filter"
+@Component
+public class CacheFilter implements GlobalFilter {
+    
+    private final RedisTemplate<String, Object> redisTemplate;
+    
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        String path = exchange.getRequest().getURI().getPath();
+        
+        // 只缓存 GET 请求的特定路径
+        if (!"GET".equals(exchange.getRequest().getMethod().name())) {
+            return chain.filter(exchange);
+        }
+        
+        // 尝试从缓存获取
+        String cacheKey = "gateway:cache:" + path;
+        String cached = (String) redisTemplate.opsForValue().get(cacheKey);
+        
+        if (cached != null) {
+            ServerHttpResponse response = exchange.getResponse();
+            response.getHeaders().add("X-Cache", "HIT");
+            response.getHeaders().setContentType(MediaType.APPLICATION_JSON);
+            DataBuffer buffer = response.bufferFactory().wrap(cached.getBytes());
+            return response.writeWith(Mono.just(buffer));
+        }
+        
+        // 缓存未命中，继续请求
+        return chain.filter(exchange).then(Mono.fromRunnable(() -> {
+            // 写入缓存逻辑
+        }));
+    }
+}
+```
+
+---
+
+## 四、网关高可用设计
+
+### 集群部署 + 负载均衡
+
+```text
+                    ┌─────────────┐
+                    │   负载均衡器  │
+                    │  (SLB/LVS)   │
+                    └──────┬──────┘
+                           │
+        ┌──────────────────┼──────────────────┐
+        │                  │                  │
+   ┌────▼────┐        ┌────▼────┐        ┌────▼────┐
+   │ Gateway │        │ Gateway │        │ Gateway │
+   │  实例1   │        │  实例2   │        │  实例3   │
+   └────┬────┘        └────┬────┘        └────┬────┘
+        │                  │                  │
+        └──────────────────┼──────────────────┘
+                           │
+                    ┌──────▼──────┐
+                    │  业务服务集群  │
+                    └─────────────┘
+```
+
+### 健康检查配置
+
+```nginx title="nginx.conf"
+upstream backend {
+    server 127.0.0.1:8080 weight=100;
+    server 127.0.0.1:8081 weight=100 backup;  # 热备
+    keepalive 32;
+}
+
+# ngx_http_upstream_check_module 健康检查
+check interval=3000 rise=2 fall=3 timeout=1000 type=http;
+check_http_send "HEAD /health HTTP/1.0\r\n\r\n";
+check_http_expect_alive http_2xx http_3xx;
+```
+
+```yaml title="Spring Cloud Gateway 健康检查"
+spring:
+  cloud:
+    gateway:
+      discovery:
+        locator:
+          enabled: true
+  # Eureka/Consul/Nacos 心跳检测
+eureka:
+  instance:
+    health-check-url-path: /actuator/health
+    lease-renewal-interval-in-seconds: 10
+```
+
+---
+
+## 五、限流在网关层
+
+### 三种限流算法
+
+| 算法 | 原理 | 优点 | 缺点 |
+|---|---|---|---|
+| **固定窗口** | 单位时间内的计数器 | 简单 | 边界突发 |
+| **滑动窗口** | 滑动的时间窗口 | 平滑 | 实现复杂 |
+| **令牌桶** | 以固定速率放入令牌 | 支持突发 | — |
+
+### 令牌桶实现
+
+```java title="网关限流 Filter"
+@Component
+public class RateLimitFilter implements GlobalFilter {
+    
+    private final RedisTemplate<String, String> redisTemplate;
+    private final RateLimiter rateLimiter = 
+        RateLimiter.create(100); // 每秒 100 个令牌
+    
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        String key = getClientId(exchange);  // 根据 IP 或用户 ID
+        
+        // 尝试获取令牌
+        if (!rateLimiter.tryAcquire()) {
+            exchange.getResponse().setStatusCode(HttpStatus.TOO_MANY_REQUESTS);
+            return exchange.getResponse().setComplete();
+        }
+        
+        return chain.filter(exchange);
+    }
+}
+```
+
+### 分布式限流
+
+```java title="Redis 令牌桶实现"
+@Component
+public class RedisRateLimiter {
+    
+    private final StringRedisTemplate redisTemplate;
+    
+    /**
+     * Lua 脚本保证原子性
+     */
+    private static final String LUA_SCRIPT = """
+        local key = KEYS[1]
+        local limit = tonumber(ARGV[1])
+        local window = tonumber(ARGV[2])
+        local current = tonumber(redis.call('GET', key) or '0')
+        
+        if current + 1 > limit then
+            return 0
+        else
+            redis.call('INCR', key)
+            if current == 0 then
+                redis.call('EXPIRE', key, window)
+            end
+            return 1
+        end
+        """;
+    
+    public boolean tryAcquire(String key, int limit, int windowSeconds) {
+        String luaScript = LUA_SCRIPT;
+        RedisScript<Long> script = RedisScript.of(luaScript, Long.class);
+        
+        Long result = redisTemplate.execute(
+            script,
+            Collections.singletonList(key),
+            String.valueOf(limit),
+            String.valueOf(windowSeconds)
+        );
+        
+        return result != null && result == 1;
+    }
+}
+```
+
+---
+
+## 六、熔断降级在网关层
+
+### 熔断器原理
+
+```text
+正常状态 → 检测到异常 → 熔断打开 → 熔断半开 → 恢复正常
+    ↑                                              ↓
+    └──────────────────────────────────────────────┘
+                    （熔断超时后尝试）
+```
+
+### Spring Cloud Gateway 熔断
+
+```yaml title="application.yml"
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: user-service
+          uri: lb://user-service
+          filters:
+            - name: CircuitBreaker
+              args:
+                name: userCircuitBreaker
+                fallbackUri: forward:/fallback/user
+```
+
+```java title="降级逻辑"
+@RestController
+public class FallbackController {
+    
+    @GetMapping("/fallback/{service}")
+    public ResponseEntity<Map<String, Object>> fallback(
+            @PathVariable String service,
+            Throwable ex) {
+        
+        Map<String, Object> result = new HashMap<>();
+        result.put("code", 503);
+        result.put("message", "服务暂时不可用，请稍后重试");
+        result.put("service", service);
+        result.put("error", ex.getMessage());
+        result.put("timestamp", System.currentTimeMillis());
+        
+        // 返回兜底数据或空数据
+        if ("user".equals(service)) {
+            result.put("data", Collections.emptyList());
+        }
+        
+        return ResponseEntity.status(503).body(result);
+    }
+}
+```
+
+---
+
+## 七、请求转发优化
+
+### 减少代理层数
+
+```text
+# 不推荐：多层代理
+客户端 → CDN → Nginx → API Gateway → Spring Cloud Gateway → 业务服务
+                              ↓
+                         可能增加 10-50ms 延迟
+
+# 推荐：扁平化
+客户端 → CDN → API Gateway → 业务服务
+            （网关层合并能力）
+```
+
+### 响应体压缩
+
+```nginx title="nginx.conf"
+server {
+    gzip on;
+    gzip_types application/json application/xml;
+    gzip_min_length 1024;
+}
+```
+
+---
+
+## 八、网关监控指标
+
+### 核心监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|---|---|---|
+| **QPS** | 每秒请求数 | — |
+| **RT (P99)** | 99 分位响应时间 | > 500ms |
+| **错误率** | 5xx 比例 | > 1% |
+| **限流触发次数** | 限流拒绝数 | > 100/分钟 |
+| **熔断打开次数** | 熔断触发数 | > 10/分钟 |
+| **连接数** | 当前活跃连接 | > 80% 最大值 |
+
+### 监控配置
+
+```yaml title="Prometheus + Grafana"
+# Prometheus 抓取配置
+scrape_configs:
+  - job_name: 'gateway'
+    metrics_path: '/actuator/prometheus'
+    static_configs:
+      - targets: ['gateway:8080']
+```
+
+```java title="自定义监控指标"
+@Component
+public class GatewayMetrics {
+    
+    private final MeterRegistry meterRegistry;
+    
+    public void recordRequest(String route, int status, long durationMs) {
+        meterRegistry.counter("gateway.requests", 
+            "route", route, 
+            "status", String.valueOf(status))
+            .increment();
+        
+        meterRegistry.timer("gateway.latency", "route", route)
+            .record(durationMs, TimeUnit.MILLISECONDS);
+    }
+}
+```
+
+---
+
+## 面试实战
+
+### 面试题 1：Spring Cloud Gateway 和 Nginx 如何选择？
+
+**参考答案**：
+
+| 维度 | Spring Cloud Gateway | Nginx |
+|---|---|---|
+| 位置 | 应用层 | 反向代理层 |
+| 能力 | 路由、限流、熔断、认证 | 负载均衡、静态资源、缓存 |
+| 性能 | 稍低（Java） | 极高（C + epoll） |
+| 灵活性 | 高（可定制 Filter） | 中（Lua 扩展） |
+
+**选型建议**：
+- 纯性能场景：Nginx + Kong
+- Spring Cloud 生态：Gateway
+- 混合场景：Nginx 前置 + Gateway 后置
+
+### 面试题 2：如何实现网关的高可用？
+
+**参考答案**：
+
+1. **集群部署**：至少 2 个网关实例，避免单点
+2. **负载均衡**：Nginx/LVS/SLB 做入口负载均衡
+3. **健康检查**：定期检查后端服务健康状态，自动剔除故障节点
+4. **限流熔断**：网关层保护后端，防止雪崩
+5. **监控告警**：实时监控 QPS、RT、错误率，及时发现问题
+
+### 面试题 3：网关如何防止雪崩？
+
+**参考答案**：
+
+1. **限流**：控制进入系统的请求量
+2. **熔断**：当下游服务异常时，快速失败
+3. **降级**：返回兜底数据或空数据
+4. **隔离**：不同服务使用不同的线程池/连接池
+5. **超时**：设置合理的超时时间，避免无限等待
+
+---
+
+## 思考题
+
+1. 如果网关和后端服务之间的网络延迟很高，有哪些优化手段？
+2. 如何设计一个支持多协议的网关（同时支持 HTTP、WebSocket、gRPC）？
+3. 网关层做认证和业务服务自己做认证，各有什么优缺点？
+
+---
+
+> [!TIP]
+> 网关是流量的入口，也是安全的出口。把好这道门，系统稳了一半。

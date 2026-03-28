@@ -1,0 +1,1237 @@
+# 分布式文件存储性能优化
+
+用户上传了一张 10MB 的图片，后端代码只需要 100ms 就存好了，但用户等了整整 5 秒才看到上传成功。紧接着，系统开始变慢，数据库响应时间从 5ms 飙升到 500ms。
+
+发生了什么？后来才发现：图片存到了 NAS 网络存储，网络带宽被占满了，所有数据库请求都被卡在网络 IO 上。
+
+这是一个典型的分布式文件存储性能问题。在分布式系统中，文件存储不是「找个地方存进去」这么简单，它涉及到架构选型、网络优化、访问模式等多个层面的考量。
+
+## 一、分布式文件存储的三大挑战
+
+### 1.1 存储层的复杂度
+
+单机存储时代，文件系统是简单的：磁盘有多大，就能存多少文件。
+
+分布式时代，存储变成了一个复杂系统：
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                      元数据服务集群                          │
+│                    (NameNode/ZooKeeper)                      │
+└──────────────────────────────────────────────────────────────┘
+                              │
+           ┌──────────────────┼──────────────────┐
+           ▼                  ▼                  ▼
+    ┌────────────┐    ┌────────────┐    ┌────────────┐
+    │  数据节点   │    │  数据节点   │    │  数据节点   │
+    │ (DataNode) │    │ (DataNode) │    │ (DataNode) │
+    └────────────┘    └────────────┘    └────────────┘
+```
+
+**元数据服务**：管理文件的元信息（文件名、路径、权限、块位置）。所有文件操作的第一步都要问元数据服务，就像图书馆的目录卡片。
+
+**数据节点**：存储实际的文件内容。通常一个文件会被分成多个块（Block），每个块复制多份存储在不同数据节点上。
+
+### 1.2 网络成为瓶颈
+
+分布式存储的最大特点是「数据在网络上」。每次读写文件，都是一次或多次网络 IO。
+
+```
+本地磁盘读取：延迟 0.1ms（机械硬盘）~ 0.01ms（SSD）
+
+同一机架网络读取：延迟 0.5ms ~ 1ms
+
+跨机架网络读取：延迟 1ms ~ 5ms
+
+跨机房网络读取：延迟 5ms ~ 50ms
+```
+
+**网络延迟是本地磁盘的 10-100 倍**，这是分布式存储必须面对的现实。
+
+### 1.3 一致性与可用性的权衡
+
+分布式存储需要在「数据一致性」和「服务可用性」之间做权衡。
+
+- **强一致性**：写入成功后，所有后续读取都能看到最新数据。但网络分区时可能不可用。
+- **最终一致性**：写入成功后，允许短暂的不一致。但数据始终是可用的。
+
+> 面试官问：「分布式文件存储和本地文件系统最大的区别是什么？」
+
+本地文件系统是「所见即所得」，读写都在本地，没有网络开销，也没有一致性问题。分布式文件存储的核心挑战是：**数据通过网络分发给多台机器存储，需要解决一致性、可用性、网络性能等多个问题**。
+
+---
+
+## 二、常见分布式存储方案对比
+
+### 2.1 HDFS：批处理场景的首选
+
+HDFS（Hadoop Distributed File System）是专为大规模数据处理设计的文件系统。
+
+**核心特点**：
+- **大文件顺序读写优化**：为顺序读写优化，不适合随机读写
+- **写入一次性，读取多次**：适合批处理，不适合频繁修改
+- **数据块大**：默认 128MB 或 256MB
+
+```java
+// HDFS Java API 使用示例
+public class HdfsFileOperations {
+    
+    private FileSystem fs;
+    private Path workingDir;
+    
+    public void init() throws IOException {
+        Configuration conf = new Configuration();
+        // 设置副本数
+        conf.set("dfs.replication", "3");
+        // 设置数据块大小
+        conf.set("dfs.blocksize", "134217728"); // 128MB
+        
+        fs = FileSystem.get(conf);
+        workingDir = new Path("/user/data");
+    }
+    
+    // 写入大文件
+    public void writeLargeFile(String filename, InputStream data) 
+            throws IOException {
+        Path filePath = new Path(workingDir, filename);
+        
+        // 使用 FSDataOutputStream 写入
+        try (FSDataOutputStream out = fs.create(filePath, true)) {
+            byte[] buffer = new byte[1024 * 1024]; // 1MB buffer
+            int bytesRead;
+            while ((bytesRead = data.read(buffer)) != -1) {
+                out.write(buffer, 0, bytesRead);
+            }
+        }
+    }
+    
+    // 读取文件
+    public void readFile(String filename) throws IOException {
+        Path filePath = new Path(workingDir, filename);
+        
+        try (FSDataInputStream in = fs.open(filePath)) {
+            IOUtils.copyBytes(in, System.out, 4096);
+        }
+    }
+}
+```
+
+### 2.2 MinIO/S3：云原生的对象存储
+
+MinIO 是兼容 S3 协议的对象存储，适合云原生架构。
+
+**核心特点**：
+- **对象存储模型**：不是文件系统，而是键值对存储
+- **原生支持 S3 API**：与 AWS S3 生态无缝对接
+- **部署简单**：单进程，可作为 Kubernetes Pod 运行
+
+```java
+// MinIO Java SDK 使用示例
+public class MinioFileOperations {
+    
+    private MinioClient minioClient;
+    
+    public void init() {
+        minioClient = MinioClient.builder()
+            .endpoint("http://minio:9000")
+            .credentials("minioadmin", "minioadmin")
+            .build();
+    }
+    
+    // 上传文件
+    public void uploadFile(String bucket, String objectName, String filePath) 
+            throws Exception {
+        minioClient.putObject(
+            PutObjectArgs.builder()
+                .bucket(bucket)
+                .object(objectName)
+                .stream(
+                    new FileInputStream(filePath),
+                    new File(filePath).length(),
+                    -1
+                )
+                .contentType("application/octet-stream")
+                .build()
+        );
+    }
+    
+    // 下载文件
+    public InputStream downloadFile(String bucket, String objectName) 
+            throws Exception {
+        return minioClient.getObject(
+            GetObjectArgs.builder()
+                .bucket(bucket)
+                .object(objectName)
+                .build()
+        );
+    }
+    
+    // 分片上传（大文件）
+    public void multipartUpload(String bucket, String objectName, String filePath) 
+            throws Exception {
+        // 创建分片上传
+        String uploadId = minioClient.initMultipartUpload(bucket, objectName);
+        
+        File file = new File(filePath);
+        long partSize = 5 * 1024 * 1024; // 5MB per part
+        int partCount = (int) Math.ceil((double) file.length() / partSize);
+        
+        List<Part> parts = new ArrayList<>();
+        
+        try (FileInputStream fis = new FileInputStream(file)) {
+            for (int i = 0; i < partCount; i++) {
+                byte[] buffer = new byte[(int) partSize];
+                int bytesRead = fis.read(buffer);
+                
+                UploadPartArgs args = UploadPartArgs.builder()
+                    .bucket(bucket)
+                    .object(objectName)
+                    .uploadId(uploadId)
+                    .partNumber(i + 1)
+                    .stream(new ByteArrayInputStream(buffer, 0, bytesRead))
+                    .length(bytesRead)
+                    .build();
+                
+                UploadPartResponse response = minioClient.uploadPart(args);
+                parts.add(new Part(response.etag(), i + 1));
+            }
+        }
+        
+        // 完成分片上传
+        minioClient.completeMultipartUpload(
+            CompleteMultipartUploadArgs.builder()
+                .bucket(bucket)
+                .object(objectName)
+                .uploadId(uploadId)
+                .parts(parts)
+                .build()
+        );
+    }
+}
+```
+
+### 2.3 Ceph：统一存储平台
+
+Ceph 支持块存储、文件存储、对象存储三种接口。
+
+**核心特点**：
+- **统一存储**：一块硬盘同时提供三种存储接口
+- **自管理**：数据自动分布、自动恢复
+- **复杂度高**：运维难度较大
+
+```bash
+# Ceph RBD（块存储）基本操作
+rbd create mypool/myimage --size 10G
+rbd map mypool/myimage
+rbd showmapped
+rbd resize mypool/myimage --size 20G
+```
+
+### 2.4 方案对比
+
+| 特性 | HDFS | MinIO/S3 | Ceph |
+|---|---|---|---|
+| 适用场景 | 大数据分析 | 云原生应用 | 企业级存储 |
+| 接口类型 | 文件系统 | 对象存储 | 块/文件/对象 |
+| 部署复杂度 | 中 | 低 | 高 |
+| 生态成熟度 | 高 | 高 | 中 |
+| 最小部署 | 3 节点 | 单节点 | 3 节点 |
+| 小文件支持 | 差 | 中 | 中 |
+
+:::tip 选型建议
+
+- **数据分析、离线计算**：HDFS
+- **云原生应用、图片/视频存储**：MinIO
+- **企业级统一存储**：Ceph
+- **一般业务系统**：直接使用云厂商的对象存储（OSS、OBS、S3）
+
+:::
+
+---
+
+## 三、小文件问题与优化
+
+### 3.1 小文件为什么是问题
+
+假设你有 100 万张图片，每张图片 10KB。如果每张图片独立存储：
+
+- **元数据开销巨大**：每个文件需要存储文件名、大小、时间、权限等元数据。100 万个文件，元数据可能占用数 GB 内存。
+- **寻址开销高**：读取一个 10KB 文件，需要先查询元数据，再读取数据。网络往返可能比实际读取数据还慢。
+- **写入放大**：每个文件创建都需要更新元数据服务，写入放大效应严重。
+
+### 3.2 Hadoop Archive：打包小文件
+
+Hadoop Archive（HAR）将多个小文件打包成一个大文件，减少 NameNode 内存占用。
+
+```bash
+# 创建 Hadoop Archive
+hadoop archive -archiveName photos.har \
+    -p /user/photos \
+    -r 3 \
+    /user/archive/photos.har
+
+# 读取 Archive 中的文件
+hdfs dfs -ls har:///user/archive/photos.har/photos/image1.jpg
+```
+
+```java
+// Java API 读取 HAR 文件
+public class HarFileReader {
+    
+    public void readFromHar(String harPath, String fileName) throws IOException {
+        Configuration conf = new Configuration();
+        Path harFilePath = new Path(harPath);
+        
+        // 通过 HAR 文件系统读取
+        FileSystem harFs = HarFileSystem.loadHarFileSystem(conf, harFilePath);
+        
+        Path filePath = new Path(harFilePath, fileName);
+        try (FSDataInputStream in = harFs.open(filePath)) {
+            // 读取文件内容
+            IOUtils.copyBytes(in, System.out, conf);
+        }
+    }
+}
+```
+
+### 3.3 对象存储打包方案
+
+对于对象存储，可以使用合并策略减少对象数量。
+
+```java
+public class SmallFileMerger {
+    
+    private final MinioClient minioClient;
+    private final String metadataBucket = "file-metadata";
+    private final String dataBucket = "file-data";
+    
+    // 合并小文件
+    public void mergeSmallFiles(String batchId, List<SmallFile> files) 
+            throws Exception {
+        // 1. 收集所有文件内容
+        ByteArrayOutputStream merged = new ByteArrayOutputStream();
+        Map<String, FileMetadata> metadataMap = new HashMap<>();
+        long currentOffset = 0;
+        
+        for (SmallFile file : files) {
+            byte[] content = downloadFromStorage(file.getPath());
+            
+            // 记录元信息
+            FileMetadata meta = new FileMetadata();
+            meta.setOriginalPath(file.getPath());
+            meta.setOffset(currentOffset);
+            meta.setLength(content.length);
+            meta.setChecksum(MD5(content));
+            metadataMap.put(file.getPath(), meta);
+            
+            // 追加到合并文件
+            merged.write(content);
+            currentOffset += content.length;
+        }
+        
+        // 2. 上传合并后的文件
+        String mergedKey = "merged/" + batchId + ".dat";
+        minioClient.putObject(
+            PutObjectArgs.builder()
+                .bucket(dataBucket)
+                .object(mergedKey)
+                .stream(new ByteArrayInputStream(merged.toByteArray()))
+                .length(merged.size())
+                .build()
+        );
+        
+        // 3. 保存元数据
+        saveMetadata(batchId, metadataMap);
+    }
+    
+    // 读取单个文件
+    public InputStream readFile(String batchId, String originalPath) 
+            throws Exception {
+        // 1. 获取元数据
+        FileMetadata meta = getMetadata(batchId, originalPath);
+        
+        // 2. 获取合并文件
+        String mergedKey = "merged/" + batchId + ".dat";
+        try (InputStream in = minioClient.getObject(
+                GetObjectArgs.builder()
+                    .bucket(dataBucket)
+                    .object(mergedKey)
+                    .build())) {
+            
+            // 3. 根据偏移量读取
+            byte[] buffer = new byte[(int) meta.getLength()];
+            in.skip(meta.getOffset());
+            in.read(buffer);
+            return new ByteArrayInputStream(buffer);
+        }
+    }
+}
+```
+
+### 3.4 Tachyon/Alluxio：分布式内存缓存
+
+Alluxio（formerly Tachyon）提供分布式内存缓存层，加速小文件读取。
+
+```java
+// Alluxio Java API
+public class AlluxioCacheExample {
+    
+    private FileSystem alluxioFs;
+    
+    public void init() throws IOException {
+        alluxioFs = FileSystem.Factory.get();
+    }
+    
+    // 从底层存储读取并缓存到内存
+    public void cacheFile(String underStoragePath) throws IOException {
+        AlluxioURI path = new AlluxioURI("/cache/" + 
+            underStoragePath.replace("/", "_"));
+        
+        // 如果缓存不存在，从底层存储加载
+        if (!alluxioFs.exists(path)) {
+            alluxioFs.create(path);
+            try (FileOutStream out = alluxioFs.createFile(path);
+                 FileInStream in = alluxioFs.open(new AlluxioURI(underStoragePath))) {
+                IOUtils.copyBytes(in, out, 4096);
+            }
+        }
+    }
+    
+    // 读取文件（优先从内存读取）
+    public void readCachedFile(String underStoragePath) throws IOException {
+        AlluxioURI cachedPath = new AlluxioURI("/cache/" + 
+            underStoragePath.replace("/", "_"));
+        
+        try (FileInStream in = alluxioFs.openFile(cachedPath)) {
+            // 读取操作，延迟极低
+            byte[] buffer = new byte[4096];
+            while (in.read(buffer) != -1) {
+                // 处理数据
+            }
+        }
+    }
+}
+```
+
+---
+
+## 四、大文件上传优化
+
+### 4.1 分片上传原理
+
+大文件上传的核心是「分而治之」：把大文件分成多个小片段，并行上传，最后合并。
+
+```
+文件 (100MB)
+    │
+    ├── 分片 1 (5MB) ──▶ 上传 ──▶ 服务器 ──▶ 存储
+    ├── 分片 2 (5MB) ──▶ 上传 ──▶ 服务器 ──▶ 存储
+    ├── 分片 3 (5MB) ──▶ 上传 ──▶ 服务器 ──▶ 存储
+    │      ...
+    └── 分片 20 (5MB) ──▶ 上传 ──▶ 服务器 ──▶ 存储
+                                            │
+                                            ▼
+                                       合并成完整文件
+```
+
+```java
+public class LargeFileUploader {
+    
+    private final MinioClient minioClient;
+    private static final int PART_SIZE = 5 * 1024 * 1024; // 5MB per part
+    
+    public UploadResult uploadLargeFile(String bucket, String objectName, 
+                                        File file) throws Exception {
+        long fileSize = file.length();
+        int partCount = (int) Math.ceil((double) fileSize / PART_SIZE);
+        
+        // 1. 初始化分片上传
+        String uploadId = minioClient.initMultipartUpload(bucket, objectName);
+        
+        List<PartETag> parts = new ArrayList<>();
+        long uploadedBytes = 0;
+        
+        try (FileInputStream fis = new FileInputStream(file)) {
+            for (int i = 0; i < partCount; i++) {
+                byte[] buffer = new byte[PART_SIZE];
+                int bytesRead = fis.read(buffer);
+                
+                // 2. 上传分片（并行）
+                UploadPartResponse response = minioClient.uploadPart(
+                    UploadPartArgs.builder()
+                        .bucket(bucket)
+                        .object(objectName)
+                        .uploadId(uploadId)
+                        .partNumber(i + 1)
+                        .stream(new ByteArrayInputStream(buffer, 0, bytesRead))
+                        .length(bytesRead)
+                        .build()
+                );
+                
+                parts.add(new PartETag(response.etag(), i + 1));
+                uploadedBytes += bytesRead;
+                
+                // 3. 计算进度
+                int progress = (int) (uploadedBytes * 100 / fileSize);
+                onProgress(progress);
+            }
+        }
+        
+        // 4. 完成分片上传
+        minioClient.completeMultipartUpload(
+            CompleteMultipartUploadArgs.builder()
+                .bucket(bucket)
+                .object(objectName)
+                .uploadId(uploadId)
+                .parts(parts)
+                .build()
+        );
+        
+        return new UploadResult(uploadId, parts.size());
+    }
+    
+    // 断点续传
+    public UploadResult resumeUpload(String bucket, String objectName, 
+                                     String uploadId, File file) throws Exception {
+        // 1. 获取已上传的分片
+        ListPartsArgs listArgs = ListPartsArgs.builder()
+            .bucket(bucket)
+            .object(objectName)
+            .uploadId(uploadId)
+            .build();
+        Part[] uploadedParts = minioClient.listParts(listArgs);
+        
+        Set<Integer> uploadedPartNumbers = Arrays.stream(uploadedParts)
+            .map(Part::partNumber)
+            .collect(Collectors.toSet());
+        
+        // 2. 从断点处继续上传
+        List<PartETag> parts = new ArrayList<>();
+        for (Part part : uploadedParts) {
+            parts.add(new PartETag(part.etag(), part.partNumber()));
+        }
+        
+        long skipBytes = parts.size() * PART_SIZE;
+        int partNumber = parts.size() + 1;
+        
+        try (FileInputStream fis = new FileInputStream(file)) {
+            fis.skip(skipBytes);
+            
+            byte[] buffer = new byte[PART_SIZE];
+            int bytesRead;
+            while ((bytesRead = fis.read(buffer)) != -1) {
+                UploadPartResponse response = minioClient.uploadPart(
+                    UploadPartArgs.builder()
+                        .bucket(bucket)
+                        .object(objectName)
+                        .uploadId(uploadId)
+                        .partNumber(partNumber++)
+                        .stream(new ByteArrayInputStream(buffer, 0, bytesRead))
+                        .length(bytesRead)
+                        .build()
+                );
+                
+                parts.add(new PartETag(response.etag(), 
+                    partNumber - 1));
+            }
+        }
+        
+        // 3. 完成上传
+        minioClient.completeMultipartUpload(
+            CompleteMultipartUploadArgs.builder()
+                .bucket(bucket)
+                .object(objectName)
+                .uploadId(uploadId)
+                .parts(parts)
+                .build()
+        );
+        
+        return new UploadResult(uploadId, parts.size());
+    }
+    
+    private void onProgress(int percent) {
+        // 回调进度
+    }
+}
+```
+
+### 4.2 MD5 分块校验
+
+上传完成后需要校验文件完整性。
+
+```java
+public class FileIntegrityChecker {
+    
+    // 计算文件的 MD5
+    public String calculateMD5(File file) throws IOException {
+        MessageDigest md = MessageDigest.getInstance("MD5");
+        
+        try (FileInputStream fis = new FileInputStream(file)) {
+            byte[] buffer = new byte[8192];
+            int bytesRead;
+            while ((bytesRead = fis.read(buffer)) != -1) {
+                md.update(buffer, 0, bytesRead);
+            }
+        }
+        
+        byte[] digest = md.digest();
+        return bytesToHex(digest);
+    }
+    
+    // 计算分片的 MD5（用于快速校验）
+    public List<String> calculatePartMD5s(File file) throws IOException {
+        List<String> md5s = new ArrayList<>();
+        MessageDigest md = MessageDigest.getInstance("MD5");
+        
+        try (FileInputStream fis = new FileInputStream(file)) {
+            byte[] buffer = new byte[PART_SIZE];
+            int bytesRead;
+            
+            while ((bytesRead = fis.read(buffer)) != -1) {
+                md.reset();
+                md.update(buffer, 0, bytesRead);
+                md5s.add(bytesToHex(md.digest()));
+            }
+        }
+        
+        return md5s;
+    }
+    
+    // 验证服务器返回的 ETag 是否匹配
+    public boolean verifyUpload(String bucket, String objectName, 
+                                String expectedMD5) throws Exception {
+        StatObjectArgs args = StatObjectArgs.builder()
+            .bucket(bucket)
+            .object(objectName)
+            .build();
+        ObjectStat stat = minioClient.statObject(args);
+        
+        // MinIO 的 ETag 通常是文件的 MD5
+        String etag = stat.etag().replace("\"", "");
+        return etag.equalsIgnoreCase(expectedMD5);
+    }
+    
+    private String bytesToHex(byte[] bytes) {
+        StringBuilder sb = new StringBuilder();
+        for (byte b : bytes) {
+            sb.append(String.format("%02x", b));
+        }
+        return sb.toString();
+    }
+}
+```
+
+### 4.3 CDN 加速
+
+静态资源（图片、视频、文件）上传后，通过 CDN 分发给用户。
+
+```java
+@Configuration
+public class CdnConfiguration {
+    
+    @Value("${cdn.domain}")
+    private String cdnDomain;
+    
+    @Value("${cdn.enable:true}")
+    private boolean cdnEnabled;
+    
+    // 生成 CDN URL
+    public String getCdnUrl(String originalUrl) {
+        if (!cdnEnabled) {
+            return originalUrl;
+        }
+        
+        // 签名 URL，有效期 1 小时
+        return cdnSignUrl(originalUrl, 3600);
+    }
+    
+    private String cdnSignUrl(String url, int expires) {
+        // 简单的签名逻辑（实际使用中需要更复杂的签名算法）
+        String path = extractPath(url);
+        long expireTime = System.currentTimeMillis() / 1000 + expires;
+        String sign = md5(path + ":" + expireTime + ":" + SECRET_KEY);
+        
+        return cdnDomain + path + 
+            "?expires=" + expireTime + 
+            "&sign=" + sign;
+    }
+}
+```
+
+---
+
+## 五、数据冗余与恢复
+
+### 5.1 副本策略
+
+分布式存储通常通过多副本保证数据可靠性。
+
+```yaml
+# HDFS 副本配置
+hdfs-site.xml:
+  <property>
+    <name>dfs.replication</name>
+    <value>3</value>  # 3 副本
+  </property>
+  <property>
+    <name>dfs.replication.min</name>
+    <value>2</value>  # 最小副本数
+  </property>
+  <property>
+    <name>dfs.block.size</name>
+    <value>134217728</value>  # 128MB blocksize
+  </property>
+```
+
+**副本放置策略**：
+- 副本 1：写入节点本地
+- 副本 2：同机架的不同节点
+- 副本 3：不同机架的节点
+
+```
+机架 A                        机架 B
+┌────────────────┐            ┌────────────────┐
+│ Node1 [数据1]  │            │ Node4          │
+│ Node2          │            │ Node5 [数据1]  │
+│ Node3          │            │ Node6          │
+└────────────────┘            └────────────────┘
+        ↑                              ↑
+        └──────── 跨机架副本 ─────────┘
+```
+
+### 5.2 纠删码：更高效的冗余
+
+纠删码（Erasure Coding）用更少的存储空间提供同样的可靠性。
+
+| 策略 | 副本数 | 存储开销 | 允许故障节点 |
+|---|---|---|---|
+| 3 副本 | 3 | 300% | 2 |
+| RS(6,3) | 9 | 150% | 3 |
+
+```java
+// HDFS 纠删码配置
+public class ErasureCodingConfig {
+    
+    // 创建 EC 策略
+    public void createECPolicy() throws IOException {
+        // RS(6,3) 编码：6 数据块 + 3 校验块，允许丢失 3 块
+        ErasureCodingPolicy policy = 
+            ErasureCodingPolicySystem.getInstance().getPolicyByName("RS-6-3-1024k");
+        
+        Path ecDir = new Path("/ec-data");
+        fs.setErasureCodingPolicy(ecDir, policy);
+    }
+    
+    // 写入 EC 文件
+    public void writeECFile(Path path, byte[] data) throws IOException {
+        try (FSDataOutputStream out = fs.create(path)) {
+            out.write(data);
+        }
+    }
+}
+```
+
+---
+
+## 六、访问模式优化
+
+### 6.1 顺序读 vs 随机读
+
+**顺序读**是分布式存储的强项，**随机读**是弱项。
+
+```java
+public class ReadPatternOptimizer {
+    
+    // 优化：批量读取，而非逐个读取
+    public List<byte[]> batchRead(List<String> keys) throws IOException {
+        // 错误做法：逐个读取
+        // for (String key : keys) {
+        //     read(key);
+        // }
+        
+        // 正确做法：批量读取
+        return distributedCache.getBulk(keys);
+    }
+    
+    // 预读取：提前加载可能需要的数据
+    public void prefetch(String prefix) throws IOException {
+        List<String> keys = scanKeys(prefix);
+        
+        // 后台预读取
+        CompletableFuture.runAsync(() -> {
+            for (String key : keys) {
+                distributedCache.prefetch(key);
+            }
+        });
+    }
+}
+```
+
+### 6.2 写入策略：WAL 先写日志
+
+对于需要强一致性的写入，使用 Write-Ahead Log。
+
+```java
+public class WALWriteStrategy {
+    
+    private final FileSystem fs;
+    private final Path walPath;
+    private final Path dataPath;
+    
+    // WAL 写入
+    public void writeWithWAL(String key, byte[] value) throws IOException {
+        // 1. 先写 WAL
+        appendToWAL(key, value);
+        
+        // 2. 同步 WAL 到磁盘
+        fs.sync(walPath);
+        
+        // 3. 写入数据文件
+        writeDataFile(key, value);
+        
+        // 4. 更新内存索引
+        updateIndex(key, value);
+    }
+    
+    // 故障恢复
+    public void recover() throws IOException {
+        // 读取 WAL 中未完成的操作
+        List<WALEntry> entries = readWAL();
+        
+        for (WALEntry entry : entries) {
+            if (!isCompleted(entry)) {
+                // 重做未完成的操作
+                writeDataFile(entry.getKey(), entry.getValue());
+                markCompleted(entry);
+            }
+        }
+        
+        // 清空 WAL
+        truncateWAL();
+    }
+}
+```
+
+### 6.3 同步 vs 异步刷盘
+
+```java
+public class FlushStrategy {
+    
+    // 同步刷盘：强一致，性能较低
+    public void syncFlush(Path file, byte[] data) throws IOException {
+        try (FSDataOutputStream out = fs.create(file)) {
+            out.write(data);
+            out.hflush();  // 刷盘到 OS
+            out.hsync();   // 刷盘到磁盘
+        }
+    }
+    
+    // 异步刷盘：高性能，可能丢失数据
+    public void asyncFlush(Path file, byte[] data) throws IOException {
+        asyncBuffer.add(new WriteRequest(file, data));
+    }
+    
+    // 批量刷盘：平衡性能和可靠性
+    public void batchFlush(Path file, List<byte[]> dataBatch) throws IOException {
+        try (FSDataOutputStream out = fs.create(file)) {
+            for (byte[] data : dataBatch) {
+                out.write(data);
+            }
+            // 只在批次结束时刷盘
+            out.hflush();
+        }
+    }
+}
+```
+
+---
+
+## 七、分布式缓存层
+
+### 7.1 热点文件缓存
+
+```java
+public class DistributedFileCache {
+    
+    private final Cache<String, byte[]> localCache;
+    private final RedisTemplate<String, byte[]> redisCache;
+    private final FileStorage fileStorage;
+    
+    public DistributedFileCache() {
+        // 本地缓存：Guava Cache
+        this.localCache = CacheBuilder.newBuilder()
+            .maximumSize(1000)
+            .expireAfterWrite(5, TimeUnit.MINUTES)
+            .build();
+            
+        this.redisCache = new RedisTemplate<>();
+        this.fileStorage = new MinioFileOperations();
+    }
+    
+    public byte[] getFile(String fileId) throws Exception {
+        // 1. 先查本地缓存
+        byte[] data = localCache.getIfPresent(fileId);
+        if (data != null) {
+            return data;
+        }
+        
+        // 2. 再查 Redis
+        data = redisCache.opsForValue().get(fileId);
+        if (data != null) {
+            localCache.put(fileId, data);
+            return data;
+        }
+        
+        // 3. 最后查分布式存储
+        data = fileStorage.readFile(fileId);
+        
+        // 4. 回填缓存
+        redisCache.opsForValue().set(fileId, data, 1, TimeUnit.HOURS);
+        localCache.put(fileId, data);
+        
+        return data;
+    }
+    
+    // 缓存预热
+    public void warmup(List<String> hotFiles) {
+        for (String fileId : hotFiles) {
+            try {
+                byte[] data = fileStorage.readFile(fileId);
+                localCache.put(fileId, data);
+                redisCache.opsForValue().set(fileId, data, 1, TimeUnit.HOURS);
+            } catch (Exception e) {
+                log.warn("Failed to warmup file: {}", fileId, e);
+            }
+        }
+    }
+}
+```
+
+### 7.2 缓存一致性
+
+```java
+public class CacheConsistencyManager {
+    
+    // 写入时更新缓存
+    public void writeWithCacheInvalidation(String fileId, byte[] data) 
+            throws Exception {
+        // 1. 写入存储
+        fileStorage.writeFile(fileId, data);
+        
+        // 2. 使缓存失效
+        localCache.invalidate(fileId);
+        redisCache.delete(fileId);
+    }
+    
+    // 监听存储变更
+    @KafkaListener(topics = "file-storage-events")
+    public void handleStorageEvent(StorageEvent event) {
+        if (event.getType() == EventType.UPDATE || 
+            event.getType() == EventType.DELETE) {
+            localCache.invalidate(event.getFileId());
+            redisCache.delete(event.getFileId());
+        }
+    }
+}
+```
+
+---
+
+## 八、监控指标
+
+### 8.1 核心监控指标
+
+```java
+public class StorageMonitoring {
+    
+    // 存储容量监控
+    public StorageMetrics getStorageMetrics() {
+        StorageMetrics metrics = new StorageMetrics();
+        
+        // MinIO 统计
+        BucketStats stats = minioClient.bucketStats(
+            GetBucketStatsArgs.builder().bucket("data").build());
+        
+        metrics.setTotalCapacity(stats.objectCount());
+        metrics.setUsedCapacity(stats.objectCount() * stats.averageObjectSize());
+        metrics.setAvailableCapacity(stats.estimateCapacity());
+        
+        // 文件数量
+        metrics.setFileCount(stats.objectCount());
+        
+        // 小文件比例（小于 1MB）
+        metrics.setSmallFileRatio(calculateSmallFileRatio(stats));
+        
+        return metrics;
+    }
+    
+    // IO 性能监控
+    public IOPerformanceMetrics getIOPerformance() {
+        IOPerformanceMetrics metrics = new IOPerformanceMetrics();
+        
+        // 读取延迟
+        metrics.setReadLatencyP50(getLatencyPercentile(50));
+        metrics.setReadLatencyP95(getLatencyPercentile(95));
+        metrics.setReadLatencyP99(getLatencyPercentile(99));
+        
+        // 吞吐量
+        metrics.setReadThroughput(getReadThroughput());
+        metrics.setWriteThroughput(getWriteThroughput());
+        
+        // 缓存命中率
+        metrics.setCacheHitRatio(calculateCacheHitRatio());
+        
+        return metrics;
+    }
+}
+```
+
+### 8.2 告警规则
+
+```yaml
+# Prometheus 告警规则
+groups:
+  - name: storage_alerts
+    rules:
+      # 存储容量告警
+      - alert: StorageCapacityLow
+        expr: storage_available_bytes / storage_total_bytes < 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "存储容量不足"
+          description: "存储可用空间低于 10%"
+      
+      # IO 延迟告警
+      - alert: StorageLatencyHigh
+        expr: storage_read_latency_p99 > 1000
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "存储读取延迟过高"
+          description: "P99 读取延迟 {{ $value }}ms"
+      
+      # 小文件过多告警
+      - alert: TooManySmallFiles
+        expr: storage_small_file_ratio > 0.5
+        for: 10m
+        labels:
+          severity: info
+        annotations:
+          summary: "小文件比例过高"
+          description: "小文件占总文件 {{ $value | humanizePercentage }}"
+```
+
+---
+
+## 九、面试实战
+
+### 9.1 场景一：大文件上传方案设计
+
+**面试官问**：「如果要设计一个支持断点续传的大文件上传功能，你会怎么做？」
+
+**回答要点**：
+
+> 断点续传的核心是「分片 + 进度记录」。
+
+**分片上传流程**：
+
+1. **初始化上传**：客户端请求服务器获取 uploadId
+2. **分片上传**：客户端将文件分成多个片段，并行上传
+3. **进度记录**：服务器记录每个分片的完成状态
+4. **分片合并**：所有分片上传完成后，服务器合并成分片
+5. **断点续传**：客户端上传前先查询已上传的分片，从断点继续
+
+**关键实现**：
+
+```java
+// 服务端 API
+@RestController
+public class UploadController {
+    
+    @PostMapping("/upload/init")
+    public UploadInitResponse initUpload(@RequestParam String filename,
+                                         @RequestParam long fileSize) {
+        String uploadId = UUID.randomUUID().toString();
+        
+        // 创建上传会话
+        UploadSession session = new UploadSession();
+        session.setUploadId(uploadId);
+        session.setFilename(filename);
+        session.setFileSize(fileSize);
+        session.setPartCount((int) Math.ceil((double) fileSize / PART_SIZE));
+        session.setUploadedParts(new BitSet(session.getPartCount()));
+        session.setCreateTime(System.currentTimeMillis());
+        
+        uploadSessionStore.save(session);
+        
+        return new UploadInitResponse(uploadId, PART_SIZE);
+    }
+    
+    @PostMapping("/upload/{uploadId}/part/{partNumber}")
+    public UploadPartResponse uploadPart(@PathVariable String uploadId,
+                                         @PathVariable int partNumber,
+                                         @RequestParam("file") MultipartFile file) {
+        UploadSession session = uploadSessionStore.get(uploadId);
+        
+        // 保存分片
+        String partPath = savePartFile(uploadId, partNumber, file);
+        
+        // 标记完成
+        session.getUploadedParts().set(partNumber);
+        uploadSessionStore.update(session);
+        
+        return new UploadPartResponse(partNumber, calculateMD5(file));
+    }
+    
+    @PostMapping("/upload/{uploadId}/complete")
+    public CompleteUploadResponse completeUpload(@PathVariable String uploadId) {
+        UploadSession session = uploadSessionStore.get(uploadId);
+        
+        // 合并分片
+        String finalPath = mergeParts(uploadId, session.getFilename());
+        
+        // 清理临时文件
+        cleanupTempFiles(uploadId);
+        uploadSessionStore.delete(uploadId);
+        
+        return new CompleteUploadResponse(finalPath);
+    }
+    
+    @GetMapping("/upload/{uploadId}/status")
+    public UploadStatusResponse getUploadStatus(@PathVariable String uploadId) {
+        UploadSession session = uploadSessionStore.get(uploadId);
+        
+        return new UploadStatusResponse(
+            session.getUploadedParts().nextClearBit(0),
+            session.getPartCount()
+        );
+    }
+}
+```
+
+### 9.2 场景二：小文件存储优化
+
+**面试官问**：「如果你有 100 万张小图片需要存储，怎么优化？」
+
+**回答要点**：
+
+> 小文件存储的核心问题是「元数据膨胀 + 寻址开销」，解决方案是「合并 + 缓存 + 预热」。
+
+**优化方案**：
+
+```java
+public class SmallFileOptimization {
+    
+    // 方案 1：HAR 归档
+    // 适用于 HDFS 场景，将小文件打包成 HAR 文件
+    
+    // 方案 2：对象存储合并
+    // 将多个小文件合并成一个大文件存储
+    
+    public void mergeSmallFiles(String batchId, List<SmallFile> files) {
+        // 收集内容
+        ByteArrayOutputStream merged = new ByteArrayOutputStream();
+        Map<String, Long> index = new HashMap<>();
+        long offset = 0;
+        
+        for (SmallFile file : files) {
+            byte[] content = file.getContent();
+            index.put(file.getPath(), offset);
+            merged.write(content);
+            offset += content.length;
+        }
+        
+        // 存储合并文件 + 索引
+        String dataKey = "merged/" + batchId + ".dat";
+        storeData(dataKey, merged.toByteArray());
+        storeIndex(batchId, index);
+    }
+    
+    // 方案 3：热点缓存
+    // 使用 Alluxio 或 Redis 缓存热点文件
+}
+```
+
+### 9.3 场景三：CDN 缓存策略
+
+**面试官问**：「静态资源（图片、视频）如何设计缓存策略？」
+
+**回答要点**：
+
+> 缓存策略的核心是「分层 + 区分 + 验证」。
+
+**分层缓存**：
+- 浏览器缓存：减少用户侧的请求
+- CDN 缓存：减少回源次数
+- 源站缓存：减少回源压力
+
+**缓存时间策略**：
+
+| 资源类型 | 缓存时间 | 说明 |
+|---|---|---|
+| HTML | 5 分钟 | 频繁更新 |
+| CSS/JS | 1 天 | 版本号控制 |
+| 图片 | 30 天 | 变化少 |
+| 视频 | 1 年 | 几乎不变 |
+
+**实现**：
+
+```java
+public class CacheHeaderStrategy {
+    
+    public void setCacheHeaders(HttpServletResponse response, 
+                                ResourceType type) {
+        switch (type) {
+            case HTML:
+                response.setHeader("Cache-Control", "no-cache");
+                response.setHeader("ETag", generateETag());
+                break;
+                
+            case STATIC:
+                // 长期缓存 + 版本号控制
+                response.setHeader("Cache-Control", 
+                    "public, max-age=31536000, immutable");
+                response.setHeader("ETag", getVersion());
+                break;
+                
+            case DYNAMIC:
+                // 短期缓存
+                response.setHeader("Cache-Control", 
+                    "private, max-age=300");
+                break;
+        }
+    }
+}
+```
+
+---
+
+## 十、留给你的思考题
+
+### 题目一：副本策略的权衡
+
+假设你的系统需要存储 1TB 数据，可靠性要求是「允许同时故障 2 个节点」。
+
+**问题**：
+1. 使用 3 副本策略，需要多少存储空间？允许故障几个节点？
+2. 使用 RS(6,3) 纠删码，需要多少存储空间？允许故障几个节点？
+3. 两种方案各有什么优缺点？
+
+### 题目二：大文件与小文件的平衡
+
+**问题**：如果你的系统需要同时存储 100MB 的日志文件和 1KB 的配置信息，你会分别采用什么样的存储策略？如何设计一个统一的存储层来兼顾这两种场景？
+
+---
+
+## 总结
+
+分布式文件存储的优化，本质上是在解决三个核心问题：**性能、可靠性和成本**。
+
+- **性能优化**：减少网络开销是关键，通过缓存、预读取、分片上传等手段提升性能
+- **可靠性保障**：副本和纠删码是基础，但恢复速度同样重要
+- **成本控制**：根据访问模式选择合适的存储方案，冷数据用归档，热数据用缓存
+
+小文件问题和大文件问题是两个极端，需要不同的策略。小文件用合并、归档；大文件用分片、并行。**没有一种方案能解决所有问题，关键是识别当前场景的主要矛盾，选择最合适的方案。**

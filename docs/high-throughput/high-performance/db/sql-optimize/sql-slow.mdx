@@ -1,0 +1,710 @@
+# 慢查询定位与排查：从日志到根因
+
+凌晨三点，你被手机铃声吵醒。监控告警：数据库 CPU 使用率飙升至 98%，业务接口响应时间从 50ms 暴涨到 5000ms。用户投诉页面打不开，运营部门连环夺命 call。
+
+你登录服务器，敲下 `show processlist`，满屏的 `Query` 状态，全是执行时间几百秒的 SQL。有人弱弱地问：「要不先重启数据库试试？」
+
+重启？开玩笑。数据还在写入，重启可能造成数据损坏。更重要的是——你根本不知道元凶是谁。
+
+这不是演习，这是每一个后端工程师都可能遇到的真实场景。问题的根源，往往就是那么几条慢查询。它们躲在暗处，悄无声息地吞噬着数据库的性能，直到某一刻集中爆发。
+
+这篇文章的核心任务，就是帮你建立一套完整的慢查询排查体系：如何发现慢查询、如何分析慢查询、如何从根源上消灭慢查询。
+
+---
+
+## 一、慢查询的本质：什么是「慢」？
+
+### 1.1 慢查询的定义
+
+在 MySQL 中，慢查询有一个精确的定义：**执行时间超过 `long_query_time` 阈值的 SQL 语句**。
+
+这个阈值默认是 `10 秒`，但实际生产环境中，10 秒的查询早就把用户逼走了。通常我们会把它设置得更激进：
+
+```sql
+-- 查看当前慢查询配置
+SHOW VARIABLES LIKE 'slow_query%';
+SHOW VARIABLES LIKE 'long_query_time';
+```
+
+```bash
++---------------------+----------------------------------+
+| Variable_name       | Value                            |
++---------------------+----------------------------------+
+| slow_query_log      | ON                               |
+| slow_query_log_file | /var/lib/mysql/mysql-slow.log    |
++---------------------+----------------------------------+
+
++-----------------+-----------+
+| Variable_name   | Value     |
++-----------------+-----------+
+| long_query_time | 2.000000  |
++-----------------+-----------+
+```
+
+这个例子中，`long_query_time` 设置为 2 秒，意味着任何执行超过 2 秒的 SQL 都会被记录。
+
+### 1.2 为什么要关注慢查询
+
+慢查询不仅仅是「执行时间长」这么简单，它背后隐藏着更大的问题：
+
+**资源占用**。一条执行 30 秒的 SQL，可能锁住某些行 30 秒。这 30 秒内，其他需要访问这些行的查询都得排队等待。如果锁的是关键业务数据，整个系统都可能陷入等待。
+
+**连接耗尽**。MySQL 的连接数是有限的，通常几百到几千条。如果大量慢查询占着连接不释放，新的请求就只能等待，严重时甚至无法建立新连接。
+
+**主从延迟**。在主从复制的架构中，慢查询会拖慢 binlog 的同步，导致从库严重滞后。一旦主库宕掉，从库可能丢失大量数据。
+
+:::tip 一条慢查询的影响
+
+想象一个场景：每秒进来 100 个请求，每个请求需要访问 A 表。有一条慢查询占着 A 表的某些行 30 秒。
+
+在这 30 秒内：
+- 可能有 3000 个请求在等待
+- 可能触发数据库连接池耗尽
+- 可能导致上游服务超时，引发连锁反应
+
+这就是慢查询的「蝴蝶效应」。
+
+:::
+
+---
+
+## 二、慢查询日志配置：让 MySQL 开口说话
+
+### 2.1 核心配置项
+
+MySQL 的慢查询日志通过以下几个配置项控制：
+
+| 配置项 | 说明 | 默认值 |
+|-------|------|--------|
+| `slow_query_log` | 是否开启慢查询日志 | OFF |
+| `slow_query_log_file` | 慢查询日志文件路径 | `主机名-slow.log` |
+| `long_query_time` | 慢查询阈值（秒），支持微秒级 | 10 |
+| `min_examined_row_limit` | 最少扫描行数，低于此值不记录 | 0 |
+| `log_queries_not_using_indexes` | 是否记录未使用索引的查询 | OFF |
+| `log_throttle_queries_not_using_indexes` | 限制未使用索引查询的记录频率 | 0 |
+
+### 2.2 动态配置慢查询日志
+
+不需要重启 MySQL，直接通过 SQL 动态开启：
+
+```sql
+-- 开启慢查询日志
+SET GLOBAL slow_query_log = 'ON';
+
+-- 设置慢查询阈值为 1 秒
+SET GLOBAL long_query_time = 1;
+
+-- 设置慢查询日志路径
+SET GLOBAL slow_query_log_file = '/var/lib/mysql/slow.log';
+
+-- 记录未使用索引的查询（生产环境慎用，可能产生大量日志）
+SET GLOBAL log_queries_not_using_indexes = 'ON';
+```
+
+:::warning 动态配置的有效范围
+
+`SET GLOBAL` 修改的是全局变量，对**新建立的连接**生效。如果你是通过某个连接执行 `SET GLOBAL`，当前连接的 `long_query_time` 不会变，需要重新登录或执行 `SET SESSION long_query_time = 1;`。
+
+:::
+
+### 2.3 永久配置慢查询日志
+
+在 `my.cnf`（或 `my.ini`）中添加配置：
+
+```ini title="my.cnf"
+[mysqld]
+# 开启慢查询日志
+slow_query_log = 1
+
+# 慢查询日志文件路径
+slow_query_log_file = /var/lib/mysql/mysql-slow.log
+
+# 慢查询阈值：1 秒
+long_query_time = 1
+
+# 至少扫描 1000 行才记录（过滤小表查询）
+min_examined_row_limit = 1000
+
+# 记录未使用索引的查询（仅建议排查阶段开启）
+log_queries_not_using_indexes = 1
+```
+
+配置完成后，重启 MySQL 使配置生效。
+
+---
+
+## 三、慢查询日志格式解析：读懂 MySQL 的「告状信」
+
+### 3.1 慢查询日志长什么样
+
+一条典型的慢查询日志条目如下：
+
+```bash
+# Time: 2024-01-15T03:15:42.123456Z
+# User@Host: app_user[app_user] @ 192.168.1.100 [192.168.1.100]  Id: 12345
+# Query_time: 5.234567  Lock_time: 0.000123  Rows_sent: 20  Rows_examined: 5000000
+# SQL_init:
+SELECT * FROM orders WHERE status = 1 ORDER BY create_time DESC LIMIT 20;
+```
+
+逐字段解析：
+
+| 字段 | 含义 | 本例中的值 |
+|-----|------|-----------|
+| `Time` | 查询执行结束时间 | 凌晨 3 点 15 分 |
+| `User@Host` | 执行用户和来源 IP | app_user @ 192.168.1.100 |
+| `Query_time` | **总执行时间** | 5.23 秒 |
+| `Lock_time` | **锁等待时间** | 0.000123 秒（约 0.1ms） |
+| `Rows_sent` | **返回给客户端的行数** | 20 行 |
+| `Rows_examined` | **扫描的行数** | 500 万行 |
+
+### 3.2 黄金法则：Rows examined >> Rows sent
+
+注意这个对比：`Rows_examined = 5000000`，`Rows_sent = 20`。
+
+扫描了 **500 万行**，只返回了 **20 行**。这就是典型的「做了大量无用功」。
+
+:::tip 慢查询的本质问题
+
+**`Rows_examined` 远大于 `Rows_sent`，意味着 MySQL 做了大量无效扫描。**
+
+这条法则几乎可以判断所有慢查询的问题：全表扫描、缺失索引、索引失效、深度分页——它们最终都表现为 `Rows_examined` 远大于 `Rows_sent`。
+
+优化慢查询，本质上就是降低 `Rows_examined` 与 `Rows_sent` 的比值，最好接近 1:1。
+
+:::
+
+### 3.3 完整日志条目解析
+
+对于更复杂的查询，慢查询日志还可能包含更多上下文：
+
+```bash
+# Time: 2024-01-15T03:15:42.123456Z
+# User@Host: app_user[app_user] @ 192.168.1.100 [192.168.1.100]  Id: 12345
+# Query_time: 12.345678  Lock_time: 0.000456  Rows_sent: 0  Rows_examined: 8000000
+# Thread_id: 12345  Err_code: 0
+use myapp_db;
+SET timestamp=1705288542;
+SELECT o.* FROM orders o
+  INNER JOIN users u ON o.user_id = u.id
+  WHERE o.status = 1
+    AND o.create_time > '2024-01-01'
+    AND u.level > 5
+  ORDER BY o.create_time DESC
+  LIMIT 20;
+```
+
+关键信息：
+
+- `Thread_id`：线程 ID，可用于 `SHOW PROCESSLIST` 中查找
+- `Err_code`：错误码，0 表示正常执行
+- `use myapp_db`：执行的数据库
+- `SET timestamp`：查询开始时的 Unix 时间戳
+
+---
+
+## 四、慢查询分析工具：从日志到洞察
+
+### 4.1 mysqldumpslow：MySQL 自带的慢查询分析器
+
+MySQL 自带了 `mysqldumpslow` 工具，可以对慢查询日志进行统计分析。
+
+```bash
+# 查看最慢的 10 条 SQL
+mysqldumpslow -s t -t 10 /var/lib/mysql/mysql-slow.log
+
+# 按平均执行时间排序，显示前 5 条
+mysqldumpslow -s at -t 5 /var/lib/mysql/mysql-slow.log
+
+# 按总锁定时间排序
+mysqldumpslow -s l -t 10 /var/lib/mysql/mysql-slow.log
+
+# 按扫描行数排序
+mysqldumpslow -s r -t 10 /var/lib/mysql/mysql-slow.log
+
+# 找出包含 'orders' 表的慢查询
+mysqldumpslow -s t /var/lib/mysql/mysql-slow.log | grep orders
+```
+
+参数说明：
+
+| 参数 | 说明 |
+|-----|------|
+| `-s t` | 按总执行时间排序 |
+| `-s at` | 按平均执行时间排序 |
+| `-s l` | 按总锁定时间排序 |
+| `-s r` | 按扫描行数排序 |
+| `-s c` | 按查询次数排序 |
+| `-t N` | 只显示前 N 条 |
+| `-g pattern` | 只包含匹配 pattern 的查询 |
+
+### 4.2 pt-query-digest：更强大的分析工具
+
+Percona Toolkit 中的 `pt-query-digest` 是更专业的慢查询分析工具，功能远比 `mysqldumpslow` 强大。
+
+```bash
+# 基本用法：分析慢查询日志
+pt-query-digest /var/lib/mysql/mysql-slow.log
+
+# 将分析结果保存到文件
+pt-query-digest /var/lib/mysql/mysql-slow.log > /tmp/slow_analysis.txt
+
+# 分析最近 24 小时的慢查询（需要日志包含时间戳）
+pt-query-digest --since='24h' /var/lib/mysql/mysql-slow.log
+
+# 只分析特定表的查询
+pt-query-digest --filter '$event->{fingerprint} =~ m/orders/i' /var/lib/mysql/mysql-slow.log
+```
+
+`pt-query-digest` 的输出通常包含以下几个部分：
+
+**第一部分：查询汇总**
+
+```bash
+# 290ms user time, 20ms system time, 24.99M rss, 3.57G vsz
+# Current date: Mon Jan 15 03:20:00 2024
+# Run time under: 5s
+# 127 queries total, 23 unique
+# Sort: sum_time DESC
+# Showing top 5 queries (set -t 5 to alter)
+```
+
+**第二部分：查询排名**
+
+```bash
+# Rank  Query ID           Response time  Calls  R/Call  V/M   Item
+# ====  ================== =============== =====  ======= ===== =====
+#    1  0xABC123...         25.2345 32.1%   1234   0.0205  0.10 SELECT orders
+#    2  0xDEF456...         18.5678 23.6%    567   0.0327  0.15 SELECT users
+#    3  0xGHI789...         12.3456 15.7%    890   0.0139  0.08 SELECT products
+```
+
+**第三部分：每条查询的详情**
+
+```bash
+# Query 1: 25.2345s (32.1% of total)
+# 1234 calls, 25.2345s total, 0 avg, 0.02-0.15s range
+# Databases: myapp_db
+# Tables: orders (Primary Key), users ( eq_ref)
+SELECT o.* FROM orders o
+  INNER JOIN users u ON o.user_id = u.id
+  WHERE o.status = 1
+  ORDER BY o.create_time DESC
+  LIMIT 20;
+```
+
+:::tip pt-query-digest 的优势
+
+1. **查询归类**：将相同模式但不同参数的 SQL 归类在一起（比如 `WHERE id = 1` 和 `WHERE id = 2` 归为一条）
+2. **性能对比**：分析查询在不同时间的性能变化
+3. **索引建议**：给出缺失索引的建议
+4. **可读性强**：输出格式更友好，易于阅读
+
+如果公司有 DBA，一定要学会用这个工具。
+
+:::
+
+---
+
+## 五、慢查询处理流程：五步定位根因
+
+### 5.1 完整处理流程
+
+处理慢查询有一个标准的五步流程：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  第一步：开启慢查询日志                                       │
+│  slow_query_log = ON, long_query_time = 1                   │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│  第二步：获取慢 SQL                                          │
+│  pt-query-digest / mysqldumpslow 分析日志                    │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│  第三步：EXPLAIN 分析执行计划                                 │
+│  EXPLAIN SELECT ...                                         │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│  第四步：检查索引                                            │
+│  SHOW INDEX FROM table_name                                 │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│  第五步：优化 SQL 并验证                                      │
+│  添加索引 / 重写 SQL / 业务调整                               │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 5.2 第三步：EXPLAIN 深度解析
+
+对于识别出的慢查询，必须用 `EXPLAIN` 分析执行计划：
+
+```sql
+EXPLAIN SELECT * FROM orders
+WHERE status = 1
+  AND create_time > '2024-01-01'
+ORDER BY create_time DESC
+LIMIT 20;
+```
+
+```bash
++----+-------------+--------+------------+------+---------------+------+---------+--------+---------+----------+------------------------------------------------+
+| id | select_type| table  | type       | key  | key_len       | ref  | rows    | rws    | rlen    | Extra                      |
++----+-------------+--------+------------+------+---------------+------+---------+--------+---------+----------+------------------------------------------------+
+|  1 | SIMPLE      | orders | ALL        | NULL | NULL          | NULL | 5000000 | 512000K| 0       | Using where; Using filesort |
++----+-------------+--------+------------+------+---------------+------+---------+--------+---------+----------+------------------------------------------------+
+```
+
+重点关注字段：
+
+**`type`**：访问类型，从好到差排序：
+
+```
+const/eq_ref/ref > range > index > ALL
+```
+
+| type | 含义 | 性能 |
+|-----|------|------|
+| `const` | 主键或唯一索引等值查询，最多匹配 1 行 | 最优 |
+| `eq_ref` | 多表 JOIN，对于前表的每一行，用主键/唯一索引等值查询 | 优 |
+| `ref` | 非唯一索引等值查询 | 良 |
+| `range` | 索引范围查询 | 中 |
+| `index` | 全索引扫描 | 差 |
+| `ALL` | **全表扫描** | 差 |
+
+`type = ALL` 是最糟糕的情况，意味着 MySQL 扫描了整张表。
+
+**`key`**：实际使用的索引。如果 `key = NULL`，说明没有使用索引。
+
+**`rows`**：MySQL 预估需要扫描的行数。这个数字越大，说明性能越差。
+
+**`Extra`**：额外的执行信息，常见值：
+
+| Extra | 含义 | 优化方向 |
+|-------|------|---------|
+| `Using filesort` | 无法使用索引排序，需要额外排序 | 添加排序字段的索引 |
+| `Using temporary` | 需要创建临时表 | 优化查询或添加索引 |
+| `Using where` | 用 WHERE 条件过滤 | 检查 WHERE 条件是否走索引 |
+| `Using index` | 覆盖索引，不需要回表 | 最优，继续保持 |
+| `Using index condition` | 索引下推 | 正常 |
+
+---
+
+## 六、常见慢查询原因与解决方案
+
+### 6.1 全表扫描
+
+**问题**：`type = ALL`，MySQL 扫描整张表。
+
+```sql
+-- 问题 SQL
+SELECT * FROM orders WHERE status = 1;
+
+-- EXPLAIN 结果
++----+-------------+-------+------+---------------+------+---------+------+----------+-------------+
+| id | select_type| table | type | key           | rows | rws     | rlen | Extra               |
++----+-------------+-------+------+---------------+------+---------+------+----------+-------------+
+|  1 | SIMPLE      | orders| ALL  | NULL          | 5M   | 512000K | 0    | Using where        |
++----+-------------+-------+------+---------------+------+---------+------+----------+-------------+
+```
+
+**解决方案**：根据 WHERE 条件添加索引。
+
+```sql
+-- 添加索引
+ALTER TABLE orders ADD INDEX idx_status(status);
+
+-- 优化后的 EXPLAIN
++----+-------------+-------+------+---------------+------+---------+------+----------+-------------+
+| id | select_type| table | type | key           | rows | rws     | rlen | Extra               |
++----+-------------+-------+------+---------------+------+---------+------+----------+-------------+
+|  1 | SIMPLE      | orders| ref  | idx_status    | 1000 | 100K    | 0    | Using where        |
++----+-------------+-------+------+---------------+------+---------+------+----------+-------------+
+```
+
+### 6.2 索引失效：函数与运算
+
+**问题**：在索引列上使用函数或运算，导致索引失效。
+
+```sql
+-- 问题 SQL：索引列上使用函数
+SELECT * FROM orders WHERE YEAR(create_time) = 2024;
+
+-- 问题 SQL：索引列上做运算
+SELECT * FROM orders WHERE id + 1 = 100000;
+```
+
+**解决方案**：将函数或运算移到常量一侧。
+
+```sql
+-- 正确写法：范围查询
+SELECT * FROM orders WHERE create_time >= '2024-01-01' AND create_time < '2025-01-01';
+
+-- 正确写法：使用 id 范围
+SELECT * FROM orders WHERE id BETWEEN 99999 AND 100001;
+```
+
+### 6.3 索引失效：类型转换
+
+**问题**：WHERE 条件中字段类型与索引类型不匹配，触发隐式类型转换。
+
+```sql
+-- user_id 是 VARCHAR 类型，但传入了数字
+SELECT * FROM orders WHERE user_id = 12345;  -- 隐式转换，索引失效
+
+-- 正确写法
+SELECT * FROM orders WHERE user_id = '12345';
+```
+
+### 6.4 索引失效：LIKE 前缀通配
+
+**问题**：`LIKE '%xxx'` 或 `LIKE '%xxx%'` 导致索引失效。
+
+```sql
+-- 问题 SQL
+SELECT * FROM orders WHERE order_no LIKE '%2024%';
+
+-- EXPLAIN 结果
++----+-------------+-------+------+---------------+------+---------+------+----------+-------------+
+| id | select_type| table | type | key           | rows | rws     | rlen | Extra               |
++----+-------------+-------+------+---------------+------+---------+------+----------+-------------+
+|  1 | SIMPLE      | orders| ALL  | NULL          | 5M   | 512000K | 0    | Using where        |
++----+-------------+-------+------+---------------+------+---------+------+----------+-------------+
+```
+
+**解决方案**：
+
+- 如果必须模糊匹配，考虑使用 Elasticsearch
+- 如果前缀固定，改用后缀通配：`LIKE '2024%'` 可以使用索引
+- 建立倒排索引
+
+### 6.5 JOIN 过多或顺序不当
+
+**问题**：多表 JOIN 时，MySQL 可能选择错误的 JOIN 顺序，导致大量扫描。
+
+```sql
+-- 问题 SQL：多表 JOIN
+SELECT o.*, u.name, p.title
+FROM orders o
+JOIN users u ON o.user_id = u.id
+JOIN products p ON o.product_id = p.id
+JOIN categories c ON p.category_id = c.id
+WHERE o.status = 1 AND u.level > 5;
+```
+
+**解决方案**：
+
+1. 确保关联字段有索引
+2. 用 `STRAIGHT_JOIN` 强制指定 JOIN 顺序（慎用）
+3. 控制 JOIN 的表数量（不超过 3-4 张）
+
+```sql
+-- 查看 JOIN 的执行顺序
+EXPLAIN SELECT STRAIGHT_JOIN o.*, u.name
+FROM orders o
+STRAIGHT_JOIN users u ON o.user_id = u.id
+WHERE o.status = 1;
+```
+
+### 6.6 ORDER BY 字段没有索引
+
+**问题**：`ORDER BY` 字段没有索引，导致 `Using filesort`。
+
+```sql
+-- 问题 SQL
+SELECT * FROM orders WHERE status = 1 ORDER BY create_time DESC;
+
+-- EXPLAIN 结果：Using filesort
++----+-------------+-------+------+---------------+------+---------+------+----------+---------------------------+
+| id | select_type| table | type | key           | rows | rws     | rlen | Extra                      |
++----+-------------+-------+------+---------------+------+---------+------+----------+---------------------------+
+|  1 | SIMPLE      | orders| ref  | idx_status    | 1000 | 100K    | 0    | Using where; Using filesort |
++----+-------------+-------+------+---------------+------+---------+------+----------+---------------------------+
+```
+
+**解决方案**：建立 `(status, create_time)` 联合索引。
+
+```sql
+ALTER TABLE orders ADD INDEX idx_status_create(status, create_time);
+```
+
+### 6.7 分页 OFFSET 过大
+
+这是最常见的慢查询原因，在 `pagination.mdx` 中有详细讲解。简单说：
+
+```sql
+-- 问题 SQL
+SELECT * FROM orders ORDER BY id DESC LIMIT 100000, 20;
+
+-- 优化方案一：延迟关联
+SELECT * FROM orders o
+INNER JOIN (
+    SELECT id FROM orders ORDER BY id DESC LIMIT 100000, 20
+) t ON o.id = t.id;
+
+-- 优化方案二：游标分页
+SELECT * FROM orders WHERE id < #{lastId} ORDER BY id DESC LIMIT 20;
+```
+
+---
+
+## 七、生产环境慢查询监控配置
+
+### 7.1 使用 Performance Schema 实时监控
+
+MySQL 5.6+ 提供了 Performance Schema，可以实时查看查询性能：
+
+```sql
+-- 开启相关监控
+UPDATE performance_schema.setup_consumers
+SET enabled = 'YES'
+WHERE name IN ('events_statements_history', 'events_statements_history_long');
+
+-- 查看最近执行的慢查询
+SELECT
+    DIGEST,
+    COUNT_STAR AS exec_count,
+    SUM_TIMER_WAIT/1000000000000 AS total_time,
+    AVG_TIMER_WAIT/1000000000000 AS avg_time,
+    SUM_ROWS_EXAMINED,
+    SUM_ROWS_SENT,
+    SUBSTR(DIGEST_TEXT, 1, 100) AS query_sample
+FROM performance_schema.events_statements_summary_by_digest
+WHERE SUM_TIMER_WAIT > 1000000000  -- 超过 1 秒
+ORDER BY SUM_TIMER_WAIT DESC
+LIMIT 10;
+```
+
+### 7.2 Prometheus + mysqld_exporter 监控
+
+在云原生环境下，通常用 Prometheus 监控 MySQL：
+
+```bash title="docker-compose.yml"
+version: '3'
+services:
+  mysqld_exporter:
+    image: prom/mysqld-exporter:latest
+    environment:
+      DATA_SOURCE_NAME: "root:password@tcp(localhost:3306)/"
+    ports:
+      - "9104:9104"
+    command:
+      - --collect.info_schema.processlist
+      - --collect.info_schema.queries
+      - --collect.perf_schema.tableiowaits
+```
+
+关键监控指标：
+
+| 指标 | 说明 |
+|-----|------|
+| `mysql_global_status_slow_queries` | 慢查询总数 |
+| `mysql_global_status_long_query_count` | 长查询计数 |
+| `mysql_info_schema_query_summary` | 查询执行统计 |
+
+### 7.3 MySQL Enterprise Monitor
+
+如果是企业级 MySQL，可以使用 MySQL Enterprise Monitor，它提供了可视化的慢查询分析界面，可以自动识别性能问题并给出优化建议。
+
+---
+
+## 八、面试实战
+
+### 8.1 场景一：慢查询排查的完整思路
+
+**面试官问**：「生产环境数据库 CPU 突然飙升，你如何排查是不是慢查询导致的？」
+
+**深入回答**：
+
+> 排查慢查询有一个标准流程。
+>
+> **第一步，看 Processlist**。执行 `SHOW PROCESSLIST`，重点关注 State 列是 `Sending data` 或 `Copying to tmp table` 的连接，这些通常是正在执行耗时查询的连接。
+>
+> **第二步，开启慢查询日志**。如果还没开，快速执行 `SET GLOBAL slow_query_log = 'ON'`，设置 `long_query_time = 0` 记录所有查询，或者设置 `long_query_time = 1` 记录超过 1 秒的查询。
+>
+> **第三步，分析慢查询日志**。用 `pt-query-digest` 或 `mysqldumpslow` 分析，找出执行时间最长、扫描行数最多的 SQL。
+>
+> **第四步，EXPLAIN 分析**。对识别出的慢查询执行 `EXPLAIN`，看是否走了全表扫描、是否有 `Using filesort`、预估扫描行数是多少。
+>
+> **第五步，检查索引**。用 `SHOW INDEX FROM table_name` 检查相关字段是否有索引，分析索引是否合理。
+>
+> **第六步，优化并验证**。根据分析结果优化：加索引、改写 SQL、优化业务逻辑。改完后再次执行 EXPLAIN 和实际压测验证效果。
+
+### 8.2 场景二：如何判断一个 SQL 是否需要优化
+
+**面试官问**：「一个查询执行时间是 2 秒，你觉得需要优化吗？」
+
+**深入回答**：
+
+> 这要看场景，不能一概而论。
+>
+> **首先看频率**。如果这个 SQL 每小时才执行一次，执行时间 2 秒完全可以接受。但如果每秒执行 100 次，那就是 200 秒/秒的 CPU 消耗，必须优化。
+>
+> **其次看 `Rows_examined` vs `Rows_sent`**。如果 `Rows_examined` 是 1000，`Rows_sent` 是 20，说明做了 50 倍的无用功，需要优化。如果 `Rows_examined` 是 100，`Rows_sent` 是 100，接近 1:1，说明查询本身是高效的。
+>
+> **最后看业务影响**。如果这个查询是用户点击「查询订单」按钮后执行的，2 秒的响应时间会严重影响用户体验，必须优化。如果只是后台报表任务，2 秒完全可以接受。
+
+### 8.3 场景三：索引失效的常见原因
+
+**面试官问**：「加了索引但 SQL 还是慢，你怀疑是索引失效，应该怎么验证？」
+
+**深入回答**：
+
+> 可以从以下几个方面排查：
+>
+> **第一，用 EXPLAIN 看是否走了索引**。如果 `type = ALL` 或 `key = NULL`，说明没走索引。
+>
+> **第二，检查是否有函数或运算**。比如 `WHERE YEAR(create_time) = 2024`，索引列上使用函数会导致索引失效。
+>
+> **第三，检查类型是否匹配**。比如 `user_id` 是 VARCHAR 类型，但传入了数字 `12345`，MySQL 会做隐式类型转换，导致索引失效。
+>
+> **第四，检查 LIKE 查询**。`LIKE '%xxx%'` 或 `LIKE '%xxx'` 无法使用索引，只有 `LIKE 'xxx%'` 可以。
+>
+> **第五，检查 OR 条件**。如果 OR 连接的多个条件中有不带索引的字段，整个 OR 条件都可能失效。解决方案是拆分成多个查询 + UNION。
+>
+> **第六，检查复合索引的列顺序**。复合索引 `(a, b, c)` 必须从左到右使用，跳过前面的列会导致后面的列索引失效。
+
+---
+
+## 九、留给你的思考题
+
+### 题目一：监控的边界
+
+假设你的慢查询阈值是 1 秒，某个查询执行了 0.9 秒，但执行频率是每秒 1000 次。这意味着这个查询每秒消耗 900 秒的 CPU 时间。
+
+你能想到什么方法，监控和分析这种「不慢但执行频率极高」的查询？
+
+### 题目二：索引与写入的权衡
+
+假设你有一张订单表 `orders`，每天写入量 100 万条，查询主要是分页查询 `WHERE status = ? ORDER BY create_time DESC`。
+
+你可能会建立 `(status, create_time)` 的联合索引来优化查询，但这个索引会导致：
+- 每次写入都要更新索引
+- 索引体积快速增长
+- 写入性能下降
+
+你会如何权衡这个取舍？有没有更好的方案？
+
+---
+
+## 总结
+
+慢查询是数据库性能问题的「冰山一角」，表面上看是一个查询慢，实际上背后可能是索引缺失、索引失效、JOIN 策略不当、分页 OFFSET 过大等问题。
+
+掌握慢查询排查的核心技能：
+
+1. **开启慢查询日志**，让 MySQL 主动报告问题
+2. **使用分析工具**（`mysqldumpslow`、`pt-query-digest`），从海量日志中找出元凶
+3. **EXPLAIN 分析执行计划**，看 `type`、`key`、`rows`、`Extra` 字段
+4. **遵循黄金法则**：`Rows_examined` 远大于 `Rows_sent` 就是问题
+5. **系统化处理**：定位 → 分析 → 优化 → 验证
+
+慢查询优化不是一劳永逸的，它需要持续监控和改进。随着数据量增长、业务变化，曾经快的 SQL 可能变慢，曾经够用的索引可能失效。建立常态化的慢查询监控机制，才是根本解决方案。

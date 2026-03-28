@@ -1,0 +1,528 @@
+# 接口响应压缩
+
+> [!TIP]
+> 性能优化进阶篇：带宽是昂贵的资源，学会用它才是高手
+
+---
+
+## 场景切入：100ms 的 RT，带宽占了 40ms
+
+想象这样一个场景：你的接口 RT（Response Time）要求控制在 100ms 以内，经过优化后数据库查询 30ms、业务逻辑 20ms、接口序列化 10ms，理论上应该没问题。但实际测试发现 RT 稳定在 110ms 左右。
+
+问题出在哪？
+
+用 `curl -w "\nTime: %{time_total}s\n"` 测试一下，你会发现响应体从服务器到客户端的传输时间竟然占了将近一半。这个数字在生产环境可能被忽视，但在高并发场景下，带宽会成为系统瓶颈——**每一次网络传输都在烧钱**。
+
+这就是我们要聊的主题：**接口响应压缩**。
+
+---
+
+## 一、带宽为什么是稀缺资源
+
+先算一笔账。假设你的系统在高峰期 QPS 为 10000，每个接口响应体大小为 50KB：
+
+```
+每秒传输数据量 = 10000 × 50KB = 500MB/s = 4Gbps
+```
+
+这意味着你需要 4Gbps 的带宽才能支撑这个并发。如果开启压缩（压缩率 70%），同样的数据只需要 1.2Gbps。**节省了 70% 的带宽成本**，这对云服务账单的影响是巨大的。
+
+带宽成本的计算公式：
+
+```
+带宽成本 = 流量（GB/月）× 单价（元/GB）
+```
+
+国内云服务商的带宽单价约为 0.8-1.2 元/Mbps/月（共享带宽），而流量费用约为 0.5-0.8 元/GB。**压缩节省的每一字节，都是真金白银**。
+
+---
+
+## 二、压缩算法对比：选对工具很重要
+
+### 常见压缩算法一览
+
+| 算法 | 压缩率 | 速度 | CPU 开销 | 兼容性 | 适用场景 |
+|---|---|---|---|---|---|
+| **GZIP** | 高（60-70%） | 中等 | 中等 | 几乎所有浏览器 | 最通用，推荐首选 |
+| **Brotli (Br)** | 更高（70-80%） | 稍慢 | 稍高 | 现代浏览器（97%+） | 对性能要求高 |
+| **Zstd** | 高且稳定 | 快 | 低 | 现代浏览器、新兴 | 均衡之选 |
+| **Snappy** | 中等（50-60%） | 极快 | 低 | 需服务端双方支持 | 内部 RPC 通信 |
+
+:::tip 推荐策略
+对外接口用 GZIP，内部服务间通信用 Zstd 或 Snappy。
+:::
+
+### GZIP：老当益壮
+
+GZIP 是目前最通用的压缩算法。它的核心是 **DEFLATE 算法**，由两部分组成：
+
+- **LZ77**：找出重复的字符串，用较短的引用替代
+- **Huffman Coding**：根据字符出现频率，分配不同长度的编码
+
+```bash
+# 查看文件压缩效果
+gzip -k -9 test.json && ls -lh test.json.gz
+```
+
+GZIP 压缩级别从 1 到 9：
+
+| 级别 | 速度 | 压缩率 | 适用场景 |
+|---|---|---|---|
+| 1 | 最快 | 最低 | 实时性要求高 |
+| 6（默认） | 平衡 | 平衡 | 一般场景 |
+| 9 | 最慢 | 最高 | 静态资源，可接受预压缩 |
+
+:::warning 压缩级别不是越高越好
+级别 6 和级别 9 的压缩率差异通常在 5% 以内，但 CPU 开销可能差 2-3 倍。除非是预压缩的静态资源，否则不建议用级别 9。
+:::
+
+### Brotli：后起之秀
+
+Brotli 是 Google 2015 年发布的算法，相比 GZIP：
+
+- 压缩率提升 **15-25%**
+- 压缩速度相近
+- 解压速度更快
+
+```bash
+# Brotli vs GZIP 对比（压缩 1MB JSON）
+brotli -q 11 test.json  # Brotli: ~120KB
+gzip -9 test.json       # GZIP: ~150KB
+```
+
+浏览器兼容性：
+
+```javascript
+// 服务端检查 Accept-Encoding
+const brotliSupport = acceptEncoding.includes('br');
+const gzipSupport = acceptEncoding.includes('gzip');
+```
+
+:::info 浏览器支持情况
+Chrome、Firefox、Safari、Edge 均支持 Brotli。截至 2024 年，全球约 97% 的浏览器支持。
+:::
+
+---
+
+## 三、压缩原理：DEFLATE 算法详解
+
+理解原理，才能更好地调优。
+
+### LZ77：找出重复
+
+LZ77 通过滑动窗口机制，找出字符串中的重复片段：
+
+```text
+原始数据: "The quick brown fox jumps over the lazy dog"
+LZ77后:   "The quick brown fox jumps over lazy dog" + 重复引用
+```
+
+原理是：当发现「The」第二次出现时，用 `(22, 3)` 这样的引用替代——表示「从位置 22 开始，复制 3 个字符」。
+
+### Huffman：频率编码
+
+Huffman 根据字符出现频率分配编码：
+
+```text
+原始字符（8位）: H:01001000, e:01100101
+Huffman编码:     H:0, e:1（高频字符用短编码）
+```
+
+结合两者，DEFLATE 实现了**高压缩率 + 较快速度**的平衡。
+
+---
+
+## 四、HTTP 压缩协商流程
+
+### 请求-响应交互
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     HTTP 压缩协商流程                        │
+├─────────────────────────────────────────────────────────────┤
+│  Client                    Server                            │
+│    │                          │                              │
+│    │─── GET /api/data ───────>│                              │
+│    │    Accept-Encoding:      │                              │
+│    │    gzip, br, deflate     │                              │
+│    │                          │                              │
+│    │                          │─── 压缩数据 ──>              │
+│    │                          │    Content-Encoding: br       │
+│    │<─────────────────────────│                              │
+│    │    解压缩后返回数据        │                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 服务端响应头
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Encoding: gzip
+Vary: Accept-Encoding
+```
+
+关键响应头说明：
+
+| 头 | 说明 |
+|---|---|
+| `Content-Encoding` | 压缩格式：`gzip`、`br`、`deflate` |
+| `Vary: Accept-Encoding` | 代理缓存需要根据 Accept-Encoding 返回不同内容 |
+
+---
+
+## 五、Nginx 配置：生产环境最佳实践
+
+### 基础配置
+
+```nginx title="nginx.conf"
+http {
+    # 开启压缩
+    gzip on;
+    
+    # 压缩级别（1-9，默认5）
+    gzip_comp_level 6;
+    
+    # 最小压缩长度（小于此值不压缩）
+    gzip_min_length 1024;
+    
+    # 压缩类型
+    gzip_types 
+        text/plain
+        text/css
+        text/xml
+        application/json
+        application/javascript
+        application/xml
+        application/xml+rss;
+    
+    # 是否在响应头添加 Vary: Accept-Encoding
+    gzip_vary on;
+    
+    # 禁用 IE6 压缩（IE6 不支持且有 bug）
+    gzip_disable "MSIE [1-6]\.";
+}
+```
+
+### 高级配置
+
+```nginx title="nginx.conf"
+http {
+    # Brotli 压缩（需 nginx 安装 brotli 模块）
+    brotli on;
+    brotli_comp_level 6;
+    brotli_types 
+        text/plain
+        text/css
+        application/json
+        application/javascript;
+    
+    # 预压缩静态资源（减少运行时 CPU 开销）
+    location ~* \.(js|css|html|svg)$ {
+        brotli_static on;
+        gzip_static on;
+    }
+}
+```
+
+### 配置检查
+
+```bash
+# 检查配置是否正确
+nginx -t
+
+# 查看压缩是否生效
+curl -H "Accept-Encoding: gzip" -I https://your-domain.com/api/data
+```
+
+预期输出：
+
+```http
+HTTP/1.1 200 OK
+Server: nginx
+Content-Encoding: gzip
+Vary: Accept-Encoding
+```
+
+---
+
+## 六、Spring Boot 配置
+
+### 启用响应压缩
+
+```yaml title="application.yml"
+server:
+  compression:
+    enabled: true
+    mime-types: application/json,application/xml,text/html,text/xml,text/plain
+    min-response-size: 1024
+```
+
+### 自定义压缩配置
+
+```java title="CompressionConfig.java"
+@Configuration
+public class CompressionConfig {
+    
+    @Bean
+    public ConfigurableServletWebServerFactory webServerFactory() {
+        TomcatServletWebServerFactory factory = new TomcatServletWebServerFactory();
+        factory.setProtocol("org.apache.coyote.http11.Http11NioProtocol");
+        
+        // 配置压缩
+        factory.addConnectorCustomizers(connector -> {
+            Http11NioProtocol protocol = (Http11NioProtocol) connector.getProtocolHandler();
+            protocol.setCompression("on");
+            protocol.setCompressionMinSize(1024);
+            protocol.setNoCompressionUserAgents("IE 6");
+            protocol.setCompressibleMimeTypes(
+                "text/html", "text/xml", "text/plain",
+                "text/css", "text/javascript", "application/javascript",
+                "application/json", "application/xml"
+            );
+        });
+        
+        return factory;
+    }
+}
+```
+
+---
+
+## 七、压缩注意事项：这些坑别踩
+
+### 压缩条件判断
+
+不是所有响应都适合压缩。以下情况**不应压缩**：
+
+| 场景 | 原因 | 阈值建议 |
+|---|---|---|
+| 小文件（< 1KB） | 压缩开销 > 节省的传输量 | < 1KB |
+| 已是压缩格式 | 二次压缩效果差 | 图片、音视频 |
+| 动态加密内容 | 可能破坏加密 | — |
+| 低配 CPU 服务器 | CPU 成为瓶颈 | QPS > 5000 时慎用 |
+
+### CPU 开销 vs 带宽收益
+
+```text
+压缩收益 = 节省的带宽成本 - 额外的 CPU 成本
+```
+
+高并发场景下，CPU 开销可能成为瓶颈：
+
+```bash
+# 监控 gzip 进程的 CPU 使用
+pidstat -p $(pgrep -f nginx) 1
+
+# 或使用 atop
+atop -d 1 | grep nginx
+```
+
+:::tip 性能监控指标
+- `gzip_ratio`：实际压缩比
+- `request_time`：处理时间
+- CPU 使用率：关注 gzip 进程
+:::
+
+### 图片压缩：不同的思路
+
+文本压缩对图片效果有限，需要专门的图片压缩：
+
+| 格式 | 压缩率 | 兼容性 | 适用场景 |
+|---|---|---|---|
+| WebP | 25-35% 更小 | 现代浏览器（97%+） | 首选 |
+| AVIF | 比 WebP 更小 | 现代浏览器（85%+） | 高压缩需求 |
+| 渐进式 JPEG | 感知加载更快 | 所有浏览器 | 图片展示 |
+| PNG → SVG | 可能大幅缩小 | — | 图标、矢量图 |
+
+```html
+<!-- 图片格式选择 -->
+<picture>
+    <source srcset="image.avif" type="image/avif">
+    <source srcset="image.webp" type="image/webp">
+    <img src="image.jpg" alt="降级方案">
+</picture>
+```
+
+---
+
+## 八、生产环境配置示例
+
+### Nginx 生产配置
+
+```nginx title="/etc/nginx/nginx.conf"
+user nginx;
+worker_processes auto;
+error_log /var/log/nginx/error.log warn;
+pid /var/run/nginx.pid;
+
+events {
+    worker_connections 10240;
+    use epoll;
+    multi_accept on;
+}
+
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    # 日志格式（包含压缩比）
+    log_format compression '$remote_addr - $request_time '
+                          '"$request" $status $body_bytes_sent '
+                          '"$http_referer" gzip_ratio=$gzip_ratio';
+
+    access_log /var/log/nginx/access.log compression;
+
+    # 发送文件优化
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on;
+
+    # GZIP 压缩
+    gzip on;
+    gzip_vary on;
+    gzip_proxied any;
+    gzip_comp_level 6;
+    gzip_buffers 16 8k;
+    gzip_http_version 1.1;
+    gzip_min_length 1024;
+    gzip_types 
+        text/plain 
+        text/css 
+        text/xml 
+        text/javascript
+        application/json 
+        application/javascript 
+        application/xml+rss
+        application/rss+xml 
+        application/atom+xml
+        image/svg+xml;
+    
+    # Brotli 压缩（需模块）
+    # brotli on;
+    # brotli_comp_level 6;
+    # brotli_types text/plain text/css text/xml application/json application/javascript image/svg+xml;
+
+    # 连接超时
+    keepalive_timeout 65;
+    keepalive_requests 1000;
+
+    # 缓冲
+    client_body_buffer_size 10k;
+    client_max_body_size 8m;
+    proxy_buffer_size 128k;
+    proxy_buffers 4 256k;
+    proxy_busy_buffers_size 256k;
+
+    upstream backend {
+        server 127.0.0.1:8080;
+        keepalive 32;  # upstream 长连接
+    }
+
+    server {
+        listen 443 ssl http2;
+        server_name api.example.com;
+
+        ssl_certificate /path/to/cert.pem;
+        ssl_certificate_key /path/to/key.pem;
+
+        location /api/ {
+            proxy_pass http://backend;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            
+            # 超时配置
+            proxy_connect_timeout 60s;
+            proxy_send_timeout 60s;
+            proxy_read_timeout 60s;
+        }
+    }
+}
+```
+
+---
+
+## 九、压缩效果验证
+
+### 实际压缩测试
+
+```bash
+# 测试接口压缩效果
+curl -H "Accept-Encoding: gzip" \
+     -w "\n\n原始大小: %{size_download}B\n压缩后: %{size_download}B\n" \
+     -o /dev/null \
+     -s https://api.example.com/users/list
+
+# 对比不同压缩算法
+echo "=== GZIP ===" && \
+curl -H "Accept-Encoding: gzip" -s -w "%{http_code} %{time_total}s\n" \
+     -o /dev/null https://api.example.com/data
+
+echo "=== Brotli ===" && \
+curl -H "Accept-Encoding: br" -s -w "%{http_code} %{time_total}s\n" \
+     -o /dev/null https://api.example.com/data
+```
+
+### 监控指标
+
+| 指标 | 含义 | 告警阈值 |
+|---|---|---|
+| `gzip_ratio` | 压缩比 | < 2（压缩效果差） |
+| 响应大小 | 压缩前体积 | > 1MB |
+| TTFB | 首字节时间 | > 200ms |
+
+---
+
+## 面试实战
+
+### 面试题 1：GZIP 的压缩原理是什么？
+
+**参考答案**：
+
+GZIP 核心是 DEFLATE 算法，由两部分组成：
+
+1. **LZ77**：滑动窗口机制，找出重复字符串，用引用替代。例如「中国」第二次出现时，用 `(位置, 长度)` 替代
+2. **Huffman Coding**：根据字符频率分配编码，高频字符用短编码（如 `e` 用 `1`），低频字符用长编码
+
+两者结合，实现高压缩率。GZIP 压缩级别 1-9，级别越高压缩率越高，但 CPU 开销越大。
+
+### 面试题 2：什么时候不应该压缩？
+
+**参考答案**：
+
+1. **小于 1KB 的响应**：压缩和解压的开销可能超过节省的传输量
+2. **已是压缩格式的数据**：图片、音视频等，再次压缩效果差甚至更大
+3. **CPU 瓶颈场景**：高并发时，压缩的 CPU 开销可能成为瓶颈
+4. **动态加密内容**：压缩可能破坏加密结构
+
+### 面试题 3：GZIP 和 Brotli 的区别？如何选？
+
+**参考答案**：
+
+| 维度 | GZIP | Brotli |
+|---|---|---|
+| 压缩率 | 60-70% | 70-80%（提升 15-25%） |
+| 速度 | 中等 | 稍慢 |
+| 兼容性 | 100% | 97%+ 浏览器 |
+| CPU 开销 | 中等 | 稍高 |
+
+**选型建议**：
+- 通用场景：GZIP（兼容性最好）
+- 高性能要求：Brotli（压缩率更高）
+- 内部服务：考虑 Zstd（CPU 开销低）
+
+---
+
+## 思考题
+
+1. 如果接口响应是 XML 格式，你会启用压缩吗？JSON 和 XML 的压缩效果会有差异吗？
+2. 在 CDN 边缘节点开启压缩和源站开启压缩，有什么不同的考量？
+3. HTTP/2 的 HPACK 头部压缩和响应体压缩是什么关系？可以同时使用吗？
+
+---
+
+> [!TIP]
+> 压缩是性价比最高的性能优化手段之一。在进行复杂的代码优化之前，先检查一下带宽是否被浪费了——也许压缩就能解决 70% 的问题。

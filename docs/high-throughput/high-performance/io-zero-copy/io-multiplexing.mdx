@@ -1,0 +1,635 @@
+# IO 多路复用：select/poll/epoll
+
+面试官问：「epoll 和 select 的区别是什么？」
+
+你回答：「epoll 效率更高，不用遍历所有 fd。」
+
+面试官追问：「那 epoll 凭什么比 select 高效？具体是怎么实现的？」
+
+你愣了一下——这问题，好像没准备到。
+
+「epoll 比 select 高效」这句话，几乎所有面试者都能说出来。但问到**为什么高效**，能回答到源码级别的，少之又少。
+
+这篇文章，就是要把 select/poll/epoll 的原理讲透，让你能回答到第四层、第五层。
+
+## 一、从问题出发：为什么需要 IO 多路复用
+
+在上一篇文章《IO 模型：同步与异步、阻塞与非阻塞》中，我们讲到 BIO 的问题是：
+
+```
+1 万连接 = 1 万线程 = 系统崩溃
+```
+
+线程是稀缺资源，每条线程默认占用 1MB 栈空间，JVM 能创建的线程数量有限。那能不能让一条线程管理多个连接？
+
+**思路一：非阻塞轮询（NIO）**
+
+```java
+while (true) {
+    for (Socket socket : sockets) {
+        if (socket.read() != -1) {
+            // 处理数据
+        }
+    }
+}
+```
+
+这个方案的问题：**CPU 空转**。99% 的连接都没有数据，但线程要不断轮询，白白浪费 CPU。
+
+**思路二：让操作系统帮忙（IO 多路复用）**
+
+能不能让操作系统告诉我们「哪些连接有数据了」，而不是我们自己轮询？
+
+这就是 IO 多路复用的核心思想：**把「轮询哪些连接有数据」这件事，交给操作系统来做。**
+
+```
+用户态：发起 select/poll/epoll
+内核态：遍历所有连接，找出就绪的 → 返回就绪列表
+用户态：处理就绪的连接
+```
+
+## 二、select 的原理与局限
+
+### 2.1 select 的工作流程
+
+select 是最早出现的 IO 多路复用机制，诞生于 BSD Unix。核心思想是：**把 fd 集合传给内核，让内核帮我们检测哪些 fd 就绪。**
+
+```c
+fd_set readfds;  // 要检测读事件的 fd 集合
+
+// 清空集合
+FD_ZERO(&readfds);
+
+// 添加感兴趣的 fd
+FD_SET(socket_fd1, &readfds);
+FD_SET(socket_fd2, &readfds);
+FD_SET(socket_fd3, &readfds);
+
+// 传入 select，检测就绪的 fd
+int n = select(max_fd + 1, &readfds, NULL, NULL, NULL);
+
+// 遍历检查哪些 fd 就绪了
+if (FD_ISSET(socket_fd1, &readfds)) {
+    // socket_fd1 可读
+}
+```
+
+select 的执行流程：
+
+```
+1. 用户态：准备 fd_set（要检测哪些 fd）
+2. 用户态 → 内核态：把 fd_set 拷贝到内核
+3. 内核态：遍历所有 fd，检查是否就绪
+4. 内核态 → 用户态：把就绪的 fd_set 拷贝回用户态
+5. 用户态：遍历所有 fd，找出哪些就绪了
+```
+
+### 2.2 select 的三大局限
+
+select 在实际使用中有三个致命问题：
+
+**局限一：fd 数量限制（默认 1024）**
+
+```c
+// select.h
+#define __FD_SETSIZE 1024
+```
+
+select 用 `fd_set` 数据结构存储 fd，而 `fd_set` 的大小是固定的——**最多只能监听 1024 个 fd**。这个数字在现代服务器面前远远不够。
+
+虽然可以通过重新编译内核来扩大这个限制，但治标不治本。
+
+**局限二：每次调用都要拷贝**
+
+```c
+select(max_fd + 1, &readfds, NULL, NULL, NULL);
+```
+
+每次调用 select，都要把 **fd_set 从用户态拷贝到内核态**。如果 fd 有 1000 个，这个拷贝开销就不小。
+
+而且 select 返回后，内核还会把修改后的 fd_set 拷贝回用户态——**两次拷贝**。
+
+**局限三：O(n) 复杂度**
+
+```c
+// 内核需要遍历所有 fd
+for (fd = 0; fd < max_fd; fd++) {
+    if (FD_ISSET(fd, &readfds)) {
+        // 检查这个 fd 是否就绪
+    }
+}
+```
+
+内核需要线性遍历所有注册的 fd，即使只有 1 个 fd 就绪，也要遍历全部 1024 个。这就是 **O(n) 复杂度**。
+
+用户态处理时，同样需要遍历所有 fd：
+
+```c
+for (fd = 0; fd < max_fd; fd++) {
+    if (FD_ISSET(fd, &readfds)) {
+        // 处理这个就绪的 fd
+    }
+}
+```
+
+### 2.3 select 的使用示例
+
+```c
+#include <sys/select.h>
+
+int main() {
+    int listen_fd = socket(...);
+    bind(listen_fd, ...);
+    listen(listen_fd, 5);
+
+    fd_set read_fds;
+    int max_fd = listen_fd;
+    fd_set temp_fds;
+
+    while (1) {
+        FD_ZERO(&temp_fds);
+        FD_SET(listen_fd, &temp_fds);
+
+        // 把所有活跃 fd 加入 temp_fds
+        for (int fd = 0; fd <= max_fd; fd++) {
+            if (fd != listen_fd && clients[fd] != -1) {
+                FD_SET(fd, &temp_fds);
+            }
+        }
+
+        // select 返回就绪的 fd
+        int nready = select(max_fd + 1, &temp_fds, NULL, NULL, NULL);
+
+        // 检查新连接
+        if (FD_ISSET(listen_fd, &temp_fds)) {
+            int client_fd = accept(listen_fd, NULL, NULL);
+            clients[client_fd] = 1;
+            max_fd = max(max_fd, client_fd);
+        }
+
+        // 检查已有连接
+        for (int fd = 0; fd <= max_fd; fd++) {
+            if (fd != listen_fd && FD_ISSET(fd, &temp_fds)) {
+                // 处理数据
+            }
+        }
+    }
+}
+```
+
+## 三、poll 的改进
+
+### 3.1 poll 的数据结构
+
+poll 是 select 的改进版本，主要解决了 **fd 数量限制**的问题。
+
+select 用 `fd_set` 存储 fd，大小固定 1024。poll 用 **链表** 存储 `pollfd` 结构体：
+
+```c
+struct pollfd {
+    int fd;          // 文件描述符
+    short events;    // 关心的事件（输入、输出、错误等）
+    short revents;   // 返回的事件（就绪、错误等）
+};
+```
+
+因为是链表，所以 **没有 fd 数量限制**。
+
+### 3.2 poll 的使用示例
+
+```c
+#include <poll.h>
+
+struct pollfd fds[1024];
+int nfds = 0;
+
+// 添加监听 fd
+fds[nfds].fd = listen_fd;
+fds[nfds].events = POLLIN;  // 关心读事件
+nfds++;
+
+// 添加普通 fd
+fds[nfds].fd = client_fd;
+fds[nfds].events = POLLIN;
+nfds++;
+
+while (1) {
+    // poll 返回就绪的 fd 数量
+    int nready = poll(fds, nfds, -1);  // -1 表示无限等待
+
+    // 遍历检查
+    for (int i = 0; i < nfds; i++) {
+        if (fds[i].revents & POLLIN) {
+            if (fds[i].fd == listen_fd) {
+                // 新连接
+            } else {
+                // 处理数据
+            }
+        }
+    }
+}
+```
+
+### 3.3 poll 的问题
+
+poll 解决了 fd 数量限制，但 select 的另外两个问题依然存在：
+
+- **每次调用都要拷贝**：pollfd 数组从用户态拷贝到内核态
+- **O(n) 复杂度**：内核还是要遍历所有注册的 fd
+
+本质上，poll 只是 select 的「小修小补」，没有解决核心问题。
+
+## 四、epoll 的突破
+
+终于，epoll 登场了。
+
+epoll 是 Linux 2.6 引入的 IO 多路复用机制，完美解决了 select/poll 的三个问题：
+
+- fd 数量无限制
+- 只需一次拷贝
+- 就绪时主动通知（O(1)）
+
+### 4.1 epoll 的三个系统调用
+
+epoll 只有三个核心系统调用：
+
+```c
+// 1. 创建 epoll 实例
+int epfd = epoll_create(1024);  // 参数已废弃（Linux 2.6.23+），传任意正值即可
+
+// 2. 注册 fd 到 epoll 实例
+struct epoll_event ev;
+ev.events = EPOLLIN;       // 关心读事件
+ev.data.fd = client_fd;
+epoll_ctl(epfd, EPOLL_CTL_ADD, client_fd, &ev);
+
+// 3. 等待事件发生
+struct epoll_event events[1024];
+int nready = epoll_wait(epfd, events, 1024, -1);  // -1 表示无限等待
+
+// 处理就绪的事件
+for (int i = 0; i < nready; i++) {
+    int fd = events[i].data.fd;
+    if (events[i].events & EPOLLIN) {
+        // 处理数据
+    }
+}
+```
+
+### 4.2 epoll 的数据结构
+
+epoll 在内核中维护了两个核心数据结构：
+
+**红黑树**：存储注册的 fd，O(log n) 插入/删除
+
+```
+红黑树
+    │
+    ├── fd=3 (客户端A)
+    ├── fd=5 (客户端B)
+    ├── fd=7 (客户端C)
+    └── fd=9 (客户端D)
+```
+
+**就绪列表（rdlist）**：存储已就绪的 fd
+
+```
+就绪列表
+    │
+    ├── fd=5 (客户端B) ← 已就绪
+    └── fd=9 (客户端D) ← 已就绪
+```
+
+### 4.3 epoll 的工作原理
+
+**第一步：注册 fd（epoll_ctl）**
+
+```c
+epoll_ctl(epfd, EPOLL_CTL_ADD, client_fd, &ev);
+```
+
+用户态把 fd 注册到内核：
+
+```
+用户态                    内核
+   │                         │
+   │──── epoll_ctl ─────────→│
+   │                         │
+   │   把 fd 加入红黑树       │
+   │                         │
+```
+
+- fd 加入红黑树，只需一次拷贝
+- 后续修改也只需操作红黑树，**不需要重复拷贝**
+
+**第二步：等待就绪（epoll_wait）**
+
+```c
+int nready = epoll_wait(epfd, events, 1024, -1);
+```
+
+epoll_wait 的核心逻辑：
+
+```
+用户态                    内核
+   │                         │
+   │──── epoll_wait ─────────│
+   │                         │
+   │   （阻塞，直到有 fd 就绪）│
+   │                         │
+   │←──── 返回就绪列表 ──────│
+   │                         │
+```
+
+关键点：
+
+- 内核通过 **回调机制** 检测 fd 是否就绪
+- fd 就绪时，自动加入 **就绪列表（rdlist）**
+- epoll_wait 直接从就绪列表返回，**无需遍历所有 fd**
+
+**第三步：处理就绪事件**
+
+```c
+for (int i = 0; i < nready; i++) {
+    int fd = events[i].data.fd;
+    // 处理就绪的 fd
+}
+```
+
+因为返回的 **nready 是就绪 fd 的数量**，而不是总注册数，所以遍历只处理就绪的 fd。
+
+### 4.4 epoll 的回调机制
+
+epoll 为什么能高效地知道哪些 fd 就绪了？
+
+答案是 **回调机制**：
+
+```
+当 fd 状态变化时（如数据可读）
+        ↓
+内核主动调用回调函数
+        ↓
+把 fd 加入就绪列表
+```
+
+不需要内核主动遍历，而是 **fd 自己「上报」状态变化**。
+
+这个机制就像：
+
+- select/poll：**老师挨个问学生有没有问题**（主动遍历）
+- epoll：**学生有问题就举手**（被动通知）
+
+### 4.5 epoll 的两种模式
+
+epoll 有两种触发模式：**LT（Level Trigger，水平触发）** 和 **ET（Edge Trigger，边沿触发）**。
+
+**LT 模式（默认）**
+
+```
+事件：fd 可读
+    ↓
+返回就绪
+    ↓
+用户态没有处理
+    ↓
+下次 epoll_wait 仍然返回这个 fd（因为它还是可读）
+```
+
+特点：**未处理会持续通知**，编程简单，不会漏掉事件。
+
+**ET 模式**
+
+```
+事件：fd 可读（从不可读变为可读）
+    ↓
+返回就绪
+    ↓
+用户态没有处理
+    ↓
+下次 epoll_wait 不再返回这个 fd（只通知一次）
+```
+
+特点：**只通知一次**，效率更高，但编程复杂——你必须在一次通知内读完所有数据，否则会漏掉。
+
+ET 模式的代码示例：
+
+```c
+while (1) {
+    int nready = epoll_wait(epfd, events, 1024, -1);
+
+    for (int i = 0; i < nready; i++) {
+        int fd = events[i].data.fd;
+
+        if (events[i].events & EPOLLIN) {
+            // ET 模式：必须循环读取，直到没有数据
+            while (1) {
+                int n = read(fd, buf, sizeof(buf));
+                if (n > 0) {
+                    // 处理数据
+                } else if (n == 0) {
+                    // 连接关闭
+                    close(fd);
+                    break;
+                } else {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        // 数据读完了
+                        break;
+                    }
+                    // 错误
+                    break;
+                }
+            }
+        }
+    }
+}
+```
+
+### 4.6 epoll 的惊群问题
+
+**惊群问题**（Thundering Herd）：多个进程/线程等待同一个事件，当事件就绪时，所有等待者都被唤醒，但只有一个能成功处理。
+
+```
+进程A：epoll_wait（等待）
+进程B：epoll_wait（等待）
+进程C：epoll_wait（等待）
+    ↓
+fd 就绪
+    ↓
+所有进程都被唤醒（惊群）
+    ↓
+只有 1 个能抢到锁，其他白跑一趟
+```
+
+Linux 2.6 解决了 accept 惊群（一个连接只会唤醒一个进程），但 epoll_wait 的惊群问题直到 **Linux 4.5 引入 SO_REUSEPORT** 才真正解决。
+
+```
+SO_REUSEPORT：多个 socket 绑定同一个端口
+    ↓
+内核负载均衡分发
+    ↓
+每个 socket 只唤醒一个进程
+```
+
+## 五、三者对比
+
+| 特性 | select | poll | epoll |
+|---|---|---|---|
+| fd 数量限制 | 1024（FD_SETSIZE） | 无限制（链表） | 无限制 |
+| 时间复杂度 | O(n) | O(n) | O(1) |
+| 内核拷贝 | 每次调用都要 | 每次调用都要 | 只拷贝一次 |
+| 就绪通知 | 遍历 | 遍历 | 回调机制 |
+| 编程复杂度 | 低 | 低 | 中 |
+| 跨平台 | 所有 Unix | 所有 Unix | Linux 独有 |
+
+### 复杂度对比
+
+```
+select/poll：
+    fd=1 → 就绪 → 遍历 1024 个
+    fd=2 → 就绪 → 遍历 1024 个
+    fd=3 → 就绪 → 遍历 1024 个
+    ...
+    总复杂度：O(n × m)，n = 注册的 fd 数，m = 调用次数
+
+epoll：
+    fd=1 → 就绪 → 加入就绪列表 → 返回 1 个
+    fd=2 → 就绪 → 加入就绪列表 → 返回 1 个
+    fd=3 → 就绪 → 加入就绪列表 → 返回 1 个
+    ...
+    总复杂度：O(m)，m = 就绪的 fd 数
+```
+
+## 六、Java NIO 与 epoll
+
+Java NIO 在 Linux 上的实现，就是基于 epoll 的。
+
+```java
+// Java NIO 底层调用 epoll
+Selector selector = Selector.open();  // epoll_create
+channel.register(selector, OP_READ);   // epoll_ctl
+selector.select();                     // epoll_wait
+```
+
+但 Java NIO 的 select() 是**阻塞的**，而且**不支持 LT/ET 模式切换**（Java NIO 默认是 LT 模式）。
+
+:::tip Java NIO 与 epoll 的关系
+
+- **Linux 2.6+**：Java NIO 使用 epoll 底层实现
+- **macOS**：Java NIO 使用 Kqueue
+- **Windows**：Java NIO.2（AIO）使用 IOCP，Java NIO（NIO.1）使用 select
+
+:::
+
+## 七、为什么 Nginx 性能这么高
+
+理解 epoll 的原理后，我们来回答一个经典面试题：**为什么 Nginx 性能这么高？**
+
+Nginx 高性能的核心原因：
+
+1. **epoll 事件驱动**：用 epoll 管理连接，O(1) 获取就绪事件
+2. **多进程架构**：每个 worker 进程独立 epoll，避免锁竞争
+3. **异步非阻塞**：所有 IO 操作都是非阻塞的
+4. **master-worker 模式**：worker 进程可动态调整，充分利用多核
+
+```nginx
+# worker 进程数 = CPU 核心数
+worker_processes auto;
+
+events {
+    # epoll 是 Linux 默认
+    use epoll;
+    # 每个 worker 处理的最大连接数
+    worker_connections 65535;
+}
+```
+
+## 八、面试追问
+
+### 追问一：epoll 会不会无限增长就绪队列？
+
+**普通回答**：不会，内核会处理。
+
+**深入回答**：
+
+> 理论上，如果所有 fd 同时就绪，就绪列表会包含所有 fd。但实际中有几个限制：
+>
+> 1. **系统限制**：`/proc/sys/fs/epoll/max_user_watches` 限制了每个用户注册 fd 的总内存开销
+> 2. **内存限制**：每个就绪的 fd 占用一定内存，如果内存不足，内核会拒绝注册
+> 3. **业务场景**：通常不会所有 fd 同时就绪（除非是突发流量）
+>
+> 更重要的是：**LT 模式下，如果 fd 没有处理完，下次 epoll_wait 仍会返回**。ET 模式下，如果用户没有读完数据，数据仍保留在内核缓冲区，下次同样会返回。
+
+### 追问二：epoll 相比 select 高效在哪里？
+
+**普通回答**：不用遍历所有 fd。
+
+**深入回答**：
+
+> epoll 高效在三个层面：
+>
+> **第一层：数据结构的改进**
+> - select 用固定大小的 fd_set（数组），epoll 用红黑树（插入/删除 O(log n)）
+> - select 返回后要遍历所有 fd，epoll 只返回就绪的 fd
+>
+> **第二层：拷贝次数的减少**
+> - select：每次调用都要把 fd_set 从用户态拷贝到内核态
+> - epoll：fd 注册到红黑树只需一次拷贝
+>
+> **第三层：通知机制的改进**
+> - select/poll：用户态主动拉取，内核线性扫描所有 fd
+> - epoll：内核通过回调机制主动推送就绪的 fd
+
+### 追问三：边缘触发模式下，如果只读了部分数据，会发生什么？
+
+**普通回答**：下次就收不到了。
+
+**深入回答**：
+
+> 这个问题考察的是对 ET 模式的理解深度。
+>
+> **具体过程**：
+> 1. 数据到达，fd 可读，epoll 返回
+> 2. 用户读取部分数据（比如读取 100 字节，但缓冲区有 1000 字节）
+> 3. 缓冲区剩余 900 字节
+> 4. **问题**：内核认为这个 fd 还是「可读」的，但因为是从不可读变为可读的那次事件已经处理完了，epoll 不会再通知
+> 5. **结果**：剩余的 900 字节永远不会被处理
+>
+> **正确做法**：
+> - 边缘触发模式下，必须**循环读取**，直到 read 返回 EAGAIN（数据读完）
+>
+> ```c
+> while (1) {
+>     int n = read(fd, buf, sizeof(buf));
+>     if (n > 0) {
+>         // 处理数据
+>     } else if (n == 0) {
+>         // 连接关闭
+>         break;
+>     } else {
+>         if (errno == EAGAIN) {
+>             // 数据读完了
+>             break;
+>         }
+>     }
+> }
+> ```
+
+---
+
+## 总结
+
+这一篇文章，我们从 select 的局限出发，理解了 poll 的改进和 epoll 的突破：
+
+| 维度 | select | poll | epoll |
+|---|---|---|---|
+| fd 限制 | 1024 | 无限制 | 无限制 |
+| 复杂度 | O(n) | O(n) | O(1) |
+| 拷贝次数 | 每次调用 2 次 | 每次调用 2 次 | 注册时 1 次 |
+| 通知机制 | 遍历 | 遍历 | 回调 |
+| 触发模式 | LT | LT | LT + ET |
+
+epoll 的核心是：**红黑树管理注册 fd + 回调机制就绪通知 + 就绪列表直接返回**。
+
+理解了这个，你就能回答「epoll 比 select 高效在哪里」这样的问题——不是背答案，而是真正理解原理。
+
+下一篇文章《零拷贝原理与实现》，我们来讲讲另一个性能杀手：**数据在内存间的四次拷贝**。

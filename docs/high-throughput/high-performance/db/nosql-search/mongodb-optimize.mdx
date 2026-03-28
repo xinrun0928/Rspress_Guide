@@ -1,0 +1,751 @@
+# MongoDB 性能优化：从索引到分片的全链路调优
+
+MySQL 处理亿级数据力不从心，你开始考虑 MongoDB。但迁移之后发现：查询依然慢，分片不均匀，写入成瓶颈。
+
+MongoDB 不是万能药。如果不理解它的索引机制和查询优化方法，性能问题依然会如影随形。
+
+这篇文章，帮你建立 MongoDB 性能优化的完整知识体系。
+
+---
+
+## 一、MongoDB 架构与 MySQL 的核心差异
+
+### 1.1 文档模型 vs 关系模型
+
+MySQL 是关系型数据库，数据按行存储；MongoDB 是文档型数据库，数据按文档（BSON）存储。
+
+```sql
+-- MySQL：关系模型
+CREATE TABLE orders (
+    id INT PRIMARY KEY,
+    user_id INT,
+    product_id INT,
+    price DECIMAL(10,2),
+    create_time DATETIME,
+    FOREIGN KEY (user_id) REFERENCES users(id)
+);
+
+-- 查询订单和用户信息
+SELECT o.*, u.name 
+FROM orders o
+JOIN users u ON o.user_id = u.id
+WHERE o.status = 1;
+```
+
+```javascript
+// MongoDB：文档模型
+db.orders.insertOne({
+    _id: ObjectId("..."),
+    user_id: ObjectId("..."),
+    user: {
+        name: "张三",
+        level: 5
+    },
+    product_id: ObjectId("..."),
+    products: [
+        { id: ObjectId("..."), name: "商品A", price: 99.99 },
+        { id: ObjectId("..."), name: "商品B", price: 199.99 }
+    ],
+    price: 299.98,
+    status: 1,
+    create_time: ISODate("2024-01-15")
+});
+
+// 查询：一条语句搞定，不需要 JOIN
+db.orders.find({ status: 1 })
+    .populate('user');
+```
+
+### 1.2 MongoDB 的优势
+
+| 特性 | MongoDB | MySQL |
+|-----|--------|-------|
+| 数据模型 | 文档型，灵活Schema | 关系型，固定Schema |
+| 写入性能 | 高（追加写入） | 中（随机写入 + 索引维护） |
+| 查询复杂度 | 支持嵌套查询 | 简单查询高效，复杂查询需优化 |
+| 扩展性 | 原生分片，易于水平扩展 | 需要手动分库分表 |
+| 事务 | 4.0+ 支持多文档事务 | 原生支持 |
+
+### 1.3 MongoDB 的劣势
+
+| 特性 | MongoDB | MySQL |
+|-----|--------|-------|
+| 事务 | 多文档事务开销大 | 成熟的事务支持 |
+| JOIN | 效率低，需要预先聚合 | 高效 |
+| 深度分页 | 限制多 | 优化方法成熟 |
+| 磁盘占用 | 通常更大 | 更紧凑 |
+
+---
+
+## 二、索引基础：MongoDB 查询优化的核心
+
+### 2.1 索引类型
+
+MongoDB 支持多种索引类型：
+
+```javascript
+// 单字段索引
+db.orders.createIndex({ user_id: 1 });
+
+// 复合索引（最常用）
+db.orders.createIndex({ status: 1, create_time: -1 });
+
+// 多键索引（数组字段）
+db.orders.createIndex({ "products.id": 1 });
+
+// 文本索引（搜索引擎）
+db.products.createIndex({ title: "text", description: "text" });
+
+// 地理位置索引
+db.stores.createIndex({ location: "2dsphere" });
+
+// 哈希索引（分片键）
+db.orders.createIndex({ _id: "hashed" });
+```
+
+### 2.2 复合索引的设计原则
+
+复合索引的设计与 MySQL 类似，遵循最左前缀原则：
+
+```javascript
+// 创建复合索引：(status, create_time, user_id)
+// 支持的查询组合：
+db.orders.find({ status: 1 })                    // ✓ 使用索引
+db.orders.find({ status: 1, create_time: { $gt: ... } })  // ✓ 使用索引
+db.orders.find({ status: 1, create_time: { $gt: ... }, user_id: ... })  // ✓ 使用索引
+db.orders.find({ create_time: { $gt: ... } })     // ✗ 不使用索引
+db.orders.find({ user_id: ... })                  // ✗ 不使用索引
+```
+
+**复合索引字段顺序原则**：
+
+1. **等值查询字段放前面**：经常用 `WHERE status = 1` 查询，把 `status` 放前面
+2. **范围查询字段放后面**：经常用 `WHERE create_time > ...` 查询，把 `create_time` 放后面
+3. **低基数字段优先**：相同值少的字段放前面，索引效率更高
+
+```javascript
+// 查询模式
+{ status: 1, create_time: { $gt: ISODate("2024-01-01") } }
+{ status: 1 }
+{ status: 1, user_id: ObjectId("...") }
+
+// 好的索引设计
+db.orders.createIndex({ status: 1, create_time: -1, user_id: 1 });
+```
+
+### 2.3 索引查看与分析
+
+```javascript
+// 查看集合的所有索引
+db.orders.getIndexes();
+
+// 查看索引详情
+db.orders.stats();
+
+// 查看查询是否使用索引
+db.orders.find({ status: 1, create_time: { $gt: ISODate("2024-01-01") } })
+    .explain("executionStats");
+
+// 输出示例
+{
+    "queryPlanner": {
+        "winningPlan": {
+            "stage": "FETCH",           // 需要回表
+            "inputStage": {
+                "stage": "IXSCAN",      // 索引扫描
+                "keyPattern": { "status": 1, "create_time": -1 },
+                "indexName": "status_1_create_time_-1",
+                "nscanned": 150,        // 扫描索引条目数
+                "nscannedObjects": 100  // 需要回表获取文档数
+            }
+        }
+    },
+    "executionStats": {
+        "executionSuccess": true,
+        "nReturned": 100,              // 返回文档数
+        "executionTimeMillis": 5,      // 执行时间
+        "totalKeysExamined": 150,      // 总扫描索引条目数
+        "totalDocsExamined": 100       // 总扫描文档数
+    }
+}
+```
+
+### 2.4 覆盖索引
+
+如果查询只需要索引字段，不需要回表，性能最好：
+
+```javascript
+// 查询字段都在索引中
+db.orders.find(
+    { status: 1 },
+    { _id: 0, status: 1, create_time: 1 }  // 只查询索引字段
+)
+.explain("executionStats");
+
+// 输出
+{
+    "winningPlan": {
+        "stage": "PROJECTION_COVERED",  // 覆盖索引，不需要回表
+        "inputStage": {
+            "stage": "IXSCAN",
+            ...
+        }
+    }
+}
+```
+
+---
+
+## 三、慢查询分析：MongoDB 的诊断工具
+
+### 3.1 slowOp 日志
+
+MongoDB 有内置的慢查询日志，配置方法：
+
+```javascript
+// 查看当前配置
+db.getProfilingStatus();
+
+// 开启慢查询日志（记录超过 100ms 的操作）
+db.setProfilingLevel(1, { slowms: 100 });
+
+// 开启记录所有操作（仅排查阶段）
+db.setProfilingLevel(2);
+
+// 关闭慢查询日志
+db.setProfilingLevel(0);
+```
+
+```javascript
+// 查看最近的慢操作
+db.system.profile.find().sort({ millis: -1 }).limit(10);
+
+// 格式化输出
+db.system.profile.aggregate([
+    { $sort: { ts: -1 } },
+    { $limit: 10 },
+    {
+        $project: {
+            ts: 1,
+            millis: 1,
+            op: 1,
+            ns: 1,
+            "command.filter": 1,
+            "command.sort": 1
+        }
+    }
+]);
+```
+
+### 3.2 explain 分析
+
+```javascript
+// 基础分析
+db.orders.find({ status: 1 }).explain();
+
+// 详细执行统计
+db.orders.find({ status: 1 }).explain("executionStats");
+
+// 所有执行计划对比
+db.orders.find({ status: 1 }).explain("allPlansExecution");
+```
+
+**关键指标解读**：
+
+| 指标 | 含义 | 优化目标 |
+|-----|------|---------|
+| `nReturned` | 返回文档数 | 越小越好 |
+| `totalKeysExamined` | 扫描索引条目数 | 接近 nReturned |
+| `totalDocsExamined` | 扫描文档数 | 接近 nReturned |
+| `executionTimeMillis` | 执行时间 | 越短越好 |
+
+**不合理的查询特征**：
+
+```javascript
+{
+    "executionStats": {
+        "nReturned": 100,
+        "totalKeysExamined": 1000000,  // ✗ 扫描了大量索引
+        "totalDocsExamined": 1000000, // ✗ 扫描了大量文档
+        "executionTimeMillis": 5000   // ✗ 执行时间过长
+    }
+}
+```
+
+### 3.3 诊断命令
+
+```javascript
+// 查看当前正在执行的操作（相当于 MongoDB 的 "SHOW PROCESSLIST"）
+db.currentOp({ "active": true, "secs_running": { $gt: 5 } });
+
+// 查看集合状态
+db.orders.stats();
+
+// 查看索引使用情况
+db.orders.aggregate([{ $indexStats: {} }]);
+
+// 查看数据库状态
+db.stats();
+db.serverStatus();
+```
+
+---
+
+## 四、分页优化：MongoDB 的深度分页问题
+
+### 4.1 基本分页
+
+```javascript
+// 第一页
+db.orders.find({ status: 1 })
+    .sort({ create_time: -1 })
+    .limit(20);
+
+// 第二页（OFFSET 方式，不推荐）
+db.orders.find({ status: 1 })
+    .sort({ create_time: -1 })
+    .skip(20)
+    .limit(20);
+```
+
+### 4.2 OFFSET 分页的问题
+
+MongoDB 的 `skip(offset)` 会跳过前面的文档，当 offset 很大时，性能急剧下降：
+
+```javascript
+// 查询第 1000 页（OFFSET 20000）
+// MongoDB 需要先扫描前 20000 个文档，然后返回 20 个
+db.orders.find({ status: 1 })
+    .sort({ create_time: -1 })
+    .skip(20000)
+    .limit(20);
+// 执行时间可能达到数秒甚至更长
+```
+
+### 4.3 游标分页（推荐）
+
+使用上一页的最后一个文档作为起点：
+
+```javascript
+// 第一页
+const page1 = db.orders.find({ status: 1 })
+    .sort({ create_time: -1 })
+    .limit(20);
+
+// 记录最后一页的游标
+let lastCursor = page1[page1.length - 1];
+const lastCreateTime = lastCursor.create_time;
+
+// 第二页：使用游标
+const page2 = db.orders.find({
+    status: 1,
+    create_time: { $lt: lastCreateTime }  // 使用 < 替代 skip
+})
+    .sort({ create_time: -1 })
+    .limit(20);
+
+// 第三页
+lastCursor = page2[page2.length - 1];
+const page3 = db.orders.find({
+    status: 1,
+    create_time: { $lt: lastCursor.create_time }
+})
+    .sort({ create_time: -1 })
+    .limit(20);
+```
+
+**游标分页的优势**：
+
+| 分页方式 | 第1000页性能 | 适用场景 |
+|---------|------------|---------|
+| OFFSET | 极差（扫描20000条） | 不推荐 |
+| 游标 | 稳定（扫描20条） | 推荐 |
+
+### 4.4 随机分页
+
+如果需要随机分页（如「换一批」功能）：
+
+```javascript
+// 不好的方案：随机 skip
+const count = db.orders.countDocuments({ status: 1 });
+const randomSkip = Math.floor(Math.random() * count);
+db.orders.find({ status: 1 }).skip(randomSkip).limit(20);
+
+// 好的方案：基于 ID 分桶
+// 假设有 10000 个订单，分成 100 个桶，每桶 100 个
+const bucketSize = 100;
+const totalBuckets = 100;
+const randomBucket = Math.floor(Math.random() * totalBuckets);
+const skipId = randomBucket * bucketSize;
+
+db.orders.find({
+    status: 1,
+    _id: { $gt: ObjectId.fromDate(new Date(skipId)) }
+})
+    .limit(20);
+```
+
+---
+
+## 五、写入优化：高性能写入的实践
+
+### 5.1 批量写入
+
+```javascript
+// 单条写入（低效）
+for (let i = 0; i < 1000; i++) {
+    db.orders.insertOne({ ... });
+}
+
+// 批量写入（高效）
+const orders = [];
+for (let i = 0; i < 1000; i++) {
+    orders.push({ ... });
+}
+db.orders.insertMany(orders, { ordered: false });
+```
+
+**参数说明**：
+
+| 参数 | 说明 |
+|-----|------|
+| `ordered: true`（默认） | 按顺序写入，一条失败全部回滚 |
+| `ordered: false` | 无序写入，一条失败不影响其他，性能更高 |
+
+### 5.2 写入关注点（Write Concern）
+
+MongoDB 的写入确认级别：
+
+```javascript
+// 不等待任何确认（最快，但不保证写入）
+db.orders.insertOne({ ... }, { writeConcern: { w: 0 } });
+
+// 等待主节点确认（默认）
+db.orders.insertOne({ ... }, { writeConcern: { w: 1 } });
+
+// 等待多数节点确认（安全）
+db.orders.insertOne({ ... }, { writeConcern: { w: "majority" } });
+
+// 等待指定数量的节点确认
+db.orders.insertOne({ ... }, { writeConcern: { w: 2, wtimeout: 5000 } });
+```
+
+**延迟对比**（大致）：
+
+```
+w: 0  →  < 1ms  （不等待）
+w: 1  →  1-5ms  （等待主节点）
+w: majority  →  5-50ms  （等待多数节点）
+```
+
+### 5.3 索引对写入的影响
+
+索引会降低写入性能，因为每次写入都要维护索引：
+
+```javascript
+// 写入前：删除所有索引
+db.orders.dropIndexes();
+
+// 批量写入 100 万条数据
+const orders = [];
+for (let i = 0; i < 1000000; i++) {
+    orders.push({ ... });
+}
+db.orders.insertMany(orders, { ordered: false });
+
+// 写入后：重建索引
+db.orders.createIndex({ user_id: 1 });
+db.orders.createIndex({ status: 1, create_time: -1 });
+```
+
+### 5.4 写入模式优化
+
+**预分配模式**（适合日志场景）：
+
+```javascript
+// 一次分配一个大文档，而不是多次写入小文档
+const logEntry = {
+    hour: ISODate("2024-01-15T10:00:00Z"),
+    events: [
+        { type: "click", user_id: "...", product_id: "..." },
+        { type: "view", user_id: "...", product_id: "..." },
+        // ... 10000 个事件
+    ]
+};
+db.hourly_logs.insertOne(logEntry);
+```
+
+---
+
+## 六、聚合管道优化：高效数据分析
+
+### 6.1 聚合管道基础
+
+```javascript
+// 统计每天的订单量
+db.orders.aggregate([
+    // 第一阶段：过滤
+    { $match: { status: 1, create_time: { $gte: ISODate("2024-01-01") } } },
+    
+    // 第二阶段：按天分组
+    { $group: {
+        _id: { $dateToString: { format: "%Y-%m-%d", date: "$create_time" } },
+        order_count: { $sum: 1 },
+        total_amount: { $sum: "$price" }
+    }},
+    
+    // 第三阶段：排序
+    { $sort: { _id: -1 } }
+]);
+```
+
+### 6.2 管道优化原则
+
+**原则一：尽早过滤（$match 放前面）**
+
+```javascript
+// 好的写法：尽早过滤
+{ $match: { status: 1 } },      // 先过滤
+{ $group: { _id: "$user_id" } }
+
+// 不好的写法：过滤放后面
+{ $group: { _id: "$user_id" } } // 先全量分组
+{ $match: { _id: ObjectId("...") } }  // 再过滤
+```
+
+**原则二：限制数据量（$limit、$sample）**
+
+```javascript
+// 随机抽样：先 limit
+{ $sample: { size: 100 } },  // 先抽样 100 条
+{ $group: { _id: "$category" } }
+
+// 逐步 limit
+{ $match: { status: 1 } },
+{ $sort: { create_time: -1 } },
+{ $limit: 1000 },  // 在排序前限制数量
+{ $group: { _id: "$user_id" } }
+```
+
+**原则三：使用索引**
+
+```javascript
+// 确保 $match 和 $sort 使用索引
+db.orders.aggregate([
+    { $match: { status: 1, create_time: { $gte: ISODate("2024-01-01") } } },
+    { $sort: { create_time: -1 } },
+    { $limit: 100 }
+]);
+// 复合索引 (status, create_time) 能优化这个查询
+```
+
+### 6.3 常用聚合优化模式
+
+**模式一：累加聚合**
+
+```javascript
+// 统计用户订单数、订单总额、最大订单金额
+db.orders.aggregate([
+    { $match: { user_id: ObjectId("...") } },
+    { $group: {
+        _id: "$user_id",
+        order_count: { $sum: 1 },
+        total_amount: { $sum: "$price" },
+        max_order: { $max: "$price" },
+        avg_order: { $avg: "$price" }
+    }}
+]);
+```
+
+**模式二：嵌套聚合**
+
+```javascript
+// 按月统计订单，再按用户排名
+db.orders.aggregate([
+    { $match: { create_time: { $gte: ISODate("2024-01-01") } } },
+    { $group: {
+        _id: {
+            month: { $dateToString: { format: "%Y-%m", date: "$create_time" } },
+            user_id: "$user_id"
+        },
+        total_amount: { $sum: "$price" }
+    }},
+    { $sort: { "_id.month": -1, total_amount: -1 } },
+    { $group: {
+        _id: "$_id.month",
+        top_users: { $push: { user_id: "$_id.user_id", amount: "$total_amount" } }
+    }},
+    { $project: { _id: 0, month: "$_id", top10: { $slice: ["$top_users", 10] } } }
+]);
+```
+
+---
+
+## 七、分片集群优化：水平扩展的艺术
+
+### 7.1 分片键选择原则
+
+分片键决定了数据的分布方式，选择不当会导致热点问题：
+
+```javascript
+// 不好：单调递增字段作为分片键
+// 所有新数据都写入最后一个 chunk，导致热chunk
+sh.shardCollection("app.orders", { _id: "hashed" });  // 哈希分片，分散热点
+
+// 好：随机分布字段作为分片键
+sh.shardCollection("app.orders", { user_id: "hashed" });
+
+// 好：根据业务特点选择
+sh.shardCollection("app.orders", { "user_id": 1, "create_time": -1 });
+// 支持按 user_id 查询 + 按时间范围查询
+```
+
+### 7.2 分片键策略
+
+| 分片键类型 | 适用场景 | 热点风险 |
+|-----------|---------|---------|
+| 哈希分片 | 高写入量、随机访问 | 低 |
+| 范围分片 | 按时间查询、按ID范围查询 | 高（时间递增） |
+| 复合分片 | 多维度查询 | 中 |
+
+### 7.3 分片状态监控
+
+```javascript
+// 查看分片状态
+sh.status();
+
+// 查看 chunk 分布
+db.adminCommand({ getShardMap: true });
+
+// 查看集合分片信息
+db.orders.getShardDistribution();
+
+// 查看 balancer 状态
+sh.getBalancerState();
+sh.isBalancerRunning();
+```
+
+### 7.4 预分片
+
+对于已知数据量的情况，提前分片可以避免迁移：
+
+```javascript
+// 预分割：创建 1000 个 chunks
+sh.shardCollection("app.orders", { _id: "hashed" });
+db.adminCommand({ split: { find: "app.orders", middle: { _id: ObjectId("...") } } });
+```
+
+---
+
+## 八、面试实战
+
+### 8.1 场景一：MongoDB vs MySQL 的选择
+
+**面试官问**：「在什么场景下你会选择 MongoDB 而不是 MySQL？」
+
+**深入回答**：
+
+> 选择 MongoDB 的场景：
+>
+> - **数据模型灵活**：Schema 变化频繁，需要存储半结构化数据
+> - **高写入量**：写入频繁，需要高性能（如日志、传感器数据）
+> - **水平扩展**：数据量预计超过单节点容量，需要分片
+> - **文档聚合**：数据天然是嵌套结构，避免多次 JOIN
+> - **快速迭代**：开发周期短，需要快速迭代 Schema
+>
+> 选择 MySQL 的场景：
+>
+> - **强事务需求**：需要 ACID 事务保证
+> - **复杂关联查询**：多表 JOIN 频繁
+> - **成熟生态**：需要成熟的主从复制、备份恢复方案
+> - **成本控制**：MySQL 运维成本更低
+
+### 8.2 场景二：MongoDB 索引优化
+
+**面试官问**：「MongoDB 索引优化的核心原则是什么？」
+
+**深入回答**：
+
+> **核心原则一：最左前缀匹配**
+>
+> 复合索引 `(a, b, c)` 必须从左到右使用，跳过前面的列会导致后面的列索引失效。
+>
+> **核心原则二：等值字段优先，范围字段放后**
+>
+> `WHERE a = 1 AND b > 2 AND c = 3` 应该用索引 `(a, c, b)` 而不是 `(a, b, c)`。
+>
+> **核心原则三：覆盖索引避免回表**
+>
+> 如果查询只需要索引字段，不需要回表获取文档，性能最好。
+>
+> **核心原则四：索引是写入成本的权衡**
+>
+> 每个索引都会降低写入性能，需要根据查询频率和写入量的比值来决定是否建立索引。
+
+### 8.3 场景三：MongoDB 分页问题
+
+**面试官问**：「MongoDB 的深度分页有什么问题？如何解决？」
+
+**深入回答**：
+
+> **OFFSET 分页的问题**：
+>
+> `skip(offset)` 会跳过前面的文档。当 offset 很大时（如第 1000 页），MongoDB 需要先扫描前面的大量文档，然后才返回结果。
+>
+> 比如 `skip(20000).limit(20)`，MongoDB 需要扫描 20020 条记录，返回 20 条，效率极低。
+>
+> **游标分页的解决方案**：
+>
+> 使用上一页的最后一个文档作为起点：
+>
+> ```javascript
+> // 第一页
+> const page1 = db.orders.find({}).sort({ _id: 1 }).limit(20);
+>
+> // 第二页
+> const lastId = page1[page1.length - 1]._id;
+> const page2 = db.orders.find({ _id: { $gt: lastId } }).limit(20);
+> ```
+>
+> 游标分页只扫描 20 条记录，性能稳定。
+
+---
+
+## 九、留给你的思考题
+
+### 题目一：索引与写入的权衡
+
+假设有一张订单表，每秒写入 10000 条，查询主要是按用户查订单和按时间范围查订单。
+
+1. 你会如何设计索引？
+2. 索引对写入性能的影响有多大？
+3. 有没有更好的方案？
+
+### 题目二：分片键的热区问题
+
+假设你用 `user_id` 作为分片键，按 `user_id` 查询性能很好。
+
+问题：如果某个「超级用户」有 1 亿条订单，每次查询这个用户的订单都会集中在同一个分片，会产生什么问题？如何解决？
+
+### 题目三：事务与性能的平衡
+
+MongoDB 4.0+ 支持多文档事务，但官方文档说事务会影响性能。
+
+问题：在什么场景下应该使用事务？在什么场景下应该避免事务？
+
+---
+
+## 总结
+
+MongoDB 是强大的文档数据库，但它的性能优化有其独特的挑战。
+
+**核心要点**：
+
+1. **索引设计**：复合索引最左前缀、等值字段优先、范围字段放后
+2. **慢查询分析**：使用 `explain()` 和 `system.profile` 定位问题
+3. **分页优化**：避免大 OFFSET，使用游标分页
+4. **写入优化**：批量写入、调整 write concern、写入前删除索引
+5. **聚合优化**：尽早过滤、使用 limit、确保使用索引
+6. **分片优化**：选择合适的分片键、避免热chunk
+
+理解 MongoDB 的工作原理，才能在这个「灵活」的数据库上构建高性能应用。

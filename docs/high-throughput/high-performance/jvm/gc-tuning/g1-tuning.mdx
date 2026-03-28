@@ -1,0 +1,685 @@
+# G1 GC 调优实战：当前主流垃圾收集器的调优指南
+
+JDK 11 发布时，官方宣布 G1（Garbage-First Garbage Collector）成为 JDK 9+ 的默认垃圾收集器。这是一个标志性的决定——它意味着 G1 不再只是一个实验性的收集器，而是真正走向了生产舞台。
+
+但 G1 真正值得关注的，不是它「被选为默认」，而是它解决了什么问题。
+
+CMS 的问题是：停顿时间不可控——你只能祈祷 GC 不要在最糟糕的时刻触发，你无法告诉 JVM「我需要停顿时间不超过 200ms」。
+
+G1 的答案是：**停顿时间可控**。你告诉 G1「我要停顿时间不超过 200ms」，G1 会尽量做到。做不到怎么办？它会告诉你，然后给你调优的方向。
+
+这篇文章的目标：**彻底搞懂 G1 的设计思想，掌握核心参数调优，解决常见问题。**
+
+## 一、G1 的核心设计思想：从分代到分区
+
+### 1.1 为什么要打破分代？
+
+在讨论 G1 之前，先回顾一下传统分代 GC 的设计：
+
+```
+传统分代设计
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+堆内存
+┌─────────────────────────────────────────────────────────────────┐
+│                          老年代（Old）                           │
+│  ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐       │
+│  │  对象 │ │  对象 │ │  对象 │ │  对象 │ │  对象 │ │  对象 │       │
+│  └──────┘ └──────┘ └──────┘ └──────┘ └──────┘ └──────┘       │
+│                        （大对象、长生命周期对象）                  │
+├─────────────────────────────────────────────────────────────────┤
+│                        年轻代（Young）                            │
+│  ┌────────────────┐  ┌──────────┐  ┌──────────┐              │
+│  │     Eden       │  │ Survivor │  │ Survivor │              │
+│  │  （新对象分配） │  │    S0    │  │    S1    │              │
+│  └────────────────┘  └──────────┘  └──────────┘              │
+│         ↑                                                    │
+│    对象创建    存活对象 age-up    晋升到 Old                    │
+└─────────────────────────────────────────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+传统分代设计的优点：年轻代回收成本低，老年代回收成本高，通过分代可以提高 GC 效率。
+
+但问题也很明显：
+
+1. **停顿时间不可控**：CMS 和 ParNew 的停顿时间取决于存活对象数量，无法精确控制
+2. **内存碎片**：CMS 使用标记-清除，会产生内存碎片
+3. **大堆表现差**：当堆大于 4GB 时，传统 GC 的停顿时间会变得难以接受
+
+### 1.2 G1 的破局之道：分区 + 价值优先
+
+G1 的设计思想是「**打破整块分代，按 Region 回收垃圾**」：
+
+```
+G1 堆内存布局
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+堆内存（划分为多个等大小的 Region）
+┌───────┬───────┬───────┬───────┬───────┬───────┬───────┬───────┐
+│  E    │  E    │  S    │  O    │  O    │  O    │  H    │  E    │
+│ (Eden)│ (Eden)│(Surv) │ (Old) │ (Old) │ (Old) │(Humon)│ (Eden)│
+├───────┴───────┴───────┴───────┴───────┴───────┴───────┴───────┤
+│                         空闲 Region                            │
+└─────────────────────────────────────────────────────────────────┘
+
+E = Eden Region（年轻代）
+S = Survivor Region（存活区）
+O = Old Region（老年代）
+H = Humongous Region（巨型对象区）
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+**G1 的核心特点**：
+
+1. **物理上不分代**：堆被划分为多个等大小的 Region（1MB-32MB）
+2. **逻辑上分代**：Region 扮演 Eden、Survivor、Old 的角色，但这些角色是动态的
+3. **价值优先**：优先回收垃圾最多的 Region（Garbage First）
+4. **软实时停顿**：可以设置目标停顿时间，G1 会尽量满足
+
+### 1.3 G1 的 Region 设计
+
+G1 将堆划分为多个等大小的 Region，每个 Region 大小相同（通过 `-XX:G1HeapRegionSize` 设置）。
+
+```
+G1 Region 大小与数量
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+堆大小 1GB → Region 大小 1MB → 约 1000 个 Region
+堆大小 4GB → Region 大小 2MB → 约 2000 个 Region
+堆大小 8GB → Region 大小 4MB → 约 2000 个 Region
+堆大小 32GB → Region 大小 8MB → 约 4000 个 Region
+堆大小 64GB → Region 大小 32MB → 约 2000 个 Region
+
+推荐 Region 大小：1MB - 32MB
+默认自动计算：Region 数 ≈ 2048
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+**Humongous Region（巨型对象区）**：
+
+- 超过 Region 大小 50% 的对象，称为 Humongous 对象
+- Humongous 对象直接分配在 Humongous Region
+- Humongous 对象是 G1 的性能杀手——回收成本高，容易导致频繁 Full GC
+
+---
+
+## 二、G1 的四个阶段：从 Young GC 到 Full GC
+
+### 2.1 Young GC：年轻代回收
+
+**触发条件**：Eden Region 耗尽，无法为新对象分配空间。
+
+**回收过程**：
+
+1. **STW 暂停**：所有用户线程暂停
+2. **扫描 GC Roots**：从 GC Roots 出发，标记 Eden Region 和 Survivor From 中的存活对象
+3. **复制到 Survivor**：存活对象复制到 Survivor To Region
+4. **年龄 age-up**：存活对象年龄 +1
+5. **交换 Survivor**：Survivor From 和 Survivor To 交换角色
+6. **计算新 Region**：G1 计算需要多少 Eden Region，更新年轻代大小
+
+**特点**：停顿时间短，通常几十毫秒。
+
+```log
+# Young GC 日志
+[GC pause (G1 Evacuation Pause) (young)
+     [Eden: 256M(256M)->0B(256M)]
+     [Survivor: 32M->32M(32M)]
+     [Old: 512M->512M(2048M)]
+     , 0.0456789 secs]
+```
+
+### 2.2 Mixed GC：混合回收
+
+**触发条件**：老年代占用率达到 `InitiatingHeapOccupancyPercent`（默认 45%）。
+
+Mixed GC 是 G1 的特色——它不仅回收年轻代，还回收部分老年代 Region。
+
+**回收过程**：
+
+1. **初始标记（Initial Mark）**：标记从 Survivor Region 出发的存活对象（STW）
+2. **并发标记（Concurrent Marking）**：从初始标记的对象出发，并发追踪所有存活对象
+3. **重新标记（Remark）**：修正并发标记期间的变动（STW）
+4. **筛选回收（Cleanup）**：统计每个老年代 Region 的价值（垃圾比例），按价值排序
+5. **混合回收**：选择价值最高的 Region 进行回收
+
+```
+Mixed GC 筛选过程
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+老年代 Region 价值排序（价值 = 垃圾比例）
+
+Region A: 垃圾 80% ████████████████ 优先回收
+Region B: 垃圾 65% ██████████████
+Region C: 垃圾 45% ██████████
+Region D: 垃圾 30% ████████
+Region E: 垃圾 15% ████
+
+G1 选择价值最高的 Region，直到达到停顿时间目标
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+**特点**：停顿时间可控，通过 `-XX:MaxGCPauseMillis` 设置目标停顿时间，G1 会尽量在目标时间内完成回收。
+
+```log
+# Mixed GC 日志
+[GC pause (G1 Evacuation Pause) (young)
+     [Eden: 256M(256M)->0B(256M)]
+     [Survivor: 32M->32M(32M)]
+     [Old: 512M->512M(2048M)]
+     , 0.0456789 secs]
+[GC pause (G1 Evacuation Pause) (mixed)
+     [Eden: 0B(256M)->0B(256M)]
+     [Survivor: 32M->32M(32M)]
+     [Old: 512M->400M(2048M), 4 regions]
+     , 0.1567890 secs]
+```
+
+### 2.3 Full GC：G1 的噩梦
+
+**触发条件**：G1 的回收速度跟不上对象分配速度，老年代空间不足。
+
+G1 的 Full GC 是**串行标记-压缩**，单线程执行，停顿时间非常长。这是 G1 调优中极力避免的情况。
+
+**Full GC 的原因**：
+
+1. **对象分配过快**：G1 的并发标记来不及完成，对象分配速率过高
+2. **Humongous 对象问题**：Humongous 对象回收慢，占用大量老年代空间
+3. **Mixed GC 不充分**：老年代 Region 回收不彻底，空间持续增长
+4. **堆内存不足**：应用程序的内存需求超过了物理内存
+
+```log
+# Full GC 日志
+[Full GC (Allocation Failure) 
+     2048M->2048M(2048M), 12.3456789 secs]
+```
+
+**解决方案**：
+
+```bash
+# 方案一：增大堆内存
+-Xmx8g -Xms8g
+
+# 方案二：调整 Mixed GC 频率
+-XX:InitiatingHeapOccupancyPercent=40
+-XX:G1ReservePercent=15
+
+# 方案三：避免 Humongous 对象
+-XX:G1HeapRegionSize=4m
+-XX:+G1SummarizeRSetStatsPeriod=1m
+
+# 方案四：升级 JDK 版本（G1 在新版中有更多优化）
+```
+
+### 2.4 并发标记周期（Concurrent Cycle）
+
+G1 的并发标记周期包括：初始标记 → 并发标记 → 重新标记 → 筛选清理。这个周期是 G1 实现低停顿的关键。
+
+```
+G1 并发标记周期
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+时间轴
+────────────────────────────────────────────────────────────────►
+
+Initial Mark (STW)    Concurrent Mark      Remark (STW)    Cleanup
+      │                    │                      │            │
+      ▼                    ▼                      ▼            ▼
+   标记 Survivor    追踪存活对象           修正变动      统计价值
+   区域出发的       （并发执行）            对象          排序 Region
+   存活对象
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+**SATB 算法**：G1 使用 Snapshot-At-The-Beginning（起始快照）算法进行并发标记。
+
+- **原理**：记录 GC 开始时的存活对象快照。并发标记期间产生的存活对象，即使后来死亡，也会被当作存活处理。
+- **优点**：标记速度快，不需要追踪所有引用变化
+- **缺点**：会产生浮动垃圾（标记期间死亡的对象不会被回收）
+
+**对比 CMS 的增量更新**：
+
+| 特性 | G1 SATB | CMS 增量更新 |
+|---|---|---|
+| 速度 | 快 | 较慢 |
+| 浮动垃圾 | 较多 | 较少 |
+| 重新标记负担 | 较轻 | 较重 |
+| 准确性 | 保守 | 更准确 |
+
+---
+
+## 三、关键参数详解：G1 调优的核心武器
+
+### 3.1 停顿时间控制
+
+**MaxGCPauseMillis：目标停顿时间**
+
+这是 G1 最重要的参数，告诉 G1「我希望每次 GC 停顿不超过多少毫秒」。
+
+```bash
+# 默认值：200ms
+# 设置目标停顿时间为 100ms
+-XX:MaxGCPauseMillis=100
+
+# 设置目标停顿时间为 500ms
+-XX:MaxGCPauseMillis=500
+```
+
+**重要说明**：
+
+1. 这是一个**软目标**，G1 会尽量满足，但不保证
+2. 如果设置太小，G1 可能无法在目标时间内完成回收，导致问题积累
+3. 如果设置太大，可能浪费系统资源
+4. 建议从 200ms 开始，根据实际情况调整
+
+**G1NewSizePercent / G1MaxNewSizePercent：年轻代比例范围**
+
+G1 的年轻代大小是动态调整的，这两个参数控制年轻代占堆的比例范围。
+
+```bash
+# 默认值：G1NewSizePercent=5, G1MaxNewSizePercent=60
+# 年轻代最小占堆的 5%，最大占堆的 60%
+
+# 如果希望减少年轻代停顿，可以减小这个范围
+-XX:G1NewSizePercent=10
+-XX:G1MaxNewSizePercent=30
+```
+
+### 3.2 并发标记控制
+
+**InitiatingHeapOccupancyPercent：触发并发周期的阈值**
+
+老年代占用率达到多少时，触发并发标记周期。
+
+```bash
+# 默认值：45%
+# 老年代占用 45% 时，触发 Mixed GC
+-XX:InitiatingHeapOccupancyPercent=40
+
+# 如果老年代增长快，可以降低这个值
+-XX:InitiatingHeapOccupancyPercent=35
+```
+
+**G1ReservePercent：预留空间比例**
+
+G1 预留一部分空间作为「to-space」，用于对象晋升时的缓冲。
+
+```bash
+# 默认值：10%
+# 预留 10% 的空间给晋升对象
+-XX:G1ReservePercent=15
+```
+
+### 3.3 Mixed GC 控制
+
+**G1HeapWastePercent：允许的浪费空间**
+
+G1 在回收时，如果 Region 的垃圾比例低于这个值，就不会回收（因为回收收益太低）。
+
+```bash
+# 默认值：5%
+# 如果 Region 垃圾比例低于 5%，不回收
+-XX:G1HeapWastePercent=5
+```
+
+**G1MixedGCLiveThresholdPercent：老年代 Region 回收的存活率阈值**
+
+老年代 Region 中存活对象比例低于这个值时，才会被选入 Mixed GC。
+
+```bash
+# 默认值：85%
+# 存活对象比例低于 85% 的老年代 Region，才会被回收
+-XX:G1MixedGCLiveThresholdPercent=80
+```
+
+**G1OldCSetRegionThresholdMax：每次 Mixed GC 回收的老年代 Region 上限**
+
+```bash
+# 默认值：10
+# 每次 Mixed GC 最多回收 10 个老年代 Region
+-XX:G1OldCSetRegionThresholdMax=20
+```
+
+### 3.4 Humongous 对象控制
+
+**G1HeapRegionSize：Region 大小**
+
+Region 大小会影响 Humongous 对象的认定——超过 Region 50% 的对象会被当作 Humongous 对象。
+
+```bash
+# 默认值：自动计算（根据堆大小，通常 1MB-32MB）
+# 手动设置 Region 大小为 4MB
+-XX:G1HeapRegionSize=4m
+```
+
+**Humongous 对象的建议处理**：
+
+```bash
+# 方案一：增大 Region 大小（减少 Humongous 对象数量）
+-XX:G1HeapRegionSize=8m
+
+# 方案二：开启 Humongous 对象统计
+-XX:+G1SummarizeRSetStatsPeriod=1m
+
+# 方案三：避免大对象（超过 Region 50%）
+```
+
+---
+
+## 四、G1 调优实战：从问题到方案
+
+### 4.1 典型场景一：G1 频繁 Mixed GC
+
+**问题现象**
+
+GC 日志显示 Mixed GC 频繁，停顿时间接近或超过 MaxGCPauseMillis 设置值。
+
+```log
+[GC pause (G1 Evacuation Pause) (young)
+     , 0.0234567 secs]
+[GC pause (G1 Evacuation Pause) (mixed)
+     [Old: 512M->400M(2048M), 4 regions]
+     , 0.2876543 secs]  <-- 停顿 287ms，超过目标
+```
+
+**分析原因**
+
+1. **老年代增长过快**：对象晋升速率高于 Mixed GC 回收速率
+2. **InitiatingHeapOccupancyPercent 太高**：太晚触发 Mixed GC
+3. **Mixed GC 回收不充分**：每次 Mixed GC 回收的老年代 Region 不够
+
+**解决方案**
+
+```bash
+# 方案一：降低 Mixed GC 触发阈值
+-XX:InitiatingHeapOccupancyPercent=35
+
+# 方案二：增大 Mixed GC 回收比例
+-XX:G1OldCSetRegionThresholdMax=20
+-XX:G1HeapWastePercent=10
+
+# 方案三：增加堆内存
+-Xmx8g -Xms8g
+
+# 方案四：减小 MaxGCPauseMillis（让 G1 更积极地回收）
+-XX:MaxGCPauseMillis=100
+```
+
+### 4.2 典型场景二：G1 Full GC
+
+**问题现象**
+
+G1 日志中出现 Full GC，停顿时间超过 10 秒。
+
+```log
+[GC pause (G1 Evacuation Pause) (young)
+     , 0.0456789 secs]
+[GC pause (G1 Evacuation Pause) (mixed)
+     , 0.5678901 secs]
+[Full GC (Allocation Failure) 
+     2048M->2048M(2048M), 12.3456789 secs]  <-- Full GC 停顿 12 秒！
+```
+
+**分析原因**
+
+1. **对象分配速率过高**：G1 的并发回收跟不上对象创建速度
+2. **Humongous 对象问题**：大量 Humongous 对象导致老年代空间快速耗尽
+3. **堆内存不足**：物理内存不够，频繁触发 GC
+
+**解决方案**
+
+```bash
+# 方案一：增大堆内存（最有效）
+-Xmx8g -Xms8g
+
+# 方案二：检查 Humongous 对象
+# 开启统计
+-XX:+G1SummarizeRSetStatsPeriod=1m
+# 增大 Region 大小
+-XX:G1HeapRegionSize=4m
+
+# 方案三：调整 Mixed GC 策略
+# 更早触发 Mixed GC
+-XX:InitiatingHeapOccupancyPercent=35
+# 更多回收
+-XX:G1MixedGCLiveThresholdPercent=90
+
+# 方案四：升级 JDK 版本
+# JDK 11+ 的 G1 有更多优化
+```
+
+### 4.3 典型场景三：停顿时间不达标
+
+**问题现象**
+
+设置了 `-XX:MaxGCPauseMillis=100`，但 GC 停顿时间经常超过 100ms。
+
+```log
+[GC pause (G1 Evacuation Pause) (young)
+     , 0.1567890 secs]  <-- 停顿 156ms
+```
+
+**分析原因**
+
+1. **MaxGCPauseMillis 设置不合理**：目标太小，G1 无法满足
+2. **年轻代太大**：年轻代 Region 太多，回收时间长
+3. **对象分配速率高**：G1 每次需要回收更多 Region
+
+**解决方案**
+
+```bash
+# 方案一：调整目标停顿时间
+# 如果 100ms 无法满足，设置 200ms
+-XX:MaxGCPauseMillis=200
+
+# 方案二：限制年轻代大小范围
+-XX:G1NewSizePercent=10
+-XX:G1MaxNewSizePercent=40
+
+# 方案三：增加 GC 线程数
+-XX:ParallelGCThreads=8
+-XX:ConcGCThreads=4
+
+# 方案四：增大堆内存（给 G1 更多缓冲）
+-Xmx8g -Xms8g
+```
+
+---
+
+## 五、G1 vs CMS vs ZGC vs Shenandoah：横向对比
+
+### 5.1 核心对比表
+
+| 特性 | Serial GC | Parallel GC | CMS | G1 | ZGC | Shenandoah |
+|---|---|---|---|---|---|---|
+| 停顿时间 | 长 | 长 | 短 | 可控 | < 1ms | < 1ms |
+| 吞吐量 | 低 | 高 | 中 | 高 | 高 | 高 |
+| 内存碎片 | 有 | 有 | 有 | 无 | 无 | 无 |
+| 堆大小支持 | 小 | 大 | 中 | 大 | 超大 | 超大 |
+| 并发阶段 | 无 | 无 | 部分 | 部分 | 全部 | 全部 |
+| 压缩 | STW | STW | 无 | 增量 | 并发 | 并发 |
+| JDK 默认 | 单核 | JDK 8 | JDK 8 | JDK 9+ | - | - |
+
+### 5.2 选择建议
+
+**选择 G1 的场景**：
+
+- JDK 9+ 项目
+- 堆大小 4GB-64GB
+- 需要可控的停顿时间
+- 不想深入调优，追求开箱即用
+
+**选择 ZGC 的场景**：
+
+- 堆大小超过 64GB
+- 对停顿时间要求极高（< 1ms）
+- JDK 11+ 项目
+- 吞吐量要求不那么严格
+
+**选择 Shenandoah 的场景**：
+
+- OpenJDK 项目（Shenandoah 不是 Oracle JDK 的一部分）
+- 需要 ZGC 类似的低停顿
+- 不能使用 ZGC（JDK 版本限制）
+
+**选择 CMS 的场景**：
+
+- JDK 8 项目（必须使用 CMS）
+- 不想迁移到 G1
+- 有 CMS 调优经验
+
+**选择 Parallel GC 的场景**：
+
+- 批处理、大数据任务
+- 追求吞吐量，不在乎停顿时间
+- 后台离线任务
+
+---
+
+## 六、G1 调优检查清单
+
+### 6.1 基础配置
+
+```bash
+# 基础 G1 配置
+-XX:+UseG1GC                    # 启用 G1
+-XX:MaxGCPauseMillis=200        # 目标停顿时间 200ms
+-XX:G1HeapRegionSize=2m          # Region 大小 2MB
+-XX:InitiatingHeapOccupancyPercent=45   # 老年代 45% 时触发
+```
+
+### 6.2 生产环境推荐配置
+
+```bash
+# 生产环境 G1 配置
+-XX:+UseG1GC
+-XX:MaxGCPauseMillis=100        # 如果业务需要更短停顿
+-XX:G1HeapRegionSize=4m         # 较大堆用 4MB Region
+-XX:InitiatingHeapOccupancyPercent=40   # 提前触发 Mixed GC
+-XX:G1NewSizePercent=10          # 限制年轻代最小比例
+-XX:G1MaxNewSizePercent=50       # 限制年轻代最大比例
+-XX:ParallelGCThreads=8          # 并行 GC 线程数
+-XX:ConcGCThreads=4              # 并发 GC 线程数
+```
+
+### 6.3 调优后的验证
+
+```bash
+# 开启 G1 详细日志
+-XX:+PrintGCDetails
+-XX:+PrintGCDateStamps
+-Xloggc:/path/to/gc.log
+
+# 开启 G1 总结日志
+-XX:+UnlockExperimentalVMOptions
+-XX:G1SummarizeRSetStatsPeriod=1m
+```
+
+---
+
+## 七、面试实战
+
+### 7.1 场景一：G1 的工作原理
+
+**面试官问**：「请描述一下 G1 垃圾收集器的工作原理。」
+
+> G1（Garbage-First）是一种面向服务器端的垃圾收集器，主要特点：
+>
+> 1. **分区管理**：G1 将堆划分为多个等大小的 Region，每个 Region 可以是 Eden、Survivor 或 Old
+>
+> 2. **价值优先回收**：G1 优先回收垃圾最多的 Region（Garbage First），而不是整个年轻代或整个堆
+>
+> 3. **软实时停顿**：通过 `-XX:MaxGCPauseMillis` 设置目标停顿时间，G1 会尽量满足
+>
+> 4. **并发标记**：G1 使用 SATB 算法进行并发标记，标记 GC 开始时的存活对象
+>
+> 5. **Mixed GC**：G1 不仅回收年轻代，还回收部分老年代 Region
+>
+> G1 的目标是解决 CMS 的内存碎片和停顿时间不可控问题，同时支持更大的堆。
+
+### 7.2 场景二：G1 的参数调优
+
+**面试官问**：「如何调优 G1 GC？」
+
+> G1 调优的核心参数：
+>
+> 1. **MaxGCPauseMillis**：设置目标停顿时间，建议 200ms，根据实际情况调整
+>
+> 2. **G1HeapRegionSize**：Region 大小，默认自动计算，通常不需要手动设置
+>
+> 3. **InitiatingHeapOccupancyPercent**：触发 Mixed GC 的老年代占用比，默认 45%
+>
+> 4. **G1NewSizePercent / G1MaxNewSizePercent**：年轻代比例范围
+>
+> 调优思路：
+>
+> - 如果停顿时间过长：减小年轻代比例、增加 GC 线程数
+> - 如果 Full GC 频繁：增大堆内存、降低触发阈值
+> - 如果 Mixed GC 频繁：增大堆内存、调整 Mixed GC 参数
+>
+> 建议先用默认参数，观察 GC 行为，再针对性调优。
+
+### 7.3 场景三：G1 vs CMS
+
+**面试官问**：「G1 和 CMS 的区别是什么？」
+
+> 主要区别：
+>
+> 1. **停顿控制**：CMS 停顿不可控，G1 可控（通过 MaxGCPauseMillis）
+>
+> 2. **内存管理**：CMS 物理分代（年轻代、老年代），G1 逻辑分代（Region 动态扮演不同角色）
+>
+> 3. **内存压缩**：CMS 标记-清除（有碎片），G1 标记-整理（无碎片）
+>
+> 4. **回收方式**：CMS 只回收老年代，G1 回收年轻代 + 部分老年代（Mixed GC）
+>
+> 5. **Humongous 对象**：CMS 无专门处理，G1 有 Humongous Region（性能杀手）
+>
+> 6. **适用场景**：CMS 适合小堆（< 4GB），G1 适合中大堆
+
+---
+
+## 八、留给你的思考题
+
+### 题目一：G1 调优场景分析
+
+假设你的应用使用 G1 GC，配置如下：
+
+```bash
+-Xmx4g -Xms4g
+-XX:+UseG1GC
+-XX:MaxGCPauseMillis=100
+-XX:InitiatingHeapOccupancyPercent=45
+```
+
+运行时发现以下问题：
+
+- Young GC 停顿时间 50ms，正常
+- Mixed GC 停顿时间 250ms，超过目标
+- Full GC 偶尔触发，停顿时间 8 秒
+
+请分析问题原因，并给出调优建议。
+
+### 题目二：G1 Region 设计
+
+G1 将堆划分为多个 Region。假设堆大小为 8GB，Region 大小为 2MB，共有多少个 Region？如果设置 `-XX:G1HeapRegionSize=4m`，会有什么影响？
+
+---
+
+## 总结
+
+G1 是当前主流的垃圾收集器，它的核心理念是「**停顿时间可控**」。通过分区管理、价值优先回收、软实时停顿，G1 解决了 CMS 的很多问题。
+
+但 G1 也不是银弹。它有自己的问题：Humongous 对象处理复杂、Full GC 是噩梦、调优需要经验积累。
+
+掌握 G1 调优的关键：
+
+1. **理解原理**：理解 G1 的 Region 设计、SATB 算法、Mixed GC 流程
+2. **设置合理目标**：MaxGCPauseMillis 不是越小越好
+3. **观察和调整**：通过 GC 日志观察 G1 行为，针对性调优
+4. **避免 Full GC**：Full GC 是 G1 的噩梦，要尽量避免
+
+G1 的调优是一个持续迭代的过程。没有最佳配置，只有最适合你业务场景的配置。

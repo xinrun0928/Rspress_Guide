@@ -1,0 +1,521 @@
+# 元空间溢出排查：JDK 8+ 特有的内存陷阱
+
+你刚把手上的项目升级到 JDK 8，以为可以告别永久代的种种问题。启动日志里没有烦人的 `java.lang.OutOfMemoryError: PermGen space`，你松了一口气。
+
+但三个月后，生产环境开始频繁 Full GC，GC 日志里出现大量 `Metadata GC Threshold` 的日志，Metaspace 使用率持续攀升。监控告警响起：「Metaspace 使用率超过 90%」。
+
+你打开告警详情，看到一个陌生的异常：
+
+```
+java.lang.OutOfMemoryError: Metaspace
+```
+
+等等，Metaspace 不是用的是本地内存吗？机器的物理内存明明还有很多空闲啊？
+
+这是 JDK 8 之后特有的问题——元空间溢出。很多从 JDK 7 升级上来的工程师，对这个新区域了解不够，在生产环境中踩了坑。
+
+这篇文章，就是你的 Metaspace 排查指南。
+
+## 一、元空间 vs 永久代：为什么要有这个改变
+
+### 1.1 永久代的历史问题
+
+在 JDK 7 及之前，类的元数据存储在 **永久代（PermGen）** 中。永久代是 JVM 堆内存的一部分，受 `-XX:MaxPermSize` 参数限制。
+
+永久代的设计带来了很多问题：
+
+**问题一：大小固定，难以调优**
+
+永久代的大小在 JVM 启动时就确定了（通过 `-XX:MaxPermSize`），在实际运行中很难预测需要多少空间。设置小了会 OOM，设置大了浪费内存。
+
+**问题二：GC 效率低**
+
+永久代和堆共享 GC 逻辑，但永久代的内存布局和回收策略与堆内存差异很大。永久代的 Full GC 往往效率低下，而且会和堆的 Full GC 互相影响。
+
+**问题三：类加载器泄漏**
+
+在 OSGi、热部署、动态类生成等场景下，类加载器会创建大量类。如果类加载器无法被回收，它加载的所有类也会留在永久代中，最终导致永久代 OOM。
+
+**问题四：符号表和字符串表冲突**
+
+永久代中同时存放了类元数据、符号表（Symbol Table）和字符串表（Interned String）。三者对空间的需求不同，但共享同一个区域，容易互相影响。
+
+### 1.2 元空间的设计思路
+
+JDK 8 彻底移除了永久代，引入了 **元空间（Metaspace）** 作为替代。
+
+元空间的核心理念是：**类元数据使用本地内存（Native Memory），不再占用堆内存。**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         JVM 进程内存                              │
+├─────────────────────────────────────────────────────────────────┤
+│  ┌─────────────┐  ┌──────────────┐  ┌───────────────────────┐   │
+│  │  堆内存     │  │  元空间       │  │     其他 Native 内存    │   │
+│  │  (Heap)    │  │ (Metaspace)  │  │   (Native Memory)     │   │
+│  │            │  │              │  │                       │   │
+│  │ -Xms/-Xmx  │  │ -XX:Max      │  │ -XX:MaxDirectMemory   │   │
+│  │             │  │   Metaspace  │  │                       │   │
+│  └─────────────┘  └──────────────┘  └───────────────────────┘   │
+│                                                                 │
+│  堆内存受 JVM 控制                      元空间使用本地内存        │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+元空间的优势：
+
+1. **大小不再固定**：可以使用机器的所有可用物理内存
+2. **独立调优**：元空间的 GC 与堆内存隔离，互不影响
+3. **更好的回收**：元空间的垃圾收集（主要是类加载器的卸载）更加高效
+4. **没有 PermGen OOM**：理论上，只要物理内存够用，就不会 OOM
+
+### 1.3 两者的核心区别
+
+| 维度 | 永久代（PermGen） | 元空间（Metaspace） |
+|---|---|---|
+| 位置 | JVM 堆内存的一部分 | 本地内存（Native Memory） |
+| 大小限制 | `-XX:MaxPermSize` | 受 OS 物理内存限制，可配置 `-XX:MaxMetaspaceSize` |
+| GC | 与堆 GC 混合 | 独立的 Metaspace GC |
+| 字符串常量池 | 存放在永久代 | JDK 7 移到堆中 |
+| 静态变量 | 存放在永久代 | JDK 7 移到堆中 |
+
+:::tip 面试提示
+
+面试官可能会问：「JDK 8 为什么移除永久代？」
+
+标准答案：**永久代的 GC 效率低、大小固定难以调优、元空间使用本地内存可以更好地利用物理内存**。另外，字符串常量和静态变量在 JDK 7 就移到了堆中，为移除永久代做了铺垫。
+
+:::
+
+## 二、Metaspace 存储了什么
+
+理解 Metaspace 溢出，首先要搞清楚 Metaspace 里到底存了什么。
+
+### 2.1 类元数据的核心组成
+
+Metaspace 主要存储以下几类数据：
+
+**类元数据（Class Metadata）**
+
+- 类的修饰符（public、final 等）
+- 类名（全限定名）
+- 父类名
+- 实现的接口列表
+- 字段信息（字段名、类型、修饰符）
+- 方法信息（方法名、返回类型、参数类型、方法字节码）
+
+**方法元数据（Method Metadata）**
+
+- 方法字节码（这是大头）
+- 方法的行号表（Line Number Table）
+- 方法的局部变量表（Local Variable Table）
+- 方法的异常表（Exception Table）
+
+**常量池（Constant Pool）**
+
+- 符号引用（Symbolic Reference）
+- 字面量（Literal）
+- 类和方法的符号描述
+
+**即时编译产物（Code Cache）**
+
+- JIT 编译器编译后的本地机器码
+- 存放在 CodeCache 中，也是本地内存的一部分
+
+### 2.2 什么是类元数据
+
+类元数据本质上是 Java 类的「描述信息」。当你写了一个类：
+
+```java
+public class UserService {
+    private String name;
+    private int age;
+
+    public String getName() {
+        return name;
+    }
+
+    public void setName(String name) {
+        this.name = name;
+    }
+}
+```
+
+这个类被加载后，JVM 会在 Metaspace 中创建 `klass` 结构来描述它：
+
+- 类名：`com.example.UserService`
+- 字段：name（String）、age（int）
+- 方法：getName()、setName()
+- 每个方法的字节码
+
+这些描述信息加在一起，就是类元数据。
+
+### 2.3 内存占用的估算
+
+一个普通的 Java 类，大约占用 **2KB - 10KB** 的 Metaspace。这个数字看起来很小，但架不住量多。
+
+| 场景 | 类数量估算 | Metaspace 占用 |
+|---|---|---|
+| 小型 Spring Boot 应用 | 1万 - 2万个类 | 20MB - 200MB |
+| 中型微服务 | 3万 - 5万个类 | 60MB - 500MB |
+| 大型企业应用 | 10万+ 个类 | 200MB - 1GB+ |
+
+在实际生产中，Metaspace 使用量从几十 MB 到几百 MB 不等。如果出现 Metaspace 持续增长，往往意味着有类加载器泄漏的问题。
+
+## 三、Metaspace OOM 的五大元凶
+
+### 3.1 动态类生成（最常见）
+
+这是 Metaspace OOM 的头号原因。
+
+**场景一：CGLIB 字节码增强**
+
+Spring AOP、Hibernate 延迟加载、MyBatis 缓存处理，这些框架底层都依赖 CGLIB 动态生成代理类。每次方法调用都可能生成新的代理类，如果这些类没有被正确卸载，Metaspace 会持续增长。
+
+```java
+// CGLIB 动态生成代理类
+public class CglibDemo {
+    public static void main(String[] args) {
+        while (true) {
+            Enhancer enhancer = new Enhancer();
+            enhancer.setSuperclass(TargetClass.class);
+            enhancer.setCallback(new MethodInterceptor() {
+                @Override
+                public Object intercept(Object obj, Method method,
+                        Object[] args, MethodProxy proxy) throws Throwable {
+                    return proxy.invokeSuper(obj, args);
+                }
+            });
+            // 每次循环都生成一个新类，永不卸载
+            enhancer.create();
+        }
+    }
+}
+```
+
+**场景二：反射调用**
+
+大量使用 `Class.forName()` 或 `ClassLoader.loadClass()` 动态加载类。
+
+```java
+// 错误写法：每次都加载新类
+public Object process(String className) throws Exception {
+    Class<?> clazz = Class.forName(className);
+    return clazz.newInstance();
+}
+```
+
+**场景三：Groovy、Kotlin 等脚本语言**
+
+脚本语言的动态特性，使得每段脚本代码都会被编译成新的类加载到 Metaspace。
+
+### 3.2 大量 JSP 编译（JDK 7 迁移到 JDK 8 的经典坑）
+
+这是从 JDK 7 迁移到 JDK 8 时最常遇到的问题。
+
+JSP 文件在首次访问时，会被编译成 Servlet 类。每次修改 JSP，都会生成新的类。如果 JSP 文件频繁变更，或者 JSP 编译器配置不当，会导致大量类堆积在 Metaspace 中。
+
+典型场景：
+
+- 开发环境频繁修改 JSP，类堆积
+- JSP 缓存配置不当，重复编译
+- JSP 编译器版本与容器版本不兼容
+
+:::warning 解决方案
+
+生产环境禁用 JSP 开发模式，生产环境的 JSP 缓存配置也要合理。升级 JDK 版本时，务必检查 JSP 编译器配置。
+
+:::
+
+### 3.3 OSGi 容器动态加载
+
+OSGi 框架（如 Apache Felix、Equinox）支持热部署和动态模块化。每个 OSGi Bundle 都有自己的类加载器。
+
+当 Bundle 被安装、卸载、升级时，旧的类加载器应该被回收，它加载的类也应该从 Metaspace 中卸载。但如果 Bundle 之间有循环依赖，或者有对象引用没有清理，类加载器无法被回收，Metaspace 会持续增长。
+
+### 3.4 Spring/Hibernate 动态 Bean 创建
+
+Spring 容器在运行时可能会动态创建 Bean，尤其是在以下场景：
+
+- 使用 `@Configuration` 类动态注册 Bean
+- 使用 `BeanDefinitionBuilder` 动态创建 Bean
+- Spring WebFlux 动态路由配置
+
+Hibernate 的延迟加载、动态代理也会生成大量类。如果 session 没有正确关闭，或者实体类被多次增强，Metaspace 会持续增长。
+
+### 3.5 大量第三方 JAR 引入
+
+每个 JAR 包都有自己的类。引入的第三方库越多，Metaspace 的初始占用就越大。
+
+更糟糕的是，某些库会动态生成类：
+
+- ORM 框架动态生成实体类
+- 序列化库动态生成序列化类
+- 日志框架的桥接类
+
+引入新依赖之前，建议用 `mvn dependency:tree` 检查依赖树，看是否有不必要的传递依赖。
+
+## 四、Metaspace OOM 排查流程
+
+### 4.1 第一步：确认问题类型
+
+Metaspace OOM 和 Heap Space OOM 的表象不同：
+
+| 症状 | 可能的类型 |
+|---|---|
+| 堆内存正常，但 Metaspace 持续增长 | Metaspace 泄漏 |
+| 堆内存和 Metaspace 都正常，但进程内存飙升 | 直接内存泄漏（见下一篇文章） |
+| Metaspace 偶尔增长后 GC 下降 | 正常波动，无需处理 |
+| Full GC 后 Metaspace 仍然增长 | 可能有类加载器泄漏 |
+
+### 4.2 第二步：监控 Metaspace 使用
+
+```bash
+# jstat 监控 Metaspace
+jstat -gc <PID>
+
+# 输出示例
+ S0C    S1C    S0U    S1U      EC       EU        OC         OU       MC      MU    CCSC   CCSU   YGC    YGCT
+1024.0 1024.0   0     256.0  82944.0  65536.0  262144.0   123456.0  53248.0  51200.0  6144.0  4608.0    45    1.234
+
+# MC = Metaspace Capacity（元空间总容量）
+# MU = Metaspace Used（元空间已使用）
+# CCSC = Compressed Class Space Capacity（压缩类空间容量）
+# CCSU = Compressed Class Space Used（压缩类空间已使用）
+```
+
+```bash
+# 每秒刷新一次
+jstat -gcutil <PID> 1000
+```
+
+观察 MU 是否持续增长，MC 是否持续扩大。
+
+### 4.3 第三步：开启类加载日志
+
+要定位是哪个类加载器加载了太多类，需要开启类加载日志：
+
+```bash
+# 在 JVM 启动参数中添加
+-XX:+TraceClassLoading -XX:+TraceClassUnloading
+
+# 也可以用 -verbose:class 替代
+-verbose:class
+```
+
+重启应用后，观察日志输出：
+
+```
+[Loaded java.lang.Object from /Library/Java/JavaVirtualMachines/jdk1.8.0_xxx.jdk/Contents/Home/jre/lib/rt.jar]
+[Loaded java.lang.String from /Library/Java/JavaVirtualMachines/jdk1.8.0_xxx.jdk/Contents/Home/jre/lib/rt.jar]
+...
+```
+
+重点关注：
+
+- 是否有大量自定义类被加载（`com.example.xxx`）
+- 是否有重复加载同一个类（类加载器问题）
+- 是否有类被卸载（`[Unloaded xxx]`）
+
+:::warning 生产环境谨慎开启
+
+类加载日志量非常大，会影响性能。生产环境建议先在测试环境定位问题，找到具体是哪个类加载器有问题后，再到生产环境针对性处理。
+
+:::
+
+### 4.4 第四步：分析类加载器
+
+用 Arthas 的 `classloader` 命令查看类加载器统计：
+
+```bash
+# 查看类加载器列表
+classloader
+
+# 查看某个类加载器加载的类数量
+classloader -l
+
+# 查看具体类的加载器
+sc -d com.example.MyClass | grep classLoader
+```
+
+如果有某个类加载器加载的类数量异常多（比如超过 10000 个），这就是泄漏的源头。
+
+### 4.5 第五步：定位问题代码
+
+找到问题类加载器后，需要定位是哪个框架或代码导致的。
+
+常见问题来源：
+
+| 来源 | 典型表现 | 排查方法 |
+|---|---|---|
+| CGLIB 动态代理 | 每次调用生成新类 | 检查 AOP 配置，升级到[JDK 8+] 用 Java 8+ |
+| JSP 编译器 | JSP 相关类持续加载 | 检查 JSP 缓存配置 |
+| OSGi 容器 | Bundle 类加载器数量异常 | 检查 Bundle 卸载逻辑 |
+| Spring 动态注册 | `@Configuration` 类不断注册 | 检查 Bean 生命周期 |
+| 脚本语言 | 脚本编译类持续增长 | 限制脚本引擎缓存 |
+
+## 五、关键参数配置
+
+### 5.1 元空间大小参数
+
+```bash
+# 初始元空间大小（触发首次 Metaspace GC 的阈值）
+-XX:MetaspaceSize=256m
+
+# 最大元空间大小（生产环境强烈建议设置）
+-XX:MaxMetaspaceSize=512m
+
+# 压缩类空间大小（JDK 8 特有，Klass* 结构的压缩）
+-XX:CompressedClassSpaceSize=256m
+```
+
+:::warning 生产环境必须设置 MaxMetaspaceSize
+
+如果不设置 `-XX:MaxMetaspaceSize`，元空间可以使用所有可用的物理内存。在极端情况下（元空间泄漏），可能导致机器内存耗尽，影响其他服务。
+
+:::
+
+### 5.2 MetaspaceSize vs MaxMetaspaceSize
+
+这两个参数的区别需要特别注意：
+
+| 参数 | 作用 |
+|---|---|
+| `-XX:MetaspaceSize` | **触发首次 Metaspace GC 的阈值**，不是初始大小。当 Metaspace 使用量达到此值时，会触发第一次 Metaspace GC。设置太小会导致频繁 GC，设置太大会推迟 GC 时机。 |
+| `-XX:MaxMetaspaceSize` | **元空间的最大上限**，防止元空间无限增长导致 OOM。 |
+
+默认值：
+
+- `MetaspaceSize`：ختلف حسب النظام（不同系统不同，约 20MB）
+- `MaxMetaspaceSize`：无限制（使用全部可用内存）
+
+### 5.3 GCOverheadLimit 限制
+
+JVM 提供了一个保护机制，防止过多 GC 导致系统几乎不可用：
+
+```bash
+# 开启（默认）
+-XX:+UseGCOverheadLimit
+
+# 关闭（不推荐）
+-XX:-UseGCOverheadLimit
+```
+
+当 98% 的时间在 GC，而只有 2% 的时间在运行对象分配时，JVM 会抛出 `OutOfMemoryError: GC overhead limit exceeded`。
+
+这个错误不是说 Metaspace 满了，而是说 GC 太频繁，系统几乎无法工作。
+
+## 六、CodeCache 溢出：一个特殊的 Metaspace 问题
+
+### 6.1 什么是 CodeCache
+
+CodeCache 是 JVM 的一块本地内存，用于存储 JIT 编译器生成的本地机器码。
+
+```
+JVM 进程内存
+├── 堆内存（Java 对象）
+├── 元空间（类元数据）
+└── CodeCache（JIT 编译产物）
+    └── 本地机器码（Native Code）
+```
+
+当 JVM 发现某个方法被频繁调用时，会将其标记为「热点代码」，JIT 编译器会将其编译成本地机器码，存放在 CodeCache 中。本地机器码的执行速度比字节码解释执行快得多。
+
+### 6.2 CodeCache OOM 的表现
+
+```
+java.lang.OutOfMemoryError: code cache
+```
+
+CodeCache 满了一般是因为：
+
+- 禁用了 JIT 编译（` -Xint`）
+- 热点方法太多，编译速度跟不上
+- 大量反射调用导致生成了大量代码
+
+### 6.3 CodeCache 配置
+
+```bash
+# CodeCache 初始大小
+-XX:InitialCodeCacheSize=2048k
+
+# CodeCache 最大大小
+-XX:ReservedCodeCacheSize=256m
+
+# CodeCache 最小保留
+-XX:CodeCacheMinimumFreeSpace=500k
+```
+
+:::tip 优化建议
+
+对于高并发服务，建议增大 CodeCache：
+
+```bash
+-XX:ReservedCodeCacheSize=512m
+-XX:+UseCodeCacheFlushing
+```
+
+`UseCodeCacheFlushing` 会在 CodeCache 接近满时，主动清除一些已编译但不再被调用的代码。
+
+:::
+
+## 七、面试追问
+
+### 7.1 问题一：Metaspace 会触发 Full GC 吗？
+
+**参考答案**：
+
+Metaspace 的 GC 和堆内存的 GC 是独立的。Metaspace 满了会触发 **Metaspace GC**（也叫 **Class Metadata GC** 或 **CMS 类回收**），而不是 Full GC。
+
+但需要注意：
+
+- Metaspace GC 发生在 Full GC 期间，所以 Full GC 期间会顺便清理 Metaspace
+- Metaspace 满了不一定触发 Full GC，除非显式调用 `System.gc()`
+- 如果 `UseConcMarkSweepGC`（CMS）收集器配置了 `CMSClassUnloadingEnabled=true`，会在 CMS 并发标记阶段尝试卸载未使用的类
+
+### 7.2 问题二：如何避免 Metaspace OOM？
+
+**参考答案**：
+
+1. **生产环境务必设置 `-XX:MaxMetaspaceSize`**：防止元空间无限增长
+2. **减少动态类生成**：避免不必要的 CGLIB 增强，考虑使用 Java 8+ 的 `default` 方法
+3. **正确配置 JSP**：生产环境禁用 JSP 开发模式
+4. **监控元空间使用**：设置告警阈值（如 80%），提前发现问题
+5. **使用合适的类加载器**：对于需要频繁卸载的场景，使用独立的类加载器
+
+### 7.3 问题三：Metaspace 大小设置为多少合适？
+
+**参考答案**：
+
+这是一个需要根据实际情况调整的参数。
+
+估算方法：
+
+1. 先不限制大小，运行一段时间
+2. 用 `jstat -gc` 观察正常运行的 Metaspace 使用量
+3. 加上 30% - 50% 的余量作为 `-XX:MaxMetaspaceSize`
+
+典型参考值：
+
+| 应用类型 | MaxMetaspaceSize 建议 |
+|---|---|
+| 小型 Spring Boot 应用 | 256MB - 512MB |
+| 中型微服务 | 512MB - 1GB |
+| 大型企业应用 | 1GB - 2GB |
+| 使用 Groovy/Kotlin 的应用 | 2GB+ |
+
+---
+
+## 总结
+
+Metaspace OOM 是 JDK 8+ 特有的内存问题，与 Heap Space OOM 的排查思路有本质区别。
+
+关键要点：
+
+- **元空间使用本地内存**，不再占用堆内存，但受物理内存限制
+- **MetaspaceSize 是触发 GC 的阈值**，不是初始大小
+- **动态类生成是最常见的泄漏原因**：CGLIB、JSP、OSGi 等
+- **排查核心**：类加载日志 + Arthas classloader + 定位问题代码
+- **预防措施**：设置 MaxMetaspaceSize、监控告警、减少动态类生成
+
+记住：元空间泄漏比堆内存泄漏更隐蔽，因为它不影响堆的使用率监控。等到 Metaspace OOM 时，问题已经比较严重了。所以，对 Metaspace 的监控同样重要。

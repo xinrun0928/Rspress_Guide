@@ -1,0 +1,555 @@
+# GC 收集器选择与参数组合
+
+JVM 的 GC 收集器不是「选一个就行」那么简单——不同的收集器有不同的适用场景，甚至同一个收集器在不同的参数组合下表现也天差地别。
+
+面试官问「你们用的什么 GC」不只是想知道名字，更想知道你是否理解背后的权衡。Serial 还是 Parallel？CMS 还是 G1？ZGC 还是 Shenandoah？每一种选择都有代价，每一种选择也都是正确的——只要你知道为什么选它。
+
+---
+
+## 六种 GC 收集器对比
+
+### Serial GC
+
+**启用参数**：`-XX:+UseSerialGC`
+
+**工作原理**：单线程执行，所有 GC 事件都在用户线程暂停时进行。使用**标记-复制**算法。
+
+```
+年轻代：Serial（标记-复制）
+老年代：Serial Old（标记-整理）
+```
+
+**特点**：
+
+| 特性 | 说明 |
+|---|---|
+| 线程数 | 单线程 |
+| 停顿时间 | 长 |
+| 吞吐量 | 低 |
+| 内存利用率 | 中 |
+| 适用堆大小 | 小（`<` 100MB） |
+
+**适用场景**：
+
+- 低配硬件（单核或极低内存）
+- 客户端应用
+- 仅用于开发测试
+
+**为什么还在用它**：
+
+大多数现代应用不再使用 Serial GC，但它在资源极度受限的环境中仍有价值。例如：
+
+- 极小的 Docker 容器（`<` 256MB）
+- 嵌入式系统
+- 某些数据处理中间件
+
+:::warning Serial GC 的陷阱
+
+Serial GC 的名字容易让人误以为「是给串行应用用的」。实际上，Serial 指的是 GC 线程是单线程，与应用的并发请求处理能力无关。
+
+一个高并发的 Web 服务，如果使用 Serial GC，GC 时所有用户线程都会被暂停——这在高并发场景下是灾难性的。
+
+:::
+
+---
+
+### Parallel GC
+
+**启用参数**：`-XX:+UseParallelGC`（年轻代）或 `-XX:+UseParallelOldGC`（老年代）
+
+**工作原理**：多线程并行执行 GC，目标是最大化应用吞吐量。使用**标记-复制**（年轻代）和**标记-整理**（老年代）算法。
+
+```
+年轻代：Parallel Scavenge（标记-复制）
+老年代：Parallel Old（标记-整理）
+```
+
+**特点**：
+
+| 特性 | 说明 |
+|---|---|
+| 线程数 | 与 CPU 核心数相关（`ParallelGCThreads`） |
+| 停顿时间 | 长（Full GC 可能数秒） |
+| 吞吐量 | 高（目标是 99%） |
+| 内存利用率 | 高 |
+| 适用堆大小 | 大（支持 TB 级） |
+
+**核心参数**：
+
+| 参数 | 说明 | 默认值 |
+|---|---|---|
+| `ParallelGCThreads` | GC 线程数 | CPU 核心数 |
+| `GCTimeRatio` | GC 时间占总时间比例 | 19（即 95% 吞吐量） |
+| `MaxGCPauseMillis` | 最大停顿时间目标 | 无限制 |
+
+```
+吞吐量计算：
+GCTimeRatio = 19 → GC 时间 : 非 GC 时间 = 1 : 19
+吞吐量 = 19 / (19 + 1) = 95%
+```
+
+**适用场景**：
+
+- 批处理任务
+- ETL 数据处理
+- 日终报表计算
+- 不关心停顿时间的离线计算
+
+**为什么叫「吞吐量优先」**：
+
+Parallel GC 不会「尽量缩短停顿」，而是「尽量在最短时间内完成 GC」。这意味着它可能会：
+
+- 长时间 STW 进行 Full GC
+- 但 GC 总时间短
+
+对于批处理任务，这是合理的——任务可以暂停，但整体处理时间必须短。
+
+---
+
+### CMS GC
+
+:::warning CMS 已废弃
+
+CMS 在 JDK 14 被移除（JEP 363）。如果你还在使用 JDK 8 或 JDK 11，建议逐步迁移到 G1。
+
+本节保留 CMS 是为了帮助你理解遗留系统和面试准备。
+
+:::
+
+**启用参数**：`-XX:+UseConcMarkSweepGC`
+
+**工作原理**：并发标记清除收集器，目标是减少停顿时间。使用**标记-清除**算法（不整理，会产生碎片）。
+
+```
+年轻代：ParNew（并行复制）
+老年代：CMS（并发标记-清除）
+```
+
+**GC 阶段**：
+
+| 阶段 | STW | 说明 |
+|---|---|---|
+| Initial Mark | 是 | 标记 GC Roots 直接引用的对象 |
+| Concurrent Mark | 否 | 并发追踪存活对象 |
+| Preclean | 否 | 预处理，修正并发期间的变化 |
+| Final Remark | 是 | 最终标记，完成所有追踪 |
+| Concurrent Sweep | 否 | 并发清除死亡对象 |
+| Concurrent Reset | 否 | 重置 CMS 状态 |
+
+**特点**：
+
+| 特性 | 说明 |
+|---|---|
+| 停顿时间 | 短（仅 Initial Mark + Final Remark） |
+| 吞吐量 | 中（并发阶段消耗 CPU） |
+| 内存利用率 | 低（内存碎片） |
+| 额外开销 | 需要预留老年代空间（`CMSInitiatingOccupancyFraction`） |
+
+**核心问题：并发模式失败**
+
+当 CMS 在并发标记期间，老年代满了，CMS 无法完成并发清除，就会触发「并发模式失败」，JVM 回退到 Serial Old 进行 Full GC。
+
+```
+CMS 失败触发：
+老年代使用率 > (100 - CMS预留比例)
+```
+
+**关键参数**：
+
+| 参数 | 说明 | 默认值 |
+|---|---|---|
+| `CMSInitiatingOccupancyFraction` | 触发 CMS 的老年代使用率 | 70% |
+| `+CMSScavengeBeforeRemark` | Final Remark 前先清理年轻代 | false |
+| `UseCMSCompactAtFullCollection` | Full GC 时整理内存 | true |
+
+**CMS 的代价**：
+
+1. **内存碎片**：标记-清除不整理，长期运行后老年代碎片化
+2. **预留空间**：需要预留 `100 - CMSInitiatingOccupancyFraction` 的老年代空间
+3. **CPU 开销**：并发阶段消耗 CPU（通常 1-2 个 CPU 核心）
+4. **浮动垃圾**：并发阶段产生的垃圾只能下次 GC 清理
+
+---
+
+### G1 GC
+
+**启用参数**：`-XX:+UseG1GC`
+
+**工作原理**：Garbage First 收集器，采用分区式架构，将堆划分为多个 Region。目标是同时满足高吞吐量和可控停顿。
+
+```
+年轻代：G1 Young GC（标记-复制）
+老年代：G1 Mixed GC（标记-复制）
+```
+
+**核心概念：Region**
+
+G1 将堆划分为多个大小相等的 Region（默认 1-32MB）：
+
+```
++----------------+----------------+----------------+
+|    Eden       |   Survivor    |      Old       |
+|  (多个 Eden)   |  (多个 Survivor)|  (多个 Old)   |
++----------------+----------------+----------------+
+|                Humongous（连续多个 Region）         |
++--------------------------------------------------+
+```
+
+**G1 的优势**：
+
+1. **可预测停顿**：通过 `MaxGCPauseMillis` 设置目标
+2. **无内存碎片**：复制算法，不会产生碎片
+3. **并行与并发结合**：GC 线程并行，用户线程与 GC 线程并发
+4. **可处理大堆**：适合 4GB 以上的堆
+
+**特点**：
+
+| 特性 | 说明 |
+|---|---|
+| 停顿时间 | 可控（通过 MaxGCPauseMillis） |
+| 吞吐量 | 高（牺牲部分吞吐量换取停顿控制） |
+| 内存利用率 | 高（几乎 100%） |
+| 适用堆大小 | 中-大（4GB+） |
+
+**适用场景**：
+
+- JDK 9+ 默认选择
+- 需要可控停顿的在线服务
+- 堆大小 4GB 以上的应用
+- 通用场景首选
+
+---
+
+### ZGC
+
+**启用参数**：`-XX:+UseZGC`（JDK 11+）
+
+**工作原理**：着色指针（Colored Pointers）+ 读屏障（Load Barrier），实现并发标记-整理，停顿时间与堆大小无关。
+
+```
+GC 阶段：并发标记 → 并发重定位 → 并发引用更新
+```
+
+**着色指针**
+
+ZGC 使用 42 位元数据位（64 位地址）标记对象状态：
+
+```
+对象地址结构：
++----------+----------+----------+
+|  颜色标记  |   对象地址   |  未使用   |
++----------+----------+----------+
+```
+
+四种颜色标记：
+
+- Marked0/Marked1：标记阶段
+- Remapped：对象已移动到新位置
+
+**读屏障（Load Barrier）**
+
+当访问对象时，ZGC 会检查对象的颜色标记：
+
+```c
+void *read(Object *obj) {
+    if (obj.color != expected) {
+        // 处理：可能需要修复指针
+    }
+    return obj.address;
+}
+```
+
+这个检查开销约 2-5%，远低于 STW 的停顿。
+
+**特点**：
+
+| 特性 | 说明 |
+|---|---|
+| 停顿时间 | `<` 1ms（与堆大小无关） |
+| 吞吐量 | 高（牺牲约 10-15% 吞吐量） |
+| 内存利用率 | 高 |
+| 适用堆大小 | 超大（支持 TB 级） |
+
+**JDK 21+ 分代 ZGC**
+
+JDK 21 引入了实验性的分代 ZGC：
+
+```bash
+-XX:+UseZGC -XX:+ZGenerational
+```
+
+分代 ZGC 将堆分为年轻代和老年代，进一步降低停顿时间和内存开销。
+
+**适用场景**：
+
+- 超低延迟应用（金融、游戏）
+- 超大堆（> 8GB）
+- 对停顿时间有严格要求（SLA < 10ms）
+
+---
+
+### Shenandoah
+
+**启用参数**：`-XX:+UseShenandoahGC`（OpenJDK）
+
+**工作原理**：与 ZGC 类似，使用**转发指针**（Brooks Pointer）实现并发整理。
+
+**与 ZGC 的区别**：
+
+| 维度 | ZGC | Shenandoah |
+|---|---|---|
+| 支持 JDK | Oracle JDK / OpenJDK 11+ | OpenJDK 8/11/17/21 |
+| GC 线程颜色标记 | 着色指针（64 位元数据） | 转发指针（对象头） |
+| 停顿时间 | `<` 1ms | `<` 1ms |
+| 内存开销 | 着色指针（少量） | 转发指针（每个对象 1 个机器字） |
+
+**特点**：
+
+| 特性 | 说明 |
+|---|---|
+| 停顿时间 | `<` 1ms |
+| 吞吐量影响 | 约 10-15% |
+| 内存开销 | 转发指针 |
+| 适用堆大小 | 中-大 |
+
+**适用场景**：
+
+- 非 Oracle JDK 的低延迟应用
+- OpenJDK 用户
+- 需要超低停顿但不想用 ZGC
+
+:::tip ZGC vs Shenandoah
+
+| 维度 | ZGC | Shenandoah |
+|---|---|---|
+| Oracle JDK 支持 | 是 | 否 |
+| 分代支持 | JDK 21+ 实验性 | 否 |
+| 性能 | 稍优 | 稍逊 |
+| 成熟度 | 高（JDK 11 稳定） | 中 |
+
+如果用 Oracle JDK，选 ZGC；如果用 OpenJDK，选 Shenandoah。
+
+:::
+
+---
+
+## GC 选型决策树
+
+```
+选择 GC 收集器：
+
+第一步：确定优先级
+├── 低延迟优先（< 10ms）→ ZGC / Shenandoah
+├── 吞吐量优先（批处理）→ Parallel GC
+└── 通用场景 → G1 GC
+
+第二步：根据堆大小选择
+├── < 100MB → Serial GC
+├── < 4GB → G1 GC
+├── 4-16GB → G1 GC / ZGC
+└── > 16GB → ZGC / G1 GC
+
+第三步：根据 JDK 版本选择
+├── JDK 8 → Parallel GC / CMS / G1（商业特性）
+├── JDK 11 → G1 GC / ZGC
+├── JDK 17+ → G1 GC / ZGC（分代）
+└── JDK 21+ → G1 GC / ZGC（分代）
+
+第四步：根据业务场景细化
+├── 金融交易 → ZGC
+├── Web 服务 → G1 GC
+├── ETL 批处理 → Parallel GC
+└── 游戏服务器 → ZGC / Shenandoah
+```
+
+---
+
+## 各收集器关键参数
+
+### Serial GC
+
+```bash
+-XX:+UseSerialGC
+-XX:NewSize=<size>        # 年轻代大小
+-XX:MaxNewSize=<size>
+-XX:SurvivorRatio=<ratio> # Survivor 比例
+```
+
+### Parallel GC
+
+```bash
+-XX:+UseParallelGC
+-XX:+UseParallelOldGC
+-XX:ParallelGCThreads=<n>  # GC 线程数
+-XX:GCTimeRatio=<n>         # 吞吐量目标
+-XX:MaxGCPauseMillis=<ms>  # 停顿目标（软）
+```
+
+### CMS GC
+
+```bash
+-XX:+UseConcMarkSweepGC
+-XX:+UseParNewGC           # 年轻代用 ParNew
+-XX:CMSInitiatingOccupancyFraction=<n>  # 触发比例
+-XX:+UseCMSCompactAtFullCollection  # Full GC 整理
+-XX:CMSFullGCsBeforeCompaction=<n>    # 多少次 Full GC 后整理
+```
+
+### G1 GC
+
+```bash
+-XX:+UseG1GC
+-XX:MaxGCPauseMillis=<ms>       # 停顿目标
+-XX:G1HeapRegionSize=<size>     # Region 大小
+-XX:InitiatingHeapOccupancyPercent=<n>  # 并发标记阈值
+-XX:G1NewSizePercent=<n>        # 年轻代最小比例
+-XX:G1MaxNewSizePercent=<n>     # 年轻代最大比例
+```
+
+### ZGC
+
+```bash
+-XX:+UseZGC
+-XX:+ZGenerational         # JDK 21+ 分代模式
+-XX:MaxGCPauseMillis=<ms> # 停顿目标（JDK 15+）
+```
+
+### Shenandoah GC
+
+```bash
+-XX:+UseShenandoahGC
+-XX:ShenandoahGCHeuristics=<mode>  # 启发式算法
+```
+
+---
+
+## 收集器切换注意点
+
+### 不能混用
+
+不同收集器的年轻代和老年代**不能混用**：
+
+```
+Serial GC：年轻代 + 老年代 → 都是 Serial
+Parallel GC：年轻代 + 老年代 → 都是 Parallel
+CMS GC：年轻代（ParNew）+ 老年代（CMS）→ 必须配套
+G1 GC：年轻代 + 老年代 → 都是 G1
+ZGC：年轻代 + 老年代 → 都是 ZGC
+```
+
+### CMS 的特殊情况
+
+CMS 是例外——它的年轻代必须用 ParNew，不能用 Parallel Scavenge：
+
+```bash
+# 正确
+-XX:+UseConcMarkSweepGC  # 自动启用 ParNew
+
+# 错误：CMS + Parallel Scavenge
+-XX:+UseConcMarkSweepGC -XX:+UseParallelGC  # 会被忽略
+```
+
+### 从 CMS 迁移到 G1
+
+迁移参数对照：
+
+| CMS 参数 | G1 等价参数 |
+|---|---|
+| `CMSInitiatingOccupancyFraction` | `InitiatingHeapOccupancyPercent` |
+| `+CMSScavengeBeforeRemark` | 不需要（G1 自动处理） |
+| `+UseCMSCompactAtFullCollection` | 不需要（G1 总是整理） |
+
+迁移建议：
+
+1. 先用 G1 默认参数运行，观察效果
+2. 逐步调整 `MaxGCPauseMillis`
+3. 监控吞吐量，确保满足要求
+
+---
+
+## 适用场景总结
+
+| 收集器 | 适用场景 | 不适用场景 |
+|---|---|---|
+| Serial GC | 低配环境、`<` 100MB 堆 | 高并发服务 |
+| Parallel GC | 批处理、离线计算、吞吐量优先 | 低延迟服务 |
+| CMS GC | 低延迟（已废弃） | JDK 14+，新系统 |
+| G1 GC | 通用场景、JDK 9+ 默认 | 超低延迟（< 1ms） |
+| ZGC | 超低延迟、超大堆（JDK 11+） | JDK 8、需要高吞吐量 |
+| Shenandoah | 超低延迟（非 Oracle JDK） | Oracle JDK、需要高吞吐量 |
+
+### 场景推荐
+
+```
+低配/嵌入式：Serial GC
+批处理/ETL：Parallel GC
+Web 服务：G1 GC
+交易系统：G1 GC / ZGC
+金融/游戏：ZGC / Shenandoah
+超大堆（> 64GB）：ZGC
+```
+
+---
+
+## 总结
+
+GC 收集器的选择是权衡的艺术：
+
+- **吞吐量 vs 停顿**：Parallel GC 吞吐量最高，但停顿时间长；ZGC 停顿最短，但吞吐量稍低
+- **通用 vs 专精**：G1 是通用场景的最佳选择；ZGC/Shenandoah 是低延迟场景的专精选择
+- **成熟 vs 新锐**：G1 成熟稳定；ZGC 21+ 分代模式更强大
+
+记住：**没有最好的收集器，只有最适合当前场景的收集器**。
+
+---
+
+## 面试实战
+
+### 面试题一：为什么 CMS 会产生内存碎片？
+
+**参考回答**：
+
+CMS 使用**标记-清除**算法，不整理内存。
+
+**过程**：
+
+1. 标记存活对象
+2. 清除死亡对象
+3. **不移动存活对象**
+
+这导致老年代的空间不连续，产生碎片。
+
+**后果**：
+
+- 大对象无法分配（找不到足够大的连续空间）
+- Full GC 被触发（JVM 不得不整理）
+- 内存利用率下降
+
+**解决方案**：G1 使用复制算法，整理内存，无碎片。
+
+### 面试题二：G1 和 ZGC 的区别是什么？
+
+**参考回答**：
+
+| 维度 | G1 | ZGC |
+|---|---|---|
+| 架构 | 分区（Region） | 着色指针 |
+| 停顿时间 | 可控（几十到几百毫秒） | `<` 1ms |
+| 停顿与堆大小 | 相关（Region 越多停顿越长） | 无关 |
+| 内存碎片 | 无（复制算法） | 无（并发整理） |
+| JDK 版本 | JDK 7+（默认 9+） | JDK 11+ 稳定 |
+| 吞吐量 | 高 | 高（稍低于 G1） |
+
+**选择建议**：
+
+- P99 < 200ms：G1
+- P99 < 10ms：ZGC
+- 堆 > 64GB：ZGC
+
+---
+
+## 思考题
+
+1. 一个批处理系统从 Parallel GC 切换到 G1 后，吞吐量下降了 5%。你会如何分析这个现象？切换回 Parallel GC 是否合理？
+
+2. CMS 已废弃，但很多遗留系统还在用。如果你要将一个 CMS 系统迁移到 G1，需要注意哪些问题？

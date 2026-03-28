@@ -1,0 +1,864 @@
+# Elasticsearch 写入优化：打造高吞吐数据管道
+
+写入性能差，是 ES 最常见的问题之一。
+
+你可能遇到过这样的场景：业务高峰期，ES 的写入队列持续积压，监控告警不断，用户查询到的数据严重滞后。有人开始怀疑人生：明明机器配置不差，网络带宽也够，为什么写入就是跑不上去？
+
+问题的根源往往不在硬件，而在于**写入方式不对**。
+
+ES 的写入机制与 MySQL 完全不同：它不是「写入即查询」，而是「写入 → 缓冲 → Refresh → 可查询」。理解这个流程，是优化写入性能的第一步。
+
+这篇文章，帮你建立 ES 写入优化的完整知识体系，从写入流程到配置调优，从批量写入到常见坑的规避。
+
+---
+
+## 一、ES 写入流程深度解析
+
+### 1.1 写入的完整生命周期
+
+当你向 ES 写入一条文档时，数据经历了以下阶段：
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│                        ES 写入完整流程                                │
+│                                                                     │
+│  1. 客户端 → 协调节点                                               │
+│  │   接收写入请求                                                    │
+│  ↓                                                                   │
+│  2. 协调节点 → 主分片节点（Primary Shard）                           │
+│  │   路由计算：shard = hash(_routing) % num_shards                   │
+│  ↓                                                                   │
+│  3. 主分片节点写入                                                   │
+│  │   ┌─────────────────────────────────────────────────────┐       │
+│  │   │  写入流程：                                           │       │
+│  │   │  Memory Buffer（内存缓冲）                           │       │
+│  │   │       ↓                                              │       │
+│  │   │  Translog（WAL 日志，保证持久性）                    │       │
+│  │   │       ↓                                              │       │
+│  │   │  Segment（内存中的索引段，可搜索）                    │       │
+│  │   └─────────────────────────────────────────────────────┘       │
+│  ↓                                                                   │
+│  4. 主分片 → 副本节点                                               │
+│  │   并行写入副本分片（可配置等待策略）                            │
+│  ↓                                                                   │
+│  5. 协调节点 → 客户端                                              │
+│  │   返回写入成功响应                                               │
+│                                                                     │
+│  ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ │
+│                                                                     │
+│  后台线程（异步）：                                                  │
+│                                                                     │
+│  6. Refresh（默认每秒执行一次）                                      │
+│  │   Memory Buffer → 新 Segment（文件系统缓存）                     │
+│  │   此时数据可被搜索                                               │
+│  ↓                                                                   │
+│  7. Flush（默认 30 分钟或 Translog 达到阈值）                       │
+│  │   Segment → 磁盘（持久化）                                        │
+│  │   清空 Translog                                                  │
+│                                                                     │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+### 1.2 核心组件详解
+
+**Memory Buffer（内存缓冲）**
+
+写入的数据首先进入内存缓冲。这是一个 LSM-Tree 类似的机制，目的是批量合并写入，减少 IO 操作。
+
+**Translog（事务日志）**
+
+Translog 是 ES 的 WAL（Write-Ahead Logging）机制。在数据写入内存缓冲的同时，同步写入 Translog。即使机器突然宕机，也可以通过 Translog 恢复未刷盘的数据。
+
+```bash
+# 查看 Translog 配置
+GET /_cluster/settings?flat_settings=true
+
+# Translog 相关配置
+# translog.durability: sync（同步刷新）或 async（异步刷新）
+# translog.sync_interval: 同步间隔，默认 5s
+# translog.size: 触发同步的大小阈值，默认 512MB
+```
+
+**Segment（索引段）**
+
+Segment 是 ES 中最小的索引单元。写入时，数据先写入内存中的 Segment（可搜索），后台线程定期将内存中的 Segment flush 到磁盘（持久化）。
+
+```
+磁盘结构：
+/var/lib/elasticsearch/nodes/0/indices/xxx/
+├── index/
+│   ├── segments_N          # Segment 元数据
+│   ├── _0.fnm              # 字段映射
+│   ├── _0.doc              # 倒排表（DocID → 词项）
+│   ├── _0.pos              # 词项位置
+│   ├── _0.nvm               # Norm（字段评分因子）
+│   └── _0.tim               # 倒排索引
+├── translog/
+│   └── translog.ckp        # Translog 检查点
+└── _state/
+    └── state-xxx.st        # 分片状态
+```
+
+### 1.3 Refresh 间隔：写入与可查询的桥梁
+
+数据写入后，需要经过 Refresh 才能被搜索到。默认 Refresh 间隔是 **1 秒**。
+
+```bash
+# 查看索引的 refresh_interval
+GET /products/_settings?flat_settings=true
+
+# 结果
+{
+  "index.refresh_interval": "1s"
+}
+```
+
+**Refresh 间隔的影响**：
+
+| refresh_interval | 写入吞吐 | 查询延迟 | 适用场景 |
+|----------------|---------|---------|---------|
+| 1s（默认） | 中等 | 1-2 秒 | 通用场景 |
+| -1（禁用） | 最高 | 很高（需手动 refresh） | 批量导入 |
+| 30s | 较高 | 30 秒 | 写入密集型 |
+| 自定义 | 可调 | 可调 | 根据业务平衡 |
+
+**临时调大 Refresh 间隔加速批量写入**：
+
+```bash
+# 批量导入时临时禁用 refresh
+PUT /products/_settings
+{
+  "index.refresh_interval": "-1"
+}
+
+# 导入完成后恢复默认
+PUT /products/_settings
+{
+  "index.refresh_interval": "1s"
+}
+
+# 手动刷新（使数据立即可查询）
+POST /products/_refresh
+```
+
+:::warning 禁用 Refresh 的风险
+
+禁用 Refresh 可以大幅提升写入性能，但期间写入的数据**不可被搜索**。如果此时 ES 宕机，Translog 中的数据会丢失。
+
+解决方案：
+1. 批量导入完成后执行 `POST /products/_refresh`
+2. 导入期间设置 `translog.durability = async`，Import 完成后改回 `sync`
+
+:::
+
+---
+
+## 二、批量写入：Bulk API 的正确姿势
+
+### 2.1 批量写入的基本语法
+
+Bulk API 是 ES 批量写入的标准方式，一次请求可以包含多条写入操作：
+
+```bash
+# 基本格式：action + document
+POST /_bulk
+{ "index": { "_index": "products", "_id": "1" } }
+{ "name": "iPhone 15", "price": 6999, "category": "手机" }
+{ "index": { "_index": "products", "_id": "2" } }
+{ "name": "MacBook Pro", "price": 12999, "category": "电脑" }
+
+# 创建文档（若存在则报错）
+POST /products/_create/3
+{ "name": "AirPods", "price": 1999, "category": "耳机" }
+
+# 更新文档
+POST /products/_update/1
+{ "doc": { "price": 6499 } }
+
+# 删除文档
+DELETE /products/_doc/1
+```
+
+### 2.2 批量大小的选择
+
+批量写入的大小直接影响写入性能。太小的批量导致请求频繁，太大的批量导致内存压力和 GC 问题。
+
+**经验值**：
+
+| 批量大小 | 优点 | 缺点 | 适用场景 |
+|---------|------|------|---------|
+| `<` 1MB | - | 请求过于频繁 | 不推荐 |
+| 5-15MB | 平衡 | - | **推荐默认值** |
+| 50MB | 高吞吐 | 内存压力大 | 大文档场景 |
+| `>` 100MB | - | 极易 OOM | 不推荐 |
+
+```bash
+# 使用 curl 批量写入（单次 10MB）
+curl -X POST "localhost:9200/_bulk" \
+  -H "Content-Type: application/x-ndjson" \
+  --data-binary @bulk_data.jsonl
+```
+
+### 2.3 单批次数量的选择
+
+除了大小，还要控制单批次的**文档数量**：
+
+```java
+// Java 客户端示例
+BulkRequestBuilder bulkRequest = client.prepareBulk();
+
+// 控制每批次 5000 条
+int batchSize = 5000;
+for (int i = 0; i < documents.size(); i++) {
+    bulkRequest.add(client.prepareIndex("products", "_doc")
+        .setSource(documents.get(i), XContentType.JSON));
+    
+    // 达到批次大小，执行并清空
+    if (i % batchSize == 0) {
+        BulkResponse bulkResponse = bulkRequest.get();
+        handleErrors(bulkResponse);
+        bulkRequest = client.prepareBulk();  // 重新创建
+    }
+}
+```
+
+**批次大小的经验公式**：
+
+```
+单批次大小（MB）= 单文档大小 × 批次数量
+推荐值：5-15MB 或 1000-5000 条，取两者中较小的
+```
+
+### 2.4 多线程写入
+
+单线程写入无法充分利用 ES 的写入能力。使用多线程并发写入：
+
+```java
+// 多线程批量写入
+ExecutorService executor = Executors.newFixedThreadPool(8);
+CountDownLatch latch = new CountDownLatch(documents.size());
+
+for (Document doc : documents) {
+    executor.submit(() -> {
+        try {
+            bulkRequest.add(client.prepareIndex("products", "_doc")
+                .setSource(doc));
+        } finally {
+            latch.countDown();
+        }
+    });
+}
+
+// 每批次 5000 条提交一次
+if (count % batchSize == 0) {
+    BulkResponse response = bulkRequest.get();
+    bulkRequest = client.prepareBulk();
+}
+```
+
+:::tip 多线程 + 批量写入的黄金组合
+
+**批量大小 + 多线程**是提升写入吞吐的最佳组合。
+
+推荐配置：
+- 批量大小：5-15MB 或 1000-5000 条
+- 并发线程数：CPU 核心数的 2-4 倍
+- 监控指标：`indexing_writer_thread_pool.queue.size`（队列积压）
+
+:::
+
+---
+
+## 三、副本与一致性：写入可靠性的权衡
+
+### 3.1 write.wait_for_active_shards
+
+写入时等待的副本数量决定了数据可靠性和写入性能的平衡：
+
+```bash
+# 创建索引时指定副本数
+PUT /products
+{
+  "settings": {
+    "number_of_shards": 3,
+    "number_of_replicas": 2  # 1 主分片 + 2 副本分片
+  }
+}
+```
+
+**写入策略**：
+
+| 配置 | 含义 | 可靠性 | 性能 | 适用场景 |
+|-----|------|-------|------|---------|
+| `wait_for_active_shards = all` | 等待所有分片（包括副本） | 最高 | 最慢 | 数据不允许丢失 |
+| `wait_for_active_shards = quorum` | 等待多数分片（默认） | 高 | 中 | 平衡场景 |
+| `wait_for_active_shards = 1` | 只等待主分片 | 中 | 快 | 可容忍少量数据丢失 |
+| `wait_for_active_shards = 0` | 不等待副本 | 快 | 最快 | 初始导入 |
+
+```bash
+# 批量导入时关闭副本确认
+POST /products/_bulk?wait_for_active_shards=0
+```
+
+### 3.2 translog.durability：持久化策略
+
+```bash
+# 同步模式（默认）：每次写入都同步刷 Translog
+PUT /products/_settings
+{
+  "index.translog.durability": "sync"
+}
+
+# 异步模式：Translog 定期批量同步
+PUT /products/_settings
+{
+  "index.translog.durability": "async",
+  "index.translog.sync_interval": "120s"  # 每 120 秒同步一次
+}
+```
+
+**异步模式的风险**：如果 ES 在两次 sync 之间宕机，这段时间的数据会丢失。
+
+:::warning 生产环境注意事项
+
+生产环境的实时写入**必须使用 `sync` 模式**。`async` 模式只适用于：
+1. 初始数据导入
+2. 数据可以接受丢失的场景（如日志、埋点数据）
+
+:::
+
+---
+
+## 四、Segment 合并策略：后台合并的艺术
+
+### 4.1 什么是 Segment 合并
+
+ES 写入时，每次 Refresh 都会产生一个新的 Segment。Segment 是不可变的，只能新建，不能修改。随着时间推移，Segment 数量会越来越多，影响查询性能。
+
+后台线程会定期将多个小 Segment 合并成一个大 Segment，这个过程叫 **Segment Merge**。
+
+```
+合并前（3 个小 Segment）：
+Segment_1: 1000 条
+Segment_2: 1000 条
+Segment_3: 1000 条
+
+合并后（1 个大 Segment）：
+Segment_4: 3000 条
+```
+
+### 4.2 合并策略配置
+
+```bash
+# 查看合并配置
+GET /products/_settings?flat_settings=true
+
+# 关键配置项
+# indices.memory.index_buffer_size: 写入缓冲区大小，默认 10%
+# index.merge.policy.segments_per_tier: 每层最少的 Segment 数，默认 10
+# index.merge.policy.max_merged_segment: 最大合并 Segment 大小，默认 5GB
+```
+
+**合并策略调优**：
+
+```bash
+# 适用于写入密集型场景的合并配置
+PUT /products/_settings
+{
+  "index": {
+    "merge": {
+      "scheduler": {
+        "max_thread_count": 1  # 限制 merge 线程数，减少与写入的竞争
+      }
+    },
+    "merge_policy": {
+      "segments_per_tier": 20,  # 允许每层更多小 Segment，减少 merge 频率
+      "max_merged_segment": "2gb"  # 限制最大合并大小
+    }
+  }
+}
+```
+
+### 4.3 写入峰值时的合并压力
+
+在写入峰值时，如果产生大量小 Segment，后台 merge 线程可能跟不上，导致 Segment 积压。
+
+**问题表现**：
+
+- `segments` 数量持续增长
+- 查询性能下降（小 Segment 太多）
+- merge 线程占满 CPU
+
+**解决方案**：
+
+1. **限流写入**：`indices.memory.index_buffer_size` 调小，减少小 Segment 产生
+2. **增加 merge 线程**：`index.merge.scheduler.max_thread_count` 调大
+3. **临时调大合并策略**：`segments_per_tier` 调大，允许更多小 Segment
+
+---
+
+## 五、自定义文档 ID：避免自动生成的开销
+
+### 5.1 文档 ID 的生成方式
+
+ES 支持三种文档 ID：
+
+| 方式 | 生成方式 | 性能 | 适用场景 |
+|-----|---------|------|---------|
+| 自动生成 | ES 自动生成 UUID | 中（需要额外的 UUID 生成和去重计算） | 不关心 ID |
+| 自定义字符串 ID | 业务指定 | 快（直接使用） | 有业务含义的 ID |
+| 数字自增 ID | `_id` 指定为数字 | 快 | 有自增 ID 场景 |
+
+### 5.2 使用业务 ID 减少开销
+
+如果业务有自己的 ID（如订单号、用户 ID），直接使用业务 ID 作为文档 `_id`：
+
+```bash
+# 使用业务 ID（推荐）
+POST /orders/_doc/ORD20240115001
+{
+  "order_no": "ORD20240115001",
+  "user_id": 10001,
+  "amount": 999.99,
+  "create_time": "2024-01-15T10:30:00Z"
+}
+
+# ES 自动生成的 ID（额外开销）
+POST /orders/_doc
+{
+  "order_no": "ORD20240115001",
+  ...
+}
+```
+
+**自定义 ID 的优势**：
+
+1. **避免去重开销**：ES 自动生成的 ID 可能冲突，需要额外的去重计算
+2. **路由优化**：如果 ID 本身有业务含义，可以设计路由策略
+3. **查询优化**：某些场景下可以直接用 `_id` 过滤
+
+### 5.3 _routing 优化
+
+如果查询总是按照某个字段过滤（如 `user_id`），可以使用 `_routing` 直接定位分片：
+
+```bash
+# 创建索引时指定 routing
+PUT /user_actions
+{
+  "mappings": {
+    "_routing": {
+      "required": true,
+      "path": "user_id"
+    },
+    "properties": {
+      "user_id": { "type": "long" },
+      "action": { "type": "keyword" }
+    }
+  }
+}
+
+# 写入时指定 routing
+POST /user_actions/_doc?routing=10001
+{
+  "user_id": 10001,
+  "action": "click"
+}
+
+# 查询时指定 routing，减少搜索的分片数
+GET /user_actions/_search?routing=10001
+{
+  "query": {
+    "term": { "user_id": 10001 }
+  }
+}
+```
+
+---
+
+## 六、字段设计：减少写入开销
+
+### 6.1 合理设置字段数量
+
+每个文档的字段数量影响写入性能：
+
+- 字段越多，`_source` 越大，序列化和反序列化越慢
+- 字段越多，Mapping 维护开销越大
+- 部分字段（如 `doc_values`、`norms`）会占用额外存储
+
+```bash
+# 合理设计字段：只存储必要的字段
+{
+  "mappings": {
+    "properties": {
+      "order_no": { "type": "keyword" },  # keyword 用于精确匹配和排序
+      "user_id": { "type": "long" },
+      "amount": { "type": "double" },
+      "items": { "type": "nested" }  # 嵌套对象使用 nested 类型
+    }
+  }
+}
+```
+
+### 6.2 禁用不必要的特性
+
+```bash
+# 创建索引时禁用不必要的特性
+{
+  "mappings": {
+    "properties": {
+      "name": {
+        "type": "text",
+        "norms": false,  # 禁用评分因子存储
+        "index_options": "freqs"  # 只存储词频，不存储位置
+      },
+      "status": {
+        "type": "byte",
+        "doc_values": false  # 如果不需要排序/聚合
+      }
+    }
+  }
+}
+```
+
+### 6.3 dynamic 策略控制
+
+`dynamic` 策略控制未知字段的处理方式：
+
+| 策略 | 行为 | 适用场景 |
+|-----|------|---------|
+| `true`（默认） | 自动创建字段 | 灵活但可能导致字段爆炸 |
+| `false` | 忽略未知字段 | 严格的字段控制 |
+| `strict` | 遇到未知字段报错 | 严格的字段控制 |
+
+```bash
+# 严格模式，避免未知字段导致 Mapping 膨胀
+PUT /products
+{
+  "mappings": {
+    "dynamic": "strict",
+    "properties": {
+      "name": { "type": "text" }
+    }
+  }
+}
+```
+
+:::warning dynamic: true 的风险
+
+如果向 `dynamic: true` 的索引写入包含新字段的文档，ES 会自动创建字段 Mapping。长期运行后，可能导致 Mapping 字段数量爆炸，影响集群稳定性。
+
+**生产环境推荐使用 `dynamic: false` 或 `dynamic: strict`**，并定期审查 Mapping。
+
+:::
+
+---
+
+## 七、生产环境配置调优
+
+### 7.1 写入相关配置
+
+```bash title="elasticsearch.yml"
+# 写入缓冲区大小（占总堆内存比例）
+indices.memory.index_buffer_size: 15%
+
+# Translog 配置
+index.translog.durability: async
+index.translog.sync_interval: 120s
+index.translog.fs.buffer_size: 64mb
+
+# 刷新间隔（批量导入时临时调大）
+index.refresh_interval: 30s
+
+# Merge 线程控制
+index.merge.scheduler.max_thread_count: 1
+
+# 写入线程池大小
+thread_pool.write.size: 16
+thread_pool.write.queue_size: 1000
+```
+
+### 7.2 写入监控指标
+
+```bash
+# 查看索引写入统计
+GET /products/_stats?level=shards
+
+# 查看写入线程池状态
+GET /_cat/thread_pool/write?v
+
+# 关键指标
+# indexer_1_indexing_time_in_millis: 索引耗时
+# indexer_1_indexing_current: 当前正在索引的文档数
+# refresh_count: refresh 次数
+# flush_count: flush 次数
+# segments: 当前 Segment 数量
+```
+
+### 7.3 常见写入问题排查
+
+**问题一：写入队列积压**
+
+```bash
+# 查看队列积压
+GET /_cat/thread_pool/write?v
+
+# 结果
+node_name name         active queue size
+node1     write-1         5    1000  # queue = 1000 说明积压了
+```
+
+**原因**：写入速度 > ES 处理速度
+
+**解决方案**：
+1. 减少批量大小（避免单次写入过大）
+2. 增加并发写入线程数
+3. 检查是否是 GC 停顿导致
+4. 检查是否是网络 IO 瓶颈
+
+**问题二：Translog 增长过快**
+
+```bash
+# 查看 Translog 大小
+GET /products/_stats?flat_settings=true | grep translog
+```
+
+**原因**：`translog.durability = async` 且 sync 间隔太长
+
+**解决方案**：调小 `translog.sync_interval`
+
+**问题三：Segment 数量过多**
+
+```bash
+# 查看各分片的 Segment 数量
+GET /_cat/shards/products?v
+
+# 查看 Segment 详情
+GET /products/_segments
+```
+
+**原因**：Refresh 过于频繁或 merge 跟不上
+
+**解决方案**：
+1. 调大 `refresh_interval`
+2. 减少 merge 线程的竞争
+3. 手动触发 merge：`POST /products/_forcemerge`
+
+---
+
+## 八、常见坑与避坑指南
+
+### 8.1 坑一：Refresh 过于频繁
+
+**问题**：默认 1 秒的 Refresh 间隔对写入密集型场景来说太频繁。
+
+**现象**：
+- 产生大量小 Segment
+- Merge 线程压力增大
+- 写入性能差
+
+**解决方案**：
+
+```bash
+# 写入密集型场景调大 Refresh 间隔
+PUT /products/_settings
+{
+  "index.refresh_interval": "30s"
+}
+```
+
+### 8.2 坑二：写入峰值触发 Merge 风暴
+
+**问题**：写入峰值时产生大量小 Segment，后台 merge 跟不上，形成「风暴」。
+
+**现象**：
+- Segment 数量持续增长
+- 查询性能逐渐下降
+- CPU 和 IO 使用率飙升
+
+**解决方案**：
+
+1. **削峰写入**：使用消息队列缓冲写入
+2. **限制 merge 线程**：`max_thread_count = 1`，减少与写入的竞争
+3. **调大 Segment 阈值**：`segments_per_tier` 调大
+
+```bash
+# 临时调大 segments_per_tier
+PUT /products/_settings
+{
+  "index.merge.policy.segments_per_tier": 30
+}
+```
+
+### 8.3 坑三：Mapping 中 dynamic: strict 触发大量 rejection
+
+**问题**：业务代码有 bug，写入了未定义的字段，导致大量写入被拒绝。
+
+**现象**：
+- `index.rejected` 指标飙升
+- 监控告警
+
+**解决方案**：
+
+1. 快速修复：将 `dynamic` 改为 `false`，允许写入但不创建字段
+2. 长期方案：修复业务代码，确保只写入定义的字段
+
+```bash
+# 临时降级为 false（不创建字段，但不报错）
+PUT /products/_settings
+{
+  "mappings": {
+    "dynamic": "false"
+  }
+}
+```
+
+### 8.4 坑四：大批量写入后数据不可查询
+
+**问题**：写入完成后立即查询，发现数据不存在。
+
+**原因**：数据还在内存 Buffer 中，没有经过 Refresh。
+
+**解决方案**：
+
+```bash
+# 写入完成后显式刷新
+POST /products/_refresh
+
+# 或者使用 refresh 参数（自动刷新）
+POST /products/_doc/1?refresh=true
+{ ... }
+```
+
+### 8.5 坑五：副本写入阻塞
+
+**问题**：副本节点响应慢，导致主分片写入被阻塞。
+
+**原因**：`wait_for_active_shards` 设置过高，部分副本不可用。
+
+**解决方案**：
+
+1. 降低 `wait_for_active_shards`：从 `all` 改为 `quorum`
+2. 监控副本健康状态：确保副本数量充足
+3. 考虑关闭副本导入模式
+
+---
+
+## 九、面试实战
+
+### 9.1 场景一：ES 写入流程
+
+**面试官问**：「ES 的写入流程是什么？数据多久可以被搜索到？」
+
+**深入回答**：
+
+> ES 的写入流程分为几个阶段：
+>
+> **第一阶段：写入主分片**。协调节点根据 `_routing` 计算目标分片，将请求发送到主分片节点。数据写入内存 Buffer 和 Translog。
+>
+> **第二阶段：写入副本分片**。主分片写入成功后，并行写入副本分片。根据 `wait_for_active_shards` 配置决定等待多少副本确认。
+>
+> **第三阶段：返回响应**。协调节点收到主分片和副本分片的响应后，返回写入成功给客户端。
+>
+> **第四阶段：后台 Refresh**。默认每秒，后台线程将内存 Buffer 中的数据写入新的 Segment，此时数据可以被搜索到。
+>
+> **第五阶段：后台 Flush**。默认 30 分钟或 Translog 达到阈值，Segment 刷盘并清空 Translog。
+>
+> 所以，默认情况下，**写入后约 1 秒数据可被搜索到**。这是因为 Refresh 间隔是 1 秒。
+
+### 9.2 场景二：写入性能优化
+
+**面试官问**：「ES 写入性能差，你怀疑是哪些原因？」
+
+**深入回答**：
+
+> ES 写入性能差的常见原因：
+>
+> **第一，批量大小不合适**。单次 Bulk 请求太大或太小都会影响性能。推荐 5-15MB 或 1000-5000 条。
+>
+> **第二，Refresh 间隔太短**。默认 1 秒的 Refresh 会产生大量小 Segment。写入密集型场景可以临时调大到 30 秒或 -1。
+>
+> **第三，副本写入阻塞**。如果 `wait_for_active_shards = all`，任何一个副本慢都会拖慢写入。改为 `quorum` 或 `1`。
+>
+> **第四，Translog 同步过于频繁**。`translog.durability = sync` 时每次写入都要刷 Translog。批量导入时可以改为 `async`。
+>
+> **第五，Segment Merge 压力大**。写入峰值产生大量小 Segment，merge 线程跟不上。调大 `segments_per_tier` 或限制 merge 线程数。
+>
+> **第六，Mapping 设计不合理**。字段过多、`dynamic = true` 导致 Mapping 膨胀。合理设计字段，使用 `strict` 模式。
+
+### 9.3 场景三：Translog 的作用
+
+**面试官问**：「Translog 在 ES 中起什么作用？如果 Translog 丢失会怎样？」
+
+**深入回答**：
+
+> Translog 是 ES 的 WAL（Write-Ahead Logging）机制。
+>
+> **作用**：
+>
+> 1. **保证数据不丢失**。数据写入时，先写 Translog 再写内存 Buffer。即使机器宕机，重启后可以通过 Translog 恢复未刷盘的数据。
+>
+> 2. **实现数据一致性**。通过 Translog 的 checkpoint 机制，确保数据的持久性和一致性。
+>
+> **如果 Translog 丢失**：
+>
+> - 如果 Translog 和 Segment 都丢了：数据完全丢失
+> - 如果 Translog 丢了但 Segment 还在：数据可恢复，但可能丢失 Refresh 之后、Flush 之前的数据
+>
+> **Translog 的持久化策略**：
+>
+> - `sync`：每次写入都同步刷 Translog，可靠性最高，性能最差
+> - `async`：定期批量刷 Translog，性能高，但可能丢失 `sync_interval` 间隔内的数据
+
+---
+
+## 十、留给你的思考题
+
+### 题目一：写入与查询的平衡
+
+假设你的业务需要**实时写入**（写入后秒级可查）和**高写入吞吐**（每秒 10 万条）。
+
+默认的 Refresh 间隔是 1 秒。如果调大到 30 秒，写入会变快，但数据延迟也会变高。
+
+你能想到什么方案，在保证实时性的同时提升写入吞吐？
+
+### 题目二：数据恢复与 Translog
+
+ES 的 Translog 用于数据恢复，但 Translog 本身也有持久化问题。
+
+如果机器在以下三个时间点宕机，分别会丢失多少数据？
+
+1. 数据刚写入内存 Buffer，还没写 Translog
+2. 数据写入了 Translog，但还没 Refresh
+3. 数据 Refresh 到了 Segment，但还没 Flush
+
+### 题目三：Merge 的代价
+
+Segment Merge 可以减少 Segment 数量，提升查询性能。但 Merge 本身也会消耗 IO 和 CPU。
+
+如果你的写入峰值是每秒 1 万条，每个 Segment 默认 1 秒产生一个，Merge 线程需要多久才能追上？
+
+---
+
+## 总结
+
+ES 写入优化是一个系统工程，需要从多个维度入手：
+
+**写入方式**：
+- 使用 Bulk API 批量写入
+- 控制批量大小（5-15MB）和并发数
+- 临时禁用 Refresh 加速批量导入
+
+**副本与一致性**：
+- `wait_for_active_shards` 根据可靠性需求选择
+- `translog.durability` 在可靠性和性能间权衡
+
+**后台机制**：
+- Refresh 间隔控制写入与可查询的平衡
+- Segment Merge 减少 Segment 数量
+- Translog 保证数据不丢失
+
+**监控与调优**：
+- 关注写入队列、Translog 大小、Segment 数量
+- 使用 profile API 分析写入瓶颈
+
+记住一句话：**ES 写入优化的核心是「批量 + 并发 + 减少不必要的开销」**。理解写入流程和内部机制，才能找到真正的性能瓶颈。
