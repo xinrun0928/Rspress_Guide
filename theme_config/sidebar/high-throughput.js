@@ -8,11 +8,13 @@ export const highThroughputSidebar = [
         link: '/high-throughput/high-performance/method/',
         collapsed: true,
         items: [
+          { text: '性能度量指标体系', link: '/high-throughput/high-performance/method/metrics' },
           { text: '木桶原理与测量驱动', link: '/high-throughput/high-performance/method/principle' },
-          { text: '性能优化度量指标', link: '/high-throughput/high-performance/method/metrics' },
-          { text: '性能瓶颈分析方法', link: '/high-throughput/high-performance/method/bottleneck' },
-          { text: '全链路压测', link: '/high-throughput/high-performance/method/pressure-test' },
-          { text: '性能优化 checklist', link: '/high-throughput/high-performance/method/checklist' },
+          { text: '瓶颈定位分析方法', link: '/high-throughput/high-performance/method/bottleneck' },
+          { text: '全链路压测实践', link: '/high-throughput/high-performance/method/pressure-test' },
+          { text: '性能剖析工具选型', link: '/high-throughput/high-performance/method/profiling-tools' },
+          { text: '空间时间互换策略', link: '/high-throughput/high-performance/method/space-time-tradeoff' },
+          { text: '优化落地检查清单', link: '/high-throughput/high-performance/method/checklist' },
         ],
       },
       {
