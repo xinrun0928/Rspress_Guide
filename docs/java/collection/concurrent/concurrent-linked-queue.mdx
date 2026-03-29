@@ -1,0 +1,200 @@
+# ConcurrentLinkedQueue 无锁实现原理
+
+ConcurrentLinkedQueue 是 Java 并发包中一个高性能的无锁队列。它使用无锁算法（Lock-Free Algorithm）实现，在高并发场景下表现出色，远超基于锁的队列实现。理解它的实现原理，需要先理解无锁编程的核心技术——CAS（Compare-And-Swap）。
+
+## 无锁编程的基本概念
+
+传统的基于锁的并发控制需要线程等待锁的释放，这个等待过程是阻塞的，可能导致线程切换开销和优先级反转问题。
+
+无锁算法则不同：它使用 CPU 提供的原子指令（如 CAS），让多个线程可以在不阻塞的情况下并发操作共享数据结构。如果 CAS 操作失败，线程会重试，而不是阻塞等待。
+
+CAS 操作包含三个操作数：
+
+```java
+boolean compareAndSwapObject(Object obj, long offset, Object expect, Object update);
+```
+
+- `obj` + `offset`：要修改的变量的内存地址
+- `expect`：期望的当前值
+- `update`：要写入的新值
+
+当且仅当 `obj` 位置的值等于 `expect` 时，才将其更新为 `update`。操作是原子的，不会被中断。
+
+## ConcurrentLinkedQueue 的节点结构
+
+```java
+public class ConcurrentLinkedQueue<E> extends AbstractQueue<E> 
+    implements Queue<E>, Serializable {
+    
+    private static class Node<E> {
+        volatile E item;
+        volatile Node<E> next;
+        
+        Node(E item) {
+            UNSAFE.putObject(this, itemOffset, item);
+        }
+    }
+    
+    private transient volatile Node<E> head;
+    private transient volatile Node<E> tail;
+}
+```
+
+每个节点包含两个 volatile 字段：
+
+- `item`：存储的元素（null 表示已出队）
+- `next`：指向下一个节点的引用
+
+## Unsafe 与 CAS 操作
+
+ConcurrentLinkedQueue 直接使用 Unsafe 类进行 CAS 操作：
+
+```java
+private static final sun.misc.Unsafe UNSAFE;
+private static final long headOffset = UNSAFE.objectFieldOffset(
+    ConcurrentLinkedQueue.class.getDeclaredField("head"));
+private static final long itemOffset = UNSAFE.objectFieldOffset(
+    Node.class.getDeclaredField("item"));
+private static final long nextOffset = UNSAFE.objectFieldOffset(
+    Node.class.getDeclaredField("next"));
+
+private static <E> boolean casItem(Node<E> node, E expect, E update) {
+    return UNSAFE.compareAndSwapObject(node, itemOffset, expect, update);
+}
+
+private static <E> boolean casNext(Node<E> node, Node<E> expect, Node<E> update) {
+    return UNSAFE.compareAndSwapObject(node, nextOffset, expect, update);
+}
+```
+
+这些方法提供了原子更新节点属性或链表指针的能力。
+
+## offer：入队操作
+
+```java
+public boolean offer(E e) {
+    if (e == null) throw new NullPointerException();
+    Node<E> n = new Node<E>(e);
+    restartFromHead:
+    for (;;) {
+        for (Node<E> h = head, p = h, q;;) {
+            if ((q = p.next) != null &&
+                (q = (p = q).next) != null)
+                p = h = head;
+            else if (p.next == null) {
+                if (p.casNext(null, n)) {
+                    if (p != h)
+                        casHead(h, n);
+                    return true;
+                }
+            }
+            else
+                p = q;
+        }
+    }
+}
+```
+
+入队操作的核心逻辑：
+
+1. 创建新节点
+2. 从 head 开始遍历，找到尾节点的 next 位置（p.next == null）
+3. 使用 CAS 将新节点链接到尾部：`p.casNext(null, n)`
+4. 如果当前节点不是 head，更新 head
+
+为什么需要更新 head？ConcurrentLinkedQueue 采用了"延迟删除"策略：出队时不立即更新 head，而是让 head 指向一个 item 为 null 的"空节点"，下次操作时再更新。
+
+## poll：出队操作
+
+```java
+public E poll() {
+    restartFromHead:
+    for (;;) {
+        for (Node<E> h = head, p = h, q;;) {
+            E item = p.item;
+            if (item != null && p.casItem(item, null)) {
+                if (p != h)
+                    casHead(h, ((q = p.next) != null) ? q : p);
+                return item;
+            }
+            else if ((q = p.next) == null) {
+                casHead(h, p);
+                return null;
+            }
+            else if (p == q)
+                continue restartFromHead;
+            else
+                p = q;
+        }
+    }
+}
+```
+
+出队操作的核心逻辑：
+
+1. 从 head 开始遍历
+2. 检查 head 的 item 是否为 null
+3. 使用 CAS 将 item 更新为 null：`p.casItem(item, null)`
+4. 如果成功，更新 head 并返回 item
+5. 如果 item 已经是 null，说明已被其他线程出队，重试
+
+## HOPS（跳过一个空节点）
+
+ConcurrentLinkedQueue 使用 HOPS（Head Offset Pointer Strategy）来减少不必要的 head 更新：
+
+```java
+private static final int HOPS = 1;
+
+final void updateHead(Node<E> h, Node<E> p) {
+    if (h != p && casHead(h, p))
+        UNSAFE.putObject(h, headOffset, p);
+}
+```
+
+updateHead 接受两个参数：当前的 head (h) 和新的 head (p)。只有当 p != h 时才更新 head。这意味着 head 不需要每次出队都更新，最多跳跃一个空节点。
+
+这样设计的好处：
+
+- 减少 CAS 操作，降低竞争
+- 避免频繁更新 head 带来的缓存失效
+
+## 无界队列与 OOM 风险
+
+ConcurrentLinkedQueue 是无界队列，不会阻塞。但这也意味着如果入队速度远快于出队，队列会无限增长，最终导致 OOM。
+
+```java
+ConcurrentLinkedQueue<Object> queue = new ConcurrentLinkedQueue<>();
+// 如果只入队不出队，内存会持续增长
+```
+
+使用无界队列时需要确保：
+
+- 消费者速度足够快
+- 或使用有界队列（如 LinkedBlockingQueue）来防止内存溢出
+
+## 与 BlockingQueue 的对比
+
+| 特性 | ConcurrentLinkedQueue | BlockingQueue |
+|------|----------------------|---------------|
+| API | offer/poll（非阻塞） | offer/take（阻塞） |
+| 容量 | 无界 | 可有界可无界 |
+| 等待 | 不等待，返回 false/null | 可等待直到可用 |
+| 适用场景 | 高性能非阻塞场景 | 生产者-消费者阻塞场景 |
+
+## 适用场景
+
+ConcurrentLinkedQueue 适合：
+
+1. **高吞吐量队列**：无锁实现带来极高的并发性能
+2. **非阻塞操作**：不想让线程因队列满/空而阻塞
+3. **生命周期管理**：队列大小可控，消费者能及时消费
+
+不适合：
+
+1. **需要阻塞操作**：应该用 BlockingQueue
+2. **有界队列**：应该用有界的 BlockingQueue
+3. **低并发场景**：简单场景下额外开销可能不值得
+
+理解 ConcurrentLinkedQueue 的无锁实现，你就能理解 Java 并发包中高性能队列的设计哲学——用算法和硬件原子指令替代锁，实现无阻塞的并发访问。
+
+在高并发消息队列或任务分发的场景中，ConcurrentLinkedQueue 是否是你的首选？

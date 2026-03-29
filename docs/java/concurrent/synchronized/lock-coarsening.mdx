@@ -1,0 +1,428 @@
+import { Badge } from '@rspress/core/theme';
+
+# 锁消除与锁粗化：JVM 的运行时优化
+
+我们都知道 synchronized 可以保证线程安全，但一个设计良好的 JIT 编译器会在运行时"悄悄"帮你优化掉不必要的锁操作——这就是**锁消除（Lock Elision）**和**锁粗化（Lock Coarsening）**。这些优化由 JIT 编译器在字节码执行时进行，不需要你手动干预，但理解它们能帮助我们写出更高效的代码。
+
+## 逃逸分析：优化的前提
+
+锁消除和锁粗化的前提是**逃逸分析（Escape Analysis）**。逃逸分析是 JIT 编译器判断一个对象是否会"逃逸"出当前线程或方法作用域的分析过程。
+
+### 什么是逃逸？
+
+```java
+public class EscapeDemo {
+    
+    // 逃逸场景1：对象作为返回值
+    public Object createObject() {
+        Object obj = new Object();
+        return obj;  // 逃逸到方法外部
+    }
+    
+    // 逃逸场景2：对象作为静态字段
+    static Object staticObj;
+    public void setStatic(Object obj) {
+        staticObj = obj;  // 逃逸到类级别
+    }
+    
+    // 逃逸场景3：作为参数传递
+    public void passToOther(Object obj) {
+        otherMethod(obj);  // 逃逸到其他方法
+    }
+    
+    // 不逃逸：对象只在方法内部使用
+    public void localScope() {
+        Object obj = new Object();  // 不会逃逸
+        obj.hashCode();
+        // 方法结束，对象被销毁
+    }
+}
+```
+
+### 逃逸分析的作用
+
+```java
+// 未优化前
+public void process() {
+    Object obj = new Object();
+    synchronized (obj) {  // 这个锁可能是不必要的
+        // 对 obj 的操作
+    }
+}
+```
+
+如果 JIT 通过逃逸分析发现 `obj` 不会逃逸出当前方法，那么：
+1. `obj` 不可能被其他线程访问
+2. `synchronized (obj)` 完全没必要
+3. JIT 可以**消除**这个锁
+
+## 锁消除：消除不必要的锁
+
+### 锁消除的实现
+
+```java
+// JDK 源码中锁消除的逻辑（JIT 编译器层面）
+// 伪代码
+class LockElisionPhase {
+    
+    // 检查是否可以消除锁
+    boolean canElideLock(Object obj) {
+        // 1. 逃逸分析：对象是否逃逸
+        if (!escapeAnalysis.canEscape(obj)) {
+            // 2. 检查锁是否只被当前线程使用
+            if (lock.isUsedOnlyByCurrentThread(obj)) {
+                return true;  // 可以消除
+            }
+        }
+        return false;
+    }
+    
+    // 应用锁消除优化
+    void elideLock(SynchronizedNode node) {
+        // 直接移除 synchronized 关键字的字节码
+        // 不生成任何锁相关的机器码
+    }
+}
+```
+
+### 实际案例
+
+```java
+public class LockElisionExample {
+    
+    // 案例1：StringBuffer 的 append
+    public String concat(String a, String b) {
+        // StringBuffer 是局部变量，不会逃逸
+        // JIT 会消除 StringBuffer 内部的 synchronized
+        StringBuffer sb = new StringBuffer();
+        sb.append(a);
+        sb.append(b);
+        return sb.toString();
+    }
+    
+    // 案例2：StringBuilder vs StringBuffer
+    public String goodConcat(String a, String b) {
+        // StringBuilder 更快，因为不需要 synchronized
+        // 但在单线程环境下，JIT 会自动优化 StringBuffer
+        StringBuffer sb = new StringBuffer();
+        sb.append(a);
+        sb.append(b);
+        return sb.toString();
+    }
+    
+    // 案例3：Integer 的缓存
+    public void cacheExample() {
+        // Integer.valueOf(1) 返回的是缓存对象
+        // 缓存对象可能被多个线程共享，不适合锁消除
+        // 但对于完全局部的计算，JIT 会分析
+        Integer a = 1;  // 缓存
+        Integer b = 2;  // 缓存
+        synchronized (a) {  // 可能被消除
+            Integer c = a + b;
+        }
+    }
+}
+```
+
+### JIT 编译后的验证
+
+```java
+import java.util.ArrayList;
+import java.util.List;
+
+public class LockElisionVerification {
+    
+    public static void main(String[] args) {
+        // warm up JIT
+        for (int i = 0; i < 100000; i++) {
+            process();
+        }
+        
+        // 使用 -XX:+PrintAssembly 可以看到实际生成的汇编
+        // 如果看到 lock cmpxchg 等指令，说明锁没有被消除
+        // 如果没有看到，说明锁被消除了
+        process();
+    }
+    
+    public static String process() {
+        StringBuffer sb = new StringBuffer();
+        for (int i = 0; i < 100; i++) {
+            sb.append(i);
+        }
+        return sb.toString();
+    }
+}
+```
+
+使用 JVM 参数 `-XX:+PrintOptoAssembly` 或 `-XX:+PrintAssembly` 可以查看 JIT 生成的汇编代码。
+
+## 锁粗化：扩大锁的范围
+
+### 为什么要锁粗化？
+
+考虑这段代码：
+
+```java
+public class LockCoarseningExample {
+    
+    StringBuilder builder = new StringBuilder();
+    
+    public void appendMany() {
+        for (int i = 0; i < 1000; i++) {
+            synchronized (builder) {
+                builder.append(i);  // 每次只锁一小段时间
+            }
+        }
+    }
+}
+```
+
+虽然每次 `append` 只需要很短的时间，但 1000 次的加锁/解锁开销累积起来也很可观。**锁粗化**会把这 1000 次同步合并为一次：
+
+```java
+// 粗化后的效果
+public void appendMany() {
+    synchronized (builder) {  // 只加锁一次
+        for (int i = 0; i < 1000; i++) {
+            builder.append(i);
+        }
+    }
+}
+```
+
+### 锁粗化的条件
+
+```java
+// JIT 锁粗化的判断逻辑
+class LockCoarseningPhase {
+    
+    boolean canCoarsen(NodeList nodes) {
+        // 1. 所有同步块使用同一把锁
+        LockNode lock1 = nodes.get(0).getLock();
+        for (int i = 1; i < nodes.size(); i++) {
+            if (nodes.get(i).getLock() != lock1) {
+                return false;  // 不同锁，不能粗化
+            }
+        }
+        
+        // 2. 锁之间的代码不能有修改锁的操作
+        for (int i = 0; i < nodes.size() - 1; i++) {
+            if (nodes.get(i).canSeeLockModification(nodes.get(i + 1))) {
+                return false;  // 中间有锁操作，不能粗化
+            }
+        }
+        
+        // 3. 粗化后的代码语义必须相同
+        if (hasSideEffectsBetween(nodes)) {
+            return false;
+        }
+        
+        return true;
+    }
+}
+```
+
+### 不能粗化的场景
+
+```java
+public class CannotCoarsenExample {
+    
+    Object lock = new Object();
+    int counter = 0;
+    
+    // 场景1：中间代码修改了锁对象
+    public void badPattern() {
+        synchronized (lock) {
+            counter++;
+        }
+        lock = new Object();  // 锁对象被修改，不能粗化
+        synchronized (lock) {
+            counter++;
+        }
+    }
+    
+    // 场景2：中间代码可能阻塞
+    public void blockingPattern() {
+        synchronized (lock) {
+            counter++;
+        }
+        Thread.sleep(100);  // 可能阻塞，不应该粗化
+        synchronized (lock) {
+            counter++;
+        }
+    }
+    
+    // 场景3：中间代码调用了 wait
+    public void waitPattern() {
+        synchronized (lock) {
+            counter++;
+        }
+        // 释放锁会导致不同的等待语义
+        // 不能粗化
+        synchronized (lock) {
+            counter++;
+        }
+    }
+}
+```
+
+### 正确的锁粗化场景
+
+```java
+public class GoodCoarseningExample {
+    
+    StringBuilder sb = new StringBuilder();
+    
+    // 场景1：循环内的同步
+    public String buildString(int n) {
+        for (int i = 0; i < n; i++) {
+            synchronized (sb) {  // JIT 会粗化
+                sb.append(i);
+            }
+        }
+        // 粗化为：
+        // synchronized (sb) {
+        //     for (int i = 0; i < n; i++) {
+        //         sb.append(i);
+        //     }
+        // }
+        return sb.toString();
+    }
+    
+    // 场景2：连续的操作
+    public void chainedOperations() {
+        List<String> list = new ArrayList<>();
+        
+        synchronized (list) { list.add("a"); }
+        synchronized (list) { list.add("b"); }
+        synchronized (list) { list.add("c"); }
+        // 可能被粗化为一个同步块
+    }
+}
+```
+
+## 锁粗化与锁消除的结合
+
+JIT 编译器会同时进行锁粗化和锁消除，形成强强联合：
+
+```java
+public class CombinedOptimization {
+    
+    Object obj = new Object();
+    
+    public void combinedExample() {
+        // 原始代码
+        for (int i = 0; i < 1000; i++) {
+            synchronized (obj) {
+                // 如果 obj 不逃逸，锁会被消除
+                // 如果消除后同步块为空，整个块被移除
+            }
+        }
+        
+        // 优化步骤：
+        // 1. 逃逸分析：obj 不逃逸
+        // 2. 锁消除：移除 synchronized
+        // 3. 标量替换：obj 的字段被拆散
+        // 结果：循环变成空循环或直接优化掉
+    }
+}
+```
+
+## JVM 参数控制
+
+可以使用 JVM 参数控制锁优化：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `-XX:+DoEscapeAnalysis` | true | 启用逃逸分析 |
+| `-XX:+EliminateLocks` | true | 启用锁消除 |
+| `-XX:+EliminateAllocations` | true | 启用标量替换 |
+| `-XX:+UseSuperWord` | true | 启用SIMD向量化优化 |
+
+```bash
+# 禁用锁消除（调试用）
+java -XX:-EliminateLocks -jar app.jar
+
+# 禁用逃逸分析
+java -XX:-DoEscapeAnalysis -jar app.jar
+
+# 查看优化日志
+java -XX:+PrintCompilation -XX:+PrintInlining -jar app.jar
+```
+
+## 实战：观察锁优化效果
+
+```java
+public class LockOptimizationBenchmark {
+    
+    private static final int ITERATIONS = 10_000_000;
+    
+    public static void main(String[] args) {
+        // warm up JIT
+        for (int i = 0; i < 100; i++) {
+            runBenchmark(false);
+        }
+        
+        // 正式测试
+        long time = runBenchmark(true);
+        System.out.println("Time: " + time + " ms");
+        
+        // 对比：禁用优化后的时间
+        // java -XX:-DoEscapeAnalysis -XX:-EliminateLocks LockOptimizationBenchmark
+    }
+    
+    // 场景1：可以锁消除
+    public static void lockElisionCase() {
+        // sb 是局部变量，不会逃逸
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < 100; i++) {
+            synchronized (sb) {  // JIT 会消除这个锁
+                sb.append(i);
+            }
+        }
+    }
+    
+    // 场景2：不能锁消除
+    public static void noElisionCase() {
+        // obj 作为返回值或参数传递时会逃逸
+        Object obj = createObject();
+        for (int i = 0; i < 100; i++) {
+            synchronized (obj) {  // JIT 不能消除
+                obj.toString();
+            }
+        }
+    }
+    
+    private static Object createObject() {
+        return new Object();
+    }
+    
+    private static long runBenchmark(boolean measure) {
+        long start = System.nanoTime();
+        for (int i = 0; i < ITERATIONS; i++) {
+            lockElisionCase();
+            noElisionCase();
+        }
+        long end = System.nanoTime();
+        return measure ? (end - start) / 1_000_000 : 0;
+    }
+}
+```
+
+## 总结
+
+锁消除和锁粗化是 JIT 编译器为我们提供的运行时优化：
+
+- **锁消除**：通过逃逸分析判断对象不会逃逸，消除不必要的 synchronized
+- **锁粗化**：将连续的多个同步块合并为一个，减少加锁/解锁开销
+
+这些优化是自动进行的，不需要开发者手动干预。但理解它们能帮助我们：
+1. 不必过度担心局部变量的同步开销
+2. 在必要时可以使用 StringBuffer 而不用担心性能
+3. 理解 JIT 优化的边界，避免写出阻止优化的代码
+
+你会不会觉得，既然 JIT 会优化，那就不用关心 synchronized 的性能了？答案是：不完全是。优化有边界，理解边界才能写出真正高效的代码。
+
+> import { Badge } from '@rspress/core/theme';
+
+<Badge>Performance</Badge> 现代 JVM 的锁优化非常成熟，大多数情况下不需要手动优化 synchronized

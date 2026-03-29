@@ -1,0 +1,324 @@
+# Future 异常处理：让错误变得可控
+
+在同步代码中，异常处理简单直接——用 try-catch 包裹即可。但在异步编程中，情况变得更加复杂。异步任务可能在另一个线程中执行，异常会被"吞掉"还是能正常传播？异步调用链中抛出异常会怎样？如何优雅地处理异步任务中的错误？本章将深入探讨 `CompletableFuture` 的异常处理机制。
+
+## 异常传播：CompletableFuture 如何传递错误
+
+与 `FutureTask` 类似，`CompletableFuture` 会捕获任务中的异常，并将其封装在 `CompletionException` 中：
+
+```java
+CompletableFuture<Integer> future = CompletableFuture.supplyAsync(() -> {
+    throw new RuntimeException("原始异常");
+});
+
+// 获取结果时会抛出 ExecutionException
+try {
+    future.get();
+} catch (ExecutionException e) {
+    System.out.println(e.getCause().getMessage());  // "原始异常"
+}
+
+// join() 同样会抛出 unchecked 异常
+try {
+    future.join();
+} catch (CompletionException e) {
+    System.out.println(e.getCause().getMessage());  // "原始异常"
+}
+```
+
+异常被包装了两层：
+- `CompletionException`（`CompletableFuture` 使用）
+- `ExecutionException`（`Future.get()` 使用）
+
+## exceptionally：捕获并恢复
+
+`exceptionally` 是最常用的异常处理方法，它让你在异常发生时返回一个默认值：
+
+```java
+CompletableFuture<String> future = CompletableFuture
+    .supplyAsync(() -> {
+        if (Math.random() < 0.5) {
+            throw new RuntimeException("随机失败");
+        }
+        return "成功";
+    })
+    .exceptionally(ex -> {
+        System.out.println("捕获异常: " + ex.getMessage());
+        return "默认值";  // 返回默认值
+    });
+
+// 无论成功还是失败，future 都有值
+System.out.println(future.join());  // "成功" 或 "默认值"
+```
+
+### exceptionally 的链式处理
+
+`exceptionally` 返回的 `CompletableFuture` 会继续后续的链式调用：
+
+```java
+CompletableFuture<String> future = CompletableFuture
+    .supplyAsync(() -> fetchData())
+    .exceptionally(ex -> {
+        log.error("获取数据失败", ex);
+        return null;
+    })
+    .thenApply(data -> {
+        // data 可能是 null
+        return processData(data);
+    })
+    .exceptionally(ex -> {
+        log.error("处理数据失败", ex);
+        return "fallback";
+    });
+```
+
+## handle：无论如何都处理
+
+`handle` 与 `exceptionally` 的区别在于：它无论成功还是失败都会执行：
+
+```java
+// 语法
+<U> CompletableFuture<U> handle(BiFunction<? super T, Throwable, ? extends U> fn);
+
+// handle 示例
+CompletableFuture<String> future = CompletableFuture
+    .supplyAsync(() -> {
+        if (Math.random() < 0.5) throw new RuntimeException("Oops");
+        return "success";
+    })
+    .handle((result, ex) -> {
+        if (ex != null) {
+            System.out.println("异常: " + ex.getMessage());
+            return "fallback";
+        }
+        System.out.println("成功: " + result);
+        return result;
+    });
+```
+
+### exceptionally vs handle：如何选择？
+
+```java
+// exceptionally：只想处理异常，成功时透传
+future.exceptionally(ex -> {
+    if (ex instanceof IOException) return "网络错误";
+    if (ex instanceof TimeoutException) return "超时";
+    return "未知错误";
+});
+
+// handle：成功和失败需要不同的处理逻辑
+future.handle((result, ex) -> {
+    if (ex != null) {
+        return "异常处理: " + ex.getMessage();
+    }
+    return "成功处理: " + result;
+});
+```
+
+## whenComplete：完成时回调
+
+`whenComplete` 类似于 `handle`，但它不改变结果：
+
+```java
+// 语法
+CompletableFuture<T> whenComplete(BiConsumer<? super T, ? super Throwable> action);
+
+// whenComplete 示例
+CompletableFuture<String> future = CompletableFuture
+    .supplyAsync(() -> doSomething())
+    .whenComplete((result, ex) -> {
+        if (ex != null) {
+            logger.error("任务失败", ex);
+        } else {
+            logger.info("任务成功: " + result);
+        }
+        // 注意：result 和 ex 只有一个是非 null 的
+    });
+
+// 注意：whenComplete 不改变结果，后续仍然获取原结果
+CompletableFuture<String> result = future.thenApply(r -> r + "!");
+// result 的值仍然是 doSomething() 的返回值
+```
+
+## exceptionallyCompose：异常时执行另一个 Future
+
+当异常发生时，有时需要执行另一个异步操作来恢复：
+
+```java
+// 使用 exceptionally（会嵌套）
+CompletableFuture<String> future = CompletableFuture
+    .supplyAsync(() -> fetchFromPrimary())
+    .exceptionally(ex -> {
+        return fallbackOperation().join();  // 嵌套
+    });
+
+// 使用 exceptionallyCompose（扁平化）
+CompletableFuture<String> flatFuture = CompletableFuture
+    .supplyAsync(() -> fetchFromPrimary())
+    .exceptionallyCompose(ex -> {
+        return fallbackOperation();  // 返回 CompletableFuture
+    });
+```
+
+### 实际应用：多级降级
+
+```java
+CompletableFuture<String> fetchUserProfile(String userId) {
+    return userService.fetchFromCache(userId)
+        .exceptionallyCompose(ex -> {
+            logger.warn("缓存失败，尝试数据库", ex);
+            return userService.fetchFromDatabase(userId);
+        })
+        .exceptionallyCompose(ex -> {
+            logger.warn("数据库失败，尝试远程API", ex);
+            return userService.fetchFromRemote(userId);
+        })
+        .exceptionally(ex -> {
+            logger.error("所有数据源都失败", ex);
+            return CompletableFuture.completedFuture("默认用户");
+        });
+}
+```
+
+## 链式异常处理：级联处理
+
+在复杂的异步链中，可以对每个环节单独处理异常：
+
+```java
+CompletableFuture<UserProfile> profile = CompletableFuture
+    .supplyAsync(() -> validateRequest(request))
+    .exceptionally(ex -> {
+        throw new BadRequestException("验证失败: " + ex.getMessage());
+    })
+    .thenApply(this::loadUserData)
+    .exceptionally(ex -> {
+        throw new UserNotFoundException("用户不存在");
+    })
+    .thenApply(this::loadUserOrders)
+    .exceptionally(ex -> {
+        throw new OrderServiceException("订单加载失败");
+    })
+    .thenApply(this::enrichWithRecommendations)
+    .exceptionally(ex -> {
+        return createBasicProfile(request.getUserId());  // 返回降级结果
+    });
+```
+
+## 异常处理的最佳实践
+
+### 1. 尽早捕获特定异常
+
+```java
+// 不好的做法：笼统处理
+future.exceptionally(ex -> "默认值");
+
+// 好的做法：区分异常类型
+future.exceptionally(ex -> {
+    if (ex.getCause() instanceof NetworkException) {
+        return "网络不可用";
+    }
+    if (ex.getCause() instanceof TimeoutException) {
+        return "请求超时";
+    }
+    throw new RuntimeException(ex.getCause());  // 未知异常重新抛出
+});
+```
+
+### 2. 提供有意义的降级值
+
+```java
+CompletableFuture<List<Product>> future = productService.search(keyword)
+    .exceptionally(ex -> {
+        logger.error("搜索服务不可用", ex);
+        return Collections.emptyList();  // 返回空列表而非 null
+    });
+```
+
+### 3. 记录异常日志
+
+```java
+future
+    .thenApply(this::processResult)
+    .exceptionally(ex -> {
+        logger.error("处理失败: {}", request, ex);
+        return null;
+    });
+```
+
+### 4. 使用 orTimeout 防止无限等待
+
+```java
+CompletableFuture<String> future = CompletableFuture
+    .supplyAsync(() -> doSomething())
+    .orTimeout(5, TimeUnit.SECONDS)  // 5秒超时
+    .exceptionally(ex -> {
+        if (ex instanceof TimeoutException) {
+            return "超时了";
+        }
+        return "失败: " + ex.getMessage();
+    });
+```
+
+## 取消与超时处理
+
+### 取消任务
+
+```java
+CompletableFuture<String> future = CompletableFuture
+    .supplyAsync(() -> doLongTimeWork());
+
+// 取消
+future.cancel(true);
+
+// 后续处理
+future.exceptionally(ex -> {
+    if (ex instanceof CancellationException) {
+        return "任务被取消";
+    }
+    return "其他错误: " + ex.getMessage();
+});
+```
+
+### 超时统一处理
+
+```java
+public <T> CompletableFuture<T> withTimeout(
+        CompletableFuture<T> future, 
+        long timeout, 
+        TimeUnit unit,
+        T defaultValue) {
+    
+    CompletableFuture<T> timeoutFuture = CompletableFuture
+        .delayedFuture(timeout, unit)
+        .thenApply(ignored -> defaultValue);
+    
+    return future.applyToEither(timeoutFuture, Function.identity());
+}
+
+private static <U> CompletableFuture<U> delayedFuture(
+        long delay, TimeUnit unit) {
+    CompletableFuture<U> promise = new CompletableFuture<>();
+    ForkJoinPool.schedule(() -> {
+        promise.complete(null);
+    }, delay, unit);
+    return promise;
+}
+```
+
+## 本章小结
+
+异步异常处理比同步异常处理更复杂，但 `CompletableFuture` 提供了丰富的工具：
+
+1. `exceptionally`：捕获异常，返回默认值
+2. `handle`：无论成功失败都处理，不改变结果
+3. `whenComplete`：完成时回调，不改变结果
+4. `exceptionallyCompose`：异常时执行另一个 Future
+
+关键原则：
+- 尽早捕获特定异常
+- 提供有意义的降级值
+- 记录异常日志便于排查
+- 使用超时防止无限等待
+- 区分 `exceptionally` 和 `handle` 的使用场景
+
+你是否在项目中遇到过难以排查的异步异常？合理使用异常处理方法，能让你的异步代码更加健壮。

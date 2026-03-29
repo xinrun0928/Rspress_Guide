@@ -1,0 +1,218 @@
+import { Badge } from '@rspress/core/theme';
+
+# 直接内存：堆外内存与 NIO
+
+在 JVM 的内存版图中，直接内存是一个独特的存在。它既不属于运行时数据区，也不受堆大小限制，却与 Java 程序的 I/O 性能密切相关。当我们谈论高性能网络通信、大文件处理、或者 NIO 零拷贝时，直接内存是核心关键词。理解直接内存的设计理念和使用场景，是成为 JVM 性能调优高手的必经之路。
+
+## 什么是直接内存
+
+<Badge>Direct Memory</Badge> <Badge>Off-Heap</Badge>
+
+直接内存（Direct Memory）也称为堆外内存（Off-Heap Memory），是 JVM 进程直接向操作系统申请的内存区域，不受 JVM 堆大小限制。在 HotSpot JVM 中，直接内存通过 `-XX:MaxDirectMemorySize` 参数设置，默认值等于堆的最大大小（`-Xmx`）。
+
+直接内存并非 JVM 运行时数据区的一部分，但它与 Java 程序的运行密切相关。NIO 引入了直接缓冲区的概念，使用直接内存作为缓冲区，可以显著提高 I/O 操作的性能。
+
+```
+┌────────────────────────────────────────────────────┐
+│                    JVM 进程内存                      │
+│  ┌──────────────────────────────────────────────┐  │
+│  │                   堆内存                       │  │
+│  │   年轻代    │    老年代    │   字符串常量池    │  │
+│  └──────────────────────────────────────────────┘  │
+│  ┌──────────────────────────────────────────────┐  │
+│  │                Metaspace（元空间）            │  │
+│  └──────────────────────────────────────────────┘  │
+│  ┌──────────────────────────────────────────────┐  │
+│  │                直接内存（堆外内存）             │  │
+│  │   NIO DirectByteBuffer                       │  │
+│  └──────────────────────────────────────────────┘  │
+│  ┌──────────────────────────────────────────────┐  │
+│  │                本地内存（Native）              │  │
+│  │   JNI、MappedByteBuffer、C++ 堆               │  │
+│  └──────────────────────────────────────────────┘  │
+└────────────────────────────────────────────────────┘
+```
+
+## 为什么需要直接内存
+
+<Badge>I/O Performance</Badge>
+
+传统的 Java I/O 操作需要在内核缓冲区和 JVM 堆内存之间复制数据。当 JVM 需要读取文件时，数据首先从磁盘读入操作系统内核缓冲区，然后复制到 JVM 堆内存供 Java 程序使用。写入操作同理。这种两次拷贝的模式在大多数场景下是可接受的，但当 I/O 量大时，拷贝开销成为性能瓶颈。
+
+直接内存打破了这一模式。使用直接缓冲区时，JVM 在直接内存中分配缓冲区，数据可以直接在直接内存和内核缓冲区之间传输，无需复制到 JVM 堆。Java 程序通过 JNI 操作直接内存中的数据，就像操作普通内存一样。
+
+```
+传统 I/O（堆缓冲区）:
+磁盘 → 内核缓冲区 → JVM堆 → 应用程序
+         ↓           ↑
+      第一次拷贝   第二次拷贝
+
+NIO I/O（直接缓冲区）:
+磁盘 → 内核缓冲区 → 直接内存 → 应用程序
+         ↓              ↑
+      第一次拷贝      无拷贝
+```
+
+## ByteBuffer 分配：堆内 vs 堆外
+
+<Badge>ByteBuffer</Badge>
+
+Java NIO 提供了两种 ByteBuffer 分配方式：`ByteBuffer.allocate()` 分配堆内缓冲区，`ByteBuffer.allocateDirect()` 分配堆外（直接）缓冲区。两者的使用场景和性能特点有明显差异。
+
+`ByteBuffer.allocate(int capacity)` 在 JVM 堆中分配 ByteBuffer。分配速度快，因为堆分配由 JVM 管理；垃圾回收友好，由 GC 自动回收。但 I/O 操作时，数据需要在内核缓冲区和堆之间复制，性能较低。
+
+`ByteBuffer.allocateDirect(int capacity)` 在直接内存中分配 ByteBuffer。I/O 操作时，数据可以直接在内核缓冲区和直接内存之间传输，无需额外的内存复制，显著提高 I/O 性能。但分配速度较慢，因为需要调用本地方法向操作系统申请内存；回收也需要通过 GC 间接完成（ Cleaner 机制）。
+
+```java
+public class BufferComparison {
+    public static void main(String[] args) {
+        // 堆内缓冲区
+        ByteBuffer heapBuffer = ByteBuffer.allocate(1024 * 1024);
+        
+        // 堆外直接缓冲区
+        ByteBuffer directBuffer = ByteBuffer.allocateDirect(1024 * 1024);
+        
+        // 直接缓冲区需要手动释放（或者依赖 Cleaner）
+        ((DirectBuffer) directBuffer).cleaner().clean();
+    }
+}
+```
+
+## Cleaner 机制与直接内存回收
+
+<Badge>Cleaner</Badge>
+
+直接内存的回收是一个容易被忽视的问题。虽然直接内存不在堆中，但它仍然受到 JVM 管理。当 DirectByteBuffer 对象被垃圾回收时，其关联的直接内存需要被释放。HotSpot JVM 通过 Cleaner 机制处理这个问题。
+
+每个 DirectByteBuffer 对象内部持有一个 PhantomReference（虚引用），关联到一个 Cleaner 对象。当 DirectByteBuffer 对象被 GC 时，Cleaner 对象被加入引用队列（ReferenceQueue）。后台线程（ReferenceHandler）定期从引用队列中取出 Cleaner 对象，调用其 `clean()` 方法释放直接内存。
+
+```java
+// DirectByteBuffer 构造过程简化
+class DirectByteBuffer {
+    private final long address;  // 直接内存的地址
+    
+    // 构造时分配直接内存
+    DirectByteBuffer(int capacity) {
+        // 调用本地方法分配直接内存
+        address = unsafe.allocateMemory(capacity);
+    }
+    
+    // 关联 Cleaner
+    static {
+        // Cleaner 用于垃圾回收时释放直接内存
+        cleaner = new Cleaner(this);
+    }
+}
+```
+
+直接内存回收依赖于 DirectByteBuffer 对象的 GC。如果程序创建了大量 DirectByteBuffer 但没有及时释放引用，可能导致直接内存持续增长，最终触发 OOM。
+
+## Unsafe 类的直接内存操作
+
+<Badge>sun.misc.Unsafe</Badge>
+
+`sun.misc.Unsafe` 提供了直接操作内存的能力，这是 Java 底层性能优化和框架开发的重要工具。通过 Unsafe，可以像 C 语言一样直接读写内存地址，实现高性能的数据操作。
+
+Unsafe 的内存操作方法包括：`allocateMemory()` 分配直接内存、`freeMemory()` 释放直接内存、`putLong()` / `getLong()` 等方法直接读写指定地址的内存。
+
+```java
+import sun.misc.Unsafe;
+import java.lang.reflect.Field;
+
+public class UnsafeMemoryDemo {
+    private static Unsafe unsafe;
+    
+    static {
+        try {
+            Field f = Unsafe.class.getDeclaredField("theUnsafe");
+            f.setAccessible(true);
+            unsafe = (Unsafe) f.get(null);
+        } catch (Exception e) {}
+    }
+    
+    public static void main(String[] args) {
+        // 分配 1KB 直接内存
+        long address = unsafe.allocateMemory(1024);
+        
+        // 写入数据
+        unsafe.putLong(address, 123456789L);
+        unsafe.putInt(address + 8, 42);
+        
+        // 读取数据
+        System.out.println(unsafe.getLong(address));
+        System.out.println(unsafe.getInt(address + 8));
+        
+        // 释放内存
+        unsafe.freeMemory(address);
+    }
+}
+```
+
+Netty 等高性能网络框架大量使用直接内存和 Unsafe 进行高效的数据传输。ByteBuf 的实现就大量依赖 Unsafe 操作，避免了 ByteBuffer 的种种限制。
+
+## 直接内存与 NIO 零拷贝
+
+<Badge>Zero-Copy</Badge>
+
+直接内存最核心的价值在于支持零拷贝（Zero-Copy）操作。传统的 I/O 操作即使使用缓冲区，数据仍然需要在内核空间和用户空间之间复制。零拷贝技术通过多种手段减少或消除这种复制。
+
+Linux 的 sendfile 系统调用可以实现文件到网络的零拷贝。数据从磁盘读取到内核缓冲区后，直接传给网络协议栈，无需经过用户空间。Java NIO 的 `FileChannel.transferTo()` 方法底层就使用了 sendfile。
+
+```java
+public class ZeroCopyDemo {
+    public void transferFile(String source, String target) throws IOException {
+        FileInputStream fis = new FileInputStream(source);
+        FileOutputStream fos = new FileOutputStream(target);
+        
+        // 使用 transferTo 实现零拷贝（内部使用 sendfile）
+        FileChannel sourceChannel = fis.getChannel();
+        FileChannel targetChannel = fos.getChannel();
+        
+        long size = sourceChannel.size();
+        sourceChannel.transferTo(0, size, targetChannel);
+        
+        fis.close();
+        fos.close();
+    }
+}
+```
+
+当 transferTo 与直接内存配合使用时，可以实现高效的文件传输：文件 → 内核缓冲区 → 直接内存 → 网络。这比文件 → 内核缓冲区 → JVM堆 → 网络的路径少了一次内核到用户空间的复制。
+
+## 直接内存的调优与问题排查
+
+<Badge>JVM 参数</Badge>
+
+直接内存的大小通过 `-XX:MaxDirectMemorySize` 参数设置。默认值等于 `-Xmx`，即堆的最大大小。在内存充足的系统上，可以适当增大直接内存上限以提高 I/O 性能。
+
+直接内存 OOM 是排查中常见的问题。当程序使用大量 NIO 操作（如网络通信、文件 I/O）时，直接内存可能耗尽。排查时可以使用 `-XX:+PrintGCDetails -XX:+PrintGC` 观察直接内存的 GC 情况。
+
+```bash
+# 查看直接内存使用
+java -XX:MaxDirectMemorySize=512m -XX:+PrintGCDetails -XX:+PrintGC MyApplication
+
+# 使用 jcmd 查看详细内存信息
+jcmd <pid> VM.native_memory summary
+```
+
+## 直接内存与性能优化实践
+
+直接内存是高性能场景的重要工具，但并非所有场景都需要使用。以下是一些使用建议：对于频繁的 I/O 操作（如网络服务器、文件处理），使用直接缓冲区可以显著提升性能。对于短暂的、临时的 I/O 操作，堆内缓冲区可能更快，因为直接内存分配和释放的成本较高。对于需要大量小缓冲区的场景，直接内存可能导致内存碎片化，应谨慎使用。
+
+Netty 是直接内存优化的典型应用。Netty 默认使用直接内存作为 ByteBuf 的存储介质，通过引用计数和池化技术管理内存，显著提升了网络通信的性能。RocketMQ、Kafka 等高性能消息队列也大量使用直接内存。
+
+## 面试高频考点
+
+**问题一：什么是直接内存？** 直接内存是 JVM 堆外内存，通过 `ByteBuffer.allocateDirect()` 分配。它不属于 JVM 堆内存，直接由操作系统管理，可以提高 I/O 操作性能。
+
+**问题二：直接内存和堆内存的区别是什么？** 堆内存受 GC 管理，分配释放由 JVM 负责，I/O 操作需要在内核和堆之间复制数据。直接内存在堆外，不受 GC 直接管理（依赖 Cleaner 机制），I/O 操作可以直接在内核和直接内存之间传输，减少数据复制。
+
+**问题三：直接内存如何回收？** 当 DirectByteBuffer 对象被 GC 时，其 Cleaner 被加入 ReferenceQueue。ReferenceHandler 线程调用 Cleaner.clean() 释放直接内存。
+
+**问题四：什么情况下会抛出直接内存 OOM？** 当程序使用大量 NIO 操作，直接内存耗尽且无法回收更多空间时抛出。常见于 Netty 等高性能框架的不当使用或内存泄漏。
+
+**问题五：`-XX:MaxDirectMemorySize` 参数的作用是什么？** 设置直接内存的最大大小。默认值等于 `-Xmx`（堆的最大大小）。
+
+**问题六：什么场景适合使用直接缓冲区？** 适合长时间占用、高频 I/O 操作的场景，如网络服务器、文件服务器。不适合短生命周期或临时性的 I/O 操作。
+
+直接内存是高性能 Java 应用的重要工具，但它也是一把双刃剑——使用不当可能导致内存泄漏或 OOM。理解它的工作原理，才能在性能优化和稳定性之间找到平衡。那么，为什么不把所有数据都存储在直接内存中，而要保留堆内存呢？

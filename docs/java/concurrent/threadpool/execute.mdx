@@ -1,0 +1,490 @@
+import { Badge } from '@rspress/core/theme';
+
+# 线程池执行流程与状态转换
+
+理解线程池的执行流程和状态转换机制，是掌握线程池的关键。`ThreadPoolExecutor` 内部维护了一套复杂的状态机，通过 `ctl` 变量同时记录线程池状态和活跃线程数。深入理解这个执行流程，能帮助我们预测线程池的行为，避免常见的并发问题。
+
+## 线程池的核心状态机
+
+### ctl：状态与线程数的合并存储
+
+`ThreadPoolExecutor` 使用一个 `AtomicInteger` 变量 `ctl` 来同时记录**线程池状态**和**活跃线程数**：
+
+```java
+public class ThreadPoolExecutor extends AbstractExecutorService {
+    
+    // ctl 是一个32位的整数
+    // 高3位：线程池状态（5种状态）
+    // 低29位：线程池中的线程数量
+    private final AtomicInteger ctl = new AtomicInteger(ctlOf(RUNNING, 0));
+    
+    // 线程数掩码：低29位
+    private static final int COUNT_BITS = Integer.SIZE - 3;  // 29
+    private static final int CAPACITY   = (1 << COUNT_BITS) - 1;  // 000...111...（29个1）
+    
+    // 线程池状态（高3位）
+    private static final int RUNNING  = -1 << COUNT_BITS;  // 111...
+    private static final int SHUTDOWN =  0 << COUNT_BITS;  // 000...
+    private static final int STOP     =  1 << COUNT_BITS;  // 001...
+    private static final int TIDYING   =  2 << COUNT_BITS;  // 010...
+    private static final int TERMINATED = 3 << COUNT_BITS;  // 011...
+    
+    // 状态值
+    // RUNNING:    接受新任务，处理队列任务
+    // SHUTDOWN:   不接受新任务，但处理队列任务
+    // STOP:       不接受新任务，不处理队列任务，中断正在执行的任务
+    // TIDYING:    所有任务终止，workerCount=0，即将执行 terminated()
+    // TERMINATED: terminated() 执行完成
+}
+```
+
+### 状态转换图
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                      线程池状态转换                              │
+│                                                                 │
+│   RUNNING ────────────► SHUTDOWN ────────────► TIDYING ───► TERMINATED  │
+│     │                     │                     │                │
+│     │ shutdown()          │ shutdownNow()       │               │
+│     │                     │                     │               │
+│     │                     ▼                     ▼               │
+│     │                 ┌──────┐             ┌───────┐           │
+│     │                 │ STOP │────────────►│TIDYING│           │
+│     │                 └──────┘  shutdown   └───────┘           │
+│     │                                 Now                      │
+│     │                                                       │
+│     │                                                       │
+│  ┌──┴────────────┐                                          │
+│  │  accepts new   │                                         │
+│  │  tasks         │                                         │
+│  └────────────────┘                                         │
+│                                                                 │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### 状态详解
+
+| 状态 | 值 | 说明 |
+|------|-----|------|
+| **RUNNING** | -536870912 (111...) | 接受新任务，处理队列中的任务 |
+| **SHUTDOWN** | 0 (000...) | 不接受新任务，继续处理队列中的任务 |
+| **STOP** | 536870912 (001...) | 不接受新任务，不处理队列任务，中断运行中的任务 |
+| **TIDYING** | 1073741824 (010...) | 所有任务终止，准备调用 terminated() |
+| **TERMINATED** | 1610612736 (011...) | terminated() 执行完成 |
+
+## 任务执行流程
+
+### execute() 方法的完整流程
+
+```java
+public void execute(Runnable command) {
+    if (command == null)
+        throw new NullPointerException();
+    
+    int c = ctl.get();
+    
+    // 1. 如果当前线程数 < 核心线程数，创建核心线程
+    if (workerCountOf(c) < corePoolSize) {
+        if (addWorker(command, true))  // true 表示创建核心线程
+            return;
+        c = ctl.get();  // 重新获取 ctl
+    }
+    
+    // 2. 如果核心线程已满，尝试加入队列
+    if (isRunning(c) && workQueue.offer(command)) {
+        // 再次检查，可能有线程在检查期间退出了
+        int recheck = ctl.get();
+        if (!isRunning(recheck) && remove(command)) {
+            // 线程池不是 RUNNING 状态，移除任务
+            reject(command);  // 执行拒绝策略
+        } else if (workerCountOf(recheck) == 0) {
+            // 如果线程数为0（核心线程可能已退出），创建非核心线程
+            addWorker(null, false);
+        }
+    }
+    // 3. 队列已满，尝试创建临时线程
+    else if (!addWorker(command, false))  // false 表示创建非核心线程
+        reject(command);  // 超过最大线程数，执行拒绝策略
+}
+```
+
+### 流程图
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                      execute() 执行流程                           │
+│                                                                 │
+│   ┌──────────────┐                                             │
+│   │  submit task │                                             │
+│   └──────┬───────┘                                              │
+│          │                                                      │
+│          ▼                                                      │
+│   ┌──────────────────────┐                                      │
+│   │ workerCount < core?  │                                      │
+│   └──────────┬───────────┘                                      │
+│        Yes │      │ No                                          │
+│            ▼      │                                             │
+│   ┌─────────────┐ │                                             │
+│   │ addWorker   │ │                                             │
+│   │ (core=true) │ │                                             │
+│   └──────┬──────┘ │                                             │
+│          │        │                                             │
+│          │        ▼                                             │
+│          │  ┌──────────────────────┐                            │
+│          │  │ add to workQueue     │                            │
+│          │  └──────────┬───────────┘                            │
+│          │             │                                         │
+│          │      ┌──────┴───────┐                                 │
+│          │      │  offer success? │                              │
+│          │      └──────┬───────┘                                 │
+│          │       Yes │      │ No                                 │
+│          │           │      │                                    │
+│          │           │      ▼                                    │
+│          │           │  ┌─────────────────────┐                  │
+│          │           │  │ workerCount < max?  │                 │
+│          │           │  └──────────┬──────────┘                  │
+│          │           │       Yes │        │ No                   │
+│          │           │           ▼        │                     │
+│          │           │  ┌─────────────┐    │                     │
+│          │           │  │ addWorker   │    │                     │
+│          │           │  │(core=false) │    │                     │
+│          │           │  └──────┬──────┘    │                     │
+│          │           │         │           │                     │
+│          │           │         │           ▼                     │
+│          │           │         │     ┌──────────┐                │
+│          │           │         │     │  reject  │                │
+│          │           │         │     └──────────┘                │
+│          │           │         ▼                                  │
+│          │           ▼  ┌──────────────────┐                     │
+│          └──────────────►│   execute success │                    │
+│                         └──────────────────┘                      │
+│                                                                 │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### addWorker() 方法
+
+```java
+private boolean addWorker(Runnable firstTask, boolean core) {
+    retry:
+    for (;;) {
+        int c = ctl.get();
+        int rs = runStateOf(c);  // 获取线程池状态
+        
+        // 检查线程池状态
+        if (rs >= SHUTDOWN &&      // 非 RUNNING/SHUTDOWN
+            !(rs == SHUTDOWN &&     // 或者不是 SHUTDOWN
+              firstTask == null &&  // 且任务为空
+              !workQueue.isEmpty())) {  // 且队列非空
+            return false;
+        }
+        
+        for (;;) {
+            int wc = workerCountOf(c);
+            
+            // 检查线程数是否超限
+            if (wc >= CAPACITY ||
+                wc >= (core ? corePoolSize : maximumPoolSize))
+                return false;
+            
+            // CAS 增加线程数
+            if (compareAndIncrementWorkerCount(c))
+                break retry;  // 成功，跳出双重循环
+            
+            c = ctl.get();
+            if (runStateOf(c) != rs)
+                continue retry;  // 状态变化，重新检查
+            
+            // 继续内层循环
+        }
+    }
+    
+    // 线程数增加成功，创建 Worker
+    Worker w = new Worker(firstTask);
+    Thread t = w.thread;
+    
+    // 添加 Worker 到 HashSet
+    workers.add(w);
+    w.created = Thread.currentThread();  // 记录创建线程
+    
+    // 启动 Worker
+    t.start();
+    
+    return true;
+}
+```
+
+## Worker：线程池中的工作线程
+
+### Worker 的结构
+
+```java
+private final class Worker extends AbstractQueuedSynchronizer {
+    
+    final Thread thread;           // 执行任务的线程
+    Runnable firstTask;            // 第一个任务（可为 null）
+    long completedTasks;          // 完成的任务数
+    
+    Worker(Runnable firstTask) {
+        // 禁止中断，直到任务开始
+        setState(-1);
+        this.firstTask = firstTask;
+        this.thread = threadFactory.newThread(this);
+    }
+    
+    // Worker 本身就是 Runnable
+    public void run() {
+        runWorker(this);
+    }
+}
+```
+
+### runWorker：任务执行循环
+
+```java
+final void runWorker(Worker w) {
+    Thread wt = Thread.currentThread();
+    Runnable task = w.firstTask;
+    w.firstTask = null;
+    
+    // 允许中断
+    w.unlock();
+    
+    boolean completedAbruptly = true;
+    try {
+        // 从队列中获取任务并执行
+        while (task != null || (task = getTask()) != null) {
+            w.lock();
+            
+            // 确保线程池状态正确
+            if ((runStateAtLeast(ctl.get(), STOP) ||
+                 Thread.interrupted() &&
+                 runStateAtLeast(ctl.get(), STOP)) &&
+                !wt.isInterrupted())
+                wt.interrupt();
+            
+            try {
+                beforeExecute(wt, task);
+                try {
+                    // 执行任务
+                    task.run();
+                    afterExecute(task, null);
+                } catch (Throwable ex) {
+                    afterExecute(task, ex);
+                    throw ex;
+                }
+            } finally {
+                task = null;  // 清除引用
+                w.completedTasks++;
+                w.unlock();
+            }
+        }
+        completedAbruptly = false;
+    } finally {
+        // 处理线程退出
+        processWorkerExit(w, completedAbruptly);
+    }
+}
+```
+
+### getTask：从队列获取任务
+
+```java
+private Runnable getTask() {
+    boolean timedOut = false;
+    
+    for (;;) {
+        int c = ctl.get();
+        int rs = runStateOf(c);
+        
+        // 检查是否需要退出
+        if (rs >= SHUTDOWN && (rs >= STOP || workQueue.isEmpty())) {
+            decrementWorkerCount();
+            return null;
+        }
+        
+        int wc = workerCountOf(c);
+        
+        // 检查是否需要回收线程
+        boolean timed = allowCoreThreadTimeOut || wc > corePoolSize;
+        
+        if ((wc > maximumPoolSize || (timed && timedOut))
+            && (wc > 1 || workQueue.isEmpty())) {
+            if (compareAndDecrementWorkerCount(c))
+                return null;
+            continue;
+        }
+        
+        try {
+            // 从队列获取任务
+            Runnable r = timed ?
+                workQueue.poll(keepAliveTime, TimeUnit.NANOSECONDS) :
+                workQueue.take();  // 阻塞获取
+            
+            if (r != null)
+                return r;
+            timedOut = true;  // 超时
+        } catch (InterruptedException retry) {
+            timedOut = false;
+        }
+    }
+}
+```
+
+## 状态转换详解
+
+### 优雅关闭：shutdown()
+
+```java
+public void shutdown() {
+    final ReentrantLock mainLock = this.mainLock;
+    mainLock.lock();
+    try {
+        // 1. 设置权限检查
+        advanceRunState(SHUTDOWN);
+        
+        // 2. 中断所有空闲线程
+        interruptIdleWorkers();
+        
+        // 3. 执行关闭回调（空实现）
+        onShutdown();
+    } finally {
+        mainLock.unlock();
+    }
+    
+    // 4. 尝试转换到 TERMINATED
+    tryTerminate();
+}
+```
+
+### 强制关闭：shutdownNow()
+
+```java
+public List<Runnable> shutdownNow() {
+    List<Runnable> tasks;
+    final ReentrantLock mainLock = this.mainLock;
+    mainLock.lock();
+    try {
+        // 1. 设置状态为 STOP
+        advanceRunState(STOP);
+        
+        // 2. 中断所有工作线程（包括正在执行的）
+        interruptWorkers();
+        
+        // 3. 清空队列，返回未执行的任务
+        tasks = drainQueue();
+    } finally {
+        mainLock.unlock();
+    }
+    
+    // 4. 尝试转换到 TERMINATED
+    tryTerminate();
+    
+    return tasks;
+}
+```
+
+### tryTerminate：尝试终止
+
+```java
+final void tryTerminate() {
+    for (;;) {
+        int c = ctl.get();
+        
+        // 条件：不是 RUNNING 状态
+        // 且不是 TIDYING/TERMINATED 状态
+        // 且（STOP 状态或队列为空）
+        if (isRunning(c) ||
+            runStateAtLeast(c, TIDYING) ||
+            (runStateOf(c) == SHUTDOWN && !workQueue.isEmpty()))
+            return;  // 不能终止
+        
+        // 如果有工作线程在运行，等待
+        if (workerCountOf(c) != 0) {
+            interruptIdleWorkers(ONLY_ONE);
+            return;
+        }
+        
+        // 没有工作线程，执行终止
+        final ReentrantLock mainLock = this.mainLock;
+        mainLock.lock();
+        try {
+            // CAS 设置为 TIDYING
+            if (ctl.compareAndSet(c, ctlOf(TIDYING, 0))) {
+                try {
+                    terminated();
+                } finally {
+                    // 设置为 TERMINATED
+                    ctl.set(ctlOf(TERMINATED, 0));
+                    termination.signalAll();
+                }
+                return;
+            }
+        } finally {
+            mainLock.unlock();
+        }
+    }
+}
+```
+
+## 实战：状态监控
+
+```java
+public class StateMonitoring {
+    
+    private final ThreadPoolExecutor executor = 
+        new ThreadPoolExecutor(2, 4, 60L, TimeUnit.SECONDS,
+            new LinkedBlockingQueue<>(100));
+    
+    public void monitor() {
+        // 获取线程池状态
+        int state = executor.getState().ordinal();
+        String stateName = executor.getState().name();
+        
+        // 获取各种指标
+        System.out.println("线程池状态: " + stateName);
+        System.out.println("核心线程数: " + executor.getCorePoolSize());
+        System.out.println("最大线程数: " + executor.getMaximumPoolSize());
+        System.out.println("活跃线程数: " + executor.getActiveCount());
+        System.out.println("当前线程数: " + executor.getPoolSize());
+        System.out.println("队列任务数: " + executor.getQueue().size());
+        System.out.println("已完成任务数: " + executor.getCompletedTaskCount());
+        System.out.println("历史上最大线程数: " + executor.getLargestPoolSize());
+    }
+    
+    public void awaitTermination() throws InterruptedException {
+        executor.shutdown();
+        
+        // 等待终止
+        if (executor.awaitTermination(1, TimeUnit.MINUTES)) {
+            System.out.println("线程池已终止");
+        } else {
+            System.out.println("等待超时");
+        }
+    }
+}
+```
+
+## 总结
+
+线程池的执行流程和状态转换：
+
+1. **任务提交**：通过 `execute()` 提交任务
+2. **核心线程优先**：线程数 < 核心线程数时，创建核心线程
+3. **队列缓冲**：核心线程满后，任务加入队列
+4. **临时线程补充**：队列满时，创建临时线程
+5. **拒绝处理**：超过最大线程数时，执行拒绝策略
+
+五种状态：
+- **RUNNING**：正常工作
+- **SHUTDOWN**：优雅关闭，不接受新任务
+- **STOP**：强制停止，中断所有任务
+- **TIDING**：准备终止
+- **TERMINATED**：已终止
+
+理解这套机制，才能正确使用线程池。
+
+> import { Badge } from '@rspress/core/theme';
+
+<Badge>JDK Source</Badge> 线程池的状态和线程数合并存储在 ctl 变量中，高3位是状态，低29位是线程数

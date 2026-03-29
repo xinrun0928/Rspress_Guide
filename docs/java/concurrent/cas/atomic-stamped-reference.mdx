@@ -1,0 +1,420 @@
+import { Badge } from '@rspress/core/theme';
+
+# AtomicStampedReference：解决 ABA 问题
+
+`AtomicStampedReference` 是 Java 并发包中专门用于解决 **ABA 问题**的原子类。它在 `AtomicReference` 的基础上增加了一个**版本号（戳记）**，每次修改不仅检查值是否变化，还检查版本号是否匹配。这使得 CAS 操作能够检测出那些"值变回去"的情况，从而完美解决 ABA 问题。
+
+## ABA 问题的本质回顾
+
+在深入理解 `AtomicStampedReference` 之前，让我们再次审视 ABA 问题：
+
+```java
+public class ABARecap {
+    
+    public static void main(String[] args) {
+        AtomicReference<String> ref = new AtomicReference<>("A");
+        
+        // 线程 A
+        String expected = "A";
+        
+        // 线程 B 执行：A -> B -> A
+        new Thread(() -> {
+            ref.compareAndSet("A", "B");  // A -> B
+            ref.compareAndSet("B", "A");  // B -> A
+        }).start();
+        
+        // 线程 A：期望 A，当前 A，CAS 成功！
+        // 但实际上值经历了 A -> B -> A 的变化
+        ref.compareAndSet(expected, "C");  // 成功，但不应该成功
+    }
+}
+```
+
+ABA 问题的危害在于：我们无法知道数据是否真的没有变化，还是经历了"变回去"的过程。
+
+## AtomicStampedReference 的设计
+
+### 数据结构
+
+```java
+public class AtomicStampedReference<V> {
+    
+    // Pair 是内部类，存储值和版本号
+    private static class Pair<T> {
+        final T reference;    // 存储的值
+        final int stamp;     // 版本号（戳记）
+        
+        Pair(T reference, int stamp) {
+            this.reference = reference;
+            this.stamp = stamp;
+        }
+        
+        static <T> Pair<T> of(T reference, int stamp) {
+            return new Pair<>(reference, stamp);
+        }
+    }
+    
+    // 使用 volatile 保证 Pair 的可见性
+    private volatile Pair<V> pair;
+    
+    // 构造函数
+    public AtomicStampedReference(V initialRef, int initialStamp) {
+        pair = Pair.of(initialRef, initialStamp);
+    }
+}
+```
+
+### 核心方法
+
+```java
+public class CoreMethods {
+    
+    AtomicStampedReference<String> ref = 
+        new AtomicStampedReference<>("A", 0);
+    
+    public void coreMethodDemo() {
+        
+        // getReference：获取引用值
+        String value = ref.getReference();
+        // "A"
+        
+        // getStamp：获取版本号
+        int stamp = ref.getStamp();
+        // 0
+        
+        // get：同时获取引用值和版本号
+        int[] holder = new int[1];
+        String currentValue = ref.get(holder);
+        int currentStamp = holder[0];
+        
+        // compareAndSet：原子更新（核心方法）
+        // 只有期望值和期望版本号都匹配时，才更新
+        boolean success = ref.compareAndSet(
+            "A",      // 期望引用值
+            "B",      // 新引用值
+            0,        // 期望版本号
+            1         // 新版本号
+        );
+        
+        // weakCompareAndSet：弱 CAS
+        // 不保证 happens-before，更轻量
+        ref.weakCompareAndSet("B", "C", 1, 2);
+        
+        // set：无条件设置
+        ref.set("D", 3);
+        
+        // attemptStamp：尝试更新版本号
+        ref.attemptStamp("D", 4);
+    }
+}
+```
+
+## compareAndSet 的实现原理
+
+```java
+public class CASImplementation {
+    
+    // compareAndSet 的核心逻辑
+    public boolean compareAndSet(V expectedReference,
+                                 V newReference,
+                                 int expectedStamp,
+                                 int newStamp) {
+        Pair<?> current = pair;
+        
+        // 1. 检查当前值和期望值是否匹配
+        if (expectedReference != current.reference &&
+            (expectedReference == null || 
+             !expectedReference.equals(current.reference))) {
+            return false;
+        }
+        
+        // 2. 检查当前版本号和期望版本号是否匹配
+        if (expectedStamp != current.stamp) {
+            return false;
+        }
+        
+        // 3. 如果两者都匹配，尝试更新
+        if (current.reference == newReference && 
+            newStamp == current.stamp) {
+            // 值和版本号都没变，不需要更新
+            return true;
+        }
+        
+        // 4. CAS 更新
+        return CAS(this, PAIR, current, 
+                   Pair.of(newReference, newStamp));
+    }
+    
+    // CAS 是 CPU 原子指令
+    private static final Unsafe unsafe = Unsafe.getUnsafe();
+    private static final long PAIR = 
+        objectFieldOffset(AtomicStampedReference.class, "pair");
+}
+```
+
+## 解决 ABA 问题的完整示例
+
+### 场景：带版本号的计数器
+
+```java
+public class VersionedCounter {
+    
+    private final AtomicStampedReference<Integer> value = 
+        new AtomicStampedReference<>(0, 0);
+    
+    public void increment() {
+        int[] stamp = new int[1];
+        while (true) {
+            Integer current = value.get(stamp);
+            int currentStamp = stamp[0];
+            
+            // CAS：期望值 current，期望版本号 currentStamp
+            // 新值 current + 1，新版本号 currentStamp + 1
+            if (value.compareAndSet(
+                    current, current + 1,
+                    currentStamp, currentStamp + 1)) {
+                return;  // 成功
+            }
+            // 失败，重试
+        }
+    }
+    
+    public int get() {
+        return value.getReference();
+    }
+}
+```
+
+### 场景：线程安全的链表
+
+```java
+public class VersionedLinkedList<E> {
+    
+    private final AtomicStampedReference<Node<E>> head = 
+        new AtomicStampedReference<>(null, 0);
+    
+    public void addFirst(E item) {
+        Node<E> newNode = new Node<>(item);
+        int[] stamp = new int[1];
+        
+        while (true) {
+            Node<E> currentHead = head.get(stamp);
+            int currentStamp = stamp[0];
+            newNode.next = currentHead;
+            
+            if (head.compareAndSet(
+                    currentHead, newNode,
+                    currentStamp, currentStamp + 1)) {
+                return;
+            }
+        }
+    }
+    
+    public boolean remove(E item) {
+        int[] stamp = new int[1];
+        
+        while (true) {
+            Node<E> currentHead = head.get(stamp);
+            int currentStamp = stamp[0];
+            
+            if (currentHead == null) {
+                return false;
+            }
+            
+            Node<E> next = currentHead.next;
+            
+            if (next != null && next.item.equals(item)) {
+                // 找到要删除的节点
+                if (head.compareAndSet(
+                        currentHead, next,
+                        currentStamp, currentStamp + 1)) {
+                    return true;
+                }
+                // CAS 失败，重试
+            } else {
+                // 继续向后查找
+                // （简化实现，实际需要遍历）
+            }
+        }
+    }
+    
+    private static class Node<E> {
+        final E item;
+        volatile Node<E> next;
+        
+        Node(E item) {
+            this.item = item;
+        }
+    }
+}
+```
+
+### 场景：乐观锁的事务处理
+
+```java
+public class OptimisticTransaction {
+    
+    private final AtomicStampedReference<AccountState> state = 
+        new AtomicStampedReference<>(
+            new AccountState(0, 0),  // 初始余额 0，版本号 0
+            0
+        );
+    
+    public boolean transfer(int amount, OptimisticTransaction other) {
+        int[] stamp = new int[1];
+        
+        while (true) {
+            AccountState current = state.get(stamp);
+            int currentStamp = stamp[0];
+            
+            // 检查余额是否足够
+            if (current.balance < amount) {
+                return false;  // 余额不足
+            }
+            
+            AccountState newState = new AccountState(
+                current.balance - amount,
+                currentStamp + 1
+            );
+            
+            // CAS 更新：只有版本号匹配时才成功
+            if (state.compareAndSet(
+                    current, newState,
+                    currentStamp, currentStamp + 1)) {
+                return true;  // 成功
+            }
+            // 版本号不匹配，说明有其他线程修改过，重试
+        }
+    }
+    
+    private static class AccountState {
+        final int balance;
+        final int version;
+        
+        AccountState(int balance, int version) {
+            this.balance = balance;
+            this.version = version;
+        }
+    }
+}
+```
+
+## AtomicMarkableReference 的对比
+
+`AtomicMarkableReference` 与 `AtomicStampedReference` 类似，但使用的是**布尔标记**而非版本号：
+
+```java
+public class MarkableVsStamped {
+    
+    // AtomicMarkableReference：使用布尔标记
+    public void markableExample() {
+        AtomicMarkableReference<String> ref = 
+            new AtomicMarkableReference<>("A", false);
+        
+        boolean[] mark = new boolean[1];
+        String value = ref.get(mark);
+        
+        // CAS：值和标记都匹配时才成功
+        ref.compareAndSet("A", "B", false, true);
+    }
+    
+    // 使用场景对比：
+    // AtomicStampedReference：需要知道修改次数/版本
+    // AtomicMarkableReference：只需要知道"是否被修改过"
+}
+```
+
+### 选择建议
+
+| 场景 | 推荐 |
+|------|------|
+| 需要记录修改次数 | `AtomicStampedReference` |
+| 只需要知道是否修改过 | `AtomicMarkableReference` |
+| 简单布尔标记 | `AtomicMarkableReference` |
+
+## 实战：实现无锁的跳表
+
+```java
+public class LockFreeSkipList<K, V> {
+    
+    private final AtomicStampedReference<Node<K, V>> head;
+    
+    public LockFreeSkipList() {
+        head = new AtomicStampedReference<>(null, 0);
+    }
+    
+    public boolean put(K key, V value) {
+        int[] stamp = new int[1];
+        
+        while (true) {
+            // 1. 找到插入位置的前驱节点
+            Node<K, V>[] preds = findPredecessors(key);
+            Node<K, V> pred = preds[0];
+            Node<K, V> current = pred.next.getReference();
+            
+            // 2. 检查是否已存在
+            if (current != null && current.key.equals(key)) {
+                return false;  // 已存在
+            }
+            
+            // 3. 创建新节点
+            Node<K, V> newNode = new Node<>(key, value, current);
+            
+            // 4. CAS 插入
+            int currentStamp = stamp[0];
+            if (pred.next.compareAndSet(
+                    current, newNode,
+                    currentStamp, currentStamp + 1)) {
+                return true;
+            }
+            // 重试
+        }
+    }
+    
+    @SuppressWarnings("unchecked")
+    private Node<K, V>[] findPredecessors(K key) {
+        int[] stamp = new int[1];
+        Node<K, V>[] result = new Node[1];
+        
+        while (true) {
+            Node<K, V> pred = head.get(stamp);
+            int stampValue = stamp[0];
+            
+            // 简化实现，实际需要遍历跳表层级
+            result[0] = pred;
+            return result;
+        }
+    }
+    
+    private static class Node<K, V> {
+        final K key;
+        final V value;
+        final AtomicStampedReference<Node<K, V>> next;
+        
+        Node(K key, V value, Node<K, V> next) {
+            this.key = key;
+            this.value = value;
+            this.next = new AtomicStampedReference<>(next, 0);
+        }
+    }
+}
+```
+
+## 总结
+
+`AtomicStampedReference` 的核心设计：
+
+1. **Pair 结构**：存储值和版本号
+2. **双重检查**：CAS 时同时检查值和版本号
+3. **ABA 问题解决**：版本号递增，保证每次修改都被检测到
+
+使用场景：
+- 解决 ABA 问题的无锁数据结构
+- 乐观锁的事务处理
+- 需要版本控制的并发场景
+
+理解 `AtomicStampedReference`，就掌握了解决 ABA 问题的标准方案。
+
+> import { Badge } from '@rspress/core/theme';
+
+<Badge>并发进阶</Badge> AtomicStampedReference 是解决 ABA 问题的标准方案

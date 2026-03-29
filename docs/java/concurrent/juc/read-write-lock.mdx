@@ -1,0 +1,446 @@
+import { Badge } from '@rspress/core/theme';
+
+# ReadWriteLock：读写锁原理
+
+在并发编程中，读操作远多于写操作是很常见的场景。想象一个图书馆的藏书管理系统：成千上万的读者可能同时查询某本书的信息（读操作），但只有少数管理员会修改书籍信息（写操作）。如果我们用普通的锁一把锁住所有操作，读操作之间也会互相阻塞，效率极低。`ReadWriteLock`（读写锁）就是为了解决这个问题而设计的——读读不互斥，只有读写、写写才互斥。
+
+## 读写锁的核心思想
+
+读写锁的基本原则：
+
+| 操作组合 | 读锁 | 写锁 |
+|----------|------|------|
+| 读 vs 读 | 不互斥 | 互斥 |
+| 读 vs 写 | 互斥 | 互斥 |
+| 写 vs 写 | 互斥 | 互斥 |
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                      读写锁访问规则                               │
+│                                                                 │
+│   Reader1 ──┬──▶  可以同时与 Reader2, Reader3... 并行读          │
+│             │                                                     │
+│   Reader2 ──┤                                                     │
+│             │     ❌ Writer1 阻塞，等待所有读者释放               │
+│   Reader3 ──┘                                                     │
+│                                                                 │
+│   Writer1 ──▶ ❌ Writer2 必须等待 Writer1 完成                   │
+│                                                                 │
+└────────────────────────────────────────────────────────────────┘
+```
+
+## ReadWriteLock 接口
+
+```java
+public interface ReadWriteLock {
+    // 返回读锁
+    ReadLock readLock();
+    
+    // 返回写锁
+    WriteLock writeLock();
+}
+
+// ReadLock 和 WriteLock 都是 Lock 接口的实现
+public interface ReadLock extends Lock {
+    void lock();
+    void lockInterruptibly();
+    boolean tryLock();
+    boolean tryLock(long time, TimeUnit unit);
+    void unlock();
+    Condition newCondition();  // 读锁的 newCondition() 抛出异常
+}
+
+public interface WriteLock extends Lock {
+    void lock();
+    void lockInterruptibly();
+    boolean tryLock();
+    boolean tryLock(long time, TimeUnit unit);
+    void unlock();
+    Condition newCondition();
+}
+```
+
+## ReentrantReadWriteLock 的实现
+
+`ReentrantReadWriteLock` 是 `ReadWriteLock` 的实现类，同时支持公平/非公平模式。
+
+### 状态设计
+
+读写锁需要维护两类状态：读锁计数和写锁计数。`ReentrantReadWriteLock` 通过 **AQS 的 `state` 字段**巧妙地实现：
+
+```java
+public class ReentrantReadWriteLock 
+        implements ReadWriteLock, java.io.Serializable {
+    
+    private final ReentrantReadWriteLock.ReadLock readerLock;
+    private final ReentrantReadWriteLock.WriteLock writerLock;
+    
+    final Sync sync;  // 继承 AQS
+    
+    // AQS 的 state 是一个 int，32位
+    // 高16位：读锁计数
+    // 低16位：写锁计数（可重入次数）
+}
+```
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                        state (32 bits)                          │
+├────────────────────────────────────────────────────────────────┤
+│                      │                                          │
+│         readCount ────┘        writeCount ────┐                  │
+│        (高16位)                              (低16位)             │
+│                                                                 │
+│  0000 0000 0000 0000 │ 0000 0000 0000 0000                        │
+│                      │                                          │
+│           16 bits ───┘           16 bits ────┐                  │
+│                                                │                  │
+│              读锁数量                             写锁重入次数        │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### 获取读锁
+
+```java
+// ReentrantReadWriteLock.ReadLock.lock()
+public void lock() {
+    sync.acquireShared(1);  // 使用共享模式
+}
+
+// Sync.tryAcquireShared()
+protected final int tryAcquireShared(int unused) {
+    Thread current = Thread.currentThread();
+    int c = getState();
+    
+    // 如果有写锁被持有，且不是当前线程，写锁被占用
+    if (exclusiveCount(c) != 0 &&
+        getExclusiveOwnerThread() != current) {
+        return -1;  // 获取失败
+    }
+    
+    // 获取读锁计数
+    int r = sharedCount(c);
+    
+    // 尝试获取读锁（核心逻辑）
+    if (!readerShouldBlock()) {
+        // CAS 增加读锁计数
+        if (compareAndSetState(c, c + SHARED_UNIT)) {
+            // 成功，设置 firstReader 和 readHolds
+            return 1;
+        }
+    }
+    
+    // 复杂的重入逻辑...
+    return fullTryAcquireShared(current);
+}
+```
+
+### 获取写锁
+
+```java
+// ReentrantReadWriteLock.WriteLock.lock()
+public void lock() {
+    sync.acquire(1);  // 使用独占模式
+}
+
+// Sync.tryAcquire()
+protected final boolean tryAcquire(int acquires) {
+    Thread current = Thread.currentThread();
+    int c = getState();
+    int w = exclusiveCount(c);  // 写锁计数
+    
+    if (c != 0) {
+        // 已经有锁被持有
+        if (w == 0 || current != getExclusiveOwnerThread()) {
+            // 有读锁，或写锁被其他线程持有
+            return false;
+        }
+        // 写锁被当前线程持有，可重入
+    }
+    
+    // 尝试获取写锁
+    if (compareAndSetState(c, c + acquires)) {
+        setExclusiveOwnerThread(current);
+        return true;
+    }
+    return false;
+}
+```
+
+### 释放读锁
+
+```java
+// ReentrantReadWriteLock.ReadLock.unlock()
+public void unlock() {
+    sync.releaseShared(1);
+}
+
+// Sync.tryReleaseShared()
+protected final boolean tryReleaseShared(int releases) {
+    Thread current = Thread.currentThread();
+    
+    // 减少读锁计数
+    for (Node node = head; node != null; node = node.next) {
+        int ws = node.waitStatus;
+        if (ws == Node.SIGNAL) {
+            // 如果有写锁等待者，唤醒
+            if (!compareAndSetWaitStatus(node, ws, 0)) {
+                continue;
+            }
+            LockSupport.unpark(node.thread);
+        }
+    }
+    
+    // 递减读锁计数
+    return fullyReleaseShared(node);
+}
+```
+
+## 读写锁的适用场景
+
+### 场景1：缓存
+
+```java
+public class Cache<K, V> {
+    
+    private final Map<K, V> cache = new ConcurrentHashMap<>();
+    private final ReadWriteLock rwLock = new ReentrantReadWriteLock();
+    private final Lock readLock = rwLock.readLock();
+    private final Lock writeLock = rwLock.writeLock();
+    
+    // 读取缓存：多个线程可以同时读
+    public V get(K key) {
+        readLock.lock();
+        try {
+            return cache.get(key);
+        } finally {
+            readLock.unlock();
+        }
+    }
+    
+    // 更新缓存：写操作独占
+    public void put(K key, V value) {
+        writeLock.lock();
+        try {
+            cache.put(key, value);
+        } finally {
+            writeLock.unlock();
+        }
+    }
+    
+    // 清空缓存
+    public void clear() {
+        writeLock.lock();
+        try {
+            cache.clear();
+        } finally {
+            writeLock.unlock();
+        }
+    }
+}
+```
+
+### 场景2：配置管理
+
+```java
+public class ConfigurationManager {
+    
+    private final Map<String, String> config = new HashMap<>();
+    private final ReadWriteLock rwLock = new ReentrantReadWriteLock();
+    
+    // 读取配置：频繁调用，需要高效
+    public String get(String key) {
+        rwLock.readLock().lock();
+        try {
+            return config.get(key);
+        } finally {
+            rwLock.readLock().unlock();
+        }
+    }
+    
+    // 读取多个配置
+    public Map<String, String> getMultiple(List<String> keys) {
+        rwLock.readLock().lock();
+        try {
+            Map<String, String> result = new HashMap<>();
+            for (String key : keys) {
+                result.put(key, config.get(key));
+            }
+            return result;
+        } finally {
+            rwLock.readLock().unlock();
+        }
+    }
+    
+    // 修改配置：低频调用
+    public void update(String key, String value) {
+        rwLock.writeLock().lock();
+        try {
+            config.put(key, value);
+        } finally {
+            rwLock.writeLock().unlock();
+        }
+    }
+}
+```
+
+## 读写锁的坑
+
+### 坑1：读锁不能升级为写锁
+
+```java
+public class LockUpgradeProblem {
+    
+    private final ReadWriteLock rwLock = new ReentrantReadWriteLock();
+    
+    // 错误：不能升级
+    public void badLockUpgrade() {
+        rwLock.readLock().lock();
+        try {
+            // ... 读操作 ...
+            
+            // 尝试升级为写锁 ❌ 会死锁
+            rwLock.writeLock().lock();  // 永远不会获得
+            try {
+                // 写操作
+            } finally {
+                rwLock.writeLock().unlock();
+            }
+        } finally {
+            rwLock.readLock().unlock();
+        }
+    }
+    
+    // 正确做法：直接获取写锁
+    public void correctLockUpgrade() {
+        rwLock.writeLock().lock();
+        try {
+            // 读写操作都在写锁保护下
+        } finally {
+            rwLock.writeLock().unlock();
+        }
+    }
+}
+```
+
+### 坑2：缓存不一致
+
+```java
+public class CacheConsistencyProblem {
+    
+    private final ReadWriteLock rwLock = new ReentrantReadWriteLock();
+    private final Map<String, Object> cache = new HashMap<>();
+    private volatile long cacheVersion;
+    
+    // 错误：读取时缓存可能正在被修改
+    public Object badGet(String key) {
+        rwLock.readLock().lock();
+        try {
+            Object value = cache.get(key);
+            if (value == null) {
+                rwLock.readLock().unlock();
+                
+                // 问题：这里释放了读锁，但写锁还没获取
+                // 其他线程可能在这期间修改了 cache
+                
+                rwLock.writeLock().lock();
+                try {
+                    // 双重检查
+                    value = cache.get(key);
+                    if (value == null) {
+                        value = loadFromDatabase(key);
+                        cache.put(key, value);
+                    }
+                } finally {
+                    rwLock.writeLock().unlock();
+                }
+                
+                return value;
+            }
+            return value;
+        } finally {
+            rwLock.readLock().unlock();
+        }
+    }
+}
+```
+
+### 坑3：锁饥饿
+
+在非公平模式下，写锁可能导致读锁饥饿（Read Preference Starvation）：
+
+```java
+public class ReadStarvation {
+    
+    private final ReadWriteLock rwLock = 
+        new ReentrantReadWriteLock(true);  // 公平模式
+    
+    // 公平模式下，写锁等待时，新的读锁请求会排队等待
+    // 非公平模式下，写锁可以"插队"读锁
+    
+    // 解决方案：使用 StampedLock（后续章节介绍）
+}
+```
+
+## StampedLock：读写锁的改进
+
+JDK 8 引入了 `StampedLock`，它提供了比 `ReentrantReadWriteLock` 更好的性能：
+
+```java
+public class StampedLockDemo {
+    
+    private final StampedLock sl = new StampedLock();
+    private double x, y;
+    
+    // 乐观读
+    public double[] read() {
+        long stamp = sl.tryOptimisticRead();  // 获取戳
+        double currentX = x;
+        double currentY = y;
+        
+        // 验证戳是否有效
+        if (!sl.validate(stamp)) {
+            // 戳无效，获取悲观读锁
+            stamp = sl.readLock();
+            try {
+                currentX = x;
+                currentY = y;
+            } finally {
+                sl.unlockRead(stamp);
+            }
+        }
+        return new double[]{currentX, currentY};
+    }
+    
+    // 写操作
+    public void write(double newX, double newY) {
+        long stamp = sl.writeLock();
+        try {
+            x = newX;
+            y = newY;
+        } finally {
+            sl.unlockWrite(stamp);
+        }
+    }
+}
+```
+
+## 总结
+
+`ReadWriteLock` 是处理读多写少场景的利器：
+
+- **读读不互斥**：多个线程可以同时读取
+- **读写/写写互斥**：保证数据一致性
+- **可重入**：支持锁的重入
+- **公平/非公平**：可选的公平策略
+
+使用注意事项：
+1. 读锁不能升级为写锁
+2. 注意缓存一致性问题
+3. 非公平模式可能导致读锁饥饿
+
+在大多数读多写少的场景下，使用 `ReadWriteLock` 能显著提升性能。你是否遇到过读多写少的业务场景？是否用读写锁优化过？
+
+> import { Badge } from '@rspress/core/theme';
+
+<Badge>JDK 8+</Badge> 推荐使用 StampedLock，它提供了更细粒度的控制和更好的性能

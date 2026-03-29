@@ -14,6 +14,18 @@ export const nav = [
     ],
   },
   {
+    "text": "Java",
+    "link": "/java/",
+    "items": [
+      { "text": "🧱 Java 基础", "link": "/java/basic/" },
+      { "text": "📦 集合框架", "link": "/java/collection/" },
+      { "text": "⚡ Java 并发编程", "link": "/java/concurrent/" },
+      { "text": "⚙️ JVM", "link": "/java/jvm/" },
+      { "text": "🌊 Java I/O 与网络", "link": "/java/io/" },
+      { "text": "✨ Java 17+ 新特性", "link": "/java/new-features/" }
+    ],
+  },
+  {
     "text": "三高架构",
     "link": "/high-throughput/",
     "items": [

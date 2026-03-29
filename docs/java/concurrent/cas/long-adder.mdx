@@ -1,0 +1,428 @@
+import { Badge } from '@rspress/core/theme';
+
+# LongAdder vs AtomicLong 高并发性能对比
+
+在 Java 并发编程中，计数器是最常见的需求之一。`AtomicLong` 曾经是 Java 8 之前实现线程安全计数器的唯一选择。但当并发量极高时，`AtomicLong` 的 CAS 自旋会成为性能瓶颈。JDK 8 引入了 **`LongAdder`** 和 **`LongAccumulator`**，专门为高并发场景优化。本文将深入对比它们的性能差异和适用场景。
+
+## AtomicLong 在高并发下的困境
+
+### CAS 自旋的问题
+
+`AtomicLong` 使用 CAS 实现原子递增，但在高竞争环境下，CAS 会频繁失败，导致大量线程空转：
+
+```java
+public class AtomicLongContention {
+    
+    private final AtomicLong counter = new AtomicLong(0);
+    
+    // 在高竞争下：
+    public void highContentionIncrement() {
+        // 每个线程都需要不断重试
+        counter.incrementAndGet();
+        // 实际执行：
+        // 1. 读取 value
+        // 2. CAS 尝试设置 value + 1
+        // 3. 如果失败，重试（自旋）
+    }
+}
+```
+
+### 性能测试
+
+```java
+public class PerformanceTest {
+    
+    public static void main(String[] args) throws Exception {
+        int threads = 100;
+        int iterations = 1_000_000;
+        
+        // 测试 AtomicLong
+        AtomicLong atomic = new AtomicLong(0);
+        long start = System.nanoTime();
+        
+        ExecutorService executor = Executors.newFixedThreadPool(threads);
+        CountDownLatch latch = new CountDownLatch(threads);
+        
+        for (int t = 0; t < threads; t++) {
+            executor.submit(() -> {
+                for (int i = 0; i < iterations; i++) {
+                    atomic.incrementAndGet();
+                }
+                latch.countDown();
+            });
+        }
+        
+        latch.await();
+        long atomicTime = System.nanoTime() - start;
+        
+        // 测试 LongAdder
+        LongAdder adder = new LongAdder();
+        start = System.nanoTime();
+        
+        latch = new CountDownLatch(threads);
+        for (int t = 0; t < threads; t++) {
+            executor.submit(() -> {
+                for (int i = 0; i < iterations; i++) {
+                    adder.increment();
+                }
+                latch.countDown();
+            });
+        }
+        
+        latch.await();
+        long adderTime = System.nanoTime() - start;
+        
+        System.out.println("AtomicLong: " + atomicTime / 1_000_000 + " ms");
+        System.out.println("LongAdder: " + adderTime / 1_000_000 + " ms");
+        System.out.println("Speedup: " + (double) atomicTime / adderTime + "x");
+        
+        executor.shutdown();
+    }
+}
+```
+
+## LongAdder 的设计思想
+
+### 核心原理：分段锁
+
+`LongAdder` 采用**分段锁**的思想：将一个计数器拆分成多个段（Cell），每个线程操作不同的段，最后汇总：
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                      LongAdder 分段结构                          │
+│                                                                 │
+│                    LongAdder                                    │
+│   ┌─────────────────────────────────────────────────────────┐  │
+│   │                                                         │  │
+│   │   ┌─────┐  ┌─────┐  ┌─────┐  ┌─────┐  ┌─────┐         │  │
+│   │   │Cell │  │Cell │  │Cell │  │Cell │  │Cell │  ...   │  │
+│   │   │  1  │  │  2  │  │  3  │  │  4  │  │  5  │         │  │
+│   │   └─────┘  └─────┘  └─────┘  └─────┘  └─────┘         │  │
+│   │                                                         │  │
+│   │   线程1  ───▶ Cell[1]  (竞争不激烈时)                  │  │
+│   │   线程2  ───▶ Cell[3]                                  │  │
+│   │   线程3  ───▶ Cell[2]                                  │  │
+│   │   线程4  ───▶ Cell[1]                                  │  │
+│   │                                                         │  │
+│   │   sum()  ───▶ 汇总所有 Cell 的值                       │  │
+│   │                                                         │  │
+│   └─────────────────────────────────────────────────────────┘  │
+│                                                                 │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### LongAdder 的结构
+
+```java
+public class LongAdder extends Striped64 {
+    
+    // 内部 Cell 数组（分段）
+    transient volatile Cell[] cells;
+    
+    // 基础值（无竞争时使用）
+    transient volatile long base;
+    
+    // CAS 锁（竞争激烈时使用）
+    transient volatile int cellsBusy;
+    
+    // Cell：分段计数器
+    @sun.misc.Contended
+    static final class Cell {
+        volatile long value;
+        
+        Cell(long x) {
+            value = x;
+        }
+        
+        final boolean cas(long cmp, long val) {
+            return UNSAFE.compareAndSwapLong(this, valueOffset, cmp, val);
+        }
+    }
+}
+```
+
+### increment() 的执行流程
+
+```java
+public class IncrementFlow {
+    
+    LongAdder adder = new LongAdder();
+    
+    public void increment() {
+        // 1. 获取 Cell 数组
+        Cell[] cs = cells;
+        long stamp = Thread.currentThread().getId();
+        
+        // 2. 如果 cells 不为空，尝试 CAS 更新 Cell
+        if (cs != null) {
+            Cell c = cs[hash(stamp) % cs.length];
+            if (c != null && c.cas(c.value, c.value + 1)) {
+                return;  // 成功
+            }
+        }
+        
+        // 3. cells 为空或有竞争，尝试更新 base
+        if (base == 0 && casBase(0, 1)) {
+            return;  // 成功
+        }
+        
+        // 4. base 有竞争，尝试扩展 cells
+        if (cellsBusy == 0 && casCellsBusy(0, 1)) {
+            try {
+                // 扩展 cells
+            } finally {
+                cellsBusy = 0;
+            }
+        }
+        
+        // 5. 继续重试
+    }
+    
+    // sum() 汇总所有值
+    public long sum() {
+        Cell[] cs = cells;
+        long sum = base;
+        
+        if (cs != null) {
+            for (Cell c : cs) {
+                if (c != null) {
+                    sum += c.value;
+                }
+            }
+        }
+        
+        return sum;
+    }
+}
+```
+
+## LongAdder vs AtomicLong 性能对比
+
+### 低竞争场景
+
+```java
+public class LowContentionTest {
+    
+    public void test() throws Exception {
+        AtomicLong atomic = new AtomicLong(0);
+        LongAdder adder = new LongAdder();
+        
+        // 单线程，100 万次递增
+        long start = System.nanoTime();
+        for (int i = 0; i < 1_000_000; i++) {
+            atomic.incrementAndGet();
+        }
+        long atomicTime = System.nanoTime() - start;
+        
+        start = System.nanoTime();
+        for (int i = 0; i < 1_000_000; i++) {
+            adder.increment();
+        }
+        long adderTime = System.nanoTime() - start;
+        
+        System.out.println("AtomicLong: " + atomicTime / 1_000_000 + " ms");
+        System.out.println("LongAdder: " + adderTime / 1_000_000 + " ms");
+        
+        // 结果：AtomicLong 更快，因为没有额外的数组和分段开销
+    }
+}
+```
+
+### 高竞争场景
+
+```java
+public class HighContentionTest {
+    
+    public void test() throws Exception {
+        AtomicLong atomic = new AtomicLong(0);
+        LongAdder adder = new LongAdder();
+        
+        // 100 线程，100 万次递增
+        int threads = 100;
+        int iterations = 1_000_000;
+        
+        // AtomicLong：高竞争，性能差
+        ExecutorService executor = Executors.newFixedThreadPool(threads);
+        CountDownLatch latch = new CountDownLatch(threads);
+        
+        for (int t = 0; t < threads; t++) {
+            executor.submit(() -> {
+                for (int i = 0; i < iterations; i++) {
+                    atomic.incrementAndGet();
+                }
+                latch.countDown();
+            });
+        }
+        
+        // LongAdder：分段锁，高竞争下性能优秀
+        // ...
+        
+        // 结果：LongAdder 比 AtomicLong 快 10-50 倍
+    }
+}
+```
+
+### 性能对比表
+
+| 场景 | AtomicLong | LongAdder | LongAdder 优势 |
+|------|------------|-----------|---------------|
+| 单线程 | 快速 | 稍慢 | 无 |
+| 低竞争（< 10 线程） | 良好 | 良好 | 接近 |
+| 中竞争（10-50 线程） | 下降 | 优秀 | 2-5 倍 |
+| 高竞争（> 50 线程） | 很差 | 优秀 | 10-50 倍 |
+| 内存占用 | 低 | 稍高 | - |
+
+## LongAdder 的适用场景
+
+### 适用场景
+
+```java
+public class SuitableScenarios {
+    
+    // 场景1：统计计数
+    private final LongAdder requestCount = new LongAdder();
+    private final LongAdder errorCount = new LongAdder();
+    
+    public void recordRequest(boolean success) {
+        requestCount.increment();
+        if (!success) {
+            errorCount.increment();
+        }
+    }
+    
+    // 场景2：流量统计
+    private final LongAdder bytesReceived = new LongAdder();
+    
+    public void receiveBytes(long bytes) {
+        bytesReceived.add(bytes);
+    }
+    
+    // 场景3：性能监控
+    private final LongAdder methodInvocations = new LongAdder();
+    
+    public void recordInvocation() {
+        methodInvocations.increment();
+    }
+}
+```
+
+### 不适用场景
+
+```java
+public class UnsuitableScenarios {
+    
+    // 场景1：需要立即读取最新值
+    private final LongAdder counter = new LongAdder();
+    
+    public void badPattern() {
+        counter.increment();
+        // 不能立即读取，因为可能有并发修改未刷新
+        // 需要使用 sum() 获取近似值
+        long value = counter.sum();  // 不精确！
+    }
+    
+    // 场景2：需要精确值（不是最终一致性的场景）
+    public void precisePattern() {
+        // 必须使用 AtomicLong
+        AtomicLong counter = new AtomicLong(0);
+        // counter.get() 总是返回精确值
+    }
+    
+    // 场景3：复合操作
+    public void compoundPattern() {
+        // LongAdder 不能保证复合操作的原子性
+        // long current = adder.sum();
+        // long next = current + 1;  // 不是原子操作！
+    }
+}
+```
+
+## LongAccumulator：更通用的累加器
+
+`LongAccumulator` 是 `LongAdder` 的通用版本，支持自定义累加函数：
+
+```java
+public class LongAccumulatorDemo {
+    
+    // 求最大值
+    public void maxAccumulator() {
+        LongAccumulator max = new LongAccumulator(
+            Long::max,  // 累加函数
+            Long.MIN_VALUE  // 初始值
+        );
+        
+        max.accumulate(10);
+        max.accumulate(5);
+        max.accumulate(20);
+        
+        System.out.println(max.get());  // 20
+    }
+    
+    // 字符串拼接
+    public void stringAccumulator() {
+        // 注意：需要同步
+        LongAccumulator counter = new LongAccumulator(
+            (a, b) -> a + b,
+            0
+        );
+        
+        counter.accumulate(1);
+        counter.accumulate(2);
+        counter.accumulate(3);
+    }
+    
+    // 计算平均值
+    public void averageAccumulator() {
+        LongAdder sum = new LongAdder();
+        LongAdder count = new LongAdder();
+        
+        // 添加值
+        sum.add(100);
+        count.increment();
+        sum.add(200);
+        count.increment();
+        
+        // 计算平均值
+        double average = (double) sum.sum() / count.sum();
+        System.out.println("Average: " + average);  // 150.0
+    }
+}
+```
+
+## DoubleAdder
+
+```java
+public class DoubleAdderDemo {
+    
+    private final DoubleAdder sum = new DoubleAdder();
+    
+    public void add(double value) {
+        sum.add(value);
+    }
+    
+    public double getSum() {
+        return sum.sum();
+    }
+}
+```
+
+## 总结
+
+| 特性 | AtomicLong | LongAdder | LongAccumulator |
+|------|------------|-----------|-----------------|
+| **线程安全** | ✓ | ✓ | ✓ |
+| **分段锁** | ✗ | ✓ | ✓ |
+| **高竞争性能** | 差 | 优秀 | 优秀 |
+| **精确值读取** | ✓ | ✗（近似） | ✗（近似） |
+| **内存占用** | 低 | 中等 | 中等 |
+| **自定义累加** | ✗ | ✗ | ✓ |
+| **sum() 结果** | 精确 | 近似 | 近似 |
+
+选择建议：
+- **高并发计数**：使用 `LongAdder`
+- **精确值必需**：使用 `AtomicLong`
+- **自定义累加逻辑**：使用 `LongAccumulator`
+
+> import { Badge } from '@rspress/core/theme';
+
+<Badge>JDK 8+</Badge> 高并发计数器场景优先使用 LongAdder

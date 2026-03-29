@@ -1,0 +1,624 @@
+import { Badge } from '@rspress/core/theme';
+
+# ScheduledThreadPoolExecutor 定时任务原理
+
+在日常开发中，我们经常需要执行定时任务：每天凌晨生成报表、每隔5分钟清理缓存、某个时间点发送通知等。`ScheduledThreadPoolExecutor` 就是 JDK 为我们提供的定时任务执行器，它继承自 `ThreadPoolExecutor`，专门用于处理**延迟任务**和**周期性任务**。
+
+## ScheduledThreadPoolExecutor 的基本用法
+
+### 核心方法
+
+```java
+public class ScheduledThreadPoolUsage {
+    
+    private final ScheduledExecutorService scheduler = 
+        Executors.newScheduledThreadPool(4);
+    
+    public void allScheduleTypes() {
+        
+        // 1. schedule(Runnable, delay, unit)
+        // 延迟执行：1秒后执行
+        ScheduledFuture<?> future1 = scheduler.schedule(
+            () -> System.out.println("1秒后执行"),
+            1, TimeUnit.SECONDS
+        );
+        
+        // 2. schedule(Callable, delay, unit)
+        // 延迟执行并返回结果
+        ScheduledFuture<String> future2 = scheduler.schedule(
+            () -> "计算结果",
+            2, TimeUnit.SECONDS
+        );
+        
+        // 3. scheduleAtFixedRate(Runnable, initialDelay, period, unit)
+        // 固定频率：以上一次开始时间计算周期
+        ScheduledFuture<?> future3 = scheduler.scheduleAtFixedRate(
+            () -> System.out.println("每3秒执行一次"),
+            1,    // 首次延迟
+            3,    // 周期
+            TimeUnit.SECONDS
+        );
+        
+        // 4. scheduleWithFixedDelay(Runnable, initialDelay, delay, unit)
+        // 固定延迟：以上一次结束时间计算周期
+        ScheduledFuture<?> future4 = scheduler.scheduleWithFixedDelay(
+            () -> System.out.println("每次执行后停2秒"),
+            1,    // 首次延迟
+            2,    // 间隔
+            TimeUnit.SECONDS
+        );
+    }
+}
+```
+
+### scheduleAtFixedRate vs scheduleWithFixedDelay
+
+```java
+public class RateVsDelay {
+    
+    private final ScheduledExecutorService scheduler = 
+        Executors.newScheduledThreadPool(2);
+    
+    // scheduleAtFixedRate：任务执行频率是固定的
+    // 如果任务执行时间超过周期，下一个任务会延迟开始（不会并发）
+    public void fixedRateExample() {
+        scheduler.scheduleAtFixedRate(
+            () -> {
+                try {
+                    Thread.sleep(5);  // 任务执行5秒
+                    System.out.println("FixedRate: " + System.currentTimeMillis());
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            },
+            0, 2, TimeUnit.SECONDS
+        );
+        // 输出（每2秒一个，但如果任务超时会顺延）：
+        // FixedRate: 0s
+        // FixedRate: 5s  (顺延)
+        // FixedRate: 10s (顺延)
+    }
+    
+    // scheduleWithFixedDelay：任务间隔是固定的
+    // 每次任务执行完成后，等待固定时间再执行下一个
+    public void fixedDelayExample() {
+        scheduler.scheduleWithFixedDelay(
+            () -> {
+                try {
+                    Thread.sleep(2);  // 任务执行2秒
+                    System.out.println("FixedDelay: " + System.currentTimeMillis());
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            },
+            0, 2, TimeUnit.SECONDS
+        );
+        // 输出（每个任务间隔2秒）：
+        // FixedDelay: 0s
+        // FixedDelay: 4s  (2s执行 + 2s等待)
+        // FixedDelay: 8s  (2s执行 + 2s等待)
+    }
+}
+```
+
+## ScheduledThreadPoolExecutor 的实现原理
+
+### 继承关系
+
+```java
+public class ScheduledThreadPoolExecutor 
+        extends ThreadPoolExecutor 
+        implements ScheduledExecutorService {
+    
+    // 继承了 ThreadPoolExecutor 的所有功能
+    // 额外实现了延迟和周期性执行的逻辑
+}
+```
+
+### DelayedWorkQueue：延迟队列
+
+`ScheduledThreadPoolExecutor` 使用 `DelayedWorkQueue` 作为任务队列，这是一个基于堆结构的延迟队列：
+
+```java
+public class DelayedWorkQueue extends AbstractQueue<Runnable>
+        implements BlockingQueue<Runnable> {
+    
+    // 延迟队列使用最小堆（按照到期时间排序）
+    private final RunnableScheduledFuture<?>[] queue = 
+        new RunnableScheduledFuture<?>[INITIAL_CAPACITY];
+    
+    private int heapSize = 0;
+    
+    // 堆的父子节点关系：
+    // parent(i) = (i - 1) / 2
+    // left(i) = 2 * i + 1
+    // right(i) = 2 * i + 2
+    
+    public RunnableScheduledFuture<?> take() throws InterruptedException {
+        for (;;) {
+            int s = lock.readLock().lock();
+            try {
+                RunnableScheduledFuture<?> first = queue[0];
+                
+                if (first == null) {
+                    // 队列为空，等待
+                    available.await();
+                } else {
+                    long delay = first.getDelay(NANOSECONDS);
+                    
+                    if (delay <= 0) {
+                        // 已到期，移出堆顶
+                        return finishPoll(0);
+                    }
+                    
+                    // 等待直到到期
+                    available.awaitNanos(delay);
+                }
+            } finally {
+                lock.readLock().unlock();
+            }
+        }
+    }
+}
+```
+
+### ScheduledFutureTask：定时任务封装
+
+```java
+private class ScheduledFutureTask<V> 
+        extends FutureTask<V> 
+        implements RunnableScheduledFuture<V> {
+    
+    // 任务序列号，用于打破相同到期时间的任务的顺序
+    private final long sequenceNumber;
+    
+    // 任务应该执行的时间（纳秒）
+    private long time;
+    
+    // 重复间隔（纳秒），0表示非周期任务
+    private final long period;
+    
+    // 任务类型
+    static final int NORMAL = 0;
+    static final int ROUNDED = 1;
+    static final int PERIODIC = 2;
+    
+    // 构造方法
+    ScheduledFutureTask(Runnable r, V result, long triggerTime,
+                        long period, long sequenceNumber) {
+        super(r, result);
+        this.time = triggerTime;      // 触发时间
+        this.period = period;          // 周期
+        this.sequenceNumber = sequenceNumber;
+    }
+    
+    // 获取延迟时间
+    public long getDelay(TimeUnit unit) {
+        return unit.convert(time - now(), TimeUnit.NANOSECONDS);
+    }
+    
+    // 比较：先比较延迟，再比较序列号
+    public int compareTo(Delayed other) {
+        if (other == this)
+            return 0;
+        if (other instanceof ScheduledFutureTask) {
+            ScheduledFutureTask<?> x = (ScheduledFutureTask<?>) other;
+            long diff = time - x.time;
+            if (diff < 0)
+                return -1;
+            else if (diff > 0)
+                return 1;
+            else if (sequenceNumber < x.sequenceNumber)
+                return -1;
+            else
+                return 1;
+        }
+        long diff = getDelay(NANOSECONDS) - other.getDelay(NANOSECONDS);
+        return (diff < 0) ? -1 : (diff > 0) ? 1 : 0;
+    }
+    
+    // 周期任务的下一次执行时间
+    public void run() {
+        if (!periodic) {
+            // 非周期任务
+            super.run();
+        } else if (!isCancelled()) {
+            // 周期任务：执行并重新安排
+            super.runAndReset();
+            
+            // 计算下一次执行时间
+            if (period > 0) {
+                time += period;
+            } else {
+                // scheduleWithFixedDelay 的处理
+                time = now() + (-period);
+            }
+            
+            // 重新加入队列
+            reExecutePeriodic(root, this);
+        }
+    }
+}
+```
+
+### 任务提交流程
+
+```java
+public class ScheduledThreadPoolExecutor {
+    
+    // 延迟执行
+    public <V> ScheduledFuture<V> schedule(
+            Callable<V> callable, long delay, TimeUnit unit) {
+        
+        // 验证参数
+        if (callable == null || delay < 0)
+            throw new IllegalArgumentException();
+        
+        // 计算触发时间
+        long triggerTime = now() + unit.toNanos(delay);
+        
+        // 创建定时任务
+        ScheduledFutureTask<V> task = 
+            new ScheduledFutureTask<>(callable, triggerTime);
+        
+        // 包装任务（添加执行线程信息）
+        RunnableScheduledFuture<V> outerTask = decorateTask(callable, task);
+        
+        // 延迟执行
+        delayedExecute(outerTask);
+        
+        return outerTask;
+    }
+    
+    // 固定频率执行
+    public ScheduledFuture<?> scheduleAtFixedRate(
+            Runnable command, long initialDelay, long period, TimeUnit unit) {
+        
+        if (command == null || period <= 0)
+            throw new IllegalArgumentException();
+        
+        // 计算首次触发时间
+        long triggerTime = now() + unit.toNanos(initialDelay);
+        
+        // 周期任务的 period 为正值
+        ScheduledFutureTask<Void> task = 
+            new ScheduledFutureTask<>(
+                command, null, triggerTime,
+                unit.toNanos(period), sequenceNumber.getAndIncrement()
+            );
+        
+        RunnableScheduledFuture<Void> outerTask = decorateTask(command, task);
+        
+        delayedExecute(outerTask);
+        
+        return outerTask;
+    }
+    
+    // 固定延迟执行
+    public ScheduledFuture<?> scheduleWithFixedDelay(
+            Runnable command, long initialDelay, long delay, TimeUnit unit) {
+        
+        if (command == null || delay <= 0)
+            throw new IllegalArgumentException();
+        
+        long triggerTime = now() + unit.toNanos(initialDelay);
+        
+        // scheduleWithFixedDelay 的 period 为负值
+        ScheduledFutureTask<Void> task = 
+            new ScheduledFutureTask<>(
+                command, null, triggerTime,
+                -unit.toNanos(delay), sequenceNumber.getAndIncrement()
+            );
+        
+        RunnableScheduledFuture<Void> outerTask = decorateTask(command, task);
+        
+        delayedExecute(outerTask);
+        
+        return outerTask;
+    }
+}
+```
+
+### delayedExecute：延迟执行
+
+```java
+private void delayedExecute(RunnableScheduledFuture<?> task) {
+    // 如果线程池已关闭，拒绝任务
+    if (isShutdown())
+        reject(task);
+    else {
+        // 加入延迟队列
+        super.getQueue().add(task);
+        
+        // 如果线程池已关闭且任务是非周期性的，移除任务
+        if (isShutdown() &&
+            canRunInCurrentRunState(task.isPeriodic()) &&
+            task.cancel(true)) {
+            remove(task);
+        }
+    }
+}
+```
+
+### reExecutePeriodic：重新安排周期任务
+
+```java
+void reExecutePeriodic(RunnableScheduledFuture<?> task) {
+    if (canRunInCurrentRunState(true)) {  // true 表示周期任务
+        // 重新加入队列
+        super.getQueue().add(task);
+        
+        // 如果不能运行，取消任务
+        if (!canRunInCurrentRunState(true))
+            remove(task);
+    }
+}
+```
+
+## 延迟队列的工作原理
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                   DelayedWorkQueue 堆结构                        │
+│                                                                 │
+│   假设有以下定时任务（按到期时间排序）：                            │
+│                                                                 │
+│              [Task1: 3s]                                        │
+│              /          \                                       │
+│     [Task2: 5s]        [Task3: 5s]                              │
+│      /      \              |                                    │
+│  [Task4:  [Task5:     [Task6:                                     │
+│    8s]     7s]          6s]                                      │
+│                                                                 │
+│   take() 时：                                                   │
+│   1. 获取堆顶任务（最近到期）                                      │
+│   2. 检查是否到期                                                │
+│   3. 到期则执行，否则等待                                        │
+│                                                                 │
+└────────────────────────────────────────────────────────────────┘
+```
+
+## 实际应用场景
+
+### 场景1：定时缓存清理
+
+```java
+public class CacheManager<K, V> {
+    
+    private final Map<K, CacheEntry<V>> cache = new ConcurrentHashMap<>();
+    private final ScheduledExecutorService cleaner = 
+        Executors.newScheduledThreadPool(1,
+            r -> {
+                Thread t = new Thread(r);
+                t.setDaemon(true);
+                return t;
+            });
+    
+    private static final long CACHE_TTL_MS = 5 * 60 * 1000;  // 5分钟
+    
+    public V get(K key) {
+        CacheEntry<V> entry = cache.get(key);
+        if (entry != null && !entry.isExpired()) {
+            return entry.getValue();
+        }
+        cache.remove(key);
+        return null;
+    }
+    
+    public void put(K key, V value) {
+        cache.put(key, new CacheEntry<>(value, System.currentTimeMillis()));
+    }
+    
+    public void startCleanup(long intervalSeconds) {
+        cleaner.scheduleAtFixedRate(
+            () -> {
+                long now = System.currentTimeMillis();
+                cache.entrySet().removeIf(e -> 
+                    now - e.getValue().timestamp > CACHE_TTL_MS);
+            },
+            intervalSeconds,  // 首次延迟
+            intervalSeconds,  // 周期
+            TimeUnit.SECONDS
+        );
+    }
+}
+```
+
+### 场景2：心跳检测
+
+```java
+public class HeartbeatService {
+    
+    private final ScheduledExecutorService scheduler = 
+        Executors.newScheduledThreadPool(2);
+    private final Map<String, ScheduledFuture<?>> heartbeats = 
+        new ConcurrentHashMap<>();
+    
+    public void registerServer(String serverId) {
+        ScheduledFuture<?> future = scheduler.scheduleAtFixedRate(
+            () -> {
+                try {
+                    sendHeartbeat(serverId);
+                } catch (Exception e) {
+                    System.err.println("心跳失败: " + serverId);
+                }
+            },
+            0,    // 立即开始
+            5,    // 每5秒一次
+            TimeUnit.SECONDS
+        );
+        
+        heartbeats.put(serverId, future);
+    }
+    
+    public void unregisterServer(String serverId) {
+        ScheduledFuture<?> future = heartbeats.remove(serverId);
+        if (future != null) {
+            future.cancel(false);
+        }
+    }
+    
+    private void sendHeartbeat(String serverId) {
+        // 发送心跳逻辑
+    }
+}
+```
+
+### 场景3：延迟重试
+
+```java
+public class RetryService {
+    
+    private final ScheduledExecutorService scheduler = 
+        Executors.newScheduledThreadPool(4);
+    
+    public <T> CompletableFuture<T> retryWithDelay(
+            Supplier<T> task, int maxRetries, long delaySeconds) {
+        
+        return CompletableFuture.supplyAsync(() -> {
+            int attempts = 0;
+            while (attempts < maxRetries) {
+                try {
+                    return task.get();
+                } catch (Exception e) {
+                    attempts++;
+                    if (attempts >= maxRetries) {
+                        throw e;
+                    }
+                    
+                    final int currentAttempt = attempts;
+                    scheduler.schedule(
+                        () -> System.out.println("重试 #" + currentAttempt),
+                        delaySeconds, TimeUnit.SECONDS
+                    );
+                }
+            }
+            throw new RuntimeException("Max retries exceeded");
+        });
+    }
+}
+```
+
+## 注意事项
+
+### 1. 任务执行时间超过周期
+
+```java
+public class LongRunningTask {
+    
+    private final ScheduledExecutorService scheduler = 
+        Executors.newScheduledThreadPool(4);
+    
+    // scheduleAtFixedRate：如果任务执行时间超过周期
+    // 下一个任务会延迟开始（不会并发执行）
+    public void atFixedRateIssue() {
+        scheduler.scheduleAtFixedRate(
+            () -> {
+                try {
+                    Thread.sleep(10);  // 任务执行10秒
+                    System.out.println("AtFixedRate: " + System.currentTimeMillis());
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            },
+            0, 3, TimeUnit.SECONDS  // 周期3秒
+        );
+        // 实际执行间隔会是10秒，而非3秒
+    }
+    
+    // scheduleWithFixedDelay：每次任务完成后等待固定时间
+    public void withFixedDelaySolution() {
+        scheduler.scheduleWithFixedDelay(
+            () -> {
+                try {
+                    Thread.sleep(10);  // 任务执行10秒
+                    System.out.println("WithFixedDelay: " + System.currentTimeMillis());
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            },
+            0, 3, TimeUnit.SECONDS  // 延迟3秒
+        );
+        // 实际执行间隔会是13秒（10秒执行 + 3秒等待）
+    }
+}
+```
+
+### 2. 异常处理
+
+```java
+public class ExceptionHandling {
+    
+    private final ScheduledExecutorService scheduler = 
+        Executors.newScheduledThreadPool(4);
+    
+    public void handleException() {
+        // 周期任务抛出异常后，该任务会被取消
+        // 不会影响其他任务
+        
+        scheduler.scheduleAtFixedRate(
+            () -> {
+                throw new RuntimeException("任务失败");
+            },
+            0, 1, TimeUnit.SECONDS
+        );
+        
+        // 正确做法：在任务内部捕获异常
+        scheduler.scheduleAtFixedRate(
+            () -> {
+                try {
+                    // 可能失败的逻辑
+                } catch (Exception e) {
+                    // 记录日志
+                    e.printStackTrace();
+                }
+            },
+            0, 1, TimeUnit.SECONDS
+        );
+    }
+}
+```
+
+### 3. 正确关闭
+
+```java
+public class ProperShutdown {
+    
+    private final ScheduledExecutorService scheduler = 
+        Executors.newScheduledThreadPool(4);
+    
+    public void shutdown() {
+        scheduler.shutdown();
+        try {
+            if (!scheduler.awaitTermination(1, TimeUnit.MINUTES)) {
+                scheduler.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            scheduler.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+    }
+}
+```
+
+## 总结
+
+`ScheduledThreadPoolExecutor` 的原理：
+
+1. **DelayedWorkQueue**：基于最小堆的延迟队列
+2. **ScheduledFutureTask**：封装延迟/周期任务
+3. **堆排序**：按到期时间自动排序
+4. **take() 阻塞**：队列为空或任务未到期时阻塞
+
+两种周期执行方式：
+- **scheduleAtFixedRate**：固定频率，可能顺延
+- **scheduleWithFixedDelay**：固定间隔，每次等上一个完成
+
+使用建议：
+- 使用 `scheduleWithFixedDelay` 更安全
+- 任务内部要捕获异常
+- 记得在不需要时关闭调度器
+
+> import { Badge } from '@rspress/core/theme';
+
+<Badge>Best Practice</Badge> 对于定时任务，推荐使用 ScheduledThreadPoolExecutor 而不是 Timer，因为 Timer 使用单个线程，抛出异常后会终止整个调度

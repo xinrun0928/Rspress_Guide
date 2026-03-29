@@ -1,0 +1,182 @@
+# ConcurrentHashMap size() 方法演进
+
+计算 ConcurrentHashMap 的元素数量（size）是一个看似简单却暗藏挑战的问题。因为并发容器随时可能被其他线程修改，很难给出一个精确的"快照"值。ConcurrentHashMap 历代版本都尝试用不同的策略来解决这个问题。
+
+## 早期版本的 size 问题
+
+在 JDK 5 引入 ConcurrentHashMap 时，计算 size 需要在所有 Segment 上加锁，然后汇总 count：
+
+```java
+public int size() {
+    long sum = 0;
+    for (int i = 0; i < segments.length; ++i) {
+        segments[i].lock();
+        try {
+            sum += segments[i].count;
+        } finally {
+            segments[i].unlock();
+        }
+    }
+    return (int) sum;
+}
+```
+
+这种方法虽然准确，但代价很大：所有写操作都必须等待 size 完成。幸好 ConcurrentHashMap 的 size() 不是一个常用操作，否则会成为严重瓶颈。
+
+## JDK 7 的改进：两轮尝试
+
+JDK 7 改进了 size 方法，使用两轮不加锁的尝试：
+
+```java
+public int size() {
+    long sum = 0;
+    long check = 0;
+    for (int i = 0; i < RETRIES_BEFORE_LOCK; ++i) {
+        check = 0;
+        sum = 0;
+        for (int j = 0; j < segments.length; ++j) {
+            sum += segments[j].count;
+            check += segments[j].modCount;
+        }
+        if (check == 0) {
+            break;
+        }
+    }
+    if (check != 0) {
+        // 加锁重试
+        sum = 0;
+        for (int j = 0; j < segments.length; ++j) {
+            segments[j].lock();
+            try {
+                sum += segments[j].count;
+            } finally {
+                segments[j].unlock();
+            }
+        }
+    }
+    return (int) sum;
+}
+```
+
+核心思想是：
+
+1. **先不加锁读取两轮**：记录 count 和 modCount（修改次数）
+2. **检查是否一致**：如果两次读取期间没有修改（modCount 没变），直接返回
+3. **不一致则加锁**：说明有并发修改，乖乖加锁计算
+
+这种方法在大多数情况下避免了加锁，提高了并发性能。
+
+## JDK 8 的 counterCell：分布式计数
+
+JDK 8 采用了完全不同的策略：为每个桶维护一个计数器（CounterCell），而不是依赖 sizeCtl 或加锁：
+
+```java
+private transient volatile CounterCell[] counterCells;
+
+@sun.misc.Contended static final class CounterCell {
+    volatile long value;
+    CounterCell(long x) { value = x; }
+}
+```
+
+`@sun.misc.Contended` 注解是 JDK 8 引入的，用于解决"伪共享"（False Sharing）问题。伪共享发生在多个线程访问同一缓存行（Cache Line）上的数据时，一个线程的修改会使其他线程的缓存失效。
+
+CounterCell 的设计使得多个线程可以独立计数，减少竞争。
+
+## addCount：原子计数
+
+```java
+private final void addCount(long x, int binCount) {
+    CounterCell[] as; long b, s;
+    if ((as = counterCells) != null ||
+        !U.compareAndSwapLong(this, BASECOUNT, b = baseCount, s = b + x)) {
+        CounterCell a; long v; int m;
+        boolean uncontended = true;
+        if (as == null || (m = as.length - 1) < 0 ||
+            (a = as[ThreadLocalRandom.getProbe() & m]) == null ||
+            !(uncontended = U.compareAndSwapLong(a, CELLSVALUE, v = a.value, v + x))) {
+            fullAddCount(x, uncontended);
+        } else if (biCount >= 1) {
+            // ...
+        }
+    }
+}
+```
+
+每次插入或删除后，调用 `addCount()` 增加计数。它首先尝试在 baseCount 上用 CAS 加一；如果失败（有竞争），则在 CounterCell 上 CAS 加一；如果还失败，则使用自旋。
+
+## JDK 8 的 size 方法
+
+```java
+public int size() {
+    long n = sumCount();
+    if (n < 0L)
+        return 0;
+    if (n > Integer.MAX_VALUE)
+        return Integer.MAX_VALUE;
+    return (int)n;
+}
+
+final long sumCount() {
+    CounterCell[] as = counterCells;
+    long sum = baseCount;
+    if (as != null) {
+        for (CounterCell a : as) {
+            sum += a.value;
+        }
+    }
+    return sum;
+}
+```
+
+`sumCount()` 遍历所有 CounterCell 并求和，再加上 baseCount，得到总数。这是一种近似值而非精确值——由于并发修改，最终返回的 size 可能与实际元素数量有细微偏差。
+
+## mappingCount：更好的 API
+
+JDK 8 还提供了 `mappingCount()` 方法：
+
+```java
+public long mappingCount() {
+    long n = sumCount();
+    return (n < 0L) ? 0L : n;
+}
+```
+
+推荐使用 `mappingCount()` 而非 `size()`，因为：
+
+1. 返回 long 而非 int，可以容纳更多元素
+2. 语义更明确：计算的是"映射数量"而非"集合大小"
+
+## 为什么 size 不需要精确值
+
+理解为什么 ConcurrentHashMap 的 size() 不需要精确值很重要。在高并发场景下，即使你拿到了精确值，下一秒可能就变了。size() 的作用通常只是判断容器是否为空或大致大小，而不是精确计数。
+
+如果确实需要精确计数，可以考虑：
+
+1. **使用 ReentrantLock**：在统计前加锁，统计期间阻止其他线程修改
+2. **使用 AtomicLong**：在每次修改时同步更新一个共享计数器
+3. **接受近似值**：直接使用 `size()` 或 `mappingCount()`，接受可能的误差
+
+```java
+// 需要精确计数时的包装
+class CountingMap<K> {
+    private final ConcurrentHashMap<K, V> map = new ConcurrentHashMap<>();
+    private final AtomicLong count = new AtomicLong(0);
+    
+    public V put(K key, V value) {
+        V old = map.put(key, value);
+        if (old == null) {
+            count.incrementAndGet();
+        }
+        return old;
+    }
+    
+    public long size() {
+        return count.get();
+    }
+}
+```
+
+理解 size() 方法的演进，你就能理解并发容器设计中"性能"与"精确性"的权衡艺术。
+
+在什么场景下你确实需要精确的元素计数？
