@@ -1,0 +1,957 @@
+import { Badge } from '@rspress/core/theme';
+
+# Nginx 高可用：Keepalived + VRRP 实现 VIP 漂移
+
+凌晨两点，你被一条告警叫醒：「线上服务不可用了！」你睡眼惺忪地打开监控，发现负载均衡器所在的服务器彻底宕机了。更要命的是，这台负载均衡器是唯一的——没有备份，没有高可用。
+
+这是每个工程师都怕遇到，但又很可能遇到的场景。
+
+单机部署的 Nginx，一旦宕机，整个服务就瘫痪了。解决这个问题的方法，就是 **Keepalived + VRRP**——用两台 Nginx 服务器组成一个高可用集群，通过 VIP（Virtual IP，虚拟 IP）漂移实现故障自动切换。
+
+这篇文章，我带你彻底搞懂 Keepalived + VRRP 的工作原理、配置细节，以及生产环境中可能遇到的各种坑。
+
+---
+
+## 一、为什么 Nginx 需要高可用？
+
+### 1.1 单点故障：架构的致命弱点
+
+在聊 Keepalived 之前，先搞清楚一个问题：为什么负载均衡器本身需要高可用？
+
+原因很简单：**负载均衡器是流量的入口**。用户请求先到负载均衡器，再转发给后端服务器。如果负载均衡器宕机，后端服务器再强也没用——用户根本进不来。
+
+```
+用户请求 → [负载均衡器] → 后端服务器
+              ↑
+           单点故障！
+```
+
+单机 Nginx 的风险：
+
+- 服务器硬件故障（电源、主板、硬盘）
+- 操作系统崩溃（内核 panic、驱动问题）
+- Nginx 进程崩溃（OOM、配置错误）
+- 网络故障（网卡损坏、网线松动）
+
+任何一种情况发生，服务就会中断。
+
+### 1.2 高可用架构的思路
+
+高可用（High Availability，HA）的核心思想是：**冗余**。一台服务器不够，就用两台；两台不够，用三台。任何一台出问题，其他服务器接管工作。
+
+对于 Nginx 高可用，常见的架构是：
+
+```
+                用户请求
+                    ↓
+        ┌───────────────────────┐
+        │     虚拟 IP (VIP)      │
+        │   192.168.1.100       │
+        └───────────────────────┘
+              ↑         ↑
+        ┌─────┘         └─────┐
+        ↓                     ↓
+  [Nginx Master]        [Nginx Backup]
+   192.168.1.11          192.168.1.12
+        │                     │
+        └─────────┬───────────┘
+                  ↓
+           后端服务器集群
+```
+
+两台 Nginx 服务器组成一个高可用组，共同对外提供一个 **虚拟 IP（VIP）**。用户只知道 VIP，不关心哪台是主哪台是备。正常情况下，VIP 在主服务器上；主服务器故障时，VIP 自动漂移到备份服务器。
+
+这就是 **VRRP 协议** 做的事情。
+
+---
+
+## 二、VRRP 协议：虚拟路由冗余协议
+
+### 2.1 协议原理
+
+VRRP（Virtual Router Redundancy Protocol，虚拟路由冗余协议）由 IETF 定义（RFC 3768），是实现路由器高可用的标准协议。
+
+VRRP 的核心概念：
+
+**虚拟路由器（Virtual Router）**：由多台物理路由器组成，对外呈现为一台「虚拟」的路由器。
+
+**虚拟 IP（Virtual IP，VIP）**：虚拟路由器的 IP 地址，用户连接的就是这个地址。
+
+**主路由器（Master）**：虚拟路由器的活跃成员，负责转发数据包。
+
+**备份路由器（Backup）**：虚拟路由器的备用成员，随时准备接管。
+
+```bash
+# VRRP 工作示意
+正常状态：
+[Master] ──→ VIP: 192.168.1.100 ──→ [Backup]
+           (活跃，权重高)          (待命，权重低)
+
+故障状态：
+[Master] 宕机！
+[Backup] 检测到 Master 不可用 → 升级为 Master → 接管 VIP: 192.168.1.100
+```
+
+### 2.2 选举机制：Priority + 抢占式
+
+VRRP 使用 **优先级（Priority）** 来决定谁是 Master，优先级高的成为 Master。
+
+```
+Master 选举规则：
+1. Priority 高的成为 Master
+2. Priority 相同时，IP 地址大的成为 Master
+3. Master 故障后，Backup 接管
+4. Master 恢复后，可能重新变为 Master（取决于是否启用抢占）
+```
+
+**抢占式（Preempt）模式**：
+
+- 启用抢占：Master 恢复后，立即夺回 Master 身份
+- 禁用抢占：Master 恢复后，仍然作为 Backup，等待下一次选举
+
+```bash
+# 抢占模式示意
+启用抢占：
+t=0: Master(priority=100) 宕机
+t=1: Backup(priority=90) 升级为 Master
+t=2: Master 恢复，重新夺回 Master
+
+禁用抢占：
+t=0: Master(priority=100) 宕机
+t=1: Backup(priority=90) 升级为 Master
+t=2: Master 恢复，保持 Backup 状态
+```
+
+### 2.3 心跳与故障检测
+
+Master 和 Backup 之间通过 **VRRP Advertisement（VRRP 广告）** 保持联系。Master 定期发送广告，Backup 监听广告来判断 Master 是否存活。
+
+```bash
+# VRRP 心跳示意
+Master → Backup: "我还活着，priority=100"
+         ↓ (每 1 秒发送一次)
+Master 宕机！
+         ↓ (3 秒没收到广告)
+Backup: "Master 没了，我升级为 Master"
+```
+
+**关键参数**：
+
+- **advertisement_interval**：广告发送间隔，默认 1 秒
+- **skew_time**：等待时间，计算公式 `(256 - priority) / 256 * advertisement_interval`
+- **master_down_interval**：Backup 认为 Master 不可用的时间，公式 `3 * advertisement_interval + skew_time`
+
+:::tip 故障切换时间
+
+默认情况下，VRRP 的故障切换时间约 3 秒（丢失 3 次广告）。这个时间可以通过调小 `advertisement_interval` 来缩短，但太短可能导致网络抖动误判。
+
+:::
+
+### 2.4 VRRP 状态机
+
+```
+                    ┌──────────────────┐
+                    │                  │
+              ┌─────→│      INIT        │←─────┐
+              │     │                  │      │
+              │     └──────────────────┘      │
+              │              │                │
+              │              ↓                │
+              │     ┌──────────────────┐      │
+              │     │                  │      │
+              │     │     BACKUP       │──────┘ (启动后接收广告)
+              │     │                  │      │
+              │     └──────────────────┘      │
+              │              │                │
+              │              ↓                │
+              │     ┌──────────────────┐      │
+              │     │                  │      │
+              │     │      MASTER      │──────┘ (接收广告超时或 priority 更高)
+              │     │                  │
+              │     └──────────────────┘
+              │              │
+              └──────────────┘ (priority=0 或故障)
+```
+
+**状态说明**：
+
+| 状态 | 说明 |
+|---|---|
+| INIT | 初始状态，VRRP 未启动 |
+| BACKUP | 备份状态，监听 Master 的广告 |
+| MASTER | 主状态，负责转发流量 |
+
+---
+
+## 三、Keepalived 架构与工作原理
+
+### 3.1 Keepalived 是什么
+
+Keepalived 是一个基于 VRRP 协议的高可用软件，最初设计用于为 Linux 系统提供负载均衡器和路由器的高可用。
+
+Keepalived 由以下组件构成：
+
+- **VRRP Stack**：实现 VRRP 协议的核心
+- **Health Checkers**：健康检查模块，检测后端服务器和本地服务
+- **SMTP**：邮件通知模块，故障时发送告警
+- **IPVS Wrapper**：与 Linux IPVS 配合，实现四层负载均衡
+
+```bash
+# Keepalived 架构示意
+┌────────────────────────────────────┐
+│            Keepalived              │
+├────────────────────────────────────┤
+│  VRRP Stack     │  Health Checkers │
+├────────────────────────────────────┤
+│        IPVS Wrapper                 │
+├────────────────────────────────────┤
+│        Netfilter (iptables)         │
+├────────────────────────────────────┤
+│           Kernel                    │
+└────────────────────────────────────┘
+```
+
+### 3.2 Keepalived 与 Nginx 的配合
+
+Keepalived 本身不转发流量，它只负责 **VIP 的漂移**。实际的负载均衡由 Nginx 完成。
+
+```
+正常状态：
+用户 → VIP → Nginx Master (192.168.1.11) → 后端服务器
+
+Master 故障：
+用户 → VIP → Nginx Backup (192.168.1.12) → 后端服务器
+                   ↑
+              Keepalived 检测到 Master 故障，VIP 漂移到本机
+```
+
+Keepalived 的工作流程：
+
+1. 启动时，根据 Priority 选举 Master
+2. Master 持续发送 VRRP 广告
+3. Backup 监听广告，超时则认为 Master 故障
+4. Backup 升级为 Master，接管 VIP
+5. 原 Master 恢复后，根据配置决定是否夺回 Master
+
+### 3.3 Keepalived 的健康检查
+
+Keepalived 可以检测本地服务状态，不仅仅是网络可达性。这是它比纯 VRRP 更强大的地方。
+
+```bash
+# 健康检查类型
+1. TCP_CHECK：检测端口是否监听
+2. HTTP_GET：检测 HTTP 接口返回状态码
+3. SSL_GET：检测 HTTPS 接口返回状态码
+4. MISC_CHECK：执行自定义脚本
+5. FILE_CHECK：检测文件是否存在
+```
+
+```bash
+# 健康检查示意
+vrrp_script check_nginx {
+    script "/etc/keepalived/check_nginx.sh"
+    interval 2  # 每 2 秒检查一次
+    weight -20   # 检查失败，priority 减 20
+}
+
+vrrp_instance VI_1 {
+    state MASTER
+    priority 100
+    track_script {
+        check_nginx  # 关联健康检查脚本
+    }
+}
+```
+
+---
+
+## 四、Keepalived 配置文件详解
+
+### 4.1 最小配置示例
+
+```bash title="keepalived.conf（节点 A - Master）"
+! Configuration File for keepalived
+
+global_defs {
+   router_id nginx_ha_01  # 路由器 ID，唯一标识
+}
+
+vrrp_instance VI_1 {
+    state MASTER           # 初始状态
+    interface eth0         # 网卡名称
+    virtual_router_id 51   # 虚拟路由器 ID，Master 和 Backup 必须相同
+    priority 100          # 优先级，Master > Backup
+    advert_int 1           # 广告间隔（秒）
+    nopreempt              # 非抢占模式
+    
+    virtual_ipaddress {
+        192.168.1.100/24 dev eth0  # VIP
+    }
+}
+```
+
+```bash title="keepalived.conf（节点 B - Backup）"
+! Configuration File for keepalived
+
+global_defs {
+   router_id nginx_ha_02
+}
+
+vrrp_instance VI_1 {
+    state BACKUP           # 初始状态
+    interface eth0
+    virtual_router_id 51   # 必须与 Master 相同
+    priority 90            # 低于 Master
+    advert_int 1
+    nopreempt              # 非抢占模式
+    
+    virtual_ipaddress {
+        192.168.1.100/24 dev eth0  # VIP
+    }
+}
+```
+
+### 4.2 global_defs 配置块
+
+```bash title="keepalived.conf"
+global_defs {
+    router_id nginx_ha_master    # 路由器 ID
+    script_user root             # 执行脚本的用户
+    enable_script_security       # 启用脚本安全检查
+    
+    # 邮件通知配置
+    notification_email {
+        admin@example.com
+    }
+    notification_email_from keepalived@example.com
+    smtp_server 192.168.1.200
+    smtp_connect_timeout 30
+    
+    # 钉钉/企微 webhook
+    # 需要安装 notify脚本 或使用外部脚本
+}
+```
+
+### 4.3 vrrp_instance 配置块
+
+```bash title="keepalived.conf"
+vrrp_instance VI_1 {
+    state BACKUP               # BACKUP 节点建议设为 BACKUP，避免脑裂
+    
+    # 网络接口
+    interface eth0
+    
+    # 虚拟路由器 ID，同一集群必须相同
+    virtual_router_id 51
+    
+    # 优先级，Master 要高于 Backup
+    priority 100
+    
+    # VRRP 广告发送间隔（秒）
+    advert_int 1
+    
+    # 非抢占模式（可选）
+    # 启用后，Master 恢复不会夺回 Master 身份
+    nopreempt
+    
+    # 抢占延迟（秒），Master 恢复后延迟这么久才夺回
+    # preempt_delay 300
+    
+    # 认证配置（简单模式，防误配）
+    authentication {
+        auth_type PASS
+        auth_pass 1234
+    }
+    
+    # 虚拟 IP 地址
+    virtual_ipaddress {
+        192.168.1.100/24 dev eth0
+        # 可以配置多个 VIP
+        192.168.1.101/24 dev eth0
+    }
+    
+    # VIP 单播模式（生产推荐）
+    unicast_peer {
+        192.168.1.12
+    }
+    
+    # 通知脚本
+    notify_master "/etc/keepalived/notify.sh master"
+    notify_backup "/etc/keepalived/notify.sh backup"
+    notify_fault "/etc/keepalived/notify.sh fault"
+}
+```
+
+### 4.4 完整的双机配置
+
+```bash title="keepalived.conf（Master 节点）"
+! Configuration File for keepalived
+global_defs {
+    router_id LVS_MASTER
+    script_user root
+    enable_script_security
+}
+
+vrrp_script check_nginx {
+    script "/etc/keepalived/check_nginx.sh"
+    interval 2
+    weight -20
+    fall 2
+    rise 1
+}
+
+vrrp_instance VI_1 {
+    state BACKUP
+    interface eth0
+    virtual_router_id 51
+    priority 100
+    advert_int 1
+    nopreempt
+    
+    authentication {
+        auth_type PASS
+        auth_pass 1111
+    }
+    
+    virtual_ipaddress {
+        192.168.1.100/24 dev eth0
+    }
+    
+    unicast_peer {
+        192.168.1.12
+    }
+    
+    track_script {
+        check_nginx
+    }
+    
+    notify_master "/etc/keepalived/notify.sh master"
+    notify_backup "/etc/keepalived/notify.sh backup"
+    notify_fault "/etc/keepalived/notify.sh fault"
+}
+
+vrrp_instance VI_2 {
+    state BACKUP
+    interface eth1
+    virtual_router_id 52
+    priority 100
+    advert_int 1
+    nopreempt
+    
+    authentication {
+        auth_type PASS
+        auth_pass 2222
+    }
+    
+    virtual_ipaddress {
+        10.0.1.100/24 dev eth1
+    }
+    
+    unicast_peer {
+        10.0.1.12
+    }
+}
+```
+
+```bash title="keepalived.conf（Backup 节点）"
+! Configuration File for keepalived
+global_defs {
+    router_id LVS_BACKUP
+    script_user root
+    enable_script_security
+}
+
+vrrp_script check_nginx {
+    script "/etc/keepalived/check_nginx.sh"
+    interval 2
+    weight -20
+    fall 2
+    rise 1
+}
+
+vrrp_instance VI_1 {
+    state BACKUP
+    interface eth0
+    virtual_router_id 51
+    priority 90
+    advert_int 1
+    nopreempt
+    
+    authentication {
+        auth_type PASS
+        auth_pass 1111
+    }
+    
+    virtual_ipaddress {
+        192.168.1.100/24 dev eth0
+    }
+    
+    unicast_peer {
+        192.168.1.11
+    }
+    
+    track_script {
+        check_nginx
+    }
+    
+    notify_master "/etc/keepalived/notify.sh master"
+    notify_backup "/etc/keepalived/notify.sh backup"
+    notify_fault "/etc/keepalived/notify.sh fault"
+}
+```
+
+---
+
+## 五、健康检查脚本
+
+### 5.1 Nginx 检测脚本
+
+```bash title="/etc/keepalived/check_nginx.sh"
+#!/bin/bash
+
+# 检查 Nginx 进程是否存在
+nginx_process=$(ps aux | grep "nginx: master" | grep -v grep)
+
+if [ -z "$nginx_process" ]; then
+    echo "Nginx process not found"
+    exit 1
+fi
+
+# 检查 Nginx 端口是否监听
+nginx_port=$(netstat -tlnp | grep 80 | grep nginx)
+
+if [ -z "$nginx_port" ]; then
+    echo "Nginx port 80 not listening"
+    exit 1
+fi
+
+# 检查本地 HTTP 接口
+http_code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1/health)
+
+if [ "$http_code" -ne 200 ]; then
+    echo "Nginx health check failed, HTTP code: $http_code"
+    exit 1
+fi
+
+echo "Nginx is healthy"
+exit 0
+```
+
+```bash
+# 添加执行权限
+chmod +x /etc/keepalived/check_nginx.sh
+```
+
+### 5.2 通知脚本
+
+```bash title="/etc/keepalived/notify.sh"
+#!/bin/bash
+
+LOGFILE="/var/log/keepalived/notify.log"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> $LOGFILE
+}
+
+case "$1" in
+    master)
+        log "Transition to MASTER state"
+        # 可以发送告警
+        # curl -X POST "https://oapi.dingtalk.com/robot/send?access_token=xxx" \
+        #      -H 'Content-Type: application/json' \
+        #      -d '{"msgtype":"text","text":{"content":"Keepalived: 切换为 MASTER"}}'
+        ;;
+    backup)
+        log "Transition to BACKUP state"
+        ;;
+    fault)
+        log "Transition to FAULT state"
+        ;;
+    *)
+        log "Unknown state: $1"
+        ;;
+esac
+```
+
+### 5.3 vrrp_script 与 track_script 的配合
+
+```bash title="keepalived.conf"
+vrrp_script check_nginx {
+    script "/etc/keepalived/check_nginx.sh"
+    interval 2      # 每 2 秒执行一次
+    weight -20       # 检查失败，priority 减去 20
+    fall 2           # 连续 2 次失败才标记为失败
+    rise 1           # 连续 1 次成功就恢复
+}
+
+vrrp_instance VI_1 {
+    state BACKUP
+    interface eth0
+    virtual_router_id 51
+    priority 100
+    
+    # 关联健康检查脚本
+    track_script {
+        check_nginx
+    }
+    
+    # 关联网卡状态
+    track_interface {
+        eth0
+        eth1
+    }
+}
+```
+
+**weight 参数的作用**：
+
+```bash
+# 场景：Master priority=100，Backup priority=90
+# 配置了 check_nginx，weight=-20
+
+正常状态：
+  Master: priority=100
+  Backup: priority=90
+  Master 是 Master
+
+Master Nginx 故障：
+  check_nginx 返回失败
+  Master: priority=100-20=80
+  Backup: priority=90
+  Backup 升级为 Master
+
+Master Nginx 恢复：
+  check_nginx 返回成功
+  Master: priority=100
+  Backup: priority=90
+  如果启用 nopreempt，Master 保持 Backup
+  如果未启用 nopreempt，Master 夺回 Master
+```
+
+---
+
+## 六、脑裂问题与预防
+
+### 6.1 什么是脑裂
+
+脑裂（Split-Brain）是指 Master 和 Backup 之间的通信中断，但双方都认为对方已经故障，都升级为 Master，都试图拥有 VIP。
+
+```
+正常状态：
+  VIP: 192.168.1.100 → Master
+
+脑裂状态（网络分区）：
+  VIP: 192.168.1.100 → Master
+  VIP: 192.168.1.100 → Backup (同时存在！)
+  
+  → 客户端可能访问到两台机器
+  → 数据不一致
+  → 网络混乱
+```
+
+### 6.2 脑裂的常见原因
+
+- 网络设备故障（交换机、路由器）
+- 网线松动或网卡故障
+- 防火墙阻止 VRRP 报文
+- 广播风暴导致网络拥塞
+
+### 6.3 脑裂预防措施
+
+**措施一：使用单播（Unicast）代替组播（Multicast）**
+
+```bash title="keepalived.conf"
+vrrp_instance VI_1 {
+    # 使用单播模式，点对点通信
+    unicast_peer {
+        192.168.1.12  # 指定对端 IP
+    }
+}
+```
+
+单播模式下，VRRP 报文直接发送到指定 IP，不依赖组播地址，更容易穿越网络设备。
+
+**措施二：启用防火墙，放行 VRRP**
+
+```bash
+# iptables 放行 VRRP
+iptables -A INPUT -p vrrp -j ACCEPT
+
+# 或者只放行来自特定 IP 的 VRRP
+iptables -A INPUT -p vrrp -s 192.168.1.0/24 -j ACCEPT
+```
+
+**措施三：配置 auth 认证**
+
+```bash title="keepalived.conf"
+vrrp_instance VI_1 {
+    authentication {
+        auth_type PASS
+        auth_pass 1234  # 密码要复杂，避免被猜测
+    }
+}
+```
+
+**措施四：检测脚本中的 VIP 检测**
+
+```bash title="/etc/keepalived/check_nginx.sh"
+#!/bin/bash
+
+# 检查 VIP 是否在本机
+vip=$(ip addr show eth0 | grep 192.168.1.100)
+
+if [ -z "$vip" ]; then
+    echo "VIP not on this node"
+    # 如果本机没有 VIP，说明不是 Master，可以直接退出
+    exit 0
+fi
+
+# 本机有 VIP，执行健康检查
+nginx_process=$(ps aux | grep "nginx: master" | grep -v grep)
+
+if [ -z "$nginx_process" ]; then
+    exit 1
+fi
+
+exit 0
+```
+
+---
+
+## 七、故障切换时序与测试
+
+### 7.1 故障切换流程
+
+```bash
+t=0s:    Master Nginx 正常，发送 VRRP 广告
+t=1s:    Master Nginx 正常，发送 VRRP 广告
+t=2s:    Master Nginx 故障，健康检查脚本返回失败
+t=3s:    Master Nginx 仍然故障，priority 降低
+t=4s:    Backup 收不到广告（超时），认为 Master 故障
+t=5s:    Backup 升级为 Master，接管 VIP
+t=5s+:   所有请求转发到 Backup 上的 Nginx
+```
+
+### 7.2 测试方法
+
+**测试一：杀掉 Nginx 进程**
+
+```bash
+# Master 节点
+killall nginx
+
+# 观察 VIP 漂移
+ip addr show eth0 | grep 192.168.1.100
+
+# 观察 Backup 是否接管
+# 应该能在 Backup 上看到 VIP
+```
+
+**测试二：停止 Keepalived**
+
+```bash
+# Master 节点
+systemctl stop keepalived
+
+# Backup 应该立即接管
+```
+
+**测试三：模拟网络故障**
+
+```bash
+# 使用 iptables 模拟网络断开
+iptables -A INPUT -p vrrp -j DROP
+
+# 等待 3-5 秒，观察切换
+```
+
+### 7.3 故障恢复
+
+```bash
+# Master 恢复后
+systemctl start keepalived
+
+# 如果启用 nopreempt
+# Master 恢复后保持 Backup 状态
+
+# 如果未启用 nopreempt
+# Master 夺回 Master 身份
+
+# 可以在 Master 上查看日志
+tail -f /var/log/messages | grep Keepalived
+```
+
+---
+
+## 八、面试追问：Keepalived + VRRP 高频问题
+
+### 8.1 问题一：Keepalived 是如何检测 Nginx 故障的？
+
+**参考答案**：
+
+Keepalived 通过 **vrrp_script** 配合 **track_script** 实现健康检查。
+
+核心流程：
+
+1. 定义一个 `vrrp_script`，指定检查脚本和检查间隔
+2. 在 `vrrp_instance` 中使用 `track_script` 关联这个检查脚本
+3. Keepalived 定期执行脚本，根据返回码判断健康状态
+4. 如果检查失败，通过 `weight` 参数动态调整 priority
+5. 如果 priority 低于 Backup，触发切换
+
+```bash
+vrrp_script check_nginx {
+    script "/etc/keepalived/check_nginx.sh"
+    interval 2
+    weight -20
+}
+
+vrrp_instance VI_1 {
+    track_script {
+        check_nginx
+    }
+}
+```
+
+如果脚本返回非 0，priority 减去 weight 值。如果结果低于其他节点，触发主备切换。
+
+### 8.2 问题二：VRRP 和 Keepalived 是什么关系？
+
+**参考答案**：
+
+VRRP 是协议，Keepalived 是实现这个协议的软件。
+
+**VRRP（Virtual Router Redundancy Protocol）**：
+
+- IETF 定义的协议标准（RFC 3768）
+- 定义了 Master/Backup 选举、广告发送、故障切换等机制
+- 是一种通用的协议，不绑定特定实现
+
+**Keepalived**：
+
+- VRRP 协议的开源实现之一
+- 除了 VRRP，还包含健康检查、SMTP 通知等功能
+- 常与 IPVS 配合实现四层负载均衡高可用
+- 也可以只负责 VIP 漂移，让 Nginx 做七层负载均衡
+
+### 8.3 问题三：抢占模式和非抢占模式的区别？
+
+**参考答案**：
+
+**非抢占模式（nopreempt）**：
+
+- Master 故障后，Backup 升级为 Master
+- Master 恢复后，不会夺回 Master 身份，保持 Backup 状态
+- 优点：避免频繁切换
+- 缺点：故障恢复后，可能不是最优配置
+
+**抢占模式（默认）**：
+
+- Master 故障后，Backup 升级为 Master
+- Master 恢复后，重新夺回 Master 身份
+- 优点：始终由 priority 最高的节点担任 Master
+- 缺点：网络抖动可能导致频繁切换
+
+**配置建议**：
+
+```bash
+# 追求稳定，启用 nopreempt
+vrrp_instance VI_1 {
+    nopreempt
+}
+
+# 追求最优配置，不启用 nopreempt
+# 但要确保网络稳定，避免频繁切换
+```
+
+### 8.4 问题四：如何避免脑裂？
+
+**参考答案**：
+
+脑裂是 Keepalived 高可用中最严重的问题。预防措施包括：
+
+**第一：使用单播代替组播**
+
+```bash
+vrrp_instance VI_1 {
+    unicast_peer {
+        192.168.1.12
+    }
+}
+```
+
+单播模式点对点通信，不依赖组播地址，更可靠。
+
+**第二：配置认证**
+
+```bash
+vrrp_instance VI_1 {
+    authentication {
+        auth_type PASS
+        auth_pass 12345678  # 密码至少 8 位
+    }
+}
+```
+
+**第三：启用防火墙**
+
+```bash
+# 只放行来自对端的 VRRP 报文
+iptables -A INPUT -p vrrp -s 192.168.1.0/24 -j ACCEPT
+iptables -A INPUT -p vrrp -j DROP
+```
+
+**第四：VIP 检测脚本**
+
+确保只有真正拥有 VIP 的节点才是 Master。
+
+---
+
+## 九、留给你的思考题
+
+### 题目一：三机高可用
+
+假设有三台 Nginx 服务器，如何用 Keepalived 实现高可用？
+
+**提示**：考虑 priority 梯度设置，以及多主模式。
+
+### 题目二：VIP 漂移与连接中断
+
+VIP 漂移过程中，用户的请求会怎样？
+
+**提示**：考虑 TCP 连接状态，以及 Nginx 的长连接配置。
+
+### 题目三：Keepalived 与 LVS 的结合
+
+Keepalived 最初是为 LVS（Linux Virtual Server）设计的。如果要实现「LVS 做四层负载均衡 + Keepalived 高可用」，架构应该怎么设计？
+
+**提示**：LVS 支持 DR、TUN、NAT 三种模式，与 Keepalived 的结合方式不同。
+
+---
+
+## 总结
+
+Keepalived + VRRP 是实现 Nginx 高可用的经典方案。
+
+**核心概念**：
+
+- **VIP（虚拟 IP）**：对外提供服务的 IP，漂移于主备节点之间
+- **VRRP 协议**：Master/Backup 选举、广告发送、故障切换
+- **Priority**：决定谁是 Master，priority 高的成为 Master
+- **抢占 vs 非抢占**：Master 恢复后是否夺回身份
+
+**关键配置**：
+
+- `vrrp_instance`：定义一个虚拟路由器实例
+- `vrrp_script` + `track_script`：健康检查与故障检测
+- `nopreempt`：非抢占模式
+- `unicast_peer`：单播模式，避免组播问题
+
+**高可用设计要点**：
+
+- 至少两台服务器组成高可用组
+- Master 和 Backup 放置在不同机架/机房
+- 配置健康检查脚本，及时发现 Nginx 故障
+- 预防脑裂，使用单播和认证
+
+记住：高可用不是「有了就安全」，而是「配置对了才安全」。每一个参数都有其意义，理解原理才能用好它。

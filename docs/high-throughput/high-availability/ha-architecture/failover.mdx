@@ -1,0 +1,818 @@
+import { Badge } from '@rspress/core/theme';
+
+# 主备切换与故障转移机制
+
+凌晨三点，你的手机突然震动。监控平台发来告警：「主数据库连接失败」。你猛地坐起来，心里一沉——主库挂了？
+
+但奇怪的是，应用似乎还在正常提供服务。仔细一看，原来是 DBA 的自动化脚本已经在两分钟前检测到了主库故障，并且把流量切换到了备用数据库。整个过程用户无感知，告警邮件甚至还没来得及发出去。
+
+这就是故障转移（Failover）的威力。
+
+如果当时没有这套自动化切换机制呢？应用会一直卡在连接主库的地方，直到你爬起来手动操作。这中间的几十分钟，对于双十一这样的峰值业务来说，可能是几千万的交易损失。
+
+所以我们今天要聊的问题是：**如何设计一个可靠的故障转移机制，让系统在主节点故障时，自动、快速、无感知地切换到备用节点？**
+
+---
+
+## 一、故障转移的本质：为什么需要它
+
+### 1.1 故障转移的定义
+
+故障转移（Failover）是一种系统保护机制，当主节点（Primary/Active）发生故障时，系统能够自动将工作负载转移到备用节点（Standby/Passive），保证服务持续可用。
+
+故障转移的核心价值在于：
+
+- **提高可用性**：主节点故障时，服务不中断
+- **减少人工干预**：自动化切换，不需要「救火队员」半夜起床
+- **快速恢复**：切换过程从分钟级缩短到秒级甚至毫秒级
+
+### 1.2 主动切换 vs 被动切换
+
+根据触发方式，故障转移分为主动切换和被动切换：
+
+**主动切换（Switchover）**：计划内的切换，比如机房维护、主库升级。此时人为发起切换，有充足的时间窗口，数据一致性可以保证。
+
+**被动切换（Failover）**：计划外的切换，即主节点非预期故障。切换是自动的，时间紧迫，数据可能存在不一致。
+
+| 维度 | 主动切换 | 被动切换 |
+|---|---|---|
+| 触发条件 | 计划内（维护、升级） | 计划外（硬件故障、软件崩溃） |
+| 时效性 | 宽松，可以提前准备 | 紧迫，需要快速响应 |
+| 数据一致性 | 可以保证 | 可能丢失最后一部分数据 |
+| 人工介入 | 必须 | 通常自动化 |
+
+### 1.3 主备架构 vs 双主架构
+
+**主备架构（Active-Passive）**：只有主节点对外提供服务，备用节点处于待机状态。主节点故障时，切换到备用节点。
+
+```
+        [主节点] ←──── 同步复制 ────→ [备用节点]
+           ↑
+        流量入口
+           ↓
+        [负载均衡器]
+```
+
+**双主架构（Active-Active）**：两个节点都对外提供服务，互为备份。任何一个节点故障时，另一个节点接管全部流量。
+
+```
+    [节点 A] ←───────────────→ [节点 B]
+       ↑                               ↑
+       └──────── 流量入口 ─────────────┘
+                  ↓
+            [负载均衡器]
+```
+
+<Badge text="选择依据" type="tip" /> 主备架构成本低，资源利用率低（50% 备用）；双主架构资源利用率高，但复杂度更高，需要处理双向数据同步和冲突问题。
+
+---
+
+## 二、健康检查：发现故障的眼睛
+
+### 2.1 健康检查的机制
+
+故障转移的第一步是「发现故障」。这听起来简单，但如何准确、快速地判断一个节点是否健康，却是个技术活。
+
+常见的健康检查方式：
+
+**网络层检测**：通过 ping 或 TCP 端口检测节点是否可达。优点是开销小，缺点是只能检测网络层，无法判断应用层是否正常。
+
+**应用层检测**：发送 HTTP 请求或执行特定的探针语句，检测应用层的健康状态。优点是准确性高，缺点是开销更大。
+
+```bash
+# 网络层检测：ping
+ping -c 3 192.168.1.100
+
+# 应用层检测：HTTP 健康检查端点
+curl -s http://192.168.1.100:8080/health | grep "status.*ok"
+```
+
+**心跳机制**：节点定期向监控中心发送心跳，证明自己还活着。如果超过一定时间没有收到心跳，就认为节点已故障。
+
+```java
+// 心跳检测伪代码
+public class HeartbeatMonitor {
+    private final Map<String, Long> lastHeartbeat = new ConcurrentHashMap<>();
+    private final long timeoutMs = 5000; // 5秒超时
+
+    public void receiveHeartbeat(String nodeId) {
+        lastHeartbeat.put(nodeId, System.currentTimeMillis());
+    }
+
+    public boolean isNodeAlive(String nodeId) {
+        Long lastBeat = lastHeartbeat.get(nodeId);
+        if (lastBeat == null) return false;
+        return System.currentTimeMillis() - lastBeat < timeoutMs;
+    }
+}
+```
+
+### 2.2 健康检查的配置策略
+
+健康检查不是「检测一次」就完事了，需要持续检测。关键配置参数包括：
+
+| 参数 | 说明 | 配置建议 |
+|---|---|---|
+| 检查间隔 | 两次检查之间的间隔 | 1-5 秒，间隔越短越快发现故障，但开销越大 |
+| 超时时间 | 单次检查的超时时间 | 1-3 秒，避免单次网络抖动导致误判 |
+| 失败阈值 | 连续失败多少次才判定为故障 | 2-3 次，防止偶发抖动导致的误判 |
+| 成功阈值 | 连续成功多少次才判定为恢复 | 1-2 次，快速恢复服务 |
+
+:::warning 健康检查不是越频繁越好
+
+如果检查间隔设置过短（比如 100ms），会产生大量的检测流量，本身就可能成为系统的负担。而且过短的间隔会让系统对网络抖动过于敏感，产生「误切换」——节点其实没坏，但因为网络瞬抖就被判死刑了。
+
+:::
+
+### 2.3 多维度健康检查
+
+生产环境的健康检查通常是「多维度」的，单一维度的检测可能不准确：
+
+```yaml
+# 多维度健康检查配置示例
+health_check:
+  - type: network        # 网络层检测
+    enabled: true
+    interval: 3s
+    timeout: 1s
+  - type: port           # 端口检测
+    enabled: true
+    interval: 3s
+    timeout: 1s
+  - type: http           # HTTP 层检测
+    enabled: true
+    url: /health
+    interval: 5s
+    timeout: 2s
+    expected_status: 200
+  - type: application    # 应用层检测
+    enabled: true
+    script: /opt/scripts/check_db.sh
+    interval: 10s
+    timeout: 5s
+```
+
+---
+
+## 三、状态同步：切换的数据基础
+
+### 3.1 同步复制 vs 异步复制
+
+主备切换时，备用节点需要尽可能同步主节点的数据。复制方式决定了切换时可能丢失多少数据。
+
+**同步复制**：主节点等待备用节点确认接收数据后才返回成功。优点是数据不丢失，缺点是性能开销大，主备之间网络延迟会直接影响主节点响应时间。
+
+**异步复制**：主节点写入后立即返回，不等待备用节点确认。优点是性能好，缺点是主节点故障时可能丢失最后一部分数据。
+
+| 维度 | 同步复制 | 异步复制 |
+|---|---|---|
+| 数据安全性 | 不丢失 | 可能丢失最后部分数据 |
+| 性能影响 | 主库写入延迟增加 | 无影响 |
+| 网络要求 | 低延迟、可靠网络 | 无特殊要求 |
+| 适用场景 | 数据敏感性高 | 性能优先，允许少量数据丢失 |
+
+### 3.2 半同步复制
+
+MySQL 的半同步复制（Semisynchronous Replication）是介于同步和异步之间的方案：
+
+- 主节点写入后，等待至少一个备用节点接收数据并写入relay log
+- 如果超时，自动降级为异步复制
+- 恢复后再次自动升级为半同步复制
+
+```sql
+-- 查看半同步复制状态
+SHOW VARIABLES LIKE 'rpl_semi_sync%';
+
+-- 启用半同步复制
+SET GLOBAL rpl_semi_sync_master_enabled = ON;
+SET GLOBAL rpl_semi_sync_slave_enabled = ON;
+```
+
+<Badge text="MySQL 5.7+" type="tip" /> MySQL 5.7 引入了「After_sync」模式的半同步复制，事务在所有备用节点确认后才提交，安全性更高。
+
+### 3.3 基于日志的同步
+
+对于分布式系统，另一种常见的同步方式是「基于日志的同步」（Log-based Replication）：
+
+- 主节点的所有写操作都记录到日志
+- 备用节点订阅并回放这些日志
+- 切换时，备用节点将日志应用到最新状态
+
+这种方式的优势在于：
+
+- 可以实现任意时刻的数据同步
+- 支持乱序回放（通过日志序列号保证顺序）
+- 可以支持多个备用节点
+
+```
+主节点          日志            备用节点1          备用节点2
+  │              │                 │                 │
+  ├──写操作───→ [日志] ──────→ 回放 ──→ 同步          │
+  │              │              回放 ──→ 同步          │
+  │              │                                   │
+```
+
+---
+
+## 四、切换机制：VIP 漂移与路由更新
+
+### 4.1 VIP 漂移原理
+
+VIP（Virtual IP，虚拟 IP）是实现故障切换的关键技术。通过 VIP，多台服务器可以共享同一个 IP 地址，切换时只需要把 VIP 从主节点「漂移」到备用节点。
+
+VIP 漂移的工作原理：
+
+```
+正常状态：
+    VIP: 192.168.1.100 → [主节点: 192.168.1.101]
+
+切换后：
+    VIP: 192.168.1.100 → [备用节点: 192.168.1.102]
+```
+
+实现 VIP 漂移的主流工具是 Keepalived + VRRP（Virtual Router Redundancy Protocol）。
+
+### 4.2 Keepalived 配置示例
+
+```conf title="/etc/keepalived/keepalived.conf"
+! Configuration File for keepalived
+
+global_defs {
+   router_id LVS_DEVEL
+   script_user root
+   enable_script_security
+}
+
+vrrp_script check_mysql {
+    script "/etc/keepalived/check_mysql.sh"  # 自定义健康检查脚本
+    interval 2                                # 检查间隔 2 秒
+    weight -20                                # 检查失败时优先级降低 20
+    fall 2                                     # 连续失败 2 次判定为失败
+    rise 1                                     # 连续成功 1 次判定为恢复
+}
+
+vrrp_instance VI_1 {
+    state BACKUP          # 初始状态为 BACKUP
+    interface eth0         # 网卡名称
+    virtual_router_id 51  # 虚拟路由 ID，两个节点必须相同
+    priority 100           # 优先级，主节点设为 100，备用设为 90
+    nopreempt             # 非抢占模式，优先级低的节点恢复后不会抢回主身份
+
+    advert_int 1           # 心跳间隔 1 秒
+    authentication {
+        auth_type PASS
+        auth_pass 1111     # 认证密码
+    }
+
+    virtual_ipaddress {
+        192.168.1.100/24  # 虚拟 IP 地址
+    }
+
+    track_script {
+        check_mysql        # 关联健康检查脚本
+    }
+
+    # 切换脚本（切换时执行）
+    notify_master "/etc/keepalived/notify.sh master"
+    notify_backup "/etc/keepalived/notify.sh backup"
+    notify_fault "/etc/keepalived/notify.sh fault"
+}
+```
+
+```bash title="/etc/keepalived/check_mysql.sh"
+#!/bin/bash
+# MySQL 健康检查脚本
+
+MYSQL_HOST="localhost"
+MYSQL_PORT="3306"
+MYSQL_USER="root"
+MYSQL_PASSWORD="your_password"
+
+# 执行 MySQL 探针查询
+mysqladmin -h ${MYSQL_HOST} -P ${MYSQL_PORT} -u ${MYSQL_USER} -p${MYSQL_PASSWORD} ping > /dev/null 2>&1
+
+if [ $? -eq 0 ]; then
+    exit 0  # MySQL 健康
+else
+    exit 1  # MySQL 故障
+fi
+```
+
+```bash title="/etc/keepalived/notify.sh"
+#!/bin/bash
+# 切换通知脚本
+
+STATE=$1
+VIP="192.168.1.100"
+
+case $STATE in
+    "master")
+        echo "切换为主节点，VIP ${VIP}"
+        # 这里可以添加业务相关的操作，如执行数据库切换脚本
+        ;;
+    "backup")
+        echo "切换为备用节点"
+        ;;
+    "fault")
+        echo "节点故障"
+        ;;
+esac
+```
+
+### 4.3 ZooKeeper 实现选举切换
+
+对于分布式集群，ZooKeeper 是常用的协调服务，可以用来实现选举和故障切换。
+
+```java title="ZooKeeperLeaderElection.java"
+import org.apache.zookeeper.*;
+import org.apache.zookeeper.data.Stat;
+
+import java.io.IOException;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
+
+public class ZooKeeperLeaderElection {
+    private static final String ZOOKEEPER_ADDRESS = "localhost:2181";
+    private static final String ELECTION_NAMESPACE = "/election";
+    private static final String NODE_PREFIX = "candidate_";
+
+    private final ZooKeeper zooKeeper;
+    private String currentZnodeName;
+    private final CountDownLatch leaderLatch = new CountDownLatch(1);
+
+    public ZooKeeperLeaderElection() throws IOException {
+        this.zooKeeper = new ZooKeeper(ZOOKEEPER_ADDRESS, 3000, event -> {
+            if (event.getType() == Watcher.Event.EventType.NodeDeleted) {
+                try {
+                    checkIfLeader();
+                } catch (Exception e) {
+                    e.printStackTrace();
+                }
+            }
+        });
+    }
+
+    public void startElection() throws Exception {
+        // 创建临时有序节点
+        String znode = zooKeeper.create(
+            ELECTION_NAMESPACE + "/" + NODE_PREFIX,
+            new byte[0],
+            ZooDefs.Ids.OPEN_ACL_UNSAFE,
+            CreateMode.EPHEMERAL_SEQUENTIAL
+        );
+        currentZnodeName = znode.replace(ELECTION_NAMESPACE + "/", "");
+
+        // 检查是否是 leader
+        checkIfLeader();
+        leaderLatch.await();
+    }
+
+    private void checkIfLeader() throws Exception {
+        // 获取所有候选节点并排序
+        List<String> candidates = zooKeeper.getChildren(ELECTION_NAMESPACE, true);
+        Collections.sort(candidates);
+
+        // 当前节点是否是排序后的第一个（最小的序号）
+        String smallestCandidate = candidates.get(0);
+        if (smallestCandidate.equals(currentZnodeName)) {
+            // 当前节点是 leader
+            System.out.println("当前节点成为 leader");
+            becomeLeader();
+        } else {
+            // 监听前一个节点
+            int currentIndex = candidates.indexOf(currentZnodeName);
+            String predecessor = candidates.get(currentIndex - 1);
+            String predecessorPath = ELECTION_NAMESPACE + "/" + predecessor;
+
+            zooKeeper.exists(predecessorPath, event -> {
+                if (event.getType() == Event.EventType.NodeDeleted) {
+                    checkIfLeader();
+                }
+            });
+        }
+    }
+
+    private void becomeLeader() {
+        // 执行 leader 相关操作，如切换 VIP、更新配置
+        System.out.println("开始执行 leader 相关操作");
+        leaderLatch.countDown();
+    }
+}
+```
+
+---
+
+## 五、脑裂问题：分区的噩梦
+
+### 5.1 什么是脑裂
+
+脑裂（Split-Brain）是分布式系统中最危险的问题之一。指的是：由于网络分区，系统被分成两个或多个独立的分区，每个分区都认为自己是「主节点」，继续处理请求。
+
+```
+网络分区前：
+    [主节点 A] ←─────── 同步 ───────→ [备用节点 B]
+
+网络分区后：
+    [主节点 A]          [备用节点 B]
+       ↑                    ↑
+       └─── 分区隔离 ───────┘
+    节点 A：认为自己是主，继续写入
+    节点 B：也认为自己是主，继续写入
+    结果：数据分裂，两边数据不一致
+```
+
+脑裂的危害极大：两边同时写入数据，数据会永久性不一致；如果两边同时修改了同一条记录，结果不可预测。
+
+### 5.2 预防脑裂的策略
+
+**投票机制（Quorum）**：只有获得多数票的节点才能成为主节点。网络分区后，只有拥有多数节点的分区能继续工作。
+
+```java
+// 基于 Quorum 的选举逻辑
+public class QuorumBasedElection {
+    private int totalNodes;
+    private int quorumSize;  // majority = totalNodes / 2 + 1
+
+    public boolean canBecomeLeader(List<String> availableNodes) {
+        return availableNodes.size() >= quorumSize;
+    }
+}
+```
+
+** fencing 机制**：切换时，对旧主节点执行「 fencing」（隔离）操作，确保它不能再写入。常见方式是断电、重启、关闭网络端口。
+
+```conf title="STONITH 配置示例（Shoot The Other Node In The Head）"]
+# Pacemaker + STONITH 配置
+primitive stonith-ipmi stonith:external/ipmi \
+    params host="192.168.1.101" \
+    params userid="admin" \
+    params passwd="password" \
+    params interface="lan"
+```
+
+**红锁算法（RedLock）**：分布式锁的一种实现，客户端需要从多个 Redis 实例获取锁才算成功。单个实例故障不会导致锁丢失。
+
+```java title="RedLock 实现（简化版）"
+public class RedLock {
+    private List<RedisClient> redisClients;
+
+    public String lock(String resource, long ttlMs) {
+        List<String> keys = Collections.singletonList(resource);
+        long startTime = System.currentTimeMillis();
+
+        // 向 N 个 Redis 实例获取锁
+        int successCount = 0;
+        for (RedisClient client : redisClients) {
+            if (tryGetLock(client, resource, ttlMs)) {
+                successCount++;
+            }
+        }
+
+        // 计算获取锁的总耗时
+        long elapsedTime = System.currentTimeMillis() - startTime;
+
+        // 成功获取锁的数量 >= N/2+1 且 总耗时 < TTL
+        if (successCount >= (redisClients.size() / 2 + 1)
+                && elapsedTime < ttlMs) {
+            return "lock-acquired";
+        } else {
+            // 释放所有已获取的锁
+            releaseAllLocks(keys);
+            return null;
+        }
+    }
+
+    private boolean tryGetLock(RedisClient client, String resource, long ttlMs) {
+        // 使用 SET NX EX 实现分布式锁
+        return client.setNX(resource, "locked", ttlMs, TimeUnit.MILLISECONDS);
+    }
+}
+```
+
+### 5.3 脑裂的检测与处理
+
+即使做了预防，脑裂仍可能发生。系统需要具备检测和快速处理脑裂的能力：
+
+```java title="脑裂检测与处理"
+public class SplitBrainDetector {
+    private final Map<String, Long> lastHeartbeat = new ConcurrentHashMap<>();
+    private final long heartbeatTimeout = 5000;
+    private final int nodeCount;
+    private final int quorumSize;
+
+    public SplitBrainDetector(int nodeCount) {
+        this.nodeCount = nodeCount;
+        this.quorumSize = nodeCount / 2 + 1;
+    }
+
+    public boolean isQuorumMet(List<String> activeNodes) {
+        return activeNodes.size() >= quorumSize;
+    }
+
+    public void handleSplitBrain(List<String> isolatedNodes) {
+        // 被隔离的节点，应该自动降级或关闭
+        for (String node : isolatedNodes) {
+            System.out.println("节点 " + node + " 处于少数派分区，执行降级");
+            degradeNode(node);
+        }
+    }
+
+    private void degradeNode(String node) {
+        // 降级处理：停止写入、只读模式
+        // 或者直接关闭节点，等待网络恢复后重新加入
+    }
+}
+```
+
+---
+
+## 六、数据库故障转移：MySQL MHA 实战
+
+### 6.1 MySQL MHA 架构
+
+MHA（MySQL Master High Availability）是 MySQL 主从复制环境下的高可用解决方案，由日本 DeNA 公司的工程师开发。
+
+MHA 的核心功能：
+
+- 自动检测主库故障
+- 在多台从库中选择最新的从库作为新主库
+- 将其他从库切换到新的主库
+- 支持半同步复制
+- 支持 VIP 漂移
+
+```
+                    [Manager 节点]
+                        │
+          ┌─────────────┼─────────────┐
+          │             │             │
+      [主库]          [从库1]       [从库2]
+         ↑               ↑             ↑
+         └───────────────┴─────────────┘
+                    主从复制
+```
+
+### 6.2 MHA 配置文件
+
+```ini title="/etc/mha/app.cnf"
+[server default]
+# Manager 运行时的工作目录
+manager_workdir=/var/log/mha/app
+# Manager 日志文件
+manager_log=/var/log/mha/app/manager.log
+# SSH 用户
+ssh_user=root
+# SSH 端口
+ssh_port=22
+# MySQL 复制用户名和密码
+repl_user=repl
+repl_password=repl_password
+# MySQL 连接用户
+user=mha_user
+password=mha_password
+# ping 测试次数
+ping_interval=3
+ping_type=SELECT
+
+[server1]
+# 主库（候选）
+hostname=192.168.1.101
+candidate_master=1   # 有资格成为新主库
+check_repl_delay=0   # 即使复制延迟较大也优先考虑
+
+[server2]
+hostname=192.168.1.102
+candidate_master=1
+
+[server3]
+hostname=192.168.1.103
+# 不优先成为主库
+candidate_master=0
+```
+
+### 6.3 故障转移流程
+
+MHA 的故障转移流程：
+
+1. **检测故障**：MHA Manager 每 3 秒 ping 主库，如果 3 次 ping 都失败，判定主库故障
+2. **选择新主库**：在所有从库中，选择 relay log 应用最快的一个作为新主库
+3. **差异同步**：如果新主库和其他从库之间有差异，尝试从旧主库获取差异日志
+4. **切换**：将其他从库指向新主库，开始复制
+5. **VIP 漂移**：将 VIP 漂移到新主库
+6. **故障转移完成**：通知管理员
+
+```bash
+# 手动触发故障转移（主库正常时）
+masterha_master_switch \
+    --conf=/etc/mha/app.cnf \
+    --master_state=alive \
+    --new_master_host=192.168.1.102
+
+# 故障转移后的检查
+masterha_check_repl --conf=/etc/mha/app.cnf
+```
+
+---
+
+## 七、应用层故障转移：无状态服务的优势
+
+### 7.1 无状态服务的特点
+
+应用层故障转移比数据库简单得多，前提是应用服务是「无状态」的。
+
+无状态服务的特点：
+
+- 所有用户数据都存储在外部（Redis、数据库、Session 服务器）
+- 应用服务器不存储任何用户相关的数据
+- 任何一台服务器宕机，流量切换到其他服务器即可
+
+```
+有状态服务：
+    用户 A → [服务器 1]（存储用户 A 的 Session）
+    用户 B → [服务器 2]（存储用户 B 的 Session）
+    → 服务器 1 挂了，用户 A 的 Session 丢失
+
+无状态服务：
+    用户 A → [任意服务器]（Session 存储在 Redis）
+    用户 B → [任意服务器]（Session 存储在 Redis）
+    → 任何服务器挂了，流量自动切换，用户无感知
+```
+
+### 7.2 Kubernetes 中的 Pod 故障转移
+
+在 Kubernetes 环境中，Pod 的故障转移由控制器自动完成：
+
+```yaml title="Deployment 配置"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service
+spec:
+  replicas: 3  # 保持 3 个副本
+  selector:
+    matchLabels:
+      app: order-service
+  template:
+    metadata:
+      labels:
+        app: order-service
+    spec:
+      containers:
+      - name: order-service
+        image: order-service:latest
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+      # 健康检查
+      livenessProbe:
+        httpGet:
+          path: /health
+          port: 8080
+        initialDelaySeconds: 30
+        periodSeconds: 10
+      readinessProbe:
+        httpGet:
+          path: /ready
+          port: 8080
+        initialDelaySeconds: 5
+        periodSeconds: 5
+```
+
+Kubernetes 的故障转移机制：
+
+- **存活探针（Liveness Probe）**：如果探测失败，Kubernetes 重启 Pod
+- **就绪探针（Readiness Probe）**：如果探测失败，Kubernetes 将 Pod 从 Service 中移除，不再接收流量
+- **副本控制器**：确保始终有 3 个 Pod 正常运行，某个 Pod 故障后自动创建新的
+
+---
+
+## 八、面试追问：故障转移高频问题
+
+### 问题一：如何设计一个故障转移机制？
+
+**参考答案**：
+
+故障转移机制的设计需要考虑以下几个方面：
+
+**故障检测**：
+
+- 多层次健康检查：网络层、端口层、应用层
+- 心跳机制：定期发送心跳包
+- 合理的超时和重试策略
+
+**状态同步**：
+
+- 同步复制：主备数据完全一致，但性能有影响
+- 异步复制：性能好，但可能丢失最后部分数据
+- 半同步复制：平衡数据安全性和性能
+
+**切换决策**：
+
+- 自动切换：适用于故障检测可靠、误判率低的场景
+- 人工介入：适用于复杂场景，需要人工判断后再切换
+- 选举机制：分布式环境下，通过选举确定新主节点
+
+**数据一致性**：
+
+- 脑裂防护：使用 fencing、quorum 等机制
+- 数据补偿：切换后执行数据校验和修复
+
+### 问题二：主备切换时如何保证数据不丢失？
+
+**参考答案**：
+
+数据不丢失是高可用设计的核心挑战。实现方式包括：
+
+**同步复制**：主库写入后，等待所有备库确认才返回成功。MySQL 半同步复制、ZooKeeper 的 ZAB 协议都是这种方式。
+
+**延迟备份**：备库故意延迟一段时间（如 30 分钟），给人工介入留出时间。如果发现误操作，可以在备库恢复。
+
+```sql
+-- MySQL 延迟复制配置
+CHANGE MASTER TO MASTER_DELAY = 1800;  -- 延迟 30 分钟
+```
+
+**写入确认策略**：写入时要求多个节点确认（如 Raft 协议要求多数派节点确认）。
+
+**定期演练**：无论使用哪种策略，都要定期进行切换演练，验证数据完整性。
+
+### 问题三：如何避免脑裂问题？
+
+**参考答案**：
+
+脑裂的预防和处理策略：
+
+**预防措施**：
+
+- 使用奇数个节点（如 3、5、7），配合 Quorum 机制
+- 启用 fencing 机制，切换时先隔离旧主节点
+- 使用分布式锁（RedLock）时，要求多数派节点成功
+
+**检测措施**：
+
+- 监控网络分区事件
+- 定期检查节点间的通信状态
+
+**处理措施**：
+
+- 少数派分区自动降级为只读或关闭
+- 恢复后进行数据校验和修复
+- 告警通知，运维人员介入
+
+### 问题四：Keepalived 是如何实现 VIP 漂移的？
+
+**参考答案**：
+
+Keepalived 使用 VRRP（Virtual Router Redundancy Protocol）协议实现 VIP 漂移：
+
+1. 主节点和备用节点组成一个虚拟路由器，拥有共同的 VIP
+2. 主节点定期发送 VRRP 广告（advertisement），证明自己存活
+3. 备用节点监听 VRRP 广告，如果超时未收到，则认为主节点故障
+4. 备用节点升级为主节点，接管 VIP（通过 ARP 广播通知网络更新 MAC 地址表）
+
+关键配置点：
+
+- `priority`：优先级高的节点为主节点
+- `nopreempt`：非抢占模式，防止频繁切换
+- `advert_int`：心跳间隔，影响故障检测速度
+- 自定义检查脚本：关联业务健康检查
+
+---
+
+## 延伸思考
+
+### 思考一：故障转移的边界条件
+
+设计故障转移机制时，需要考虑各种边界条件：
+
+- 主库和备库同时故障怎么办？
+- 网络分区时间过长，导致数据差异太大怎么办？
+- 切换过程中，客户端缓存了旧的连接信息怎么办？
+
+### 思考二：自动切换 vs 人工介入
+
+自动化切换虽然快，但存在误判的风险。什么场景下应该自动切换，什么场景下应该人工介入？
+
+提示：考虑故障的影响范围、误切换的后果、以及人工响应的速度。
+
+---
+
+## 总结
+
+故障转移是高可用架构的核心组件，它决定了系统在故障发生时能否快速恢复。
+
+关键要点回顾：
+
+- **故障转移类型**：主动切换（计划内）vs 被动切换（计划外）
+- **健康检查**：多层次检测，合理配置间隔和阈值
+- **状态同步**：同步 vs 异步 vs 半同步，各有权衡
+- **VIP 漂移**：Keepalived + VRRP 是主流实现
+- **脑裂防护**：Quorum、fencing、分布式锁
+- **数据库场景**：MySQL MHA 是成熟的主从高可用方案
+- **应用层**：无状态服务让故障转移更简单
+
+故障转移不是银弹，它只是高可用架构的一环。配合监控告警、容量规划、变更管理等措施，才能构建真正可靠的系统。

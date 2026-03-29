@@ -1,0 +1,615 @@
+import { Badge } from '@rspress/core/theme';
+
+# 单机限流：Guava RateLimiter 令牌桶实现
+
+你有没有遇到过这种情况：代码里用了 `synchronized`，自认为「线程安全」了，结果上线后系统还是被流量冲垮了？
+
+`synchronized` 保护的是代码逻辑，不是系统容量。你用一把锁把 10000 个并发请求拦在门口排队，锁是保住了，但 CPU 全被上下文切换吃光了。
+
+单机限流不是万能药，但它是你系统的**第一道护城河**。这篇文章，我们来聊聊 Java 中最成熟的单机限流方案——Guava RateLimiter。
+
+## 一、为什么需要单机限流
+
+在说 RateLimiter 之前，先回答一个基础问题：为什么需要限流？
+
+### 1.1 流量洪峰是常态
+
+你以为流量是平稳的？不，真实世界的流量是这样的：
+
+- 早上 9 点上班打卡，瞬间流量
+- 秒杀活动，整点抢购
+- 热点事件，引发大量访问
+- 爬虫、攻击、恶意刷接口
+
+没有限流的系统，就像没有闸门的水库——水来了就全放进来，迟早溃坝。
+
+### 1.2 单机限流的定位
+
+很多同学觉得单机限流「太简单」：
+
+> 「单机限流有什么用？反正我有分布式限流。」
+
+这种想法是错误的。单机限流和分布式限流是**互补关系**，不是替代关系：
+
+- **分布式限流**：在网关层统一拦截，保护整个集群
+- **单机限流**：在服务内部精细控制，保护单个实例
+
+分布式限流是「防外敌」，单机限流是「守城池」。只有两者配合，才能构建完整的限流体系。
+
+### 1.3 单机限流的优势
+
+相比分布式限流，单机限流有几个显著优势：
+
+- **零网络开销**：完全基于本地计算，延迟极低
+- **无外部依赖**：不依赖 Redis、数据库，天然高可用
+- **实现简单**：API 简洁，学习成本低
+- **性能极高**：单实例可达数十万 QPS
+
+:::tip 最佳实践：两层限流
+
+推荐的做法是**两层限流**：
+
+1. **网关层分布式限流**：保护整个集群，设置整体 QPS 上限
+2. **服务层单机限流**：保护单个实例，防止突发流量打垮单个节点
+
+这样既能应对集群级别的流量控制，又能在实例级别做精细化管理。
+
+:::
+
+## 二、Guava RateLimiter 核心原理
+
+Guava RateLimiter 是 Google Guava 库中的限流组件，基于**令牌桶算法**实现。它的设计目标有两个：
+
+1. **限制接口的访问速率**（Rate Limiting）
+2. **允许一定程度的突发流量**（Burst Handling）
+
+### 2.1 令牌桶的进化：预消费机制
+
+传统的令牌桶算法，每次请求需要等待一个令牌。Guava 在此基础上做了优化：**预消费（Pre-Consume）**。
+
+预消费的核心思想是：**不需要每次都等令牌，先让你过，但之后的请求要等久一点。**
+
+举个例子：
+
+- 限流器配置：每秒 100 个令牌
+- 你突然要发 50 个请求
+- 传统令牌桶：第 1 个请求等 0 秒，第 2 个请求等 0.01 秒……第 50 个请求等 0.49 秒
+- Guava RateLimiter：第 1 个请求等 0 秒（预消费），后续请求根据「欠债」程度等待
+
+Guava 的 RateLimiter 会记录你的「欠债」——多拿了多少令牌，然后在后续请求中慢慢还。
+
+### 2.2 两种限流器：SmoothBursty vs SmoothWarmingUp
+
+Guava RateLimiter 有两个实现类，分别应对不同的场景：
+
+**SmoothBursty（平滑突发）**：
+
+- 允许一定程度的突发流量
+- 令牌桶容量 = `permitsPerSecond`（默认等于每秒令牌数）
+- 适合大多数场景
+
+**SmoothWarmingUp（带预热的平滑）**：
+
+- 冷启动时，速率逐渐增加
+- 适合需要预热的场景（如缓存预热、连接池建立）
+- 有「冷却期」机制
+
+```java
+// SmoothBursty（默认）
+RateLimiter limiter1 = RateLimiter.create(100); // 每秒 100 个令牌
+
+// SmoothWarmingUp（预热）
+RateLimiter limiter2 = RateLimiter.create(100, 5, TimeUnit.SECONDS); // 预热 5 秒
+```
+
+### 2.3 冷却期机制
+
+SmoothWarmingUp 有一个关键概念：**冷却期（Cool Down）**。
+
+假设限流器配置是：每秒 100 个令牌，预热时间 5 秒。
+
+- 冷启动时，冷却期很长，几乎不发令牌
+- 随着时间推移，冷却期逐渐缩短
+- 5 秒后，达到正常的每秒 100 个令牌
+
+冷却期的计算公式：
+
+```
+冷却时间 = warmup / (2 * stableInterval)
+```
+
+其中 `stableInterval = 1 / permitsPerSecond`。
+
+:::info 什么时候用预热
+
+如果你有以下场景，建议使用 SmoothWarmingUp：
+
+- 依赖冷启动较慢的资源（如数据库连接池）
+- 需要防止瞬间流量压垮后端
+- 流量是逐步增加而不是突然爆发
+
+大多数普通接口，用默认的 SmoothBursty 即可。
+
+:::
+
+## 三、RateLimiter 核心 API
+
+### 3.1 acquire —— 阻塞获取令牌
+
+```java
+RateLimiter limiter = RateLimiter.create(100);
+
+// 获取 1 个令牌，阻塞等待
+limiter.acquire();
+
+// 获取 5 个令牌，阻塞等待
+limiter.acquire(5);
+
+// 获取 1 个令牌，返回等待时间（不阻塞）
+double waitTime = limiter.acquire();
+System.out.println("等待了 " + waitTime + " 秒");
+```
+
+`acquire()` 方法会一直阻塞，直到获取到令牌。返回的 `double` 值表示等待的秒数。
+
+### 3.2 tryAcquire —— 非阻塞尝试获取
+
+```java
+RateLimiter limiter = RateLimiter.create(100);
+
+// 非阻塞尝试获取 1 个令牌
+if (limiter.tryAcquire()) {
+    // 获取成功，处理请求
+    doRequest();
+} else {
+    // 获取失败，快速失败或降级
+    doFallback();
+}
+```
+
+### 3.3 tryAcquire 带超时
+
+```java
+RateLimiter limiter = RateLimiter.create(100);
+
+// 非阻塞尝试，最多等待 500 毫秒
+if (limiter.tryAcquire(1, 500, TimeUnit.MILLISECONDS)) {
+    doRequest();
+} else {
+    doFallback();
+}
+```
+
+这是最实用的 API：**等一下可以，但不能无限等**。
+
+### 3.4 API 对比
+
+| 方法 | 阻塞 | 超时 | 返回值 |
+|---|---|---|---|
+| `acquire()` | 是 | 否（一直等） | 等待时间（秒） |
+| `acquire(int permits)` | 是 | 否（一直等） | 等待时间（秒） |
+| `tryAcquire()` | 否 | 否（立即返回） | boolean |
+| `tryAcquire(int permits)` | 否 | 否（立即返回） | boolean |
+| `tryAcquire(timeout)` | 否 | 是 | boolean |
+
+## 四、生产级集成：Spring Boot 注解方式
+
+在 Spring Boot 中，手动调用 `limiter.acquire()` 太繁琐。最理想的方式是**注解+AOP**，在方法级别限流。
+
+### 4.1 自定义限流注解
+
+```java
+@Target(ElementType.METHOD)
+@Retention(RetentionPolicy.RUNTIME)
+@Documented
+public @interface RateLimited {
+    // 每秒允许的请求数
+    double permitsPerSecond() default 100;
+
+    // 超时时间（获取令牌的最大等待时间）
+    long timeout() default 0;
+
+    // 超时时间单位
+    TimeUnit unit() default TimeUnit.SECONDS;
+
+    // 限流失败时的提示消息
+    String message() default "请求过于频繁，请稍后再试";
+}
+```
+
+### 4.2 AOP 切面实现
+
+```java
+@Aspect
+@Component
+public class RateLimiterAspect {
+    // 使用 ConcurrentHashMap 存储每个方法的限流器
+    private final Map<String, RateLimiter> limiters = new ConcurrentHashMap<>();
+
+    @Autowired
+    private HttpServletResponse response;
+
+    @Around("@annotation(rateLimited)")
+    public Object around(ProceedingJoinPoint joinPoint, RateLimited rateLimited) throws Throwable {
+        String methodName = joinPoint.getSignature().toShortString();
+        RateLimiter limiter = limiters.computeIfAbsent(methodName,
+            k -> RateLimiter.create(rateLimited.permitsPerSecond())
+        );
+
+        boolean acquired;
+        if (rateLimited.timeout() > 0) {
+            acquired = limiter.tryAcquire(1, rateLimited.timeout(), rateLimited.unit());
+        } else {
+            acquired = limiter.tryAcquire();
+        }
+
+        if (!acquired) {
+            response.setStatus(429);
+            response.setContentType("application/json;charset=UTF-8");
+            response.getWriter().write(
+                String.format("{\"code\":429,\"message\":\"%s\"}", rateLimited.message())
+            );
+            return null;
+        }
+
+        return joinPoint.proceed();
+    }
+}
+```
+
+### 4.3 使用示例
+
+```java
+@Service
+public class OrderService {
+
+    @RateLimited(permitsPerSecond = 100, timeout = 500, message = "下单过于频繁，请稍后再试")
+    public Order createOrder(OrderRequest request) {
+        // 下单逻辑
+        return orderRepository.save(request.toOrder());
+    }
+
+    @RateLimited(permitsPerSecond = 1000, timeout = 1, message = "查询过于频繁，请稍后再试")
+    public Product getProduct(Long productId) {
+        return productRepository.findById(productId);
+    }
+}
+```
+
+### 4.4 全局限流器 vs 方法级限流器
+
+两种策略各有优劣：
+
+| 策略 | 优点 | 缺点 |
+|---|---|---|
+| 全局限流器 | 全局控制简单，资源共享 | 无法针对单个方法精细控制 |
+| 方法级限流器 | 精细控制，每个方法独立 | 资源可能浪费（多个限流器独立运转） |
+
+**推荐策略**：对于核心接口（如下单、支付），使用方法级限流器；对于普通接口，使用全局限流器。
+
+## 五、RateLimiter 内部实现解析
+
+理解 RateLimiter 的内部实现，有助于在面试中回答「RateLimiter 是如何实现平滑限流的」这类问题。
+
+### 5.1 核心字段
+
+```java
+abstract class RateLimiter {
+    // 锁（用于同步）
+    private final Object mutex = new Object();
+
+    // 下一次可以获取令牌的时间（微秒）
+    private long nextFreeTicketMicros;
+
+    // 每秒产生的令牌数
+    private final double permitsPerSecond;
+
+    // 产生一个令牌需要的时间（微秒）
+    private final double stableIntervalMicros;
+
+    // 限流器类型（SmoothBursty 或 SmoothWarmingUp）
+    protected final SleepyStopwatch stopwatch;
+}
+```
+
+### 5.2 预消费的核心：nextFreeTicketMicros
+
+RateLimiter 使用 `nextFreeTicketMicros` 来记录「下一次可以获取令牌的时间」。
+
+当请求到来时：
+
+1. 计算需要等待的时间 = `nextFreeTicketMicros - now`
+2. 如果 `nextFreeTicketMicros <= now`，说明有足够的令牌，直接通过
+3. 如果 `nextFreeTicketMicros > now`，说明令牌不够，需要等待
+
+```java
+// 伪代码
+double queryEarliestAvailable(long nowMicros) {
+    return nextFreeTicketMicros;
+}
+
+long reserveEarliestAvailable(int permitsRequired, long nowMicros) {
+    // 计算需要等待的时间
+    long waitTime = nextFreeTicketMicros - nowMicros;
+    if (waitTime <= 0) {
+        // 立即可用
+        nextFreeTicketMicros = nowMicros;
+    } else {
+        // 需要等待
+        nextFreeTicketMicros += permitsRequired * stableIntervalMicros;
+    }
+    return nextFreeTicketMicros;
+}
+```
+
+### 5.3 平滑限流的秘密
+
+RateLimiter 的「平滑」体现在：**不是简单地在每次请求时检查计数器，而是在时间轴上均匀分布令牌。**
+
+- 假设限流器配置为每秒 100 个令牌
+- `stableIntervalMicros = 10000` 微秒 = 10 毫秒
+- 第 1 个请求：立即通过，`nextFreeTicketMicros = now + 10`
+- 第 2 个请求：等 10 毫秒后通过，`nextFreeTicketMicros += 10`
+- ……
+
+这样，请求在时间轴上被均匀「摊开」，实现了平滑限流。
+
+### 5.4 突发处理的秘密：storedPermits
+
+SmoothBursty 还维护了一个 `storedPermits` 字段，记录桶中「存储的」令牌数。
+
+```java
+// SmoothBursty 的核心字段
+private double storedPermits;           // 桶中存储的令牌数
+private double maxStoredPermits;         // 桶的最大容量
+
+// 初始化时，桶是满的
+this.maxStoredPermits = permitsPerSecond;
+this.storedPermits = maxStoredPermits;
+```
+
+当系统空闲时，令牌会积累在桶中。当突发请求到来时，可以用这些「存储的令牌」快速响应。
+
+## 六、与其他单机限流方案的对比
+
+除了 Guava RateLimiter，Java 中还有其他单机限流方案。
+
+### 6.1 Semaphore —— 计数信号量
+
+Semaphore 是 JDK 自带的并发工具，用于控制同时访问某个资源的线程数。
+
+```java
+Semaphore semaphore = new Semaphore(100); // 最多 100 个并发
+
+public void doRequest() {
+    if (semaphore.tryAcquire()) {
+        try {
+            // 处理请求
+            doWork();
+        } finally {
+            semaphore.release();
+        }
+    } else {
+        // 拒绝请求
+        doFallback();
+    }
+}
+```
+
+**Semaphore vs RateLimiter**：
+
+| 对比 | Semaphore | RateLimiter |
+|---|---|---|
+| 控制维度 | 并发数（同时多少请求在执行） | 速率（每秒多少请求） |
+| 突发处理 | 不支持，等待获取许可 | 支持，允许积累 |
+| 时间维度 | 无（只看并发数） | 有（每秒为单位） |
+| 适用场景 | 资源池、连接池限制 | 接口调用频率限制 |
+
+**Semaphore 的场景**：数据库连接池（同时最多 N 个连接）、线程池限制、文件句柄限制。
+
+**RateLimiter 的场景**：API 调用频率限制、接口 QPS 控制、突发流量限制。
+
+### 6.2 AtomicInteger —— 简单计数器
+
+最原始的限流方式，用一个原子计数器控制。
+
+```java
+private final AtomicInteger counter = new AtomicInteger(0);
+private final int limit = 100;
+private volatile long windowStart = System.currentTimeMillis();
+
+public boolean tryAcquire() {
+    long now = System.currentTimeMillis();
+    if (now - windowStart >= 1000) {
+        windowStart = now;
+        counter.set(0);
+    }
+    return counter.incrementAndGet() <= limit;
+}
+```
+
+**问题**：这种方式简单但粗糙，有「边界突变」问题。RateLimiter 的精度和公平性远优于它。
+
+### 6.3 对比总结
+
+| 方案 | 精度 | 突发处理 | 实现复杂度 | 依赖 |
+|---|---|---|---|---|
+| Guava RateLimiter | 高 | 支持 | 低 | Guava |
+| Semaphore | 高（并发维度） | 不支持 | 低 | JDK |
+| AtomicInteger | 低（边界问题） | 不支持 | 低 | JDK |
+| 自定义令牌桶 | 可控 | 支持 | 高 | 无 |
+
+## 七、生产环境配置建议
+
+### 7.1 线程安全
+
+RateLimiter 本身是线程安全的，可以安全地在多线程环境下共享。
+
+但需要注意：**不要为每个请求创建一个新的 RateLimiter**。
+
+```java
+// 错误：每个请求创建一个新的限流器
+public void badExample(String request) {
+    RateLimiter limiter = RateLimiter.create(100); // 每次都创建新的
+    limiter.acquire();
+}
+
+// 正确：使用单例或池化
+private static final RateLimiter limiter = RateLimiter.create(100);
+public void goodExample(String request) {
+    limiter.acquire();
+}
+```
+
+### 7.2 配置参数选择
+
+RateLimiter 的核心参数是 `permitsPerSecond`（每秒令牌数）。如何确定这个值？
+
+**建议**：
+
+1. **基于历史数据**：观察系统在正常负载下的 QPS，设置一个略高于正常值的上限
+2. **基于容量测试**：通过压测确定系统的最大 QPS，设置 70%-80% 作为限流阈值
+3. **留有余量**：考虑到突发流量，限流阈值应该略低于系统容量
+
+```java
+// 保守配置：限流阈值 = 最大 QPS 的 70%
+RateLimiter limiter = RateLimiter.create(maxQps * 0.7);
+
+// 激进配置：允许一定突发
+RateLimiter limiter = RateLimiter.create(maxQps);
+RateLimiter.setBurstCapacity((int) (maxQps * 1.5)); // 允许 1.5 倍突发
+```
+
+### 7.3 监控与告警
+
+限流器需要配合监控才能发挥作用。
+
+```java
+public class MonitoredRateLimiter {
+    private final RateLimiter limiter;
+    private final MeterRegistry meterRegistry;
+    private final Counter passCounter;
+    private final Counter blockCounter;
+
+    public MonitoredRateLimiter(double permitsPerSecond, MeterRegistry registry) {
+        this.limiter = RateLimiter.create(permitsPerSecond);
+        this.meterRegistry = registry;
+        this.passCounter = Counter.builder("rate.limit.pass")
+            .description("通过限流的请求数")
+            .register(registry);
+        this.blockCounter = Counter.builder("rate.limit.block")
+            .description("被限流拒绝的请求数")
+            .register(registry);
+    }
+
+    public boolean tryAcquire(Duration timeout) {
+        boolean acquired = limiter.tryAcquire(1, timeout);
+        if (acquired) {
+            passCounter.increment();
+        } else {
+            blockCounter.increment();
+        }
+        return acquired;
+    }
+}
+```
+
+建议监控以下指标：
+
+- 通过限流的请求数
+- 被限流拒绝的请求数
+- 限流拒绝率（> 10% 说明限流阈值可能过低）
+- 平均等待时间（> 100ms 说明限流过严）
+
+## 八、面试追问：RateLimiter 相关问题
+
+### 8.1 问题一：RateLimiter 是如何实现平滑限流的？
+
+**参考答案**：
+
+RateLimiter 使用「预消费」机制实现平滑限流。核心在于 `nextFreeTicketMicros` 字段：
+
+1. 每次请求被处理后，`nextFreeTicketMicros` 会被推进 `stableIntervalMicros`
+2. 新请求到达时，计算当前时间与 `nextFreeTicketMicros` 的差值
+3. 如果当前时间还没到 `nextFreeTicketMicros`，需要等待
+
+这样，令牌不是一次性发完，而是在时间轴上均匀分布，实现了平滑限流。
+
+### 8.2 问题二：RateLimiter 和 Semaphore 的区别是什么？
+
+**参考答案**：
+
+两者控制的是不同的维度：
+
+- **Semaphore** 控制的是「并发数」——同时有多少个请求在执行
+- **RateLimiter** 控制的是「速率」——每秒能处理多少请求
+
+举个例子：
+
+- Semaphore 限流 100：同一时刻最多 100 个请求在执行，其他的排队等待
+- RateLimiter 限流 100：每秒最多 100 个请求通过，超出的等待下一秒
+
+**选择依据**：如果关注的是「系统能不能扛住这么多并发」，用 Semaphore；如果关注的是「接口每秒最多调用多少次」，用 RateLimiter。
+
+### 8.3 问题三：RateLimiter 的预热机制是什么？
+
+**参考答案**：
+
+SmoothWarmingUp 的预热机制用于处理「冷启动」场景。核心是**冷却期（Cool Down）**：
+
+1. 预热开始时，冷却期很长，几乎不发令牌
+2. 随着时间推移，冷却期逐渐缩短
+3. 预热时间到达后，恢复正常速率
+
+冷却时间的计算公式：
+
+```
+当前冷却时间 = warmup * (storedPermits / maxStoredPermits)²
+```
+
+当 `storedPermits = maxStoredPermits` 时，冷却时间最长；当 `storedPermits = 0` 时，冷却时间为 0。
+
+### 8.4 问题四：单机限流能替代分布式限流吗？
+
+**参考答案**：
+
+**不能**。单机限流和分布式限流有本质区别：
+
+- **单机限流**：每个实例独立限流，无法保护整个集群
+- **分布式限流**：统一控制整个集群的请求量
+
+举个例子：限流阈值是 1000 QPS，有 10 个实例。
+
+- 单机限流：每个实例限流 1000 QPS，总计可达 10000 QPS（远超阈值）
+- 分布式限流：集群总计限流 1000 QPS，严格控制
+
+**最佳实践**：在网关层做分布式限流，在服务层做单机限流。两者配合，既能保护集群，又能保护单个实例。
+
+---
+
+## 延伸思考
+
+### 题目一：RateLimiter 的预消费与公平性
+
+RateLimiter 支持「预消费」，即一次获取多个令牌。假设有两个线程交替调用 `acquire(1)` 和 `acquire(10)`，RateLimiter 如何保证公平性？
+
+**提示**：考虑 `nextFreeTicketMicros` 的推进机制。
+
+### 题目二：SmoothBursty vs SmoothWarmingUp 的选择
+
+如果你的系统依赖数据库连接池（冷启动需要 30 秒），你应该选择哪种限流器？为什么？
+
+**提示**：考虑预热时间与数据库连接池建立时间的匹配。
+
+---
+
+## 总结
+
+Guava RateLimiter 是 Java 中最成熟的单机限流方案：
+
+- **令牌桶算法**：支持突发流量，允许一定程度的「预消费」
+- **两种实现**：SmoothBursty（默认）和 SmoothWarmingUp（预热）
+- **核心 API**：`acquire()` 阻塞等待，`tryAcquire()` 非阻塞尝试
+- **最佳实践**：配合 Spring AOP 做注解式限流，两层限流保护集群和实例
+
+在实际项目中，RateLimiter 是服务层限流的首选，配合分布式限流构建完整的限流体系。

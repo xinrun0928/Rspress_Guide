@@ -1,0 +1,632 @@
+import { Badge } from '@rspress/core/theme';
+
+# 舱壁模式：热点隔离与线程池隔离
+
+想象一艘船在海上航行。如果船体被撞破了一个洞，海水会灌进来——但如果船体被分成多个独立的舱室（舱壁），即使一个舱室进水，也不会影响其他舱室。这就是**舱壁模式（Bulkhead Pattern）**的由来。
+
+在微服务架构中，舱壁模式用于**隔离故障**，防止一个服务的故障扩散到整个系统。
+
+这篇文章，我们来聊聊舱壁模式的原理、实现和最佳实践。
+
+## 一、舱壁模式的起源
+
+### 1.1 船舱的启示
+
+泰坦尼克号的沉没是一个经典案例。如果船体没有分成多个舱室，一次碰撞可能导致整艘船沉没。正是因为有了舱壁设计，即使部分舱室进水，船也不会立即沉没，为救援争取了时间。
+
+软件设计中的舱壁模式与此类似：**将系统划分为多个独立的「舱室」，一个舱室的故障不会影响其他舱室**。
+
+### 1.2 微服务中的故障传播
+
+在微服务架构中，故障传播是一个严重问题：
+
+```
+用户请求 → 服务 A → 服务 B → 服务 C
+                              ↓
+                          服务 C 故障
+                              ↓
+                       服务 B 线程阻塞
+                              ↓
+                       服务 A 线程阻塞
+                              ↓
+                        系统崩溃
+```
+
+**问题**：服务 C 的问题被放大，拖垮了整个系统。
+
+### 1.3 舱壁模式的解决方案
+
+舱壁模式通过**隔离资源**来解决问题：
+
+```
+舱壁 1 (UserService)     舱壁 2 (OrderService)    舱壁 3 (PaymentService)
+┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
+│ ThreadPool: 20  │    │ ThreadPool: 30  │    │ ThreadPool: 10  │
+│ Semaphore: 50   │    │ Semaphore: 100  │    │ Semaphore: 20   │
+└─────────────────┘    └─────────────────┘    └─────────────────┘
+       ↓                      ↓                      ↓
+   用户服务                订单服务                支付服务
+```
+
+**舱壁模式的价值**：
+
+- **资源隔离**：每个服务有独立的线程池/信号量
+- **故障隔离**：一个服务的故障不影响其他服务
+- **限流能力**：每个舱室的并发量可独立控制
+
+## 二、线程池隔离
+
+### 2.1 Hystrix 的线程池隔离
+
+Hystrix 是最早实现线程池隔离的框架。
+
+```java
+public class GetUserCommand extends HystrixCommand<User> {
+    public GetUserCommand(Long userId) {
+        super(Setter
+            .withGroupKey(HystrixCommandGroupKey.Factory.asKey("UserService"))
+            .andThreadPoolKey(HystrixThreadPoolKey.Factory.asKey("UserPool"))
+            .andThreadPoolPropertiesDefaults(
+                HystrixThreadPoolProperties.Setter()
+                    .withCoreSize(20)              // 核心线程数
+                    .withMaxQueueSize(100)        // 队列大小
+                    .withQueueSizeRejectionThreshold(80)  // 队列满时拒绝
+                    .withKeepAliveTimeMinutes(1)  // 线程存活时间
+            )
+        );
+    }
+
+    @Override
+    protected User run() {
+        return userService.getUser(userId);
+    }
+
+    @Override
+    protected User getFallback() {
+        return User.placeholder();
+    }
+}
+```
+
+### 2.2 线程池隔离的原理
+
+线程池隔离的核心是**独立的线程池**：
+
+```
+主线程                      Hystrix 线程池
+   │                           │
+   ├───── 调用 A ──────────▶ Thread A (处理 UserService)
+   │                           │
+   ├───── 调用 B ──────────▶ Thread B (处理 OrderService)
+   │                           │
+   ├───── 调用 C ──────────▶ Thread C (处理 PaymentService)
+   │                           │
+```
+
+当一个服务变慢时：
+
+- 它的线程池会堆积请求
+- 但不会占用其他服务的线程
+- 其他服务仍能正常处理请求
+
+### 2.3 线程池参数配置
+
+线程池的参数配置是关键：
+
+| 参数 | 说明 | 推荐值 |
+|---|---|---|
+| `coreSize` | 核心线程数 | 根据服务 QPS 和平均响应时间计算 |
+| `maxQueueSize` | 队列大小 | 通常为核心线程数的 5-10 倍 |
+| `queueSizeRejectionThreshold` | 拒绝阈值 | 通常为 maxQueueSize 的 80% |
+| `keepAliveTimeMinutes` | 线程存活时间 | 1-5 分钟 |
+
+**计算公式**：
+
+```
+核心线程数 = 预期 QPS × 平均响应时间
+```
+
+例如：预期 QPS = 100，平均响应时间 = 200ms
+
+```
+核心线程数 = 100 × 0.2 = 20
+```
+
+## 三、信号量隔离
+
+### 3.1 信号量隔离的原理
+
+线程池隔离有线程切换的开销。如果服务响应很快，可以使用**信号量隔离**。
+
+```java
+// Resilience4j 信号量隔离
+BulkheadConfig config = BulkheadConfig.custom()
+    .maxConcurrentCalls(50)    // 最大并发调用数
+    .maxWaitDuration(Duration.ofMillis(500)) // 最大等待时间
+    .build();
+
+Bulkhead bulkhead = BulkheadRegistry.of(config).bulkhead("userService");
+
+Supplier<User> decoratedSupplier = Bulkhead
+    .decorateSupplier(bulkhead, () -> userService.getUser(userId));
+
+User user = Try.ofSupplier(decoratedSupplier)
+    .recover(Exception.class, e -> User.placeholder())
+    .get();
+```
+
+### 3.2 线程池隔离 vs 信号量隔离
+
+| 对比维度 | 线程池隔离 | 信号量隔离 |
+|---|---|---|
+| 资源类型 | 线程 | 计数器 |
+| 调用方式 | 跨线程 | 同一线程 |
+| 线程开销 | 有（上下文切换） | 无 |
+| 超时控制 | 支持 | 依赖外部超时 |
+| 适用场景 | 依赖慢服务 | 依赖快服务 |
+| 内存占用 | 高 | 低 |
+
+### 3.3 选择建议
+
+| 场景 | 推荐隔离方式 |
+|---|---|
+| 依赖外部 HTTP API | 信号量隔离 |
+| 依赖数据库 | 信号量隔离 |
+| 依赖 RPC 服务（响应慢） | 线程池隔离 |
+| 依赖 RPC 服务（响应快） | 信号量隔离 |
+| 需要超时控制 | 线程池隔离 |
+
+:::tip 最佳实践
+
+对于大多数场景，**信号量隔离 + 外部超时控制**是更好的选择：
+
+- 信号量开销小，性能更好
+- 配合 Hystrix 的超时控制或 Resilience4j 的 TimeLimiter
+
+只有当服务响应特别慢（> 1 秒）时，才使用线程池隔离。
+
+:::
+
+## 四、Resilience4j 舱壁模式实现
+
+### 4.1 依赖引入
+
+```xml
+<dependency>
+    <groupId>io.github.resilience4j</groupId>
+    <artifactId>resilience4j bulkhead</artifactId>
+    <version>1.7.0</version>
+</dependency>
+```
+
+### 4.2 信号量隔离配置
+
+```java
+// 定义舱壁配置
+BulkheadConfig defaultConfig = BulkheadConfig.custom()
+    .maxConcurrentCalls(50)           // 最大并发调用数
+    .maxWaitDuration(Duration.ofMillis(100)) // 等待超时
+    .build();
+
+// 注册配置
+BulkheadRegistry registry = BulkheadRegistry.of(defaultConfig);
+
+// 创建舱壁
+Bulkhead userBulkhead = registry.bulkhead("userService");
+Bulkhead orderBulkhead = registry.bulkhead("orderService");
+```
+
+### 4.3 线程池隔离配置
+
+```java
+// 定义线程池配置
+ThreadPoolBulkheadConfig config = ThreadPoolBulkheadConfig.custom()
+    .maxThreadPoolSize(20)              // 最大线程数
+    .coreThreadPoolSize(10)            // 核心线程数
+    .queueCapacity(100)                 // 队列容量
+    .keepAliveDuration(Duration.ofSeconds(30)) // 线程存活时间
+    .build();
+
+// 创建线程池舱壁
+ThreadPoolBulkhead bulkhead = ThreadPoolBulkheadRegistry.of(config)
+    .bulkhead("userService");
+
+// 使用
+CompletableFuture<User> future = bulkhead.executeSupplier(
+    () -> userService.getUser(userId)
+);
+```
+
+### 4.4 装饰器模式使用
+
+Resilience4j 支持多种装饰器：
+
+```java
+// 装饰 Supplier
+Supplier<User> decorated = Bulkhead.decorateSupplier(bulkhead, () -> userService.getUser(userId));
+
+// 装饰 Callable
+Callable<User> decorated = Bulkhead.decorateCallable(bulkhead, () -> userService.getUser(userId));
+
+// 装饰 Runnable
+Runnable decorated = Bulkhead.decorateRunnable(bulkhead, () -> userService.doSomething());
+
+// 装饰 Supplier + 重试
+Supplier<User> withRetry = Retry.decorateSupplier(retry, () -> userService.getUser(userId));
+Supplier<User> withBulkhead = Bulkhead.decorateSupplier(bulkhead, withRetry);
+```
+
+## 五、舱壁模式与断路器配合
+
+### 5.1 两者配合的原理
+
+舱壁模式和断路器是互补的：
+
+| 模式 | 作用 | 触发时机 |
+|---|---|---|
+| **舱壁模式** | 限制并发量，保护资源 | 任何时候生效 |
+| **断路器** | 检测故障，快速失败 | 故障时生效 |
+
+两者配合使用：
+
+```
+请求 → [舱壁] → [断路器] → [调用]
+          ↓          ↓
+      并发超限     故障检测
+```
+
+### 5.2 Resilience4j 组合使用
+
+```java
+// 创建舱壁
+Bulkhead bulkhead = BulkheadRegistry.of(defaultConfig).bulkhead("userService");
+
+// 创建断路器
+CircuitBreaker circuitBreaker = CircuitBreakerRegistry.of(defaultBreakerConfig)
+    .circuitBreaker("userService");
+
+// 组合装饰器
+Supplier<User> decorated = Bulkhead
+    .decorateSupplier(bulkhead,
+        CircuitBreaker
+            .decorateSupplier(circuitBreaker,
+                () -> userService.getUser(userId)
+            )
+    );
+
+// 执行
+User user = Try.ofSupplier(decorated)
+    .recover(Exception.class, e -> User.placeholder())
+    .get();
+```
+
+### 5.3 Spring Boot 注解方式
+
+```java
+@Service
+public class UserService {
+    @Bulkhead(name = "userService", fallbackMethod = "getUserFallback")
+    @CircuitBreaker(name = "userService", fallbackMethod = "getUserFallback")
+    public User getUser(Long userId) {
+        return userClient.getUser(userId);
+    }
+
+    public User getUserFallback(Long userId, Throwable t) {
+        return User.placeholder();
+    }
+}
+```
+
+## 六、舱壁模式的常见问题
+
+### 6.1 舱壁配置过小
+
+**问题**：舱壁配置太小，导致正常的请求也被拒绝。
+
+```
+配置：maxConcurrentCalls = 10
+实际：正常 QPS = 50，平均 RT = 20ms
+
+理论并发 = 50 × 0.02 = 1（实际并发很低）
+但如果有抖动，并发可能达到 10+
+```
+
+**解决方案**：
+
+1. 根据正常负载的峰值来配置
+2. 留有一定的余量（20%-50%）
+3. 监控舱壁的拒绝率
+
+### 6.2 舱壁配置过大
+
+**问题**：舱壁配置太大，失去隔离的意义。
+
+**解决方案**：
+
+1. 根据服务的重要性分级配置
+2. 核心服务配置小一点（更严格的保护）
+3. 非核心服务配置大一点（更宽松）
+
+### 6.3 线程池数量过多
+
+**问题**：每个服务都配置独立的线程池，线程总数太多。
+
+```
+UserService: 20 线程
+OrderService: 30 线程
+PaymentService: 50 线程
+库存服务: 30 线程
+通知服务: 20 线程
+...
+总计: 200+ 线程
+```
+
+**解决方案**：
+
+1. **服务分组**：按服务组共享线程池
+2. **信号量优先**：快服务用信号量，减少线程数
+3. **合理拆分**：按依赖关系拆分，不是按业务拆分
+
+## 七、生产环境最佳实践
+
+### 7.1 分层隔离策略
+
+推荐采用**分层隔离**策略：
+
+| 层级 | 隔离方式 | 配置 |
+|---|---|---|
+| 网关层 | 网关限流 | Nginx / Spring Cloud Gateway |
+| 服务层 | 线程池/信号量隔离 | Resilience4j Bulkhead |
+| 熔断层 | 断路器 | Resilience4j CircuitBreaker |
+| 降级层 | 降级策略 | Fallback |
+
+### 7.2 配置推荐
+
+```yaml
+# application.yml
+resilience4j:
+  bulkhead:
+    instances:
+      userService:
+        maxConcurrentCalls: 50
+        maxWaitDuration: 500ms
+      orderService:
+        maxConcurrentCalls: 100
+        maxWaitDuration: 500ms
+      paymentService:
+        maxConcurrentCalls: 30
+        maxWaitDuration: 200ms
+
+  circuitbreaker:
+    instances:
+      userService:
+        failureRateThreshold: 50
+        minimumNumberOfCalls: 20
+        waitDurationInOpenState: 30s
+      orderService:
+        failureRateThreshold: 50
+        minimumNumberOfCalls: 30
+        waitDurationInOpenState: 30s
+```
+
+### 7.3 监控指标
+
+建议监控以下舱壁指标：
+
+| 指标 | 说明 | 告警阈值 |
+|---|---|---|
+| `bulkhead.available_concurrent_calls` | 可用并发数 | < 10% |
+| `bulkhead.maximum_concurrent_calls` | 最大并发数 | - |
+| `bulkhead.rejected_calls` | 被拒绝的调用数 | 持续 > 0 |
+
+```java
+// 监听舱壁事件
+bulkhead.getEventPublisher()
+    .onCallRejected(event -> {
+        log.warn("Call rejected: {}", event.getBulkheadName());
+        alertService.alert("UserService bulkhead rejected");
+    })
+    .onCallFinished(event -> {
+        metricsService.record("bulkhead.finished", 1);
+    });
+```
+
+### 7.4 降级策略
+
+舱壁拒绝后的降级策略：
+
+```java
+@Service
+public class UserService {
+    private final Bulkhead bulkhead = BulkheadRegistry.of(defaultConfig)
+        .bulkhead("userService");
+
+    public User getUser(Long userId) {
+        return Try.ofSupplier(Bulkhead.decorateSupplier(bulkhead,
+                () -> userClient.getUser(userId)))
+            .recover(BulkheadFullException.class, e -> {
+                // 舱壁满时的降级
+                return getUserFromCache(userId);
+            })
+            .recover(Exception.class, e -> {
+                // 其他异常
+                return User.placeholder(userId);
+            })
+            .get();
+    }
+
+    private User getUserFromCache(Long userId) {
+        User cached = cache.get(userId);
+        return cached != null ? cached : User.placeholder(userId);
+    }
+}
+```
+
+## 八、舱壁模式 vs 线程池隔离 vs 信号量
+
+### 8.1 三者对比
+
+| 对比维度 | 舱壁模式 | 线程池隔离 | 信号量 |
+|---|---|---|---|
+| 隔离对象 | 并发调用数 | 线程数 | 并发数 |
+| 实现方式 | Bulkhead | ThreadPool | Semaphore |
+| 资源消耗 | 低 | 高 | 极低 |
+| 超时控制 | 依赖外部 | 内部支持 | 依赖外部 |
+| 适用场景 | 大多数场景 | 依赖慢服务 | 依赖快服务 |
+| 复杂度 | 中 | 高 | 低 |
+
+### 8.2 组合策略
+
+实际项目中，可以组合使用：
+
+```java
+@Service
+public class OrderService {
+    // 快依赖用信号量
+    private final Bulkhead productBulkhead = BulkheadRegistry.of(config)
+        .bulkhead("productService");
+
+    // 慢依赖用线程池
+    private final ThreadPoolBulkhead paymentBulkhead = ThreadPoolBulkheadRegistry.of(config)
+        .bulkhead("paymentService");
+
+    public Order createOrder(OrderRequest request) {
+        // 查询商品（快）
+        Product product = Try.ofSupplier(
+            Bulkhead.decorateSupplier(productBulkhead,
+                () -> productService.getProduct(request.getProductId())
+            )
+        ).recover(e -> Product.placeholder()).get();
+
+        // 调用支付（慢）
+        PaymentResult result = Try.ofSupplier(
+            paymentBulkhead.executeSupplier(
+                () -> paymentService.pay(request)
+            )
+        ).recover(e -> PaymentResult.failed()).get();
+
+        return orderRepository.save(new Order(product, result));
+    }
+}
+```
+
+## 九、面试追问：舱壁模式相关问题
+
+### 9.1 问题一：舱壁模式和线程池隔离的区别是什么？
+
+**参考答案**：
+
+舱壁模式和线程池隔离在概念上是**相同**的，都是为了隔离资源。
+
+但在实现上有区别：
+
+- **线程池隔离**：使用独立的线程池执行请求
+- **舱壁模式**：更通用的概念，可以使用信号量或线程池实现
+
+Resilience4j 中：
+
+- `Bulkhead`：信号量隔离
+- `ThreadPoolBulkhead`：线程池隔离
+
+### 9.2 问题二：舱壁模式是如何防止级联故障的？
+
+**参考答案**：
+
+舱壁模式通过以下方式防止级联故障：
+
+1. **资源隔离**：每个服务有独立的资源池，一个服务耗尽资源不会影响其他服务
+2. **并发控制**：限制每个服务的并发量，防止服务过载
+3. **快速拒绝**：舱壁满时快速拒绝，而不是等待超时
+
+例如：OrderService 依赖 PaymentService。如果 PaymentService 变慢：
+
+- **无舱壁**：OrderService 的线程被 PaymentService 阻塞，耗尽线程池
+- **有舱壁**：OrderService 的舱壁堆积请求，但不会阻塞其他线程
+
+### 9.3 问题三：如何确定舱壁的大小？
+
+**参考答案**：
+
+确定舱壁大小需要考虑：
+
+1. **服务的重要性**：核心服务配置小一点，非核心服务配置大一点
+2. **服务的承载能力**：根据压测确定服务的最大 QPS
+3. **超时时间**：超时时间越长，需要更大的舱壁
+
+**计算公式**：
+
+```
+舱壁大小 = 预期 QPS × 平均响应时间 × 安全系数
+```
+
+例如：QPS = 100，RT = 50ms，安全系数 = 1.5
+
+```
+舱壁大小 = 100 × 0.05 × 1.5 = 7.5 ≈ 10
+```
+
+### 9.4 问题四：舱壁模式和断路器如何配合使用？
+
+**参考答案**：
+
+舱壁模式和断路器是互补的：
+
+- **舱壁模式**：任何时候都生效，限制并发量
+- **断路器**：故障时生效，快速失败
+
+执行顺序：请求 → 舱壁检查 → 断路器检查 → 调用
+
+```java
+Supplier<User> decorated = Bulkhead
+    .decorateSupplier(bulkhead,           // 先检查舱壁
+        CircuitBreaker
+            .decorateSupplier(circuitBreaker,  // 再检查断路器
+                () -> userService.getUser(userId)
+            )
+    );
+```
+
+---
+
+## 延伸思考
+
+### 题目一：舱壁模式的成本与收益
+
+舱壁模式可以防止故障扩散，但也有成本：
+
+- 更多的资源消耗（线程池、信号量）
+- 更复杂的配置和管理
+- 可能造成资源浪费
+
+你能设计一个评估方法，决定哪些服务需要舱壁保护吗？
+
+**提示**：考虑服务的依赖关系、故障影响范围、资源消耗。
+
+### 题目二：舱壁模式的边界
+
+舱壁模式可以隔离服务级别的故障，但无法隔离：
+
+- JVM 级别的故障（OOM、GC）
+- 网络级别的故障
+- 基础设施的故障
+
+你能设计一个更全面的隔离策略吗？
+
+---
+
+## 总结
+
+舱壁模式是保护微服务系统的重要手段：
+
+- **线程池隔离**：适合依赖慢服务，有线程切换开销
+- **信号量隔离**：适合依赖快服务，开销小
+- **与断路器配合**：舱壁 + 断路器 = 更完善的保护
+
+在实际项目中：
+
+1. 按服务的重要性分级配置舱壁
+2. 快服务用信号量，慢服务用线程池
+3. 监控舱壁的拒绝率，及时调整配置
+4. 配合断路器使用，构建完整的保护体系
+
+舱壁模式的核心思想是**隔离**，只有隔离得当，系统才能在故障面前保持稳定。

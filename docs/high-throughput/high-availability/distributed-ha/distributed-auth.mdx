@@ -1,0 +1,1163 @@
+import { Badge } from '@rspress/core/theme';
+
+# 分布式认证与会话管理：高可用身份验证
+
+你正在浏览一个电商网站，挑选心仪的商品，加购物车，结算下单。突然，页面弹出一个提示：「登录状态已过期，请重新登录。」你回到登录页，输入用户名密码，完成了验证。几分钟后，同样的提示又出现了。
+
+你开始怀疑人生：为什么登录状态这么不稳定？是大促流量太大导致服务器扛不住，还是 Session 存储出了问题？
+
+这可能是分布式系统中最容易被忽视、但影响最广泛的系统性问题之一——**认证与会话管理的高可用设计**。
+
+在单体架构时代，Session 存储在单机内存中，问题相对简单。但在分布式架构时代，一个用户的请求可能被路由到任何一台服务器，如果 Session 还在单机内存中，那意味着只有存储了这份 Session 的那台服务器能处理该用户的请求，其他服务器都会说"我不认识你"。
+
+这篇文章，就是你的分布式认证与会话管理设计指南。我会从问题的本质讲起，深入剖析主流的分布式认证方案，最后给出高可用设计的最佳实践。
+
+## 一、问题的本质：分布式环境下的身份认同危机
+
+### 1.1 单体时代的 Session：简单但脆弱
+
+在单体架构时代，用户的登录状态存储在应用服务器的内存中。
+
+```
+用户浏览器 ──▶ 应用服务器（单机）
+                ├── Session ID: xxx
+                └── Session Data: { userId: 123, username: "zhang" }
+```
+
+请求到达应用服务器后，服务器从内存中取出 Session 数据，验证用户身份。整个流程简单直接。
+
+但这种方案有一个致命的问题：**无法水平扩展**。
+
+如果你的应用部署了三台服务器，用户的第一次请求可能被路由到 Server A，登录成功后 Session 存在 Server A 的内存中。但第二次请求可能被负载均衡器路由到 Server B，Server B 的内存里没有这份 Session——用户就被"踢"了。
+
+### 1.2 分布式时代的三大挑战
+
+分布式架构给认证与会话管理带来了三大挑战：
+
+**挑战一：Session 共享**
+
+多台应用服务器之间需要共享 Session 数据，否则用户的请求可能被路由到任何一台没有 Session 数据的服务器。
+
+**挑战二：高可用**
+
+Session 存储本身需要高可用。如果 Session 存储（如 Redis）宕机，整个系统都会"不认识用户"。
+
+**挑战三：性能与一致性**
+
+Session 的读写延迟直接影响接口响应时间。在分布式环境下，Session 的数据一致性也是一个需要权衡的问题。
+
+### 1.3 认证与会话的核心概念
+
+在深入设计之前，先厘清几个核心概念：
+
+| 概念 | 说明 | 示例 |
+|---|---|---|
+| 认证（Authentication） | 验证用户是谁 | 输入用户名密码，系统验证身份 |
+| 授权（Authorization） | 验证用户能做什么 | 判断用户是否有访问某个接口的权限 |
+| 会话（Session） | 维护用户的登录状态 | 用户登录后，系统生成的会话标识 |
+| Token | 无状态的身份凭证 | JWT、Opaque Token |
+| Cookie | 浏览器存储的凭证 | JSESSIONID、token |
+
+**认证 vs 授权**：认证是"你是谁"，授权是"你能做什么"。两者经常配合使用，但概念不同。
+
+## 二、Session 共享方案：让每台服务器都认识用户
+
+### 2.1 方案一：粘性 Session（Sticky Session）
+
+粘性 Session 的思路是"不解决共享问题，而是绕过它"——让负载均衡器把同一个用户的请求始终路由到同一台服务器。
+
+```
+用户浏览器 ──▶ 负载均衡器
+                 │
+                 ▼
+        ┌───────────────┐
+        │ 根据 Cookie   │
+        │ 路由到 Server A│  ←── 始终路由到这一台
+        └───────────────┘
+                 │
+                 ▼
+        ┌───────────────┐
+        │   Server A    │
+        │ Session Data  │
+        └───────────────┘
+```
+
+**实现方式**：负载均衡器（如 Nginx）根据 Cookie 中的 JSESSIONID，计算哈希后路由到对应服务器。
+
+```nginx
+upstream backend {
+    ip_hash;  # 基于 IP 的粘性会话
+    
+    server 192.168.1.10:8080;
+    server 192.168.1.11:8080;
+    server 192.168.1.12:8080;
+}
+```
+
+**优点**：
+
+- 实现简单，不需要改应用代码
+- Session 读写在本地，性能好
+
+**缺点**：
+
+- 服务器宕机时，该服务器上的所有用户会被"踢出"
+- 无法水平扩展（扩容后 Session 分布不均匀）
+- 违背了分布式设计的初衷（应该无状态）
+
+:::warning 粘性 Session 不适合生产环境
+
+粘性 Session 本质上是"回避问题"而不是"解决问题"。它只适合作为临时方案或小规模系统的过渡方案。对于生产环境的高可用系统，不建议使用粘性 Session。
+
+:::
+
+### 2.2 方案二：集中式 Session 存储
+
+集中式 Session 存储的思路是"把 Session 集中存到一个地方"——所有服务器都从这个集中存储中读写 Session。
+
+```
+用户浏览器 ──▶ 应用服务器
+                 │
+                 │ 读写 Session
+                 ▼
+        ┌───────────────┐
+        │  Redis 集群   │
+        │ Session Store │
+        └───────────────┘
+```
+
+这是目前最主流的分布式 Session 方案。Redis 凭借其高性能和高可用特性，成为 Session 存储的首选。
+
+**实现：Spring Session + Redis**
+
+Spring Session 提供了开箱即用的分布式 Session 支持，只需简单配置即可。
+
+```java
+@Configuration
+@EnableRedisHttpSession(maxInactiveIntervalInSeconds = 3600)
+public class SessionConfig {
+    // Redis 连接配置
+    @Bean
+    public RedisConnectionFactory connectionFactory() {
+        RedisStandaloneConfiguration config = new RedisStandaloneConfiguration();
+        config.setHostName("redis-host");
+        config.setPort(6379);
+        return new LettuceConnectionFactory(config);
+    }
+}
+```
+
+```yaml
+# application.yml
+spring:
+  session:
+    store-type: redis
+    redis:
+      namespace: myapp:session
+  data:
+    redis:
+      host: redis-host
+      port: 6379
+```
+
+**Session 数据的存储结构**：
+
+```
+Key: spring:session:sessions:abc123def456
+Value: {
+  "sessionAttr": {
+    "userId": 12345,
+    "username": "zhangsan"
+  },
+  "creationTime": 1679123456789,
+  "maxInactiveInterval": 3600,
+  "lastAccessedTime": 1679123567890
+}
+```
+
+**优点**：
+
+- Session 集中管理，任意服务器都能访问
+- 支持水平扩展
+- Redis 本身支持高可用（主从、哨兵、集群）
+
+**缺点**：
+
+- 每次请求都需要访问 Redis，有网络延迟
+- 增加了 Redis 的负载
+- 引入新的依赖（Redis）
+
+### 2.3 方案三：无状态 Token（JWT）
+
+无状态 Token 的思路是"不用存储"——把用户信息编码到 Token 本身，服务器只需要验证 Token 的有效性，不需要存储任何状态。
+
+```
+用户登录
+    ↓
+服务器生成 Token（包含用户信息）
+    ↓
+Token 返回给客户端，客户端保存
+    ↓
+后续请求携带 Token
+    ↓
+服务器验证 Token，解码出用户信息
+    ↓
+无需访问任何存储
+```
+
+**JWT 的结构**：
+
+JWT 由三部分组成，用 `.` 分隔：
+
+```
+eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c
+```
+
+| 部分 | 说明 | 示例 |
+|---|---|---|
+| Header | Token 类型和签名算法 | `{"alg":"HS256","typ":"JWT"}` |
+| Payload | 存放的用户信息 | `{"userId":123,"username":"zhang"}` |
+| Signature | 签名，防止篡改 | `HMACSHA256(...)` |
+
+**JWT 的生成和验证**：
+
+```java
+// 生成 JWT
+public String generateToken(User user) {
+    Date now = new Date();
+    Date expiry = new Date(now.getTime() + 3600000); // 1小时后过期
+    
+    return Jwts.builder()
+        .setSubject(String.valueOf(user.getId()))
+        .claim("username", user.getUsername())
+        .claim("roles", user.getRoles())
+        .setIssuedAt(now)
+        .setExpiration(expiry)
+        .signWith(Keys.hmacShaKeyFor(SECRET_KEY.getBytes()))
+        .compact();
+}
+
+// 验证 JWT
+public Claims parseToken(String token) {
+    return Jwts.parserBuilder()
+        .setSigningKey(Keys.hmacShaKeyFor(SECRET_KEY.getBytes()))
+        .build()
+        .parseClaimsJws(token)
+        .getBody();
+}
+```
+
+**优点**：
+
+- 完全无状态，服务器不需要存储任何信息
+- 支持跨域认证
+- 性能好，不需要每次都访问存储
+
+**缺点**：
+
+- Token 一旦签发，无法在到期前撤销
+- Token 信息不能太多（太大影响传输性能）
+- Token 泄露后，攻击者可以在有效期内使用
+
+:::tip JWT 适合的场景 vs 不适合的场景
+
+**适合 JWT 的场景**：
+
+- 短期有效的访问令牌（Access Token）
+- 无需主动失效的无状态 API
+- 跨域认证
+
+**不适合 JWT 的场景**：
+
+- 需要主动失效的会话（如强制登出、踢人下线）
+- 需要频繁修改的用户信息
+- 对安全性要求极高的场景
+
+:::
+
+### 2.4 三种方案对比
+
+| 维度 | 粘性 Session | 集中式 Session | JWT |
+|---|---|---|---|
+| 实现复杂度 | 低 | 中 | 中 |
+| 可扩展性 | 差 | 好 | 最好 |
+| 性能 | 高 | 中 | 高 |
+| 服务器依赖 | 无 | Redis | 无 |
+| 失效机制 | 简单 | 简单 | 复杂 |
+| 适用场景 | 临时过渡 | 大多数场景 | 无状态 API |
+| 数据容量 | 无限制 | 受限 | 有限 |
+
+## 三、高可用 Session 存储：Redis 集群设计
+
+### 3.1 Redis 主从复制：基础版高可用
+
+Redis 主从复制是最基础的高可用方案。
+
+```
+        ┌───────────────┐
+        │     Master    │  ←── 写入
+        │   (192.168.1.10)│
+        └───────┬───────┘
+                │
+        ┌───────┴───────┬───────┐
+        ▼               ▼       ▼
+    ┌────────┐     ┌────────┐ ┌────────┐
+    │ Slave1 │     │ Slave2 │ │ Slave3 │
+    │ (读)   │     │ (读)   │ │ (读)   │
+    └────────┘     └────────┘ └────────┘
+```
+
+**配置主从复制**：
+
+```redis
+# 从节点配置
+replicaof 192.168.1.10 6379
+replica-read-only yes
+```
+
+**应用层的读写分离**：
+
+```java
+@Configuration
+public class RedisConfig {
+    
+    @Bean
+    public LettuceClientConfigurationBuilderCustomizer customizer() {
+        return builder -> builder.readFrom(ReadFrom.REPLICA_PREFERRED);
+    }
+}
+```
+
+**优点**：
+
+- 配置简单
+- 读写分离，提高读取性能
+- 主节点宕机后，可以手动切换
+
+**缺点**：
+
+- 主节点宕机需要手动切换（有停机时间）
+- 数据复制是异步的，可能有短暂的数据不一致
+
+### 3.2 Redis 哨兵模式：自动故障转移
+
+哨兵（Sentinel）是 Redis 的高可用解决方案。哨兵是一个独立运行的进程，负责监控主从节点的健康状态，在主节点宕机时自动进行故障转移。
+
+```
+                ┌─────────────┐
+                │   Sentinel   │
+                │   (Monitor)   │
+                └──────┬───────┘
+                       │
+        ┌──────────────┼──────────────┐
+        ▼              ▼              ▼
+    ┌────────┐     ┌────────┐     ┌────────┐
+    │ Master │     │ Slave1 │     │ Slave2 │
+    └────────┘     └────────┘     └────────┘
+```
+
+**哨兵的工作流程**：
+
+1. **监控**：哨兵持续监控主从节点的健康状态
+2. **选主**：主节点宕机后，哨兵从从节点中选举出新的主节点
+3. **通知**：哨兵通知应用层新的主节点地址
+
+```redis
+# 启动哨兵
+redis-sentinel /path/to/sentinel.conf
+
+# sentinel.conf 配置
+sentinel monitor mymaster 192.168.1.10 6379 2
+sentinel down-after-milliseconds mymaster 5000
+sentinel failover-timeout mymaster 30000
+```
+
+**Spring Boot 集成哨兵**：
+
+```yaml
+spring:
+  redis:
+    sentinel:
+      master: mymaster
+      nodes: 192.168.1.20:26379,192.168.1.21:26379,192.168.1.22:26379
+```
+
+**优点**：
+
+- 自动故障转移，无需人工干预
+- 故障转移期间，应用层可以继续工作（使用新主节点）
+
+**缺点**：
+
+- 故障转移需要时间（通常几十秒）
+- 哨兵本身也需要高可用（需要部署多个哨兵）
+- 数据复制是异步的，可能丢失少量数据
+
+### 3.3 Redis Cluster：水平扩展的高可用
+
+Redis Cluster 是 Redis 的分布式集群方案，支持数据分片和高可用。
+
+```
+                ┌─────────────────────────────┐
+                │       Redis Cluster         │
+                │                             │
+                │   ┌───┐ ┌───┐ ┌───┐       │
+                │   │ A │ │ B │ │ C │       │  槽 0-5460
+                │   └───┘ └───┘ └───┘       │
+                │   Master  Master  Master   │
+                │     │       │       │       │
+                │     ▼       ▼       ▼       │
+                │   ┌───┐ ┌───┐ ┌───┐       │
+                │   │ A'│ │ B'│ │ C'│       │  槽 0-5460
+                │   └───┘ └───┘ └───┘       │
+                │   Slave   Slave   Slave    │
+                └─────────────────────────────┘
+```
+
+**Redis Cluster 的特点**：
+
+- **数据分片**：16384 个槽，分布在多个 Master 节点上
+- **高可用**：每个 Master 节点可以有一个或多个 Slave 节点
+- **自动故障转移**：Master 宕机后，Slave 自动晋升为 Master
+- **客户端分片**：客户端直接连接对应节点，无需代理
+
+**Session 存储的分片策略**：
+
+```java
+// 一致性哈希分片
+public class ConsistentHashSessionRouter implements SessionRouter {
+    
+    private final TreeMap<Long, String> nodes = new TreeMap<>();
+    private final HashFunction hashFunction = Hashing.murmur3_128();
+    
+    public ConsistentHashSessionRouter(List<String> clusterNodes) {
+        for (String node : clusterNodes) {
+            // 每个节点虚拟出多个副本，均匀分布
+            for (int i = 0; i < 160; i++) {
+                long hash = hash(node + "#" + i);
+                nodes.put(hash, node);
+            }
+        }
+    }
+    
+    @Override
+    public String getNode(String sessionId) {
+        long hash = hash(sessionId);
+        Map.Entry<Long, String> entry = nodes.ceilingEntry(hash);
+        if (entry == null) {
+            entry = nodes.firstEntry();
+        }
+        return entry.getValue();
+    }
+}
+```
+
+**优点**：
+
+- 支持水平扩展，数据分布在多个节点
+- 高可用，每个分片都有主从复制
+- 自动故障转移
+
+**缺点**：
+
+- 配置和管理相对复杂
+- 不支持跨槽的批量操作（需要使用 Hash Tag）
+- 故障转移期间，部分请求可能失败
+
+### 3.4 Session 存储的高可用设计建议
+
+生产环境的 Session 存储推荐以下架构：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    应用服务器集群                             │
+│           ┌────────┐  ┌────────┐  ┌────────┐              │
+│           │Server 1│  │Server 2│  │Server 3│              │
+│           └────────┘  └────────┘  └────────┘              │
+└─────────────────────────────────────────────────────────────┘
+                            │
+                            │ Session 读写
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│                  Redis Sentinel Cluster                     │
+│                                                             │
+│  ┌─────────┐  ┌─────────┐  ┌─────────┐                    │
+│  │ Master  │  │ Slave 1 │  │ Slave 2 │  ← 同一分片         │
+│  └─────────┘  └─────────┘  └─────────┘                    │
+│                                                             │
+│  ┌─────────┐  ┌─────────┐  ┌─────────┐                    │
+│  │ Master  │  │ Slave 1 │  │ Slave 2 │  ← 另一分片         │
+│  └─────────┘  └─────────┘  └─────────┘                    │
+│                                                             │
+│  ┌─────────────────────────────────────────────────────┐  │
+│  │                  Sentinel 集群                       │  │
+│  │      S1              S2              S3               │  │
+│  └─────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**关键配置点**：
+
+| 配置项 | 推荐值 | 说明 |
+|---|---|---|
+| Redis 节点数 | >= 6 | 每个分片 1 主 2 从，2 个分片 |
+| Sentinel 数 | >= 3 | 奇数个，避免脑裂 |
+| 超时时间 | 3-5 秒 | 网络抖动的容忍 |
+| 故障转移阈值 | 2 | 至少 2 个 Sentinel 同意才转移 |
+
+## 四、Token 生命周期管理：JWT 的失效机制
+
+### 4.1 JWT 的核心矛盾：签发简单，失效困难
+
+JWT 的最大优点是无状态——服务器不需要存储任何东西。但这恰恰也是它的最大问题：**如果用户被"踢"了，或者 Token 泄露了，你没办法让它立即失效**。
+
+这是一个架构上的 trade-off：
+
+- **Session 方案**：Token 存在 Redis 中，可以随时删除、修改
+- **JWT 方案**：Token 本身包含所有信息，无法修改，只能等它自然过期
+
+### 4.2 解决方案一：短期 Token + 黑名单
+
+把 JWT 的有效期设得很短（如 15 分钟），同时维护一个"黑名单"列表，存放被撤销的 Token。
+
+```
+用户登录 → 生成 Access Token（15分钟）+ Refresh Token（7天）
+    ↓
+使用 Access Token 访问接口
+    ↓
+Token 过期？→ 使用 Refresh Token 换取新的 Access Token
+    ↓
+用户被踢下线 → 把 Refresh Token 加入黑名单
+```
+
+**黑名单的实现**：
+
+```java
+@Component
+public class TokenBlacklistService {
+    
+    @Autowired
+    private StringRedisTemplate redisTemplate;
+    
+    private static final String BLACKLIST_PREFIX = "token:blacklist:";
+    
+    // 将 Token 加入黑名单
+    public void blacklist(String token) {
+        Claims claims = parseToken(token);
+        Date expiry = claims.getExpiration();
+        long ttl = (expiry.getTime() - System.currentTimeMillis()) / 1000;
+        
+        if (ttl > 0) {
+            String key = BLACKLIST_PREFIX + token;
+            redisTemplate.opsForValue().set(key, "1", ttl, TimeUnit.SECONDS);
+        }
+    }
+    
+    // 检查 Token 是否在黑名单
+    public boolean isBlacklisted(String token) {
+        String key = BLACKLIST_PREFIX + token;
+        return Boolean.TRUE.equals(redisTemplate.hasKey(key));
+    }
+}
+```
+
+**优点**：
+
+- Token 有效期短，泄露影响有限
+- 黑名单机制可以撤销特定 Token
+- Refresh Token 可以设置较长的有效期
+
+**缺点**：
+
+- 每次验证 Token 都需要查询黑名单
+- 如果 Token 数量很大，黑名单会占用较多内存
+
+### 4.3 解决方案二：Token 版本号
+
+为每个用户维护一个 Token 版本号。当用户修改密码、被踢下线时，递增版本号。
+
+```
+用户ID: 123 → 当前版本号: 5 → 只有版本号 >= 5 的 Token 才有效
+```
+
+**版本号验证逻辑**：
+
+```java
+public Claims verifyToken(String token) {
+    Claims claims = parseToken(token);
+    String userId = claims.getSubject();
+    Integer tokenVersion = claims.get("version", Integer.class);
+    
+    // 查询数据库获取用户的当前版本号
+    Integer currentVersion = userService.getTokenVersion(userId);
+    
+    if (tokenVersion == null || tokenVersion < currentVersion) {
+        throw new TokenExpiredException("Token 已失效");
+    }
+    
+    return claims;
+}
+```
+
+**用户被踢下线**：
+
+```java
+public void forceLogout(Long userId) {
+    // 递增版本号
+    userService.incrementTokenVersion(userId);
+    
+    // 记录操作日志
+    logService.record("force_logout", userId, "管理员踢出");
+}
+```
+
+**优点**：
+
+- 不需要维护 Token 黑名单
+- 验证逻辑简单
+
+**缺点**：
+
+- 需要查询数据库获取版本号（可以使用 Redis 缓存）
+- 无法撤销特定 Token（只能撤销该用户的所有 Token）
+
+### 4.4 解决方案三：结合使用
+
+生产环境通常结合多种方案：
+
+- Access Token：短期（15 分钟），使用版本号验证
+- Refresh Token：长期（7 天），存储在 Redis 中，可主动撤销
+- 黑名单：用于特殊场景（如密码修改、异常登录）
+
+```java
+@Service
+public class TokenService {
+    
+    @Autowired
+    private UserService userService;
+    
+    @Autowired
+    private RefreshTokenStore refreshTokenStore;
+    
+    // 生成 Token
+    public TokenPair generateTokens(Long userId) {
+        Integer version = userService.getTokenVersion(userId);
+        
+        String accessToken = generateAccessToken(userId, version);
+        String refreshToken = generateRefreshToken();
+        
+        // 存储 Refresh Token
+        refreshTokenStore.store(userId, refreshToken);
+        
+        return new TokenPair(accessToken, refreshToken);
+    }
+    
+    // 验证 Access Token
+    public Claims verifyAccessToken(String token) {
+        Claims claims = parseToken(token);
+        Long userId = Long.parseLong(claims.getSubject());
+        Integer version = claims.get("version", Integer.class);
+        
+        Integer currentVersion = userService.getTokenVersion(userId);
+        if (version == null || version < currentVersion) {
+            throw new TokenExpiredException("请重新登录");
+        }
+        
+        return claims;
+    }
+    
+    // 刷新 Token
+    public TokenPair refreshTokens(String refreshToken) {
+        // 验证 Refresh Token
+        RefreshTokenInfo info = refreshTokenStore.verify(refreshToken);
+        if (info == null) {
+            throw new TokenExpiredException("Refresh Token 已失效");
+        }
+        
+        // 生成新的 Token 对
+        return generateTokens(info.getUserId());
+    }
+    
+    // 强制下线
+    public void forceLogout(Long userId) {
+        // 1. 递增版本号（使所有 Access Token 失效）
+        userService.incrementTokenVersion(userId);
+        
+        // 2. 删除 Refresh Token（使所有刷新请求失效）
+        refreshTokenStore.delete(userId);
+        
+        // 3. 记录日志
+        logService.record(LogType.FORCE_LOGOUT, userId);
+    }
+}
+```
+
+## 五、分布式认证的安全加固
+
+### 5.1 Token 安全的最佳实践
+
+**实践一：使用 HTTPS**
+
+所有携带 Token 的请求必须使用 HTTPS，防止 Token 在传输过程中被窃取。
+
+**实践二：Token 不要放在 URL 中**
+
+URL 会被记录在日志中、浏览器历史中、甚至 Referer 头中传递到第三方。Token 应该放在 Header 或 Cookie 中。
+
+```http
+# 不推荐
+GET /api/user?token=xxx HTTP/1.1
+
+# 推荐
+GET /api/user HTTP/1.1
+Authorization: Bearer xxx
+```
+
+**实践三：敏感操作需要额外验证**
+
+对于敏感操作（如修改密码、修改手机号），除了验证 Token 外，还应该要求用户重新输入密码或验证码。
+
+```java
+@PostMapping("/changePassword")
+public Result changePassword(@RequestBody ChangePasswordRequest request,
+                              @CurrentUser User user) {
+    // 验证密码
+    if (!passwordEncoder.matches(request.getOldPassword(), user.getPassword())) {
+        throw new BizException("原密码错误");
+    }
+    
+    // 验证通过，修改密码
+    userService.changePassword(user.getId(), request.getNewPassword());
+    
+    // 强制下线所有会话
+    tokenService.forceLogout(user.getId());
+    
+    return Result.success();
+}
+```
+
+**实践四：Token 泄露的检测与处理**
+
+记录 Token 的"指纹"（如 IP 地址、User Agent），如果 Token 被从不同的设备或 IP 使用，立即告警并处理。
+
+```java
+public Claims verifyToken(String token, HttpRequest request) {
+    Claims claims = parseToken(token);
+    
+    // 检查 Token 使用环境
+    String tokenIp = claims.get("ip", String.class);
+    String currentIp = getClientIp(request);
+    
+    if (!tokenIp.equals(currentIp)) {
+        // 记录异常登录
+        securityAlertService.alert("异常登录", 
+                                   claims.getSubject(), 
+                                   tokenIp, 
+                                   currentIp);
+    }
+    
+    return claims;
+}
+```
+
+### 5.2 防止 CSRF 攻击
+
+CSRF（跨站请求伪造）是 Token 认证的一个常见威胁。攻击者诱导用户访问恶意页面，利用用户的登录态发起恶意请求。
+
+**防御方案：CSRF Token**
+
+服务端生成一个 CSRF Token，客户端在表单中提交该 Token，服务端验证 Token 的有效性。
+
+```html
+<form action="/transfer" method="POST">
+    <input type="hidden" name="csrf_token" value="${csrfToken}">
+    <!-- 其他表单字段 -->
+</form>
+```
+
+**防御方案：SameSite Cookie**
+
+现代浏览器支持 SameSite Cookie，可以防止 Cookie 被跨站请求携带。
+
+```java
+// 设置 SameSite Cookie
+@Bean
+public DefaultCookieSerializer cookieSerializer() {
+    DefaultCookieSerializer serializer = new DefaultCookieSerializer();
+    serializer.setSameSite("Strict");  // 严格模式，禁止跨站携带
+    return serializer;
+}
+```
+
+| SameSite 值 | 说明 | 安全性 |
+|---|---|---|
+| Strict | 完全禁止跨站携带 | 最安全，但用户体验差 |
+| Lax | 允许导航请求携带（如链接跳转） | 平衡安全与体验 |
+| None | 允许跨站携带，但需要 HTTPS | 需要配合 Secure 属性 |
+
+### 5.3 防止 XSS 攻击
+
+XSS（跨站脚本攻击）是另一种常见的安全威胁。攻击者在页面中注入恶意脚本，窃取用户的 Token。
+
+**防御方案**：
+
+1. **输入过滤**：对用户输入进行严格的过滤和转义
+2. **HTTPOnly Cookie**：设置 Cookie 为 HTTPOnly，防止 JavaScript 读取
+3. **CSP（Content Security Policy）**：配置 CSP 策略，限制脚本来源
+
+```java
+@Bean
+public DefaultCookieSerializer cookieSerializer() {
+    DefaultCookieSerializer serializer = new DefaultCookieSerializer();
+    serializer.setUseHttpOnlyCookie(true);  // HTTPOnly
+    serializer.setUseSecureCookie(true);     // Secure（HTTPS only）
+    return serializer;
+}
+```
+
+## 六、高可用认证架构设计
+
+### 6.1 认证中心架构
+
+大型系统通常会抽取出一个独立的"认证中心"，统一处理用户登录、注册、Token 发放等操作。
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    业务服务集群                              │
+│           ┌────────┐  ┌────────┐  ┌────────┐              │
+│           │订单服务│  │商品服务│  │用户服务│              │
+│           └────────┘  └────────┘  └────────┘              │
+└─────────────────────────────────────────────────────────────┘
+                            │
+                            │ 验证 Token
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│                      认证中心                                │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐        │
+│  │  登录注册   │  │  Token发放  │  │  权限验证   │        │
+│  └─────────────┘  └─────────────┘  └─────────────┘        │
+│                           │                                │
+│                           ▼                                │
+│                    ┌─────────────┐                        │
+│                    │  Token 验证 │                        │
+│                    └─────────────┘                        │
+└─────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│                   Redis 集群                                │
+│              (Session + Token + 黑名单)                    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**认证中心的职责**：
+
+| 职责 | 说明 |
+|---|---|
+| 用户注册/登录 | 验证凭证，发放 Token |
+| Token 管理 | 签发、验证、刷新、撤销 |
+| 权限管理 | 角色、权限的验证 |
+| 安全策略 | 登录失败次数限制、异常检测 |
+
+### 6.2 认证服务的高可用设计
+
+**设计一：认证服务无状态**
+
+认证服务本身应该是无状态的，Token 的验证逻辑不依赖本地存储。所有状态（Session、黑名单等）都存储在 Redis 中。
+
+```java
+@Service
+public class AuthService {
+    
+    @Autowired
+    private TokenStore tokenStore;  // Redis 实现
+    
+    public Claims verifyToken(String token) {
+        // 1. 检查黑名单
+        if (tokenStore.isBlacklisted(token)) {
+            throw new TokenRevokedException();
+        }
+        
+        // 2. 验证 Token 签名和有效期
+        Claims claims = jwtService.verify(token);
+        
+        // 3. 验证 Token 版本（可选）
+        if (tokenVersionService.isVersionValid(claims)) {
+            throw new TokenExpiredException();
+        }
+        
+        return claims;
+    }
+}
+```
+
+**设计二：多级缓存**
+
+为了提高 Token 验证的性能，可以使用多级缓存：
+
+1. **本地缓存**：验证 Token 的基本格式和签名（第一次验证）
+2. **Redis 缓存**：验证 Token 的状态（黑名单、版本号）
+3. **数据库**：持久化用户权限数据（定期同步）
+
+```java
+@Service
+public class TokenVerificationService {
+    
+    private final LoadingCache<String, Claims> localCache;
+    
+    @Autowired
+    private JwtService jwtService;
+    
+    @Autowired
+    private RedisTokenStore redisTokenStore;
+    
+    public TokenVerificationService() {
+        // 本地缓存：容量 10000，过期时间 5 分钟
+        this.localCache = Caffeine.newBuilder()
+            .maximumSize(10000)
+            .expireAfterWrite(5, TimeUnit.MINUTES)
+            .build(this::verifyFromRedis);
+    }
+    
+    public Claims verify(String token) {
+        // 先从本地缓存获取
+        try {
+            return localCache.get(token, () -> verifyFromRedis(token));
+        } catch (ExecutionException e) {
+            throw new RuntimeException(e);
+        }
+    }
+    
+    private Claims verifyFromRedis(String token) {
+        // 检查黑名单
+        if (redisTokenStore.isBlacklisted(token)) {
+            throw new TokenRevokedException();
+        }
+        
+        // 验证 JWT
+        return jwtService.verify(token);
+    }
+}
+```
+
+**设计三：降级策略**
+
+当 Redis 不可用时，认证服务需要有降级策略：
+
+| 场景 | 降级策略 |
+|---|---|
+| Redis 不可用，黑名单查询失败 | 跳过黑名单检查（接受轻微安全风险） |
+| Redis 不可用，Token 验证失败 | 降级为本地 JWT 验证（不检查版本号） |
+| 认证中心整体不可用 | 返回"认证服务暂不可用"，不降级放行 |
+
+```java
+public Claims verifyToken(String token) {
+    try {
+        // 正常验证流程
+        return doVerify(token);
+    } catch (RedisConnectionException e) {
+        // Redis 不可用，降级处理
+        log.warn("Redis 不可用，降级为本地验证");
+        return jwtService.verify(token);
+    }
+}
+```
+
+### 6.3 分布式 Session 的最佳实践
+
+**实践一：Session 数据要精简**
+
+Session 中只存储必要的用户信息，避免存储大量数据：
+
+```java
+// 不要
+session.setAttribute("user", userEntity);  // 整个用户实体
+
+// 推荐
+session.setAttribute("userId", user.getId());
+session.setAttribute("username", user.getUsername());
+session.setAttribute("roles", user.getRoles());
+```
+
+**实践二：合理设置 Session 过期时间**
+
+| 场景 | 推荐过期时间 |
+|---|---|
+| 普通业务系统 | 30 分钟 |
+| 高安全要求系统 | 15 分钟 |
+| 记住登录功能 | 7 天 |
+
+**实践三：Session 同步要异步化**
+
+Session 的写入应该是异步的，避免同步写入影响主流程：
+
+```java
+public void updateSession(Long userId, Map<String, Object> updates) {
+    // 同步写入缓存
+    sessionCache.put(userId, updates);
+    
+    // 异步同步到数据库
+    asyncService.execute(() -> {
+        sessionDao.update(userId, updates);
+    });
+}
+```
+
+## 七、面试追问：分布式认证的高频问题
+
+### 7.1 问题一：Cookie 和 Session 的区别？
+
+**参考答案**：
+
+| 维度 | Cookie | Session |
+|---|---|---|
+| 存储位置 | 浏览器端 | 服务器端 |
+| 存储容量 | 约 4KB | 无限制 |
+| 安全性 | 较低（浏览器可见） | 较高（服务器存储） |
+| 性能 | 无服务器开销 | 有服务器开销 |
+| 跨域支持 | 支持（需配置） | 不支持（跨域需要特殊处理） |
+| 生命周期 | 可以很长 | 通常较短 |
+
+**两者的关系**：Session 通常使用 Cookie 来存储 Session ID（或其他会话标识符）。Cookie 只是一个存储载体，Session 才是真正的会话管理机制。
+
+### 7.2 问题二：如何实现单点登录（SSO）？
+
+**参考答案**：
+
+单点登录（Single Sign-On）的核心是"一处登录，处处通行"。
+
+**实现原理**：
+
+1. 用户在 CAS（中央认证服务）登录，CAS 颁发 Ticket
+2. 用户访问其他应用时，携带 Ticket
+3. 应用验证 Ticket 的有效性
+4. 验证通过后，在本地建立 Session
+
+**CAS 协议流程**：
+
+```
+用户浏览器          应用A              CAS Server
+    │                 │                    │
+    │──访问应用A──────▶│                    │
+    │                 │──重定向到CAS───────▶│
+    │◀───登录页面──────┤◀──────────────────┤
+    │──输入凭证───────▶│                    │
+    │                 │──验证凭证─────────▶│
+    │                 │◀───Ticket──────────┤
+    │                 │                    │
+    │◀───应用A页面────┤                    │
+    │──访问应用B──────▶│                    │
+    │（携带Cookie）    │                    │
+    │                 │                    │
+```
+
+**关键技术点**：
+
+- **跨域 Cookie**：使用父域的 Cookie（如 `.example.com`）
+- **Ticket 验证**：每次访问都需要验证 Ticket 的有效性
+- **Session 映射**：Ticket 和用户 Session 的映射关系
+
+### 7.3 问题三：Token 过期了怎么处理？
+
+**参考答案**：
+
+Token 过期的处理方式取决于 Token 的设计：
+
+**方案一：使用 Refresh Token**
+
+```
+Access Token 过期 → 使用 Refresh Token 换取新的 Access Token → 继续使用
+Refresh Token 过期 → 需要重新登录
+```
+
+**方案二：使用短期 Token + 自动刷新**
+
+```javascript
+// 前端自动刷新 Token
+axios.interceptors.response.use(
+  response => response,
+  async error => {
+    if (error.response.status === 401) {
+      // Token 过期，尝试刷新
+      const newToken = await refreshToken();
+      if (newToken) {
+        // 重试原请求
+        error.config.headers['Authorization'] = `Bearer ${newToken}`;
+        return axios(error.config);
+      }
+    }
+    throw error;
+  }
+);
+```
+
+**方案三：提示用户重新登录**
+
+适用于对安全性要求较高的场景，如金融系统。
+
+### 7.4 问题四：分布式 Session 和 JWT 各有什么优劣？
+
+**参考答案**：
+
+| 维度 | 分布式 Session | JWT |
+|---|---|---|
+| 状态管理 | 有状态，需要存储 | 无状态，不需存储 |
+| 扩展性 | 需要 Redis 集群 | 天然支持分布式 |
+| 性能 | 每次请求需要访问 Redis | 不需额外存储 |
+| 失效控制 | 可以立即失效 | 需要黑名单或版本号 |
+| 数据容量 | 可存储大量数据 | Payload 有限制 |
+| 跨域支持 | 需要特殊处理 | 原生支持跨域 |
+| 适用场景 | 需要即时失效的会话 | 无状态 API、微服务认证 |
+
+**选择建议**：
+
+- **选择 Session**：需要即时失效、存储大量用户数据、团队熟悉传统会话机制
+- **选择 JWT**：微服务架构、无状态 API、需要跨域认证、性能要求极高
+
+---
+
+## 延伸思考
+
+### 思考一：多设备登录的管理
+
+现代用户通常有多个设备（手机、平板、电脑），同一个用户可能同时在多个设备登录。
+
+**问题**：如何设计一个机制，让用户可以查看、管理自己的登录设备？
+
+**提示**：
+
+- 为每个设备生成唯一的设备 ID
+- 记录每个 Token 关联的设备信息
+- 提供"查看登录设备"和"踢出指定设备"的接口
+- 敏感操作（如修改密码）可以选择"踢出所有其他设备"
+
+### 思考二：无密码认证的未来
+
+密码认证是安全的，但也是用户体验的痛点。FIDO2、WebAuthn 等标准正在推动"无密码认证"的普及。
+
+**问题**：如果不用密码，我们如何实现高可用的身份认证？
+
+**提示**：
+
+- 生物识别（指纹、面部识别）
+- 硬件安全密钥（YubiKey 等）
+- 设备绑定 + 动态验证码
+- 考虑无密码认证的高可用设计挑战
+
+---
+
+## 总结
+
+分布式认证与会话管理是分布式系统中最复杂的子系统之一，但也是影响用户体验最直接的子系统。
+
+核心要点回顾：
+
+- **Session 共享**：粘性 Session 是过渡方案，集中式 Session 存储是主流方案
+- **Token 认证**：JWT 是无状态认证的最佳选择，但需要注意失效机制
+- **高可用存储**：Redis Sentinel 或 Redis Cluster 是 Session 存储的首选
+- **安全加固**：HTTPS、CSRF 防护、XSS 防护缺一不可
+- **降级策略**：认证服务需要具备降级能力，避免成为单点故障
+
+记住：认证系统是系统的"守门人"。一个好的认证设计，不仅要保证安全，还要保证性能，更要保证高可用。当用户在登录界面等待太久，他们可能直接离开；当用户频繁被"踢"出登录，他们会对你的系统失去信任。
+
+认证无小事，每一行代码都关乎用户的信任。

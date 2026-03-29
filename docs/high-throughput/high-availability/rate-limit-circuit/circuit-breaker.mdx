@@ -1,0 +1,661 @@
+import { Badge } from '@rspress/core/theme';
+
+# 断路器模式：状态机原理与实现
+
+你有没有遇到过这种情况：系统正常运行时一切安好，突然某个下游服务变慢了，你的系统也跟着变慢，然后越来越慢，最后整个系统崩溃了。
+
+这不是你的代码有问题，这是**级联故障（Cascading Failure）**——一个服务的故障，引发了连锁反应，最终拖垮了整个系统。
+
+断路器模式就是为了解决这个问题而生的。这篇文章，我们来聊聊断路器的原理、实现和最佳实践。
+
+## 一、为什么需要断路器
+
+### 1.1 级联故障：一个失败的例子
+
+想象一个典型的微服务调用链：
+
+```
+用户请求 → 服务 A → 服务 B → 服务 C
+```
+
+正常情况下：
+
+- 服务 A 调用服务 B，耗时 10ms
+- 服务 B 调用服务 C，耗时 10ms
+- 整体耗时 20ms
+
+现在，服务 C 变慢了（响应时间从 10ms 增加到 5 秒）：
+
+1. 服务 B 调用服务 C，等待 5 秒
+2. 服务 B 的线程被阻塞，无法处理其他请求
+3. 服务 A 调用服务 B，也开始等待
+4. 服务 A 的线程也开始阻塞
+5. 最终，整个系统被拖垮
+
+**问题根源**：服务 C 的问题被放大，扩散到了整个系统。
+
+### 1.2 断路器的核心思想
+
+断路器的灵感来自现实中的**电路断路器**：
+
+```
+正常状态：电流正常通过
+过载状态：电流过大，断路器跳闸，切断电路
+修复状态：检查电路，排除故障
+恢复状态：重新合闸，恢复供电
+```
+
+软件断路器的逻辑类似：
+
+```
+正常状态：请求正常调用服务
+故障状态：服务连续失败，断路器「跳闸」，拒绝后续请求
+半开状态：尝试放行少量请求，探测服务是否恢复
+恢复状态：服务恢复正常，断路器「合闸」，恢复正常调用
+```
+
+断路器的价值在于：**快速失败，防止故障扩散**。
+
+当检测到下游服务不可用时，断路器会「跳闸」，拒绝后续请求：
+
+- 调用方：立即返回错误，不用等待超时
+- 服务方：减少请求压力，有时间恢复
+- 系统：避免级联故障，保持可用性
+
+:::tip 断路器 vs 超时
+
+超时是「被动等待」，断路器是「主动拦截」。
+
+- **超时**：等一段时间，发现不行再放弃
+- **断路器**：发现多次不行，直接跳闸
+
+超时只能避免长时间等待，无法阻止故障扩散。断路器可以主动停止调用，让系统快速恢复。
+
+:::
+
+## 二、断路器状态机
+
+### 2.1 三种状态
+
+断路器有三种状态：
+
+| 状态 | 说明 | 行为 |
+|---|---|---|
+| **CLOSED**（闭合） | 正常状态，断路器关闭，请求正常通过 | 调用正常统计失败次数 |
+| **OPEN**（打开） | 故障状态，断路器打开，请求直接拒绝 | 快速失败，不调用服务 |
+| **HALF_OPEN**（半开） | 探测状态，断路器半开，允许部分请求通过 | 尝试探测服务是否恢复 |
+
+### 2.2 状态转换图
+
+```
+                              失败次数超过阈值
+                            ┌─────────────────────┐
+                            │                     │
+                            ▼                     │
+┌───────────────┐      ┌───────────┐      ┌─────▼────────┐
+│               │      │           │      │             │
+│   CLOSED      │─────▶│   OPEN    │◀─────│  HALF_OPEN  │
+│   (闭合)      │      │   (打开)  │      │  (半开)     │
+│               │◀─────│           │─────▶│             │
+└───────────────┘      └───────────┘      └─────┬───────┘
+      ▲                                           │
+      │         探测成功次数超过阈值               │
+      │         或超时时间到达                     │
+      └───────────────────────────────────────────┘
+```
+
+**状态转换规则**：
+
+1. **CLOSED → OPEN**：失败次数/失败率超过阈值
+2. **OPEN → HALF_OPEN**：等待超时时间后，允许试探
+3. **HALF_OPEN → CLOSED**：探测请求全部成功
+4. **HALF_OPEN → OPEN**：探测请求失败
+
+### 2.3 失败检测的三个维度
+
+断路器判断「服务故障」有三个维度：
+
+| 维度 | 说明 | 示例 |
+|---|---|---|
+| **失败次数** | 连续失败 N 次后跳闸 | 连续 5 次失败 |
+| **失败率** | 失败请求占总请求的比例 | 50% 失败率 |
+| **慢调用比例** | 响应时间超过阈值的比例 | 30% 请求超过 1s |
+
+```java
+// 基于失败次数
+circuitBreakerConfig
+    .failureRateThreshold(50)  // 失败率阈值 50%
+    .minimumNumberOfCalls(10)  // 最小请求数（用于计算失败率）
+    .slidingWindowSize(100)    // 滑动窗口大小
+    .slowCallRateThreshold(30) // 慢调用比例阈值 30%
+    .slowCallDurationThreshold(Duration.ofSeconds(1)); // 慢调用阈值 1s
+```
+
+## 三、状态机实现
+
+### 3.1 状态枚举
+
+```java
+public enum CircuitBreakerState {
+    CLOSED,     // 闭合状态
+    OPEN,       // 打开状态
+    HALF_OPEN   // 半开状态
+}
+```
+
+### 3.2 断路器核心实现
+
+```java
+public class CircuitBreaker {
+    // 配置
+    private final int failureRateThreshold;    // 失败率阈值
+    private final int minimumNumberOfCalls;      // 最小请求数
+    private final long openToHalfOpenTimeout;    // OPEN 到 HALF_OPEN 的超时
+    private final int halfOpenSuccessThreshold;  // 半开后成功阈值
+
+    // 状态
+    private volatile CircuitBreakerState state = CircuitBreakerState.CLOSED;
+    private volatile long lastFailureTime;       // 上次失败时间
+    private volatile int halfOpenSuccessCount;   // 半开状态成功次数
+
+    // 滑动窗口：记录最近 N 次请求的结果
+    private final Deque<CallResult> slidingWindow = new ConcurrentLinkedDeque<>();
+    private final int slidingWindowSize;
+
+    // 统计
+    private final AtomicLong totalCalls = new AtomicLong(0);
+    private final AtomicLong failedCalls = new AtomicLong(0);
+
+    /**
+     * 尝试执行调用
+     */
+    public <T> T call(Callable<T> callable) throws Exception {
+        if (!canPass()) {
+            throw new CircuitBreakerOpenException("Circuit breaker is OPEN");
+        }
+
+        try {
+            T result = callable.call();
+            onSuccess();
+            return result;
+        } catch (Exception e) {
+            onFailure();
+            throw e;
+        }
+    }
+
+    /**
+     * 判断是否可以放行
+     */
+    private boolean canPass() {
+        switch (state) {
+            case CLOSED:
+                return true;
+            case OPEN:
+                // 检查是否超时，可以进入半开状态
+                if (System.currentTimeMillis() - lastFailureTime >= openToHalfOpenTimeout) {
+                    toHalfOpen();
+                    return true;
+                }
+                return false;
+            case HALF_OPEN:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * 记录成功调用
+     */
+    private void onSuccess() {
+        addCallResult(CallResult.SUCCESS);
+
+        if (state == CircuitBreakerState.HALF_OPEN) {
+            halfOpenSuccessCount++;
+            if (halfOpenSuccessCount >= halfOpenSuccessThreshold) {
+                toClosed();
+            }
+        }
+    }
+
+    /**
+     * 记录失败调用
+     */
+    private void onFailure() {
+        lastFailureTime = System.currentTimeMillis();
+        addCallResult(CallResult.FAILURE);
+
+        if (state == CircuitBreakerState.HALF_OPEN) {
+            // 半开状态失败，直接跳回 OPEN
+            toOpen();
+        } else {
+            // 检查失败率
+            checkFailureRate();
+        }
+    }
+
+    /**
+     * 检查失败率，决定是否跳闸
+     */
+    private void checkFailureRate() {
+        if (totalCalls.get() < minimumNumberOfCalls) {
+            return; // 请求数不够，不判断
+        }
+
+        double failureRate = (double) failedCalls.get() / totalCalls.get() * 100;
+        if (failureRate >= failureRateThreshold) {
+            toOpen();
+        }
+    }
+
+    /**
+     * 状态转换：CLOSED
+     */
+    private void toClosed() {
+        state = CircuitBreakerState.CLOSED;
+        halfOpenSuccessCount = 0;
+        totalCalls.set(0);
+        failedCalls.set(0);
+        slidingWindow.clear();
+    }
+
+    /**
+     * 状态转换：OPEN
+     */
+    private void toOpen() {
+        state = CircuitBreakerState.OPEN;
+        halfOpenSuccessCount = 0;
+    }
+
+    /**
+     * 状态转换：HALF_OPEN
+     */
+    private void toHalfOpen() {
+        state = CircuitBreakerState.HALF_OPEN;
+        halfOpenSuccessCount = 0;
+    }
+}
+
+/**
+ * 调用结果
+ */
+public enum CallResult {
+    SUCCESS,
+    FAILURE,
+    TIMEOUT
+}
+```
+
+### 3.3 装饰器模式封装
+
+为了方便使用，可以用装饰器模式封装断路器：
+
+```java
+public class CircuitBreakerDecorator<T> {
+    private final CircuitBreaker circuitBreaker;
+    private final Callable<T> target;
+
+    public CircuitBreakerDecorator(CircuitBreaker circuitBreaker, Callable<T> target) {
+        this.circuitBreaker = circuitBreaker;
+        this.target = target;
+    }
+
+    public T execute() throws Exception {
+        return circuitBreaker.call(target);
+    }
+
+    // 静态工厂方法
+    public static <T> Callable<T> decorate(Callable<T> callable, CircuitBreaker circuitBreaker) {
+        return () -> circuitBreaker.call(callable);
+    }
+}
+```
+
+### 3.4 使用示例
+
+```java
+CircuitBreaker circuitBreaker = CircuitBreaker.builder("userService")
+    .failureRateThreshold(50)
+    .minimumNumberOfCalls(10)
+    .openToHalfOpenTimeout(Duration.ofSeconds(30))
+    .build();
+
+public User getUser(Long userId) {
+    try {
+        Callable<User> callable = () -> userServiceClient.getUser(userId);
+        Callable<User> decorated = CircuitBreakerDecorator.decorate(callable, circuitBreaker);
+        return decorated.call();
+    } catch (CircuitBreakerOpenException e) {
+        return User.placeholder(); // 降级返回
+    } catch (Exception e) {
+        throw new RuntimeException("User service unavailable", e);
+    }
+}
+```
+
+## 四、断路器的三大策略
+
+### 4.1 基于失败次数的熔断
+
+最简单的策略：**连续失败 N 次后跳闸**。
+
+```java
+CircuitBreakerConfig config = CircuitBreakerConfig.custom()
+    .failureRateThreshold(100)  // 失败次数阈值
+    .minimumNumberOfCalls(5)     // 最小请求数
+    .slidingWindowType(SlidingWindowType.COUNT_BASED)  // 计数滑动窗口
+    .slidingWindowSize(10)       // 窗口大小 10 次
+    .build();
+```
+
+**适用场景**：对可靠性要求极高的服务（如支付服务），宁可错杀不可放过。
+
+### 4.2 基于失败率的熔断
+
+更精细的策略：**失败率超过阈值后跳闸**。
+
+```java
+CircuitBreakerConfig config = CircuitBreakerConfig.custom()
+    .failureRateThreshold(50)    // 50% 失败率
+    .minimumNumberOfCalls(20)    // 至少 20 次请求才计算
+    .slidingWindowType(SlidingWindowType.TIME_BASED)  // 时间滑动窗口
+    .slidingWindowSize(100)      // 100 秒内
+    .build();
+```
+
+**适用场景**：大多数服务，平衡了「敏感度」和「稳定性」。
+
+### 4.3 基于慢调用比例的熔断
+
+保护下游服务的策略：**慢调用比例过高时跳闸**。
+
+```java
+CircuitBreakerConfig config = CircuitBreakerConfig.custom()
+    .slowCallRateThreshold(30)   // 30% 慢调用
+    .slowCallDurationThreshold(Duration.ofSeconds(2)) // 超过 2s 算慢调用
+    .minimumNumberOfCalls(10)
+    .build();
+```
+
+**适用场景**：依赖外部 API 或数据库的服务，慢调用会占用线程资源。
+
+:::tip 三个策略如何选择
+
+- **失败次数**：适合请求量小的服务（如定时任务）
+- **失败率**：适合大多数服务
+- **慢调用比例**：适合依赖慢下游的服务
+
+可以同时配置多个策略，满足不同的保护需求。
+
+:::
+
+## 五、断路器 vs 重试 vs 限流
+
+这三个概念很容易混淆，它们服务于不同的目的：
+
+| 模式 | 目的 | 行为 |
+|---|---|---|
+| **重试** | 提高成功率 | 失败后重新尝试 |
+| **限流** | 保护系统不被冲垮 | 拒绝超出阈值的请求 |
+| **断路器** | 防止故障扩散 | 快速失败，停止调用 |
+
+### 5.1 组合使用
+
+实际项目中，三者往往配合使用：
+
+```
+请求 → [限流] → [断路器] → [调用] → [重试]
+       ↓           ↓
+   拒绝请求    快速失败
+```
+
+- **限流**：在最外层，限制总请求量
+- **断路器**：在调用层，防止下游故障扩散
+- **重试**：在调用内部，偶发失败时自动重试
+
+### 5.2 重试 + 断路器的配合
+
+断路器打开后，重试应该停止：
+
+```java
+public <T> T callWithRetry(Callable<T> callable, CircuitBreaker circuitBreaker) {
+    int maxRetries = 3;
+    for (int i = 0; i < maxRetries; i++) {
+        try {
+            return circuitBreaker.call(callable);
+        } catch (CircuitBreakerOpenException e) {
+            // 断路器打开，直接失败，不重试
+            throw e;
+        } catch (Exception e) {
+            if (i == maxRetries - 1) {
+                throw e; // 最后一次也失败，抛出异常
+            }
+            // 重试
+            try {
+                Thread.sleep(1000L * (i + 1)); // 指数退避
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException(ie);
+            }
+        }
+    }
+    throw new RuntimeException("Should not reach here");
+}
+```
+
+## 六、生产环境配置建议
+
+### 6.1 参数配置参考
+
+断路器的参数需要根据业务特点来调：
+
+| 参数 | 推荐值 | 说明 |
+|---|---|---|
+| 失败率阈值 | 50% | 超过一半失败就跳闸 |
+| 最小请求数 | 10-50 | 太少会导致误判 |
+| OPEN 到 HALF_OPEN 超时 | 30-60s | 太短会频繁探测，太长恢复慢 |
+| 半开状态探测数 | 3-10 | 太少不准确，太多浪费资源 |
+| 滑动窗口大小 | 10-100 | 根据 QPS 调整 |
+
+```java
+// 生产环境推荐配置
+CircuitBreakerConfig config = CircuitBreakerConfig.custom()
+    .failureRateThreshold(50)
+    .minimumNumberOfCalls(20)
+    .openToHalfOpenTimeout(Duration.ofSeconds(30))
+    .slidingWindowType(SlidingWindowType.TIME_BASED)
+    .slidingWindowSize(100)
+    .slowCallRateThreshold(30)
+    .slowCallDurationThreshold(Duration.ofSeconds(2))
+    .build();
+```
+
+### 6.2 降级策略
+
+断路器打开后，需要有降级策略：
+
+```java
+public User getUser(Long userId) {
+    try {
+        return userService.getUser(userId);
+    } catch (CircuitBreakerOpenException e) {
+        // 降级方案 1：返回默认值
+        return User.guest();
+    } catch (Exception e) {
+        // 降级方案 2：返回缓存
+        User cached = userCache.get(userId);
+        if (cached != null) {
+            return cached;
+        }
+        // 降级方案 3：抛出业务异常
+        throw new UserServiceUnavailableException("用户服务暂时不可用");
+    }
+}
+```
+
+### 6.3 监控与告警
+
+断路器的状态变化需要监控：
+
+```java
+CircuitBreakerRegistry registry = CircuitBreakerRegistry.of(config);
+
+// 注册状态变化监听器
+registry.getDefaultRegistry().getEventPublisher()
+    .onStateTransition(event -> {
+        CircuitBreaker breaker = event.getCircuitBreaker();
+        CircuitBreakerState from = event.getStateTransition().getFromState();
+        CircuitBreakerState to = event.getStateTransition().getToState();
+
+        log.warn("Circuit breaker {} state changed: {} -> {}",
+            breaker.getName(), from, to);
+
+        // 发送告警
+        alertService.alert("Circuit breaker opened: " + breaker.getName());
+    });
+```
+
+建议监控以下指标：
+
+- 断路器状态变化次数
+- 请求成功率
+- 平均响应时间
+- 当前状态（CLOSED / OPEN / HALF_OPEN）
+
+## 七、断路器的常见误区
+
+### 7.1 误区一：断路器只在异常时跳闸
+
+断路器不仅会在**异常**时跳闸，还会在**超时**、**慢调用**时跳闸。
+
+```java
+// 超时也会触发断路器
+try {
+    return circuitBreaker.call(() -> {
+        return restTemplate.getForObject(url, User.class);
+    });
+} catch (Exception e) {
+    // 超时也会到这里
+    throw e;
+}
+```
+
+### 7.2 误区二：断路器打开后会自动恢复
+
+断路器打开后，不会自动恢复。必须经过 **HALF_OPEN** 状态，探测服务是否恢复后，才会决定恢复还是继续打开。
+
+```java
+// 断路器不会自动从 OPEN 变回 CLOSED
+// 必须经过 HALF_OPEN 探测
+```
+
+### 7.3 误区三：断路器可以完全替代超时
+
+断路器是超时策略的补充，不是替代。两者应该同时使用：
+
+- **超时**：防止长时间等待
+- **断路器**：防止大量请求打到故障服务
+
+```java
+// 两者都要配置
+@Configuration
+public class TimeoutConfig {
+    @Bean
+    public RestTemplate restTemplate() {
+        SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
+        factory.setConnectTimeout(Duration.ofSeconds(2));  // 连接超时
+        factory.setReadTimeout(Duration.ofSeconds(3));   // 读取超时
+        return new RestTemplate(factory);
+    }
+}
+```
+
+## 八、面试追问：断路器相关问题
+
+### 8.1 问题一：断路器的状态转换是什么？
+
+**参考答案**：
+
+断路器有三种状态：**CLOSED（闭合）**、**OPEN（打开）**、**HALF_OPEN（半开）**。
+
+转换规则：
+
+- **CLOSED → OPEN**：失败次数或失败率超过阈值
+- **OPEN → HALF_OPEN**：等待超时时间后，允许试探
+- **HALF_OPEN → CLOSED**：试探请求全部成功
+- **HALF_OPEN → OPEN**：试探请求失败
+
+### 8.2 问题二：断路器和限流的区别是什么？
+
+**参考答案**：
+
+| 对比维度 | 断路器 | 限流 |
+|---|---|---|
+| 触发条件 | 服务故障（失败/超时） | 请求量超过阈值 |
+| 目的 | 防止故障扩散 | 保护系统容量 |
+| 行为 | 快速失败，不调用服务 | 拒绝超出阈值的请求 |
+| 恢复方式 | 探测后自动恢复 | 流量降低后自动恢复 |
+
+断路器保护的是「服务的可用性」，限流保护的是「系统的容量」。
+
+### 8.3 问题三：如何选择断路器的失败率阈值？
+
+**参考答案**：
+
+选择失败率阈值需要考虑两个因素：
+
+1. **服务的可靠性要求**：核心服务阈值要低（如 30%），非核心服务可以高（如 70%）
+2. **流量的波动性**：流量波动大的服务，阈值要适当提高，避免频繁跳闸
+
+**推荐做法**：
+
+- 核心服务：30%-50%
+- 普通服务：50%-70%
+- 非核心服务：70%-100%
+
+同时设置**最小请求数**，避免请求量少时误判。
+
+### 8.4 问题四：断路器打开后如何恢复？
+
+**参考答案**：
+
+断路器打开后，会在 **HALF_OPEN** 状态探测服务是否恢复：
+
+1. **OPEN 状态**：等待超时时间（通常 30-60 秒）
+2. **超时后进入 HALF_OPEN**：允许少量请求通过，探测服务
+3. **探测成功**：恢复 CLOSED 状态
+4. **探测失败**：重新回到 OPEN 状态
+
+HALF_OPEN 状态的探测请求数通常为 3-10 个，全部成功才恢复。
+
+---
+
+## 延伸思考
+
+### 题目一：断路器的局限性
+
+断路器能防止故障扩散，但它有一个局限性：它只能检测到「调用失败」，无法检测到「调用变慢」。
+
+你能设计一个机制，检测到「服务变慢」的情况吗？
+
+**提示**：考虑基于响应时间的统计，而不是基于成功/失败。
+
+### 题目二：断路器 vs 舱壁模式
+
+断路器是「全局保护」，舱壁模式是「隔离保护」。两者如何配合使用？
+
+**提示**：考虑舱壁模式保护单个资源池，断路器保护整个服务。
+
+---
+
+## 总结
+
+断路器是保护微服务系统的关键组件：
+
+- **三种状态**：CLOSED、OPEN、HALF_OPEN
+- **三种策略**：失败次数、失败率、慢调用比例
+- **核心优势**：快速失败，防止故障扩散
+- **最佳实践**：配合超时、重试、降级使用
+
+在实际项目中，断路器通常配合限流和舱壁模式，构建完整的服务保护体系。

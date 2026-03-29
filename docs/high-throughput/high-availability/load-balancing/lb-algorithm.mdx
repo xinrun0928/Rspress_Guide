@@ -1,0 +1,699 @@
+import { Badge } from '@rspress/core/theme';
+
+# 负载均衡算法：轮询、随机、加权、哈希、最小连接、一致性哈希
+
+双十一零点，你的下单接口 QPS 突然飙到 10 万。四台后端服务器配置一样，但你发现 A 服务器的 CPU 已经打满了，B 服务器却还空闲着 40% 的算力。
+
+这是为什么？问题很可能出在负载均衡算法上。
+
+很多人以为负载均衡「就是把请求分到不同服务器」这么简单。实际上，不同的分发策略会产生截然不同的效果。选错了算法，即使服务器配置完全一样，也可能出现「旱的旱死，涝的涝死」的局面。
+
+这篇文章，我带你把负载均衡算法彻底搞透。从最简单的轮询，到最玄妙的一致性哈希，每种算法都有它的适用场景和致命缺陷。
+
+---
+
+## 一、轮询算法：最公平，但不完美
+
+### 1.1 基础轮询（Round Robin）
+
+轮询是最朴素、最容易理解的负载均衡算法。每次收到请求，就按顺序分发给下一个服务器，循环往复。
+
+```bash
+请求 1 → Server A
+请求 2 → Server B
+请求 3 → Server C
+请求 4 → Server A
+请求 5 → Server B
+请求 6 → Server C
+...
+```
+
+配置示例：
+
+```nginx title="nginx.conf"
+upstream backend {
+    server 192.168.1.101;
+    server 192.168.1.102;
+    server 192.168.1.103;
+}
+```
+
+**优点**：
+
+- 实现简单，逻辑清晰
+- 请求分发均匀（当请求量足够大时）
+- 不需要知道服务器的任何状态
+
+**缺点**：
+
+- 不考虑服务器的实际性能差异
+- 不考虑请求的实际复杂度差异
+- 不考虑服务器当前的负载状况
+- 会话保持困难
+
+### 1.2 加权轮询（Weighted Round Robin）
+
+基础轮询假设所有服务器「生而平等」，但现实往往不是这样。有的服务器 32 核 128G，有的只有 8 核 16G——让它们承担相同的流量，显然不合理。
+
+加权轮询应运而生：给每台服务器分配一个权重值，权重越高的服务器，分到的请求越多。
+
+```nginx title="nginx.conf"
+upstream backend {
+    server 192.168.1.101 weight=5;  # 5 倍权重
+    server 192.168.1.102 weight=3;  # 3 倍权重
+    server 192.168.1.103 weight=2;  # 2 倍权重
+}
+```
+
+**加权轮询的数学原理**：
+
+假设有 A、B、C 三台服务器，权重分别是 5、3、2。把它们想象成一条线段：
+
+```
+|---AAAAA---|---BBB---|---CC---|
+0           5        8        10
+```
+
+每收到一个请求，就在 0~10 的范围内生成一个随机数，看落在哪个区间：
+
+- 落在 0~5：请求发给 A
+- 落在 5~8：请求发给 B
+- 落在 8~10：请求发给 C
+
+这样，A 的请求量恰好是 C 的 2.5 倍，与权重比例一致。
+
+**平滑加权轮询（Smooth Weighted Round Robin）**：
+
+上面的实现可能导致连续多个请求打到同一台服务器（Nginx 早期版本就是这样）。平滑加权轮询会尽量把请求分散开：
+
+```
+第一轮：A(5-2=3) B(3-1=2) C(2-1=1) → 选择 A
+第二轮：A(3-2=1) B(2-1=1) C(1-1=0) → 选择 B
+第三轮：A(1-2=-1) B(1-1=0) C(0-1=-1) → 选择 B
+第四轮：A(-1+5=4) B(0-1=-1) C(-1+2=1) → 选择 A
+...
+```
+
+Nginx 从 1.11.1 版本开始支持 `smooth` 关键字实现平滑加权轮询。
+
+### 1.3 轮询算法的适用场景
+
+| 优点 | 缺点 |
+|---|---|
+| 实现简单，开销低 | 不考虑服务器性能差异（除非加权） |
+| 天然分布式，无状态 | 不考虑当前负载状况 |
+| 请求分发均匀 | 不适合有状态服务 |
+
+**适用场景**：服务器配置相同、请求复杂度相近、无状态服务。
+
+---
+
+## 二、随机算法：简单但有效
+
+### 2.1 基础随机（Random）
+
+和轮询一样，随机算法也是最朴素的分发策略。每次收到请求，随机选择一台服务器分发过去。
+
+```nginx title="nginx.conf"
+upstream backend {
+    random;
+    server 192.168.1.101;
+    server 192.168.1.102;
+    server 192.168.1.103;
+}
+```
+
+**随机算法的数学原理**：
+
+当请求量足够大时，随机算法和轮询算法在统计上会收敛到相同的分布——每台服务器的请求量都接近平均。但随机不需要维护轮询指针，理论上性能稍好一点（实际上这点差距可以忽略不计）。
+
+### 2.2 加权随机（Weighted Random）
+
+和加权轮询类似，给每台服务器分配权重：
+
+```nginx title="nginx.conf"
+upstream backend {
+    random two;
+    server 192.168.1.101 weight=5;
+    server 192.168.1.102 weight=3;
+    server 192.168.1.103 weight=2;
+}
+```
+
+加权随机的实现思路：把所有权重加起来得到总和 S，然后生成 [0, S) 的随机数 R，遍历服务器列表累加权重，第一个让累加和超过 R 的服务器就是目标。
+
+```java title="加权随机算法实现"
+public static Server weightedRandom(List<Server> servers) {
+    int totalWeight = servers.stream().mapToInt(Server::getWeight).sum();
+    int random = ThreadLocalRandom.current().nextInt(totalWeight);
+    
+    int cumulative = 0;
+    for (Server server : servers) {
+        cumulative += server.getWeight();
+        if (random < cumulative) {
+            return server;
+        }
+    }
+    return servers.get(servers.size() - 1);
+}
+```
+
+### 2.3 随机 vs 轮询
+
+| 维度 | 轮询 | 随机 |
+|---|---|---|
+| 实现复杂度 | 低 | 低 |
+| 短期分布 | 均匀 | 可能不均匀 |
+| 长期分布 | 均匀 | 均匀 |
+| 无状态 | 是 | 是 |
+| 性能开销 | 极低 | 极低 |
+
+理论上两者性能相近，轮询在短期内更均匀，随机在分布式场景下更容易实现负载均衡。
+
+---
+
+## 三、最小连接数算法：动态感知服务器压力
+
+### 3.1 算法原理
+
+轮询和随机都是「静态」的——它们在分发请求时，不考虑服务器当前的状态。一台服务器可能正在处理耗时的请求，但新的请求还是会分给它。
+
+最小连接数算法（Least Connections）解决了这个问题：每次选择当前「最空闲」的服务器分发请求。
+
+```nginx title="nginx.conf"
+upstream backend {
+    least_conn;  # 开启最小连接数
+    server 192.168.1.101;
+    server 192.168.1.102;
+    server 192.168.1.103;
+}
+```
+
+**算法流程**：
+
+1. 记录每台服务器当前正在处理的连接数
+2. 新请求来时，选择连接数最少的服务器
+3. 服务器处理完请求后，连接数减 1
+
+```java title="最小连接数算法实现"
+public class LeastConnectionsLoadBalancer {
+    private List<Server> servers;
+    
+    public Server select() {
+        Server minServer = servers.get(0);
+        int minConnections = minServer.getActiveConnections();
+        
+        for (Server server : servers) {
+            if (server.getActiveConnections() < minConnections) {
+                minServer = server;
+                minConnections = server.getActiveConnections();
+            }
+        }
+        
+        minServer.incrementConnections();
+        return minServer;
+    }
+}
+```
+
+### 3.2 加权最小连接数
+
+和前面几种算法一样，最小连接数也可以加权。公式是：
+
+```
+优先级 = 当前连接数 / 权重
+```
+
+选择优先级最低的服务器。
+
+```nginx title="nginx.conf"
+upstream backend {
+    least_conn;
+    server 192.168.1.101 weight=5;
+    server 192.168.1.102 weight=3;
+    server 192.168.1.103 weight=2;
+}
+```
+
+### 3.3 最小连接数的适用场景
+
+| 场景 | 是否适合 |
+|---|---|
+| 请求处理时间差异大 | ✅ 非常适合 |
+| 长连接服务（WebSocket、gRPC） | ✅ 非常适合 |
+| 请求处理时间相近 | ⚠️ 和轮询效果差不多 |
+| 短连接、高并发 | ⚠️ 统计连接数开销大 |
+
+---
+
+## 四、哈希算法：让请求「认路」
+
+### 4.1 IP 哈希（IP Hash）
+
+IP 哈希是最简单的会话保持算法：根据客户端 IP 地址做哈希，确保来自同一 IP 的请求始终打到同一台服务器。
+
+```nginx title="nginx.conf"
+upstream backend {
+    ip_hash;
+    server 192.168.1.101;
+    server 192.168.1.102;
+    server 192.168.1.103;
+}
+```
+
+**算法原理**：
+
+```
+target_server = hash(client_ip) % server_count
+```
+
+例如，IP `192.168.1.100` 的哈希值是 12345，对 3 取模得到 0，所以永远打 Server A。
+
+**为什么需要会话保持**？
+
+有些场景下，用户的状态存储在服务器本地（比如 Session）。如果第一次请求打到 Server A，第二次请求打到 Server B，用户状态就丢失了。IP 哈希解决了这个问题。
+
+### 4.2 普通哈希的问题
+
+IP 哈希看起来很美好，但它有一个致命缺陷——**当服务器数量变化时，所有映射关系都会被打乱**。
+
+假设原来有 3 台服务器，用户 IP `192.168.1.100` 哈希到 Server A（索引 0）：
+
+```
+hash("192.168.1.100") % 3 = 0 → Server A
+```
+
+现在新增一台 Server D，变成 4 台服务器：
+
+```
+hash("192.168.1.100") % 4 = ?（假设结果是 2）→ Server C
+```
+
+用户被重新路由到 Server C，但 Session 数据还在 Server A——用户登录状态丢失了。这就是著名的 **缓存雪崩** 问题。
+
+### 4.3 一致性哈希：解决缓存雪崩的利器
+
+一致性哈希（Consistent Hashing）由 MIT 的 Karger 于 1997 年提出，专门解决「服务器节点变化时，映射关系尽可能少变化」的问题。
+
+#### 4.3.1 原理：环形空间 + 虚拟节点
+
+一致性哈希的核心思想是：**把服务器和请求都映射到一个环形空间（Hash Ring）上，请求沿着环顺时针找，遇到的第一个服务器就是目标**。
+
+```
+                    服务器 A (hash=100)
+                         /
+                        /
+                       /
+    请求 R (hash=50) --
+                       \
+                        \
+                         \
+                          服务器 B (hash=300)
+```
+
+在上面的例子中：
+
+- 请求 R（hash=50）顺时针走，遇到的第一个服务器是 A（hash=100），所以发给 A
+- 如果增加服务器 C（hash=200），只有 R 原本应该去 A 的请求会受影响（可能被 C 抢走）
+- 其他请求完全不受影响
+
+#### 4.3.2 虚拟节点：解决负载不均
+
+真实场景中，服务器性能可能不同，而且哈希环的分布也可能不均匀（哈希碰撞）。虚拟节点（Virtual Nodes）解决了这个问题。
+
+**原理**：每台物理服务器映射到多个虚拟节点，均匀分布在哈希环上。
+
+```java title="一致性哈希实现（含虚拟节点）"
+public class ConsistentHashing {
+    // 虚拟节点数量
+    private static final int VIRTUAL_NODES = 150;
+    
+    // 物理服务器列表
+    private final List<Server> physicalServers;
+    
+    // 哈希环：hash 值 -> 服务器
+    private final TreeMap<Long, Server> hashRing = new TreeMap<>();
+    
+    public ConsistentHashing(List<Server> servers) {
+        this.physicalServers = servers;
+        initHashRing();
+    }
+    
+    private void initHashRing() {
+        for (Server server : physicalServers) {
+            // 为每台物理服务器创建 VIRTUAL_NODES 个虚拟节点
+            for (int i = 0; i < VIRTUAL_NODES; i++) {
+                long hash = hash("VIRTUAL_" + server.getName() + "_" + i);
+                hashRing.put(hash, server);
+            }
+        }
+    }
+    
+    public Server route(String key) {
+        long hash = hash(key);
+        // 找到第一个大于等于 hash 的节点
+        Map.Entry<Long, Server> entry = hashRing.ceilingEntry(hash);
+        if (entry == null) {
+            // 环的起点
+            entry = hashRing.firstEntry();
+        }
+        return entry.getValue();
+    }
+    
+    private long hash(String key) {
+        // 使用 MurmurHash 或其他均匀分布的哈希算法
+        return MurmurHash.hash(key);
+    }
+}
+```
+
+**为什么虚拟节点能解决负载不均？**
+
+假设有 3 台服务器，没有虚拟节点时，哈希环上只有 3 个点。如果它们的哈希值恰好「扎堆」，某个区间的请求会全部打到某一台服务器。
+
+有了 150 个虚拟节点后，哈希环上有 450 个点，分布会均匀得多。每台物理服务器负责环上 1/3 的区间。
+
+:::tip 虚拟节点数量的经验值
+
+通常设置为 100~200。太小不均匀，太大增加内存开销。也可以根据服务器性能差异设置不同的虚拟节点数量。
+
+:::
+
+#### 4.3.3 节点变化时的再平衡
+
+当服务器节点增加或减少时，一致性哈希的再平衡范围是局部最优的：
+
+```bash
+# 场景：3 台服务器，新增 1 台
+
+基础哈希：   hash(key) % 4 会导致 75% 的请求重新路由
+一致性哈希： 只有受影响的 1/4 请求重新路由
+
+# 场景：4 台服务器，宕机 1 台
+
+基础哈希：   hash(key) % 3 会导致 75% 的请求重新路由
+一致性哈希： 只有受影响的 1/4 请求重新路由
+```
+
+这就是一致性哈希的精髓：**节点变化时，映射关系的变动范围最小**。
+
+---
+
+## 五、算法对比与选型
+
+### 5.1 全方位对比
+
+| 算法 | 会话保持 | 负载均匀度 | 计算开销 | 适用场景 |
+|---|---|---|---|---|
+| 轮询 | ❌ | 高（大流量时） | 极低 | 无状态服务 |
+| 加权轮询 | ❌ | 高 | 低 | 服务器性能不均 |
+| 随机 | ❌ | 高（大流量时） | 低 | 无状态服务 |
+| 加权随机 | ❌ | 高 | 低 | 服务器性能不均 |
+| 最小连接 | ❌ | 高 | 中 | 长连接、处理时间差异大 |
+| IP 哈希 | ✅ | 中 | 低 | Session 保持 |
+| 一致性哈希 | ✅ | 高 | 中 | 分布式缓存 |
+
+### 5.2 选型决策树
+
+```
+有会话保持需求？
+    └── 是 ──> 数据存储在单机本地？
+              └── 是 ──> 短期会话 → IP 哈希
+              └── 否 ──> 分布式缓存 → 一致性哈希
+    └── 否 ──> 请求处理时间差异大？
+              └── 是 ──> 最小连接数
+              └── 否 ──> 服务器性能不均？
+                      └── 是 ──> 加权轮询 / 加权随机
+                      └── 否 ──> 轮询 / 随机
+```
+
+### 5.3 一致性哈希的变体
+
+在实际生产中，一致性哈希还有一些变体：
+
+**带权重的虚拟节点**：性能强的服务器分配更多虚拟节点。
+
+```java title="带权重的一致性哈希"
+public void initHashRingWithWeight() {
+    for (Server server : physicalServers) {
+        // 虚拟节点数量 = 基础数量 × 权重
+        int vNodeCount = VIRTUAL_NODES * server.getWeight();
+        for (int i = 0; i < vNodeCount; i++) {
+            long hash = hash("VIRTUAL_" + server.getName() + "_" + i);
+            hashRing.put(hash, server);
+        }
+    }
+}
+```
+
+**虚拟桶（Virtual Buckets）**：简化一致性哈希的管理，适合大规模集群。
+
+---
+
+## 六、代码实战：手写负载均衡器
+
+### 6.1 策略模式实现
+
+```java title="LoadBalancer.java"
+public interface LoadBalancer {
+    Server select(List<Server> servers);
+}
+```
+
+```java title="RoundRobinLoadBalancer.java"
+public class RoundRobinLoadBalancer implements LoadBalancer {
+    private final AtomicInteger counter = new AtomicInteger(0);
+    
+    @Override
+    public Server select(List<Server> servers) {
+        int index = counter.getAndIncrement() % servers.size();
+        return servers.get(index);
+    }
+}
+```
+
+```java title="LeastConnectionsLoadBalancer.java"
+public class LeastConnectionsLoadBalancer implements LoadBalancer {
+    @Override
+    public Server select(List<Server> servers) {
+        return servers.stream()
+            .min(Comparator.comparingInt(Server::getActiveConnections))
+            .orElseThrow(() -> new RuntimeException("No server available"));
+    }
+}
+```
+
+```java title="ConsistentHashLoadBalancer.java"
+public class ConsistentHashLoadBalancer implements LoadBalancer {
+    private final TreeMap<Long, Server> hashRing = new TreeMap<>();
+    private final int vNodeCount;
+    
+    public ConsistentHashLoadBalancer(int vNodeCount) {
+        this.vNodeCount = vNodeCount;
+    }
+    
+    public void addServer(Server server) {
+        for (int i = 0; i < vNodeCount; i++) {
+            long hash = hash("VN_" + server.getId() + "_" + i);
+            hashRing.put(hash, server);
+        }
+    }
+    
+    @Override
+    public Server select(List<Server> servers) {
+        // 实现选择逻辑
+        return null; // 简化
+    }
+    
+    private long hash(String key) {
+        return Math.abs(key.hashCode());
+    }
+}
+```
+
+### 6.2 Spring Cloud LoadBalancer 集成
+
+```java title="NacosLoadBalancerConfiguration.java"
+@Configuration
+public class NacosLoadBalancerConfiguration {
+    
+    @Bean
+    @ConditionalOnMissingBean
+    public ReactorLoadBalancer<ServiceInstance> reactorServiceInstanceLoadBalancer(
+            Environment environment,
+            LoadBalancerClientFactory factory) {
+        String name = environment.getProperty(CommonClientConfigName.Namespace);
+        NacosDiscoveryProperties discoveryProperties = factory
+            .getProperties(NacosDiscoveryProperties.class);
+        
+        return new NacosLoadBalancer(
+            discoveryProperties,
+            name,
+            factory.getContextId(name)
+        );
+    }
+}
+```
+
+---
+
+## 七、面试追问：负载均衡算法高频问题
+
+### 7.1 问题一：一致性哈希的缺点是什么？
+
+**参考答案**：
+
+一致性哈希虽然解决了缓存雪崩问题，但也有自己的缺点：
+
+**第一：节点分布不均匀**
+
+如果服务器节点的哈希值「扎堆」，会导致负载不均。解决方案是虚拟节点。
+
+**第二：实现复杂度高**
+
+相比简单哈希，一致性哈希需要维护环形结构，实现更复杂。
+
+**第三：不适合服务器数量频繁变化的场景**
+
+虽然变动范围小，但频繁变动仍然会导致缓存失效。比如 Kubernetes 动态扩缩容场景，每次 Pod 数量变化都会触发重哈希，可能导致缓存命中率下降。
+
+**第四：无法保证严格的负载均衡**
+
+一致性哈希关注的是「变化范围最小化」，而非「每台服务器负载完全相等」。如果对负载均衡有严格要求，最小连接数算法更合适。
+
+### 7.2 问题二：如何实现最小连接数的精确统计？
+
+**参考答案**：
+
+最小连接数的实现有一个关键问题：**如何准确统计每台服务器的当前连接数**？
+
+**方案一：集中式计数器**
+
+负载均衡器维护一个计数器表，每次请求加减计数。问题是所有请求都要经过负载均衡器，是性能瓶颈。
+
+**方案二：分布式感知（推荐）**
+
+后端服务器定期上报自己的连接数到负载均衡器，负载均衡器根据上报数据做决策。这种方式更准确，但实现更复杂。
+
+**方案三：加权预估**
+
+不统计精确连接数，而是根据响应时间做预估。响应时间越长，说明服务器越繁忙，降低分发权重。这是 Netflix Zuul 早期版本的策略。
+
+```nginx title="nginx least_conn 的实际行为"
+upstream backend {
+    least_conn;
+    server 192.168.1.101;
+    server 192.168.1.102;
+}
+```
+
+Nginx 的 `least_conn` 算法会考虑服务器当前的活动连接数，但这个数字是 Nginx 本地的，不一定反映后端服务器的真实状态。这也是为什么生产环境通常需要单独的健康检查模块。
+
+### 7.3 问题三：IP 哈希和 Cookie 哈希有什么区别？
+
+**参考答案**：
+
+| 维度 | IP 哈希 | Cookie 哈希 |
+|---|---|---|
+| 标识来源 | 客户端 IP 地址 | 服务端生成的 Cookie |
+| 稳定性 | IP 可能变化（移动网络、NAT） | 稳定 |
+| 隐私 | 涉及 IP 隐私 | 不涉及 |
+| 跨设备 | 同一用户不同设备会路由到不同服务器 | 可以配置为跨设备共享 |
+
+实际生产中，Cookie 哈希比 IP 哈希更可靠，因为 Cookie 是服务端可控的。可以把 Session ID 放在 Cookie 里，用 Session ID 做哈希：
+
+```nginx title="nginx.conf"
+# 基于 cookie 的会话保持
+upstream backend {
+    ip_hash;
+    server 192.168.1.101;
+    server 192.168.1.102;
+}
+# nginx 默认不支持 cookie 哈希，但可以用 Lua 扩展实现
+```
+
+### 7.4 问题四：如何实现零 downtime 的服务器变更？
+
+**参考答案**：
+
+服务器上线或下线时，如果处理不当，可能导致：
+
+- 下线时，正在处理的请求被中断
+- 上线时，瞬间大量请求涌入，服务器过载
+
+**优雅下线（Graceful Shutdown）**：
+
+1. 停止接受新请求，但保留现有连接
+2. 等待现有请求处理完成
+3. 再关闭进程
+
+```nginx title="nginx.conf"
+upstream backend {
+    server 192.168.1.101;
+    server 192.168.1.102;
+    
+    # 慢启动：新上线的服务器权重从低到高
+    slow_start 30s;  # 30 秒内权重从 0 渐变到完整权重
+}
+```
+
+**金丝雀发布**：
+
+先用极小流量验证新服务器，确认无问题后再逐步增加流量：
+
+1. 先把新服务器权重设为 1%（小部分流量）
+2. 观察错误率、延迟等指标
+3. 逐步提高权重到 10%、50%、100%
+
+---
+
+## 八、留给你的思考题
+
+### 题目一：哈希环的边界问题
+
+假设你实现了一致性哈希，用 TreeMap 的 `ceilingEntry()` 找顺时针下一个节点。如果请求的哈希值恰好大于环上最大的节点哈希值，会发生什么？
+
+**提示**：TreeMap 的 `ceilingEntry()` 返回大于等于给定键的第一个元素，如果不存在会返回 null。
+
+### 题目二：分布式 Session 的替代方案
+
+IP 哈希虽然能实现会话保持，但有以下问题：
+
+- 移动网络用户 IP 经常变化
+- 公司内网用户 NAT 出口 IP 相同
+- 无法跨设备同步
+
+如果不使用 IP 哈希，还有哪些方案可以实现分布式 Session？各有什么优缺点？
+
+**提示**：考虑中央存储（Redis）和 Token 方案。
+
+### 题目三：最小连接数 vs 最小响应时间
+
+最小连接数算法优先选择连接数最少的服务器，但连接数少不代表响应快——某台服务器可能连接少，但每条连接都在处理复杂计算。
+
+如果让你设计一个「最小响应时间」算法，你会怎么做？需要考虑哪些指标？
+
+---
+
+## 总结
+
+负载均衡算法是分布式系统的地基，选对了算法，后端服务器的利用率才能最大化。
+
+**算法速查**：
+
+| 算法 | 关键词 | 适用场景 |
+|---|---|---|
+| 轮询 / 加权轮询 | 简单、均匀 | 无状态服务 |
+| 随机 / 加权随机 | 简单、统计均匀 | 无状态服务 |
+| 最小连接数 | 动态、感知负载 | 长连接、处理时间差异大 |
+| IP 哈希 | 会话保持 | 简单 Session |
+| 一致性哈希 | 缓存、节点变化影响小 | 分布式缓存、Redis Cluster |
+
+**实战建议**：
+
+- 内部无状态服务：加权轮询，权重按 CPU 核心数或内存大小设置
+- 外部 API 网关：最小连接数，动态感知后端压力
+- 分布式缓存：一致性哈希，避免节点变化导致的缓存雪崩
+- 会话保持：Cookie 哈希或 Token 方案，避免 IP 哈希的局限性
+
+记住：没有银弹算法，只有最合适的算法。理解每种算法的原理和适用场景，才能在面试和实战中做出正确的选择。

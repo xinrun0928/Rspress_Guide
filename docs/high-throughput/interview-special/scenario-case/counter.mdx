@@ -1,0 +1,997 @@
+import { Badge } from '@rspress/core/theme';
+
+# 高并发计数器：Redis 计数与分布式锁实现
+
+微博热搜第一的帖子，一分钟点赞量破百万；电商首页的实时 GMV 大屏，每秒更新成交额；双十一零点订单量实时跳动……这些数字是怎么来的？
+
+靠 MySQL count(*)？等着数据库爆炸吧。
+
+靠手动累加？并发一来，数据全乱了。
+
+答案是 Redis。
+
+这篇文章，帮你彻底搞懂高并发计数器的设计。
+
+## 一、什么是高并发计数器
+
+### 1.1 计数器的业务场景
+
+计数器无处不在，几乎每个系统都会用到：
+
+| 场景 | 计数类型 | 特点 |
+|---|---|---|
+| 点赞/收藏 | 每用户每内容 | 量大，实时性要求高 |
+| 阅读量/播放量 | 每内容 | 极大，需要去重 |
+| 实时 UV | 每页面/每时间窗口 | 去重精确度要求高 |
+| 商品库存 | 每商品 | 严格一致性 |
+| 排行榜积分 | 每用户 | 需要排序聚合 |
+
+### 1.2 普通计数器的问题
+
+用 MySQL 做计数器，看着简单，但问题一大堆：
+
+```sql
+-- 问题一：并发更新，同一时刻只能有一个事务
+UPDATE counter SET count = count + 1 WHERE id = 1;
+
+-- 问题二：读-改-写，不是原子操作
+SELECT count FROM counter WHERE id = 1;  -- 100
+count = count + 1;  -- 101
+UPDATE counter SET count = 101 WHERE id = 1;
+
+-- 问题三：频繁更新，性能差
+-- 10000 QPS 的点赞，每秒 10000 次数据库更新
+```
+
+:::warning 性能瓶颈
+
+MySQL 单机 QPS 撑死 5000-10000，而 Redis 可以轻松达到 10万+ QPS。这就是为什么计数器要用 Redis。
+
+::::
+
+---
+
+## 二、Redis 原子计数：基础操作
+
+### 2.1 INCR/INCRBY：最常用的原子递增
+
+Redis 的 INCR 命令是原子操作，底层执行的是单线程命令，不存在并发问题：
+
+```bash
+# 基础递增
+INCR article:views:1001
+# 返回: 1, 2, 3, ... 每次调用 +1
+
+# 批量递增（原子）
+INCRBY article:views:1001 5
+# 一次 +5
+```
+
+```java
+@Service
+public class ViewCounterService {
+    
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+    
+    /**
+     * 文章阅读量 +1
+     */
+    public Long incrementView(Long articleId) {
+        String key = "article:views:" + articleId;
+        return redisTemplate.opsForValue().increment(key);
+    }
+    
+    /**
+     * 文章阅读量 +N
+     */
+    public Long incrementView(Long articleId, long delta) {
+        String key = "article:views:" + articleId;
+        return redisTemplate.opsForValue().increment(key, delta);
+    }
+    
+    /**
+     * 获取阅读量
+     */
+    public Long getViewCount(Long articleId) {
+        String key = "article:views:" + articleId;
+        String value = redisTemplate.opsForValue().get(key);
+        return value == null ? 0L : Long.parseLong(value);
+    }
+}
+```
+
+### 2.2 DECR/DECCRBY：原子递减
+
+与 INCR 对应，用于库存扣减等场景：
+
+```bash
+# 库存扣减
+DECRBY product:stock:1001 1
+# 返回: 99, 98, 97, ...
+
+# 库存不足检查
+DECRBY product:stock:1001 1
+if result < 0 then
+    INCRBY product:stock:1001 1  -- 回滚
+    return "库存不足"
+```
+
+### 2.3 INCRBYFLOAT：小数计数
+
+用于评分、排名等需要小数的场景：
+
+```bash
+# 用户评分 +0.5
+INCRBYFLOAT user:rating:1001 0.5
+```
+
+---
+
+## 三、复合操作：Lua 脚本
+
+### 3.1 为什么需要 Lua 脚本
+
+简单的 INCR 够用，但复杂场景下需要「判断 + 操作」的组合：
+
+```lua
+-- Lua 脚本：带检查的库存扣减
+-- 返回值: 1=成功, 0=库存不足, -1=不存在
+
+local key = KEYS[1]
+local quantity = tonumber(ARGV[1])
+
+local current = tonumber(redis.call('GET', key) or 0)
+
+if current == nil then
+    return -1  -- 库存 key 不存在
+end
+
+if current < quantity then
+    return 0  -- 库存不足
+end
+
+redis.call('DECRBY', key, quantity)
+return 1  -- 扣减成功
+```
+
+```java
+public class InventoryLuaScript {
+    
+    private static final String DEDUCT_SCRIPT = """
+        local key = KEYS[1]
+        local quantity = tonumber(ARGV[1])
+        
+        local current = tonumber(redis.call('GET', key) or 0)
+        
+        if current == nil then
+            return -1
+        end
+        
+        if current < quantity then
+            return 0
+        end
+        
+        redis.call('DECRBY', key, quantity)
+        return 1
+        """;
+    
+    public boolean deductStock(String inventoryKey, int quantity) {
+        RedisScript<Long> script = RedisScript.of(DEDUCT_SCRIPT, Long.class);
+        Long result = redisTemplate.execute(
+            script,
+            Collections.singletonList(inventoryKey),
+            String.valueOf(quantity)
+        );
+        return Objects.equals(1L, result);
+    }
+}
+```
+
+### 3.2 点赞功能：去重 + 计数
+
+点赞需要：同一用户只能点赞一次，计数 +1。
+
+```lua
+-- Lua 脚本：带去重的点赞
+-- KEYS[1]: 点赞记录 set key
+-- KEYS[2]: 点赞计数 counter key
+-- ARGV[1]: 用户 ID
+
+local userId = ARGV[1]
+
+-- 检查是否已点赞
+local alreadyLiked = redis.call('SISMEMBER', KEYS[1], userId)
+
+if alreadyLiked == 1 then
+    -- 已点赞，取消点赞
+    redis.call('SREM', KEYS[1], userId)
+    redis.call('DECR', KEYS[2])
+    return {0, 'cancel'}  -- 返回 0 表示取消成功
+else
+    -- 未点赞，执行点赞
+    redis.call('SADD', KEYS[1], userId)
+    redis.call('INCR', KEYS[2])
+    return {1, 'liked'}  -- 返回 1 表示点赞成功
+end
+```
+
+```java
+@Service
+public class LikeService {
+    
+    private static final String LIKE_SCRIPT = """
+        local userId = ARGV[1]
+        local alreadyLiked = redis.call('SISMEMBER', KEYS[1], userId)
+        
+        if alreadyLiked == 1 then
+            redis.call('SREM', KEYS[1], userId)
+            redis.call('DECR', KEYS[2])
+            return {0, 'cancel'}
+        else
+            redis.call('SADD', KEYS[1], userId)
+            redis.call('INCR', KEYS[2])
+            return {1, 'liked'}
+        end
+        """;
+    
+    public LikeResult toggleLike(Long userId, Long articleId) {
+        String likeSetKey = "article:like:users:" + articleId;
+        String likeCountKey = "article:like:count:" + articleId;
+        
+        RedisScript<List> script = RedisScript.of(LIKE_SCRIPT, List.class);
+        List<Object> result = redisTemplate.execute(
+            script,
+            Arrays.asList(likeSetKey, likeCountKey),
+            userId.toString()
+        );
+        
+        int action = ((Number) result.get(0)).intValue();
+        String message = (String) result.get(1);
+        Long likeCount = Long.parseLong(
+            redisTemplate.opsForValue().get(likeCountKey)
+        );
+        
+        return new LikeResult(action == 1, likeCount, message);
+    }
+}
+```
+
+---
+
+## 四、HyperLogLog：UV 统计
+
+### 4.1 什么是 HyperLogLog
+
+如果让你统计「今天有多少独立用户访问了网站」，你会怎么做？
+
+- 用 Set 记录每个用户 ID？内存爆炸
+- 用 SQL DISTINCT？太慢
+
+HyperLogLog 是 Redis 提供的概率算法，用 **12KB 内存** 就能统计 **2^64** 个独立元素，误差率约 0.81%。对于 UV 统计来说，这个精度完全够用。
+
+### 4.2 HyperLogLog 命令
+
+```bash
+# 添加用户
+PFADD uv:2024:01:15 user_1001 user_1002 user_1003
+
+# 统计 UV
+PFCOUNT uv:2024:01:15
+# 返回: 3
+
+# 合并多天 UV
+PFMERGE uv:week uv:2024:01:15 uv:2024:01:16 uv:2024:01:17
+PFCOUNT uv:week
+```
+
+```java
+@Service
+public class UvCounterService {
+    
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+    
+    /**
+     * 记录用户访问
+     */
+    public void recordVisit(String userId) {
+        String key = "uv:" + LocalDate.now().format(DateTimeFormatter.ISO_DATE);
+        redisTemplate.opsForHyperLogLog().add(key, userId);
+    }
+    
+    /**
+     * 获取今日 UV
+     */
+    public long getTodayUv() {
+        String key = "uv:" + LocalDate.now().format(DateTimeFormatter.ISO_DATE);
+        Long size = redisTemplate.opsForHyperLogLog().size(key);
+        return size == null ? 0 : size;
+    }
+    
+    /**
+     * 获取一周 UV（去重合并）
+     */
+    public long getWeekUv() {
+        String[] keys = new String[7];
+        LocalDate date = LocalDate.now();
+        for (int i = 0; i < 7; i++) {
+            keys[i] = "uv:" + date.minusDays(i).format(DateTimeFormatter.ISO_DATE);
+        }
+        redisTemplate.opsForHyperLogLog().union(keys);
+        return redisTemplate.opsForHyperLogLog().size(keys);
+    }
+}
+```
+
+### 4.3 HyperLogLog vs 其他方案
+
+| 方案 | 内存占用 | 精度 | 适用场景 |
+|---|---|---|---|
+| Set | O(N) | 100% | 精确去重，数据量小 |
+| HyperLogLog | 12KB | 99.19% | 大数据量 UV 统计 |
+| Bitmap | O(N/8) | 100% | 有明确用户 ID，量级中等 |
+| 数据库 DISTINCT | - | 100% | 离线分析 |
+
+---
+
+## 五、Bitmap：精确去重
+
+### 5.1 Bitmap 原理
+
+Bitmap 本质上是位数组，每个用户 ID 对应一个 bit 位：
+
+```
+用户 ID:    1    2    3    4    5    6    7    8
+           ┌────┬────┬────┬────┬────┬────┬────┬────┐
+位数组:    │ 1  │ 0  │ 1  │ 0  │ 1  │ 0  │ 1  │ 0  │
+           └────┴────┴────┴────┴────┴────┴────┴────┘
+           用户 1,3,5,7 访问过
+```
+
+优点：内存极低（1亿用户 = 12.5MB）。缺点：用户 ID 必须连续且数值不能太大。
+
+### 5.2 Bitmap 命令
+
+```bash
+# 设置某位为 1（用户访问）
+SETBIT daily:uv:2024:01:15 1001 1
+
+# 检查某位（是否访问过）
+GETBIT daily:uv:2024:01:15 1001
+# 返回: 1 (已访问) 或 0 (未访问)
+
+# 统计 1 的个数（UV）
+BITCOUNT daily:uv:2024:01:15
+
+# 多天去重合并
+BITOP OR week:uv daily:uv:2024:01:15 daily:uv:2024:01:16
+```
+
+### 5.3 实战：每日活跃用户统计
+
+```java
+@Service
+public class DailyActiveUserService {
+    
+    private static final int USER_ID_MAX = 100_000_000;  // 1亿用户
+    
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+    
+    /**
+     * 记录用户活跃
+     */
+    public void recordActive(Long userId) {
+        String key = "dau:" + LocalDate.now().format(DateTimeFormatter.ISO_DATE);
+        redisTemplate.opsForValue().setBit(key, userId, true);
+    }
+    
+    /**
+     * 检查用户今日是否活跃
+     */
+    public boolean isActiveToday(Long userId) {
+        String key = "dau:" + LocalDate.now().format(DateTimeFormatter.ISO_DATE);
+        return Boolean.TRUE.equals(
+            redisTemplate.opsForValue().getBit(key, userId)
+        );
+    }
+    
+    /**
+     * 获取今日 DAU
+     */
+    public long getTodayDau() {
+        String key = "dau:" + LocalDate.now().format(DateTimeFormatter.ISO_DATE);
+        Long count = redisTemplate.execute(
+            (RedisCallback<Long>) conn -> conn.bitCount(key.getBytes())
+        );
+        return count == null ? 0 : count;
+    }
+    
+    /**
+     * 获取本周 DAU（去重合并）
+     */
+    public long getWeekDau() {
+        String weekKey = "dau:week:" + LocalDate.now().format(DateTimeFormatter.ISO_DATE);
+        
+        // 先尝试从缓存获取
+        String cached = redisTemplate.opsForValue().get(weekKey);
+        if (cached != null) {
+            return Long.parseLong(cached);
+        }
+        
+        // 计算本周每天的 key
+        String[] keys = new String[7];
+        LocalDate date = LocalDate.now();
+        for (int i = 0; i < 7; i++) {
+            keys[i] = "dau:" + date.minusDays(i).format(DateTimeFormatter.ISO_DATE);
+        }
+        
+        // BITOP OR 合并
+        redisTemplate.execute((RedisCallback<Long>) conn -> {
+            conn.bitOp(
+                RedisCommands.BitOp.OVERLAY,
+                weekKey.getBytes(),
+                Arrays.stream(keys).map(String::getBytes).toArray(byte[][]::new)
+            );
+            return null;
+        });
+        
+        Long count = redisTemplate.execute(
+            (RedisCallback<Long>) conn -> conn.bitCount(weekKey.getBytes())
+        );
+        
+        // 缓存 1 小时
+        redisTemplate.opsForValue().set(weekKey, String.valueOf(count), 1, TimeUnit.HOURS);
+        
+        return count == null ? 0 : count;
+    }
+}
+```
+
+---
+
+## 六、计数器聚合同步
+
+### 6.1 Redis → MySQL 同步策略
+
+Redis 计数器是易失的（Redis 挂了数据就丢了），需要定期同步到 MySQL 持久化存储：
+
+```java
+@Service
+public class CounterSyncService {
+    
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+    
+    @Autowired
+    private CounterMapper counterMapper;
+    
+    /**
+     * 定时任务：每分钟同步计数到 MySQL
+     */
+    @Scheduled(fixedRate = 60000)
+    @Transactional
+    public void syncCountersToDb() {
+        // 1. 获取所有需要同步的 counter key
+        Set<String> counterKeys = redisTemplate.keys("counter:pending:*");
+        if (counterKeys == null || counterKeys.isEmpty()) {
+            return;
+        }
+        
+        // 2. 批量读取 Redis 计数
+        List<String> keys = new ArrayList<>(counterKeys);
+        List<String> values = redisTemplate.opsForValue().multiGet(keys);
+        
+        // 3. 批量更新 MySQL
+        for (int i = 0; i < keys.size(); i++) {
+            String key = keys.get(i);
+            String value = values.get(i);
+            
+            if (value == null) continue;
+            
+            String counterId = key.replace("counter:pending:", "");
+            long count = Long.parseLong(value);
+            
+            counterMapper.incrementCount(counterId, count);
+        }
+        
+        // 4. 清理已同步的 key
+        redisTemplate.delete(keys);
+        
+        log.info("同步计数器到 MySQL 完成，共 {} 条", keys.size());
+    }
+}
+```
+
+### 6.2 双写策略：写 Redis + 写 MySQL
+
+对于一致性要求高的场景（比如库存），可以同时写 Redis 和 MySQL：
+
+```java
+@Service
+public class InventoryService {
+    
+    private static final String INVENTORY_CACHE_KEY = "inventory:";
+    private static final String INVENTORY_PENDING_KEY = "counter:pending:inventory:";
+    
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+    @Autowired
+    private InventoryMapper inventoryMapper;
+    
+    /**
+     * 扣减库存
+     */
+    public boolean deductStock(Long productId, int quantity) {
+        // 1. 先扣 Redis（快）
+        String cacheKey = INVENTORY_CACHE_KEY + productId;
+        Long result = redisTemplate.opsForValue().increment(cacheKey, -quantity);
+        
+        if (result == null || result < 0) {
+            // 库存不足，回滚 Redis
+            redisTemplate.opsForValue().increment(cacheKey, quantity);
+            return false;
+        }
+        
+        // 2. 再写 MySQL（慢，异步）
+        // 使用消息队列异步处理，避免阻塞
+        String pendingKey = INVENTORY_PENDING_KEY + productId;
+        redisTemplate.opsForValue().increment(pendingKey, quantity);
+        
+        return true;
+    }
+    
+    /**
+     * 定时任务：消费 pending，更新 MySQL
+     */
+    @Scheduled(fixedRate = 1000)
+    @Transactional
+    public void flushPendingToDb() {
+        // 从 pending 获取需要更新的数量
+        // 然后更新 MySQL
+    }
+}
+```
+
+---
+
+## 七、计数器防刷：限流保护
+
+### 7.1 写入限流
+
+如果用户可以无限制地增加计数（比如刷点赞），需要限流保护：
+
+```lua
+-- Lua 脚本：带限流的计数
+-- KEYS[1]: 限流 key
+-- KEYS[2]: 计数器 key
+-- ARGV[1]: 用户 ID
+-- ARGV[2]: 时间窗口（秒）
+-- ARGV[3]: 时间窗口内最大次数
+
+local userId = ARGV[1]
+local window = tonumber(ARGV[2])
+local maxCount = tonumber(ARGV[3])
+
+local rateKey = KEYS[1] .. ':' .. userId
+local count = tonumber(redis.call('GET', rateKey) or 0)
+
+if count >= maxCount then
+    return {-1, '请求过于频繁'}  -- 被限流
+end
+
+-- 增加计数
+redis.call('INCR', rateKey)
+redis.call('EXPIRE', rateKey, window)
+
+-- 执行真正的计数
+redis.call('INCR', KEYS[2])
+
+return {1, 'success'}
+```
+
+### 7.2 多维度限流
+
+```java
+@Service
+public class CounterRateLimiter {
+    
+    /**
+     * 多维度限流检查
+     * @param userId 用户 ID
+     * @param action 操作类型
+     * @return true=允许, false=限流
+     */
+    public boolean checkRateLimit(Long userId, String action) {
+        // 1. 单用户维度：每秒最多 10 次
+        if (!checkUserRate(userId, 1, 10)) {
+            return false;
+        }
+        
+        // 2. 单用户 + 单操作：每分钟最多 100 次
+        if (!checkUserActionRate(userId, action, 60, 100)) {
+            return false;
+        }
+        
+        // 3. 全局维度：每秒最多 10000 次
+        if (!checkGlobalRate(1, 10000)) {
+            return false;
+        }
+        
+        return true;
+    }
+    
+    private boolean checkUserRate(Long userId, int seconds, int maxCount) {
+        String key = "rate:user:" + userId + ":" + seconds;
+        Long count = redisTemplate.opsForValue().increment(key);
+        if (count != null && count == 1) {
+            redisTemplate.expire(key, seconds, TimeUnit.SECONDS);
+        }
+        return count == null || count <= maxCount;
+    }
+}
+```
+
+---
+
+## 八、分布式锁：库存扣减的最终方案
+
+### 8.1 为什么需要分布式锁
+
+Redis INCR 是原子的，但「检查库存 → 扣减库存 → 返回」这个流程不是原子的。如果需要更复杂的业务逻辑（比如检查用户等级、优惠活动等），就需要分布式锁。
+
+### 8.2 Redis 分布式锁实现
+
+```java
+@Service
+public class DistributedLockService {
+    
+    private static final String LOCK_PREFIX = "lock:";
+    private static final long DEFAULT_LOCK_TIMEOUT = 30;  // 30 秒
+    private static final long DEFAULT_WAIT_TIMEOUT = 5;    // 5 秒
+    
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+    
+    /**
+     * 获取锁
+     */
+    public String tryLock(String lockKey) {
+        return tryLock(lockKey, DEFAULT_LOCK_TIMEOUT, DEFAULT_WAIT_TIMEOUT);
+    }
+    
+    /**
+     * 获取锁（带超时）
+     */
+    public String tryLock(String lockKey, long lockTimeout, long waitTimeout) {
+        String lockValue = UUID.randomUUID().toString();
+        long endTime = System.currentTimeMillis() + waitTimeout * 1000;
+        
+        while (System.currentTimeMillis() < endTime) {
+            Boolean success = redisTemplate.opsForValue()
+                .setIfAbsent(
+                    LOCK_PREFIX + lockKey, 
+                    lockValue, 
+                    lockTimeout, 
+                    TimeUnit.SECONDS
+                );
+            
+            if (Boolean.TRUE.equals(success)) {
+                return lockValue;
+            }
+            
+            // 自旋等待
+            try {
+                Thread.sleep(50);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return null;
+            }
+        }
+        
+        return null;  // 获取锁失败
+    }
+    
+    /**
+     * 释放锁
+     */
+    public void unlock(String lockKey, String lockValue) {
+        String key = LOCK_PREFIX + lockKey;
+        
+        // Lua 脚本：只删除自己的锁
+        String script = """
+            if redis.call('get', KEYS[1]) == ARGV[1] then
+                return redis.call('del', KEYS[1])
+            else
+                return 0
+            end
+            """;
+        
+        redisTemplate.execute(
+            new DefaultRedisScript<>(script, Long.class),
+            Collections.singletonList(key),
+            lockValue
+        );
+    }
+    
+    /**
+     * 使用锁执行操作（模板方法）
+     */
+    public <T> T executeWithLock(String lockKey, Supplier<T> action) {
+        String lockValue = tryLock(lockKey);
+        if (lockValue == null) {
+            throw new RuntimeException("获取锁失败: " + lockKey);
+        }
+        
+        try {
+            return action.get();
+        } finally {
+            unlock(lockKey, lockValue);
+        }
+    }
+}
+```
+
+### 8.3 分布式锁 + 计数器：库存扣减完整实现
+
+```java
+@Service
+public class StockDeductionService {
+    
+    @Autowired
+    private DistributedLockService lockService;
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+    @Autowired
+    private ProductMapper productMapper;
+    
+    /**
+     * 扣减库存（分布式锁 + Redis 计数器）
+     */
+    public boolean deductStock(Long productId, int quantity) {
+        String lockKey = "stock:lock:" + productId;
+        
+        return lockService.executeWithLock(lockKey, () -> {
+            // 1. 检查 Redis 库存
+            String stockKey = "stock:count:" + productId;
+            Long currentStock = Long.parseLong(
+                redisTemplate.opsForValue().get(stockKey) ?? "0"
+            );
+            
+            if (currentStock < quantity) {
+                return false;  // 库存不足
+            }
+            
+            // 2. 扣减 Redis 库存
+            redisTemplate.opsForValue().increment(stockKey, -quantity);
+            
+            // 3. 异步更新 MySQL
+            productMapper.decrementStock(productId, quantity);
+            
+            return true;
+        });
+    }
+}
+```
+
+---
+
+## 九、Pipeline 批量操作
+
+### 9.1 为什么需要 Pipeline
+
+如果你要一次读取 100 个计数器的值，逐个 GET 会产生 100 次网络往返：
+
+```bash
+# 低效：100 次网络往返
+GET counter:1
+GET counter:2
+GET counter:3
+...
+GET counter:100
+```
+
+Pipeline 可以将 100 次操作打包成一次网络往返：
+
+```java
+@Service
+public class PipelineCounterService {
+    
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+    
+    /**
+     * 批量获取计数器（Pipeline）
+     */
+    public Map<String, Long> batchGetCounters(List<String> counterIds) {
+        String pattern = "counter:*";
+        
+        // 使用 Pipeline
+        List<String> keys = new ArrayList<>(counterIds.size());
+        for (String id : counterIds) {
+            keys.add("counter:" + id);
+        }
+        
+        List<Object> results = redisTemplate.executePipelined(
+            (RedisCallback<String>) connection -> {
+                for (String key : keys) {
+                    connection.stringCommands().get(key.getBytes());
+                }
+                return null;
+            }
+        );
+        
+        Map<String, Long> counterMap = new HashMap<>();
+        for (int i = 0; i < counterIds.size(); i++) {
+            String value = (String) results.get(i);
+            counterMap.put(counterIds.get(i), value == null ? 0L : Long.parseLong(value));
+        }
+        
+        return counterMap;
+    }
+    
+    /**
+     * 批量递增计数器（Pipeline）
+     */
+    public void batchIncrementCounters(Map<String, Long> increments) {
+        redisTemplate.executePipelined((RedisCallback<Object>) connection -> {
+            for (Map.Entry<String, Long> entry : increments.entrySet()) {
+                byte[] key = entry.getKey().getBytes();
+                byte[] value = String.valueOf(entry.getValue()).getBytes();
+                connection.stringCommands().incrBy(key, Bytes.toLong(value));
+            }
+            return null;
+        });
+    }
+}
+```
+
+---
+
+## 十、计数器丢失与容灾
+
+### 10.1 计数器的脆弱性
+
+Redis 是内存数据库，一旦发生以下情况，计数器数据可能丢失：
+
+- Redis 宕机
+- Redis 进程崩溃
+- 机器断电
+
+### 10.2 解决方案：Checkpoint 机制
+
+```java
+@Service
+public class CounterCheckpointService {
+    
+    private static final String CHECKPOINT_KEY = "counter:checkpoint:";
+    
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+    
+    /**
+     * 定期保存 checkpoint
+     */
+    @Scheduled(fixedRate = 5000)  // 每 5 秒
+    public void saveCheckpoint() {
+        // 1. 获取所有计数器
+        Set<String> counterKeys = redisTemplate.keys("counter:*");
+        if (counterKeys == null) return;
+        
+        for (String key : counterKeys) {
+            String value = redisTemplate.opsForValue().get(key);
+            if (value != null) {
+                // 2. 保存到持久化存储
+                String checkpointKey = key.replace("counter:", "counter:checkpoint:");
+                saveToFile(checkpointKey, value);
+            }
+        }
+    }
+    
+    /**
+     * 故障恢复时，从 checkpoint 恢复
+     */
+    public void restoreFromCheckpoint() {
+        Set<String> checkpointKeys = redisTemplate.keys("counter:checkpoint:*");
+        if (checkpointKeys == null) return;
+        
+        for (String ck : checkpointKeys) {
+            String value = redisTemplate.opsForValue().get(ck);
+            if (value != null) {
+                String counterKey = ck.replace("counter:checkpoint:", "counter:");
+                redisTemplate.opsForValue().set(counterKey, value);
+            }
+        }
+    }
+}
+```
+
+---
+
+## 十一、实时性 vs 最终一致性
+
+### 11.1 两种计数模式
+
+| 模式 | 说明 | 适用场景 |
+|---|---|---|
+| **实时计数** | 每次操作立即更新 | 库存扣减、点赞/取消点赞 |
+| **异步计数** | 批量聚合后更新 | 阅读量、播放量 |
+
+### 11.2 选择建议
+
+```java
+@Service
+public class CounterStrategy {
+    
+    /**
+     * 选择计数模式
+     */
+    public CounterMode getMode(String counterType) {
+        // 需要精确的操作 → 实时
+        if ("stock".equals(counterType) || "like".equals(counterType)) {
+            return CounterMode.REAL_TIME;
+        }
+        
+        // 允许误差，且量大 → 异步
+        if ("view".equals(counterType) || "play".equals(counterType)) {
+            return CounterMode.ASYNC;
+        }
+        
+        return CounterMode.REAL_TIME;
+    }
+}
+```
+
+---
+
+## 面试追问
+
+### 问题一：Redis 计数器和 MySQL 计数器如何保证最终一致性？
+
+**参考答案**：
+
+1. **写放大**：每次 Redis 操作后，异步写入 MySQL pending 表
+2. **定时同步**：每分钟将 pending 表批量写入 MySQL
+3. **对账机制**：每小时检查 Redis 和 MySQL 差异，差异过大告警
+4. **故障恢复**：Redis 启动时，从 MySQL 加载最新计数
+
+### 问题二：如何设计一个每分钟排行榜？
+
+**参考答案**：
+
+1. **Redis Sorted Set**：用 ZADD 更新分数，ZREVRANGE 获取 Top N
+2. **滑动窗口**：每分钟一个 key，过期后合并
+3. **增量更新**：不每次都更新 Sorted Set，而是累计 delta，定时批量更新
+
+### 问题三：HyperLogLog 的误差率是如何计算的？
+
+**参考答案**：
+
+HyperLogLog 基于伯努利试验的概率估计。算法使用寄存器记录最大尾部零点数，通过调和平均估算基数。标准误差约为 `1.04 / sqrt(m)`，其中 m 是寄存器数量（Redis 使用 16384 个寄存器）。
+
+---
+
+## 延伸思考
+
+### 思考题一：如何设计一个 618 大促的实时 GMV 大屏？
+
+每秒更新一次，峰值 QPS 达到百万级别，支持按省市区、品类、商品等多个维度下钻。
+
+**提示**：考虑多级缓存、预聚合、MQ 分区消费等技术。
+
+### 思考题二：如何防止排行榜被人为刷分？
+
+**提示**：考虑风控策略、行为分析、设备指纹等多维度识别。
+
+---
+
+## 总结
+
+高并发计数器的设计，核心就三个字：**快、准、稳**。
+
+- **快**：Redis 原子操作，10万+ QPS
+- **准**：HyperLogLog / Bitmap / Set，根据精度要求选方案
+- **稳**：定期同步、Checkpoint、限流保护
+
+掌握这些，你就能应对任何计数器场景的面试题了。

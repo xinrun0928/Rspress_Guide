@@ -1,0 +1,825 @@
+import { Badge } from '@rspress/core/theme';
+
+# 全链路监控：SkyWalking、Prometheus 与链路追踪
+
+凌晨两点，你被一条告警叫醒：「订单服务 P99 延迟超过 2 秒！」
+
+你揉着眼睛打开监控大屏，但问题来了——订单服务依赖 12 个下游服务，涉及 3 个数据库、2 个 Redis 缓存、1 个 Kafka 消息队列。告警只告诉你「慢」，但没说「哪里慢」。
+
+你开始手动排查：
+- 查数据库慢查询日志？没有明显问题
+- 查 Redis 延迟？没有异常
+- 查 Kafka 消费延迟？略微积压，但不是瓶颈
+
+折腾了 2 个小时，终于定位到是某个下有服务的某个接口超时导致的连锁反应。
+
+这就是没有全链路监控的代价——你知道系统有问题，但不知道问题在哪里。
+
+这篇文章，我们来聊聊全链路监控的三大支柱：**Metrics（指标）**、**Logs（日志）**、**Traces（链路追踪）**，以及如何用 SkyWalking、Prometheus 等工具构建完整的可观测性体系。
+
+## 一、可观测性的三大支柱
+
+### 1.1 为什么可观测性如此重要
+
+传统的监控关注的是「系统是否活着」——CPU 高不高、内存够不够、磁盘满不满。但微服务架构下，这种监控远远不够：
+
+**服务数量爆炸**：一个典型的微服务系统可能有几十上百个服务，每个服务有自己的监控指标，但整体性能如何？跨服务的调用链路是怎样的？传统监控无法回答。
+
+**故障定位困难**：微服务的一个故障可能引发连锁反应，导致整个系统性能下降。但告警通常只告诉你「某个服务慢了」，无法定位根因。
+
+**用户体验黑盒**：用户抱怨「下单很慢」，但你无法从系统指标推断出用户感受到的延迟是多少秒，哪个环节拖了后腿。
+
+可观测性（Observability）应运而生。它的核心理念是：**通过系统外部输出了解内部状态**——即使是你没有预料到的问题，也能通过数据分析发现。
+
+### 1.2 三大支柱概览
+
+可观测性有三大支柱，它们各有侧重、相辅相成：
+
+| 支柱 | 关注点 | 典型问题 | 数据特征 |
+|---|---|---|---|
+| **Metrics（指标）** | 「系统现在怎么样」 | CPU 使用率、P99 延迟、QPS | 聚合后的数值，带时间戳 |
+| **Logs（日志）** | 「发生了什么」 | 错误堆栈、访问日志、业务日志 | 非结构化或半结构化文本 |
+| **Traces（链路追踪）** | 「怎么走到这里的」 | 调用链、性能分析、根因定位 | 带父子关系的 Span 序列 |
+
+**Metrics 回答「是否正常」**：如果 CPU 超过 80%，说明可能有性能问题。
+
+**Logs 回答「发生了什么」**：如果日志里出现大量 SQLException，说明数据库可能有问题。
+
+**Traces 回答「为什么会这样」**：如果链路追踪显示某个 HTTP 调用耗时 1.5 秒，其中 1.4 秒在等待数据库响应，说明瓶颈在数据库。
+
+:::tip 三者结合
+
+真正有效的可观测性需要三者结合：
+
+1. Metrics 发现异常（P99 延迟飙升）
+2. Logs 发现线索（某个接口大量报错）
+3. Traces 定位根因（数据库查询超时）
+
+单独使用任何一个都无法完整回答问题。
+
+:::
+
+## 二、Metrics：系统指标的可量化监控
+
+### 2.1 四种核心指标类型
+
+Metrics 是可量化、可聚合的测量值。根据用途，可以分为四种类型：
+
+**Counter（计数器）**：
+
+单调递增的数值，用于统计「发生了多少次」。
+
+```java
+// Micrometer Counter 示例
+@Autowired
+private MeterRegistry meterRegistry;
+
+public void recordOrder(Order order) {
+    // 记录订单数量
+    Counter.builder("order.created")
+        .tag("service", "order-service")
+        .tag("region", "us-east-1")
+        .register(meterRegistry)
+        .increment();
+}
+```
+
+适用场景：请求次数、订单数量、用户登录次数。
+
+**Gauge（仪表）**：
+
+可以上下波动的数值，反映「当前状态」。
+
+```java
+// Micrometer Gauge 示例
+AtomicInteger activeConnections = new AtomicInteger(0);
+
+meterRegistry.gauge("http.active.connections", activeConnections);
+
+// 业务中更新值
+public void onConnect() {
+    activeConnections.incrementAndGet();
+}
+
+public void onDisconnect() {
+    activeConnections.decrementAndGet();
+}
+```
+
+适用场景：当前连接数、队列长度、内存使用量。
+
+**Histogram（直方图）**：
+
+统计分布的桶，用于计算分位数（P50、P90、P99 等）。
+
+```java
+// Micrometer Histogram 示例
+Timer.builder("order.process.duration")
+    .description("订单处理耗时")
+    .publishPercentiles(0.5, 0.9, 0.99)
+    .publishPercentileHistogram()
+    .register(meterRegistry)
+    .record(() -> processOrder(order));
+```
+
+适用场景：请求延迟、响应大小、处理时间。
+
+**Summary（摘要）**：
+
+类似 Histogram，但由客户端计算分位数。
+
+```java
+// Micrometer Summary 示例
+DistributionSummary.builder("response.size")
+    .publishQuantiles(0.5, 0.9, 0.99)
+    .register(meterRegistry)
+    .record(response.getSize());
+```
+
+### 2.2 RED 方法：服务指标核心
+
+RED 方法是服务监控的核心框架，适用于大多数无状态服务：
+
+| 指标 | 说明 | 公式 |
+|---|---|---|
+| **Rate** | 请求速率 | 每秒请求数（QPS） |
+| **Errors** | 错误率 | 错误请求数 / 总请求数 |
+| **Duration** | 响应时间 | 请求耗时（P50/P90/P99） |
+
+```java
+// RED 指标实现
+public class RedMetrics {
+    private final Counter totalRequests;
+    private final Counter errorRequests;
+    private final Timer requestDuration;
+    
+    public RedMetrics(MeterRegistry registry, String serviceName) {
+        this.totalRequests = Counter.builder(serviceName + ".requests")
+            .register(registry);
+        this.errorRequests = Counter.builder(serviceName + ".errors")
+            .register(registry);
+        this.requestDuration = Timer.builder(serviceName + ".duration")
+            .publishPercentiles(0.5, 0.9, 0.99)
+            .register(registry);
+    }
+    
+    public void recordRequest(boolean success, long durationMs) {
+        totalRequests.increment();
+        if (!success) {
+            errorRequests.increment();
+        }
+        requestDuration.record(Duration.ofMillis(durationMs));
+    }
+}
+```
+
+### 2.3 USE 方法：资源指标核心
+
+USE 方法适用于监控基础设施（CPU、内存、磁盘、网络等）：
+
+| 指标 | 说明 | 告警阈值建议 |
+|---|---|---|
+| **Utilization** | 利用率 | CPU > 80% |
+| **Saturation** | 饱和度 | 队列长度 > 80% |
+| **Errors** | 错误数 | 非零错误 |
+
+## 三、Prometheus：云原生时代的指标收集器
+
+### 3.1 Prometheus 的核心设计
+
+Prometheus 是 CNCF 的毕业项目，专为云原生环境设计。它的核心特点是：
+
+- **Pull 模式**：Prometheus 主动从目标服务拉取指标，而非等待服务推送
+- **多维数据模型**：指标 + 标签（Labels），支持灵活查询
+- **强大的查询语言**：PromQL 支持复杂的数据聚合和计算
+- **高效的存储**：时序数据库，自研 TSM 存储引擎
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      Prometheus Server                      │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐      │
+│  │   ServiceA    │  │   ServiceB    │  │   ServiceC    │      │
+│  │  /metrics    │  │  /metrics     │  │  /metrics     │      │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘      │
+│         │                 │                 │               │
+│         └─────────────────┼─────────────────┘               │
+│                           │                                  │
+│                    Pull (每15秒)                             │
+└───────────────────────────┼─────────────────────────────────┘
+                            │
+                   ┌────────▼────────┐
+                   │   TSDB Storage   │
+                   │  (时序数据库)     │
+                   └────────┬────────┘
+                            │
+                   ┌────────▼────────┐
+                   │     Grafana     │
+                   │    Dashboard    │
+                   └─────────────────┘
+```
+
+### 3.2 Prometheus 数据模型
+
+Prometheus 的数据模型是 Labeled Time Series（带标签的时序数据）：
+
+```
+# 格式说明
+<metric_name>{<label_name>=<label_value>, ...}
+
+# 示例
+order_service_requests_total{service="order", method="POST", status="200"} 12345
+order_service_requests_total{service="order", method="POST", status="500"} 23
+order_service_requests_total{service="order", method="GET", status="200"} 9876
+```
+
+指标名称 + 标签集合 = 唯一时序数据。相同指标名、不同标签是**不同的指标**。
+
+### 3.3 服务埋点与暴露指标
+
+Spring Boot + Micrometer + Prometheus 的集成：
+
+```xml
+<!-- 添加依赖 -->
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-actuator</artifactId>
+</dependency>
+<dependency>
+    <groupId>io.micrometer</groupId>
+    <artifactId>micrometer-registry-prometheus</artifactId>
+</dependency>
+```
+
+```yaml
+# 暴露 Prometheus 端点
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  endpoint:
+    health:
+      show-details: always
+  metrics:
+    tags:
+      application: ${spring.application.name}
+```
+
+访问 `http://localhost:8080/actuator/prometheus` 查看暴露的指标：
+
+```promql
+# HELP jvm_gc_pause_seconds Time spent in GC pause
+# TYPE jvm_gc_pause_seconds summary
+jvm_gc_pause_seconds_sum{action="end of major GC",cause="Allocation Failure",application="order-service"} 0.245
+jvm_gc_pause_seconds_count{action="end of major GC",cause="Allocation Failure",application="order-service"} 12
+
+# HELP http_server_requests_seconds HTTP请求耗时
+# TYPE http_server_requests_seconds summary
+http_server_requests_seconds_sum{uri="/api/orders",method="POST",status="200",application="order-service"} 45.678
+http_server_requests_seconds_count{uri="/api/orders",method="POST",status="200",application="order-service"} 1234
+```
+
+### 3.4 PromQL：强大的查询语言
+
+PromQL 是 Prometheus 的查询语言，支持多种操作：
+
+**基础查询**：
+
+```promql
+# 查询某个指标的所有时序
+order_service_requests_total
+
+# 查询某个标签组合
+order_service_requests_total{service="order", status="200"}
+
+# 使用正则匹配
+order_service_requests_total{service=~"order|inventory"}
+```
+
+**聚合操作**：
+
+```promql
+# 按标签聚合求和
+sum(order_service_requests_total) by (service)
+
+# 计算错误率
+sum(rate(order_service_errors_total[5m])) / sum(rate(order_service_requests_total[5m]))
+
+# P99 延迟
+histogram_quantile(0.99, rate(http_server_requests_seconds_bucket[5m]))
+```
+
+**计算与函数**：
+
+```promql
+# 增长率
+rate(order_service_requests_total[5m])
+
+# 预测未来值
+predict_linear(node_filesystem_free_bytes[10m], 3600)
+
+# 计算 CPU 使用率
+100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)
+```
+
+## 四、分布式链路追踪：追踪请求的全生命周期
+
+### 4.1 为什么需要链路追踪
+
+在微服务架构中，一个用户请求可能涉及十几个服务的调用：
+
+```
+用户下单请求
+    │
+    ├─→ API Gateway
+    │       │
+    │       ├─→ 订单服务
+    │       │       │
+    │       │       ├─→ 用户服务
+    │       │       │       │
+    │       │       │       ├─→ 数据库查询 (5ms)
+    │       │       │       └─→ Redis 查询 (2ms)
+    │       │       │
+    │       │       ├─→ 库存服务
+    │       │       │       │
+    │       │       │       └─→ 库存数据库 (50ms)  ← 瓶颈！
+    │       │       │
+    │       │       └─→ 支付服务
+    │       │               │
+    │       │               ├─→ 第三方支付 API (200ms)
+    │       │               │
+    │       │               └─→ 支付数据库 (10ms)
+    │       │
+    │       └─→ 消息队列（异步通知）
+```
+
+如果没有链路追踪，你只知道「下单请求慢」。有了链路追踪，你可以清晰看到瓶颈在「库存服务访问数据库」这一步。
+
+### 4.2 Trace、Span、Context 的核心概念
+
+链路追踪有三个核心概念：
+
+**Trace（追踪）**：
+
+一次完整的请求调用链，从起点到终点。每个 Trace 有一个全局唯一的 TraceID。
+
+**Span（片段）**：
+
+Trace 中的一个独立操作单元。每个 Span 有自己的 SpanID，以及父 SpanID（Root Span 没有父 Span）。
+
+**Context（上下文）**：
+
+在服务之间传递的元数据，包含 TraceID、SpanID 等信息，用于关联不同服务的调用。
+
+```
+Trace: abc123 (全局唯一)
+│
+├─ Span 1: API Gateway (根 Span)
+│   │
+│   ├─ Span 2: Order Service
+│   │   │
+│   │   ├─ Span 3: User Service
+│   │   │       │
+│   │   │       ├─ Span 4: Database Query (5ms)
+│   │   │       └─ Span 5: Redis Query (2ms)
+│   │   │
+│   │   ├─ Span 6: Inventory Service
+│   │   │       │
+│   │   │       └─ Span 7: Inventory DB (50ms) ← 50ms!
+│   │   │
+│   │   └─ Span 8: Payment Service
+│   │           │
+│   │           ├─ Span 9: Third-party API (200ms)
+│   │           └─ Span 10: Payment DB (10ms)
+```
+
+### 4.3 OpenTracing 与 OpenTelemetry
+
+**OpenTracing** 是链路追踪的标准化 API，定义了 Tracer、Span、SpanContext 等接口。主要实现包括 Zipkin、Jaeger、SkyWalking。
+
+**OpenTelemetry**（OTel）是 OpenTracing 和 OpenCensus 合并后的产物，已成为 CNCF 的标准项目，提供统一的 Metrics、Logs、Traces 收集方案。
+
+```java
+// OpenTelemetry 手动埋点示例
+public class OrderService {
+    
+    private final Tracer tracer;
+    
+    public Order createOrder(OrderRequest request) {
+        // 创建 Span
+        Span span = tracer.spanBuilder("createOrder")
+            .setParent(Context.current())
+            .setTag("order.type", request.getType())
+            .startSpan();
+        
+        try (Scope scope = span.makeCurrent()) {
+            // 业务逻辑
+            Order order = doCreateOrder(request);
+            
+            span.setTag("order.id", order.getId());
+            span.setStatus(StatusCode.OK);
+            return order;
+        } catch (Exception e) {
+            span.setStatus(StatusCode.ERROR, e.getMessage());
+            span.recordException(e);
+            throw e;
+        } finally {
+            span.end();
+        }
+    }
+}
+```
+
+### 4.4 SkyWalking：强大的应用性能监控平台
+
+SkyWalking 是 Apache 基金会的毕业项目，提供全链路追踪、性能指标、日志、告警等一站式 APM 解决方案。
+
+**架构概览**：
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                        SkyWalking OAP                          │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐        │
+│  │  Trace       │  │  Metrics     │  │  Log          │        │
+│  │  Processor   │  │  Processor   │  │  Processor    │        │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘        │
+│         │                 │                 │                   │
+│         └─────────────────┼─────────────────┘                   │
+│                           │                                    │
+│                    ┌──────▼──────┐                             │
+│                    │   Storage   │                             │
+│                    │  (ES/H2/MySQL)│                            │
+│                    └──────┬──────┘                             │
+└───────────────────────────┼────────────────────────────────────┘
+                            │
+                ┌────────────┴────────────┐
+                │                         │
+        ┌───────▼───────┐         ┌───────▼───────┐
+        │  SkyWalking   │         │   SkyWalking  │
+        │  Web UI       │         │   CLI / API   │
+        └───────────────┘         └───────────────┘
+```
+
+**Java Agent 自动埋点**：
+
+SkyWalking 的 Java Agent 可以自动埋点，无需修改代码：
+
+```bash
+# 下载并配置 Java Agent
+wget https://archive.apache.org/dist/skywalking/{version}/apache-skywalking-apm-{version}.tar.gz
+tar -xzf apache-skywalking-apm-{version}.tar.gz
+
+# 配置 agent.config
+collector.backend_service=${SW_AGENT_COLLECTOR_BACKEND_SERVICES:127.0.0.1:11800}
+agent.service_name=${SW_AGENT_NAME:order-service}
+
+# 启动应用时加载 Agent
+java -javaagent:/path/to/skywalking-agent.jar \
+     -Dskywalking.agent.service_name=order-service \
+     -Dskywalking.collector.backend_service=localhost:11800 \
+     -jar your-application.jar
+```
+
+**SkyWalking UI 功能**：
+
+1. **拓扑图**：可视化服务调用关系
+2. **链路追踪**：查看完整调用链和每个 Span 的耗时
+3. **性能指标**：QPS、响应时间、错误率
+4. **告警**：基于指标阈值的告警规则
+
+### 4.5 Jaeger vs Zipkin vs SkyWalking
+
+| 特性 | SkyWalking | Jaeger | Zipkin |
+|---|---|---|---|
+| **架构** | OAP 平台 | Collector + Query + UI | Collector + Query + UI |
+| **存储** | ES、H2、MySQL、TiDB | ES、Cassandra、Kafka | ES、MySQL、Memory |
+| **语言支持** | Java、Go、Node.js、Python 等 | 多语言（tracing SDK） | 多语言 |
+| **额外能力** | APM + 日志 + 告警 | 纯链路追踪 | 纯链路追踪 |
+| **性能** | 高 | 中 | 中 |
+| **上手难度** | 中（功能多） | 低 | 低 |
+
+## 五、日志聚合：ELK Stack
+
+### 5.1 ELK Stack 架构
+
+ELK Stack 是最流行的日志聚合解决方案，由 Elasticsearch、Logstash、Kibana 三部分组成：
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      ELK Stack                                  │
+│                                                                  │
+│  ┌─────────┐    ┌─────────────┐    ┌──────────────┐           │
+│  │ Beats   │───→│  Logstash   │───→│ Elasticsearch │           │
+│  │ (采集)   │    │  (处理)      │    │  (存储/搜索)   │           │
+│  └─────────┘    └─────────────┘    └──────┬───────┘           │
+│       ↑                                     │                    │
+│       │                                     │                    │
+│  ┌────┴─────┐                         ┌────▼────┐               │
+│  │  应用日志 │                         │  Kibana │               │
+│  │ (文件/stdout) │                     │ (可视化) │               │
+│  └───────────┘                         └─────────┘               │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 5.2 Filebeat 配置
+
+```yaml
+# Filebeat 配置
+filebeat.inputs:
+  - type: log
+    enabled: true
+    paths:
+      - /var/log/spring-boot/*.log
+    json.keys_under_root: true
+    fields:
+      service: order-service
+      environment: production
+
+processors:
+  - add_host_metadata:
+      when.not.contains.tags: forwarded
+  - add_cloud_metadata: ~
+
+output.logstash:
+  hosts: ["logstash.example.com:5044"]
+```
+
+### 5.3 日志关联 Trace
+
+日志与 Trace 的关联是微服务可观测性的关键。通过在日志中加入 TraceID：
+
+```java
+// MDC + SkyWalking 自动注入 TraceID
+public class TraceIdFilter extends OncePerRequestFilter {
+    
+    @Override
+    protected void doFilterInternal(HttpServletRequest request, 
+                                    HttpServletResponse response,
+                                    FilterChain chain) throws IOException, ServletException {
+        // SkyWalking 自动设置 TraceID 到 MDC
+        ContextCarrier contextCarrier = new ContextCarrier();
+        CarrierItem next = contextCarrier.items();
+        while (next.hasNext()) {
+            next = next.next();
+        }
+        
+        try {
+            chain.doFilter(request, response);
+        } finally {
+            // 清理 MDC
+        }
+    }
+}
+```
+
+日志输出会自动带上 TraceID：
+
+```json
+{
+  "timestamp": "2024-01-15T10:30:00.123Z",
+  "level": "ERROR",
+  "service": "order-service",
+  "traceId": "abc123.456.789",
+  "message": "Failed to create order",
+  "exception": "InventoryException: Insufficient stock"
+}
+```
+
+在 SkyWalking UI 中输入 TraceID，可以直接跳转到对应的链路追踪。
+
+## 六、服务网格可观测性
+
+### 6.1 Istio Telemetry V2
+
+在服务网格（Service Mesh）架构中，Istio 可以自动采集所有服务的 Metrics、Logs、Traces，无需代码埋点。
+
+```yaml
+# Istio 启用 Telemetry
+apiVersion: telemetry.istio.io/v1alpha1
+kind: Telemetry
+metadata:
+  name: mesh-default
+  namespace: istio-system
+spec:
+  tracing:
+    - providers:
+        - name: jaeger
+      randomSamplingPercentage: 100
+  metrics:
+    - providers:
+        - name: prometheus
+```
+
+### 6.2 Envoy Access Log
+
+Envoy 作为 Sidecar 代理，会记录所有进出的请求：
+
+```yaml
+# Envoy access log 配置
+access_log:
+  - name: envoy.access_loggers.file
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+      path: /dev/stdout
+      log_format:
+        text_format: |
+          [%Y-%m-%d %T.%3Z][%level][%envoy_date_time][%thread_name]
+          [%trace_id] %host %service% %method% %path% %protocol%
+          %response_code% %response_flags% %bytes_received% %bytes_sent%
+          %duration% %upstream_service_time% %x-forwarded-for%
+```
+
+## 七、告警与 SLA/SLO
+
+### 7.1 SLO 与告警设计
+
+SLO（Service Level Objective）是服务级别目标，SLO 是对 SLO 的承诺，Error Budget 是 SLO 的「容错空间」。
+
+```
+SLO: 每月 99.9% 可用性
+
+每月分钟数: 43,200 分钟
+允许的不可用时间: 43.2 分钟 (0.1%)
+实际不可用时间: 30 分钟
+
+Error Budget: 13.2 分钟（还有 13.2 分钟的容错空间）
+```
+
+### 7.2 Prometheus AlertManager 告警规则
+
+```yaml
+# Prometheus 告警规则
+groups:
+  - name: order-service-alerts
+    rules:
+      # P99 延迟告警
+      - alert: OrderServiceHighLatency
+        expr: |
+          histogram_quantile(0.99, 
+            rate(http_server_requests_seconds_bucket{service="order"}[5m])
+          ) > 2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Order service P99 latency is high"
+          description: "P99 latency is {{ $value | humanizeDuration }}"
+      
+      # 错误率告警
+      - alert: OrderServiceHighErrorRate
+        expr: |
+          sum(rate(http_requests_total{service="order", status=~"5.."}[5m]))
+          / sum(rate(http_requests_total{service="order"}[5m])) > 0.01
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Order service error rate is above 1%"
+      
+      # SLO Burn Rate 告警
+      - alert: OrderServiceSLOBurnRate
+        expr: |
+          sum(rate(http_requests_total{service="order", status=~"5.."}[1h]))
+          / sum(rate(http_requests_total{service="order"}[1h])) > 0.001
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Order service SLO burn rate is high"
+```
+
+### 7.3 Grafana 告警渠道
+
+```yaml
+# Grafana 告警配置
+apiVersion: 1
+
+apiKey: ${GRAFANA_API_KEY}
+
+notifiers:
+  - name: dingtalk
+    type: dingtalk
+    uid: dingtalk-webhook
+    settings:
+      url: https://oapi.dingtalk.com/robot/send?access_token=xxx
+      messageType: link
+
+groups:
+  - orgId: 1
+    name: order-service-alerts
+    folder: Alerting
+    interval: 1m
+    rules:
+      - uid: order-p99-latency
+        title: Order Service P99 Latency
+        condition: C
+        data:
+          - refId: A
+            queryType: ''
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: histogram_quantile(0.99, rate(http_server_requests_seconds_bucket{service="order"}[5m]))
+```
+
+## 面试追问
+
+### 问题一：Prometheus 和 SkyWalking 的区别是什么？
+
+**参考答案**：
+
+| 维度 | Prometheus | SkyWalking |
+|---|---|---|
+| **定位** | Metrics 采集 + 时序数据库 | APM 平台（Metrics + Traces + Logs） |
+| **数据模型** | Pull-based Time Series | Trace-first，多种存储 |
+| **埋点方式** | 应用暴露 /agent 拉取 | Agent 自动埋点 / SDK 手动埋点 |
+| **链路追踪** | 需要额外组件（如 Jaeger） | 原生支持 |
+| **查询能力** | PromQL（强大） | 自有 DSL |
+
+**选择建议**：
+- 需要全面的 APM（链路追踪 + 指标 + 日志）→ SkyWalking
+- 只需要指标监控 → Prometheus + Grafana
+- 大型系统、需要告警和日志联动 → SkyWalking + Prometheus
+
+### 问题二：如何设计一个低开销的链路追踪系统？
+
+**参考答案**：
+
+链路追踪的开销主要来自三个方面：数据采集、数据传输、数据存储。优化策略：
+
+**采样策略**：
+- 头采样（Head-based）：在请求入口决定是否追踪，适合资源控制
+- 尾采样（Tail-based）：先收集所有追踪数据，采样后存储，适合全量分析
+
+```java
+// 采样配置
+tracer:
+  sampler:
+    # 采样率 10%
+    ratio: 0.1
+    # 或基于规则的采样
+    rules:
+      - operation: /health
+        rate: 0.0  # 健康检查不采样
+      - operation: /api/orders
+        rate: 1.0  # 核心接口全量采样
+```
+
+**异步传输**：追踪数据先写入内存队列，异步发送到收集器，不阻塞主流程。
+
+**压缩存储**：Span 数据使用高效编码（如 Protocol Buffers），减少存储空间。
+
+### 问题三：全链路压测和全链路监控有什么区别？
+
+**参考答案**：
+
+| 维度 | 全链路监控 | 全链路压测 |
+|---|---|---|
+| **目的** | 实时观测生产系统 | 模拟压力测试 |
+| **数据** | 生产真实流量 | 模拟构造的流量 |
+| **时机** | 持续运行 | 按需执行 |
+| **风险** | 低（观测不影响系统） | 高（压测可能影响系统） |
+| **工具** | SkyWalking、Prometheus | JMeter、wrk、Locust |
+
+全链路压测通常需要**流量标记**（标记压测流量）和**影子存储**（压测数据不污染生产数据）。
+
+---
+
+## 延伸思考
+
+### 思考一：可观测性的边界在哪里？
+
+可观测性不是万能的。有些问题很难通过指标、日志、追踪发现：
+
+- **安全问题**：恶意请求通常不会在业务指标中体现
+- **资源竞争**：需要更底层的性能分析工具（如 async-profiler）
+- **架构问题**：需要人工代码审查和架构评审
+
+思考一下：你的可观测性体系能覆盖哪些问题？不能覆盖哪些？
+
+### 思考二：OpenTelemetry 能统一可观测性吗？
+
+OpenTelemetry 正在成为可观测性的标准，但挑战依然存在：
+
+- **指标模型不统一**：Prometheus 和 OTel 的数据模型有差异
+- **向后兼容**：迁移成本高
+- **生态成熟度**：部分语言 SDK 还不完善
+
+思考一下：你的团队应该现在就开始拥抱 OpenTelemetry，还是等待生态更成熟？
+
+---
+
+## 总结
+
+全链路监控是可观测性落地的关键，它让我们能够「看得见、看得清、追得准」。
+
+**关键要点回顾**：
+
+- **三大支柱**：Metrics（日志聚合）、Logs（结构化分析）、Traces（链路追踪）
+- **Prometheus**：强大的指标采集和查询能力，是云原生监控的事实标准
+- **SkyWalking**：一站式 APM 平台，支持链路追踪、指标、日志、告警
+- **OpenTelemetry**：可观测性的未来标准，统一 Metrics、Logs、Traces 数据采集
+
+好的全链路监控，让你在面对故障时，不再盲目猜测，而是胸有成竹。

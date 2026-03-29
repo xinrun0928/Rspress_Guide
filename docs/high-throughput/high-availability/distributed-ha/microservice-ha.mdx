@@ -1,0 +1,799 @@
+import { Badge } from '@rspress/core/theme';
+
+# 微服务高可用：服务注册、健康检查、故障剔除
+
+双十一零点，你正紧盯着监控大屏。订单量飙升，但服务稳稳当当。就在这时，数据库突然抖了一下——0.5 秒的抖动，一批订单服务的实例网络连接断了。
+
+正常情况下，这会导致大量请求失败，服务雪崩。但你的系统安然无恙——不健康的服务实例在 10 秒内被自动剔除，流量自动切换到健康实例，用户甚至没有感知到这次故障。
+
+这就是微服务高可用的力量——它让系统在故障面前「自愈」。
+
+这篇文章，我们来聊聊微服务高可用的三个核心机制：**服务注册与发现**、**健康检查**、**故障剔除**，以及它们如何协同工作，让你的系统真正具备抗故障能力。
+
+## 一、服务注册与发现：微服务的「电话簿」
+
+### 1.1 为什么需要服务发现
+
+在微服务架构中，服务实例的数量是动态变化的：
+- 新版本部署时，会启动新实例，同时关闭旧实例
+- 流量高峰时，可能会自动扩容，增加实例
+- 实例故障时，需要被快速识别并隔离
+
+服务发现要解决的核心问题是：**消费者如何知道服务提供者的地址？**
+
+传统的做法是「配置化」——把服务地址写在配置文件里。但这种方式在实例动态变化时简直是一场噩梦：你需要手动维护地址列表，需要在每次变更时更新所有消费者，还需要处理地址变更时的服务中断。
+
+服务发现应运而生。它的核心思想是**「注册-查询」模式**：服务实例启动时主动注册到注册中心，消费者从注册中心查询可用实例的列表。
+
+### 1.2 两种注册模式
+
+**自注册模式（Self-Registration）**：
+
+服务实例启动时，主动向注册中心注册自己；心跳保活；停止时主动注销。
+
+```java
+// Spring Cloud Eureka 自注册
+@SpringBootApplication
+@EnableEurekaClient
+public class OrderServiceApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(OrderServiceApplication.class, args);
+    }
+}
+```
+
+这种方式简单直接，但服务实例需要依赖注册中心，增加代码耦合。
+
+**第三方注册模式（Third-Party Registration）**：
+
+服务实例不直接注册，而是由独立的注册代理（Registrar）代为注册。常见实现是 Kubernetes 的 Service Controller。
+
+```yaml
+# Kubernetes Service 自动注册
+apiVersion: v1
+kind: Service
+metadata:
+  name: order-service
+spec:
+  selector:
+    app: order-service
+  ports:
+    - protocol: TCP
+      port: 8080
+      targetPort: 8080
+```
+
+这种方式解耦了服务与注册中心，但需要额外的运维成本。
+
+### 1.3 两种发现模式
+
+**客户端发现（Client-Side Discovery）**：
+
+服务消费者直接从注册中心获取服务实例列表，并在本地实现负载均衡。代表框架：Eureka、Ribbon。
+
+```java
+// Ribbon 客户端负载均衡
+@Configuration
+public class RibbonConfig {
+    @Bean
+    public IRule ribbonRule() {
+        // 负载均衡策略：轮询
+        return new RoundRobinRule();
+    }
+}
+
+public class OrderServiceClient {
+    @Autowired
+    private RestTemplate restTemplate;
+    
+    @HystrixCommand(fallbackMethod = "fallback")
+    public String callInventory(String productId) {
+        // Ribbon 会自动从 Eureka 获取实例列表并负载均衡
+        return restTemplate.getForObject(
+            "http://inventory-service/api/inventory/" + productId, 
+            String.class
+        );
+    }
+}
+```
+
+**服务端发现（Server-Side Discovery）**：
+
+服务消费者通过负载均衡器（如 Nginx、API Gateway）访问服务，负载均衡器从注册中心获取实例列表。代表实现：Kubernetes Service、AWS ELB。
+
+```yaml
+# Kubernetes 服务发现
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: inventory-service
+subsets:
+  - addresses:
+      - ip: 10.0.0.1
+      - ip: 10.0.0.2
+    ports:
+      - port: 8080
+```
+
+| 发现模式 | 优点 | 缺点 |
+|---|---|---|
+| 客户端发现 | 低延迟、无单点故障、负载均衡策略灵活 | 消费者需要集成注册客户端、升级困难 |
+| 服务端发现 | 消费者代码简单、易于统一管理 | 额外的网络跳转、负载均衡器是单点 |
+
+### 1.4 服务注册的数据结构
+
+无论使用哪种服务发现框架，注册中心存储的核心数据结构是相似的：
+
+```json
+{
+  "serviceName": "inventory-service",
+  "instances": [
+    {
+      "instanceId": "192.168.1.1:8080",
+      "host": "192.168.1.1",
+      "port": 8080,
+      "healthCheckUrl": "/actuator/health",
+      "metadata": {
+        "version": "v1.2.3",
+        "region": "us-east-1",
+        "weight": "1.0"
+      },
+      "leaseInfo": {
+        "lastUpdateTime": "2024-01-15T10:30:00Z",
+        "durationInSecs": 90
+      }
+    }
+  ]
+}
+```
+
+关键字段说明：
+
+- **instanceId**：实例唯一标识，通常是 host:port 组合
+- **healthCheckUrl**：健康检查接口地址
+- **metadata**：自定义元数据，用于路由、标签等高级功能
+- **leaseInfo**：心跳租约信息，用于判断实例是否存活
+
+## 二、健康检查：服务的「体检报告」
+
+### 2.1 健康检查的意义
+
+健康检查是微服务高可用的核心保障。没有健康检查，服务消费者可能会把请求发送到已经故障的实例上，导致请求失败。
+
+健康检查的本质是：**让服务实例「主动汇报」自己的存活状态**。
+
+### 2.2 主动健康检查 vs 被动健康检查
+
+**主动健康检查**：注册中心主动向服务实例发送探测请求，检查实例是否存活。
+
+```yaml
+# Nacos 健康检查配置
+nacos:
+  discovery:
+    heartbeat:
+      interval: 5000  # 心跳间隔 5 秒
+      timeout: 3000  # 心跳超时 3 秒
+      expected: 3    # 连续 3 次心跳失败，标记为不健康
+```
+
+**被动健康检查**：注册中心不主动探测，而是依赖服务实例主动发送心跳。
+
+```java
+// Eureka 心跳续约
+@Component
+public class EurekaHealthIndicator implements HealthIndicator {
+    @Override
+    public Health health() {
+        // 检查各项组件状态
+        if (checkDatabase() && checkRedis()) {
+            return Health.up().build();
+        }
+        return Health.down()
+            .withDetail("database", "unavailable")
+            .build();
+    }
+}
+```
+
+| 检查方式 | 优点 | 缺点 |
+|---|---|---|
+| 主动检查 | 能发现「假死」实例、精确控制检查策略 | 增加网络开销、需要服务开放健康检查端口 |
+| 被动检查 | 简单、无额外端口暴露 | 无法发现「假死」、心跳间隔内故障无法感知 |
+
+### 2.3 健康检查的实现
+
+Spring Boot Actuator 提供了标准的健康检查端点：
+
+```yaml
+# 开启健康检查端点
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: always
+      probes:
+        enabled: true  # 启用 k8s probes
+```
+
+访问健康检查端点：
+
+```bash
+# 检查整体健康状态
+curl http://localhost:8080/actuator/health
+
+# 响应
+{
+  "status": "UP",
+  "components": {
+    "db": {
+      "status": "UP",
+      "details": {
+        "database": "MySQL",
+        "result": 1
+      }
+    },
+    "diskSpace": {
+      "status": "UP"
+    },
+    "ping": {
+      "status": "UP"
+    },
+    "redis": {
+      "status": "UP"
+    }
+  }
+}
+```
+
+自定义健康检查：
+
+```java
+// 自定义健康检查：检查第三方依赖
+@Component
+public class ExternalServiceHealthIndicator implements HealthIndicator {
+    
+    @Autowired
+    private PaymentGatewayClient paymentClient;
+    
+    @Autowired
+    private SmsServiceClient smsClient;
+    
+    @Override
+    public Health health() {
+        Map<String, Boolean> services = new HashMap<>();
+        services.put("payment", checkPaymentGateway());
+        services.put("sms", checkSmsService());
+        
+        boolean allHealthy = services.values().stream()
+            .allMatch(Boolean::booleanValue);
+        
+        if (allHealthy) {
+            return Health.up()
+                .withDetails(services)
+                .build();
+        } else {
+            return Health.down()
+                .withDetails(services)
+                .withException(new RuntimeException("Some services unavailable"))
+                .build();
+        }
+    }
+}
+```
+
+### 2.4 Spring Boot Admin：可视化健康监控
+
+Spring Boot Admin 提供了可视化的健康监控界面：
+
+```xml
+<!-- Admin Server 依赖 -->
+<dependency>
+    <groupId>de.codecentric</groupId>
+    <artifactId>spring-boot-admin-starter-server</artifactId>
+    <version>2.7.10</version>
+</dependency>
+
+<!-- Admin Client 依赖 -->
+<dependency>
+    <groupId>de.codecentric</groupId>
+    <artifactId>spring-boot-admin-starter-client</artifactId>
+    <version>2.7.10</version>
+</dependency>
+```
+
+```yaml
+# Admin Client 配置
+spring:
+  boot:
+    admin:
+      client:
+        url: http://admin-server:8080
+        instance:
+          prefer-ip: true
+```
+
+Spring Boot Admin 的功能包括：
+- 服务实例列表与状态监控
+- 详细的健康检查信息
+- 日志查看与级别调整
+- JMX beans 访问
+- 线程Dump、堆Dump
+- 告警通知（邮件、钉钉等）
+
+## 三、故障剔除：自动化的「免疫系统」
+
+### 3.1 故障剔除的触发条件
+
+故障剔除（Fault Tolerant）是指当服务实例被判定为不健康时，自动将其从可用列表中移除，防止请求发送到故障实例。
+
+触发故障剔除的条件通常包括：
+
+| 条件 | 说明 | 示例 |
+|---|---|---|
+| **心跳超时** | 服务实例未按时发送心跳 | Nacos 连续 3 次心跳失败 |
+| **健康检查失败** | 健康检查接口返回非 UP 状态 | Eureka health check 失败 |
+| **连接超时** | 调用实例时连续多次连接超时 | Ribbon 连续 3 次超时 |
+| **熔断触发** | Hystrix/Sentinel 熔断器打开 | 异常比例超过阈值 |
+
+### 3.2 故障剔除的流程
+
+以 Nacos 为例，故障剔除的标准流程：
+
+```
+1. 服务实例启动 → 注册到 Nacos → 状态为 HEALTHY
+2. 实例心跳正常 → 定时续约 → 保持 HEALTHY 状态
+3. 实例心跳中断 → 开始计时（默认 15 秒）
+4. 超时后 → Nacos 将实例标记为 UNHEALTHY
+5. UNHEALTHY 实例 → 从服务列表中移除 → 不再接收流量
+6. 实例恢复后 → 重新发送心跳 → 恢复 HEALTHY 状态 → 重新加入服务列表
+```
+
+### 3.3 故障剔除的实现：Ribbon 的负载均衡策略
+
+Ribbon 提供了多种负载均衡策略，其中 `AvailabilityFilteringRule` 实现了基于故障剔除的过滤：
+
+```java
+// Ribbon 可用性过滤规则
+@Configuration
+public class RibbonConfig {
+    @Bean
+    public IRule availabilityFilteringRule() {
+        return new AvailabilityFilteringRule();
+    }
+}
+
+// AvailabilityFilteringRule 源码核心逻辑
+public class AvailabilityFilteringRule extends PredicateBasedRule {
+    
+    @Override
+    public Server choose(Object key) {
+        LoadBalancerStats stats = getLoadBalancerStats();
+        
+        // 过滤掉不健康的实例
+        List<Server> filteredServers = ServerFilters.byAvailablity(
+            stats,
+            getPredicate()
+        ).getEligibleServers(servers, key);
+        
+        // 从过滤后的列表中选择
+        return super.choose(filteredServers, key);
+    }
+}
+```
+
+### 3.4 Nacos 的故障剔除机制
+
+Nacos 的故障剔除更加完善，支持实例权重、就近访问等高级特性：
+
+```yaml
+# Nacos 故障剔除配置
+nacos:
+  discovery:
+    # 关闭临时实例的健康检查（适合 K8s 环境）
+    ephemeral: false
+    health-checker:
+      # TCP 端口检查
+      tcp:
+        enabled: true
+        connect-timeout: 1000
+      # HTTP 检查
+      http:
+        enabled: true
+        path: /actuator/health
+      # 自定义检查
+      custom:
+        enabled: false
+```
+
+```java
+// Nacos 实例权重配置
+List<Instance> instances = namingService.selectInstances("order-service", true);
+for (Instance instance : instances) {
+    // 权重越高，接收流量越多
+    System.out.println(instance.getInstanceId() + " weight: " + instance.getWeight());
+}
+
+// 动态调整实例权重（灰度发布）
+namingService.registerInstance("order-service", 
+    Instance.builder()
+        .ip("192.168.1.100")
+        .port(8080)
+        .weight(0.1)  // 新版本实例权重降低，灰度验证
+        .build()
+);
+```
+
+### 3.5 Eureka 的自我保护机制
+
+Eureka 有一个独特的设计：**自我保护机制**。当 Eureka Server 在短时间内丢失过多客户端心跳时，会进入自我保护模式，不再剔除注册信息。
+
+```yaml
+# Eureka Server 自我保护配置
+eureka:
+  server:
+    # 关闭自我保护（生产环境建议开启）
+    enable-self-preservation: true
+    # 续约百分比阈值（低于此值时触发自我保护）
+    renewal-percent-threshold: 0.85
+    # 清理间隔（毫秒）
+    eviction-interval-timer-in-ms: 60000
+```
+
+:::warning 自我保护的副作用
+
+自我保护机制可能导致一个严重的问题：**已经宕机的实例仍然留在服务列表中**。
+
+这在以下场景是致命的：
+- 某个服务实例确实已经彻底崩溃（不是心跳问题，是进程都没了）
+- 由于其他实例的心跳正常，自我保护机制被激活
+- 故障实例一直留在列表中，请求持续失败
+
+正确做法是：
+1. 生产环境开启自我保护
+2. 配合健康检查，不能只依赖心跳
+3. 设置合理的 eviction-interval-timer-in-ms
+
+:::
+
+## 四、服务实例更新传播机制
+
+### 4.1 服务列表缓存
+
+服务消费者不会每次请求都去注册中心拉取服务列表，而是会缓存一份。当注册中心的服务列表更新时，需要有一种机制让消费者感知到变化。
+
+| 传播机制 | 实现方式 | 延迟 | 资源消耗 |
+|---|---|---|---|
+| **缓存刷新** | 定时拉取（通常 30 秒） | 高（最多延迟 30 秒） | 低 |
+| **事件通知** | 注册中心推送变更 | 低（秒级） | 中 |
+| **混合模式** | 定时拉取 + 事件触发 | 低 | 中 |
+
+### 4.2 Nacos 的服务列表同步
+
+Nacos 采用**推送 + 拉取混合模式**：当服务列表变化时，注册中心主动推送变更给消费者；同时消费者也会定时拉取兜底。
+
+```java
+// Nacos 服务订阅（事件通知模式）
+public class ServiceSubscriptionDemo {
+    private NamingService namingService;
+    
+    public void subscribeService() throws NacosException {
+        // 订阅服务变化
+        namingService.subscribe("order-service", event -> {
+            if (event instanceof NamingEvent) {
+                NamingEvent namingEvent = (NamingEvent) event;
+                List<Instance> instances = namingEvent.getInstances();
+                
+                // 更新本地服务列表
+                updateLocalCache(instances);
+            }
+        });
+    }
+}
+```
+
+### 4.3 Eureka 的服务同步
+
+Eureka 采用 **Region + Zone** 架构，同一 Region 内的 Eureka Server 之间会同步注册信息：
+
+```yaml
+# Eureka Client 配置
+eureka:
+  client:
+    # 注册中心地址（多地址实现高可用）
+    service-url:
+      defaultZone: http://eureka-server-1:8761/eureka/,http://eureka-server-2:8761/eureka/
+    # 拉取注册信息间隔（默认 30 秒）
+    registry-fetch-interval-seconds: 30
+  instance:
+    # 心跳间隔（默认 30 秒）
+    lease-renewal-interval-in-seconds: 30
+    # 心跳超时（默认 90 秒）
+    lease-expiration-duration-in-seconds: 90
+```
+
+## 五、服务发现与负载均衡的集成
+
+### 5.1 Ribbon vs Spring Cloud LoadBalancer
+
+Ribbon 是 Netflix 提供的客户端负载均衡库，Spring Cloud 2020.0 版本将其标记为过时，推荐使用 Spring Cloud LoadBalancer。
+
+```java
+// Spring Cloud LoadBalancer 配置
+@Configuration
+public class LoadBalancerConfig {
+    @Bean
+    public ReactorLoadBalancer<ServiceInstance> randomLoadBalancer(
+            Environment environment) {
+        // 随机负载均衡
+        return new RandomLoadBalancer(
+            new DefaultServiceInstanceListSupplier(
+                environment.getProperty("spring.cloud.loadbalancer.configuration")
+            )
+        );
+    }
+    
+    @Bean
+    public ReactorLoadBalancer<ServiceInstance> roundRobinLoadBalancer(
+            Environment environment) {
+        // 轮询负载均衡
+        return new RoundRobinLoadBalancer(
+            new DefaultServiceInstanceListSupplier(
+                environment.getProperty("spring.cloud.loadbalancer.configuration")
+            )
+        );
+    }
+}
+```
+
+### 5.2 自定义负载均衡策略
+
+实际业务中，经常需要实现基于权重的灰度发布、基于区域的就近访问等策略：
+
+```java
+// 基于权重的灰度负载均衡
+public class WeightedLoadBalancer implements ReactorServiceInstanceLoadBalancer {
+    
+    private final ObjectProvider<ServiceInstanceListSupplier> supplierProvider;
+    
+    @Override
+    public Mono<Response<ServiceInstance>> choose(Request request) {
+        return supplierProvider.getIfAvailable()
+            .get(request)
+            .next()
+            .map(instances -> {
+                // 按权重选择
+                ServiceInstance selected = selectByWeight(instances);
+                return new Response<>(selected);
+            });
+    }
+    
+    private ServiceInstance selectByWeight(List<ServiceInstance> instances) {
+        // 计算总权重
+        double totalWeight = instances.stream()
+            .mapToDouble(this::getWeight)
+            .sum();
+        
+        // 随机选择
+        double random = ThreadLocalRandom.current().nextDouble() * totalWeight;
+        
+        double cursor = 0;
+        for (ServiceInstance instance : instances) {
+            cursor += getWeight(instance);
+            if (cursor >= random) {
+                return instance;
+            }
+        }
+        
+        return instances.get(0);
+    }
+    
+    private double getWeight(ServiceInstance instance) {
+        Map<String, String> metadata = instance.getMetadata();
+        return Double.parseDouble(metadata.getOrDefault("weight", "1.0"));
+    }
+}
+```
+
+## 六、网络分区与容灾
+
+### 6.1 网络分区场景分析
+
+当微服务集群发生网络分区时，会出现以下问题：
+
+```
+正常情况：
+┌─────────────────────────────────────────┐
+│           服务消费者                      │
+│  ┌─────────────────────────────────┐    │
+│  │      服务列表（5个实例）           │    │
+│  │  [实例1] [实例2] [实例3] [实例4] [实例5] │
+│  └─────────────────────────────────┘    │
+└─────────────────────────────────────────┘
+          │ 正常访问
+          ▼
+    [实例1] [实例2] [实例3] [实例4] [实例5]
+            全部可访问
+
+网络分区后（实例3、4、5 在另一分区）：
+┌─────────────────────────────────────────┐
+│           服务消费者                      │
+│  ┌─────────────────────────────────┐    │
+│  │      服务列表（仍然显示5个实例）    │    │
+│  │  [实例1✗] [实例2✗] [实例3] [实例4] [实例5] │
+│  └─────────────────────────────────┘    │
+└─────────────────────────────────────────┘
+          │ 尝试访问
+          ▼
+    [实例1✗] [实例2✗] ——→ 连接超时/失败
+```
+
+### 6.2 应对策略
+
+**策略一：快速失败 + 重试**
+
+```java
+// Ribbon 配置快速失败
+product-service:
+  ribbon:
+    # 连接超时
+    ConnectTimeout: 1000
+    # 读取超时
+    ReadTimeout: 3000
+    # 同一实例重试次数
+    MaxAutoRetries: 1
+    # 切换到下一个实例重试
+    MaxAutoRetriesNextServer: 2
+```
+
+**策略二：多级降级**
+
+```java
+// 多级降级策略
+@HystrixCommand(
+    fallbackMethod = "fallback1",
+    commandProperties = {
+        @HystrixProperty(name = "execution.isolation.thread.timeoutInMilliseconds", value = "500")
+    }
+)
+public String callInventory(String productId) {
+    return restTemplate.getForObject(
+        "http://inventory-service/api/inventory/" + productId, 
+        String.class
+    );
+}
+
+// 第一级降级：查询本地缓存
+public String fallback1(String productId) {
+    return getFromLocalCache(productId);
+}
+
+// 第二级降级：返回友好提示
+public String fallback2(String productId) {
+    return "Inventory temporarily unavailable";
+}
+```
+
+**策略三：跨可用区路由**
+
+```yaml
+# Nacos 元数据路由
+nacos:
+  discovery:
+    instance:
+      metadata:
+        # 可用区标识
+        zone: us-east-1a
+        # 权重
+        weight: 1.0
+```
+
+```java
+// 优先访问同可用区实例
+public class ZoneAffinityLoadBalancer implements ReactorServiceInstanceLoadBalancer {
+    
+    private final String currentZone;
+    
+    @Override
+    public Mono<Response<ServiceInstance>> choose(Request request) {
+        return supplier.getIfAvailable().get(request)
+            .next()
+            .map(instances -> {
+                // 先过滤同 zone 实例
+                List<ServiceInstance> zoneInstances = instances.stream()
+                    .filter(i -> currentZone.equals(i.getMetadata().get("zone")))
+                    .collect(Collectors.toList());
+                
+                // 如果没有同 zone 实例，使用全部实例
+                List<ServiceInstance> candidates = 
+                    zoneInstances.isEmpty() ? instances : zoneInstances;
+                
+                // 负载均衡选择
+                return doSelect(candidates);
+            });
+    }
+}
+```
+
+## 面试追问
+
+### 问题一：Eureka 和 Nacos 有什么区别？
+
+**参考答案**：
+
+| 维度 | Eureka | Nacos |
+|---|---|---|
+| **一致性模型** | AP | CP+AP 可切换 |
+| **服务删除机制** | 依赖心跳超时 + 自我保护 | 主动健康检查 + 超时剔除 |
+| **配置管理** | 不支持 | 支持 |
+| **多语言支持** | 需要 Eureka Server | 支持 HTTP API，多语言友好 |
+| **生态集成** | Spring Cloud Netflix（已停止维护） | Spring Cloud Alibaba（活跃） |
+
+**核心区别**：Eureka 是纯 AP 系统，适合服务注册但不保证一致性；Nacos 同时支持 AP/CP，可以根据场景选择。
+
+### 问题二：服务注册中心宕机了怎么办？
+
+**参考答案**：
+
+这是一个典型的「基础设施单点」问题。解决方案：
+
+1. **注册中心高可用部署**：Eureka 可以部署多个 Server 节点，客户端配置多个 Server 地址
+2. **本地缓存**：客户端会缓存服务列表，注册中心宕机时使用缓存（可能数据过期）
+3. **降级策略**：注册中心不可用时，禁用注册和摘除，流量继续使用现有实例
+
+```yaml
+# Eureka 降级配置
+eureka:
+  client:
+    # 禁用从 Eureka 拉取服务列表（注册中心宕机时使用）
+    fetch-registry: true
+    # 禁用向 Eureka 注册（注册中心宕机时避免心跳失败）
+    register-with-eureka: true
+    # 缓存刷新间隔
+    registry-fetch-interval-seconds: 30
+```
+
+### 问题三：如何设计一个支持百万级实例的服务发现系统？
+
+**参考答案**：
+
+1. **分层架构**：将注册中心分为「注册层」和「查询层」
+2. **数据分片**：按服务名或机房分片，避免单节点压力
+3. **异步化**：注册和查询异步化，避免同步阻塞
+4. **多级缓存**：客户端本地缓存 + 注册中心内存缓存 + 数据库持久化
+5. **推送优化**：使用增量推送而非全量推送
+
+---
+
+## 延伸思考
+
+### 思考一：服务发现是否可以去中心化？
+
+随着服务网格（Service Mesh）的兴起，有人提出使用 **gossip 协议** 实现完全去中心化的服务发现，不再依赖中心化的注册中心。
+
+gossip 协议的优势是**无单点故障**，但代价是**数据最终一致**（可能短暂不一致）。
+
+思考一下：你的业务场景是否能容忍短暂的数据不一致？如果是，gossip 可能是更优雅的方案。
+
+### 思考二：健康检查的边界在哪里？
+
+很多团队把健康检查做得越来越复杂——检查数据库、Redis、外部服务……但过度复杂的健康检查反而可能导致**误判**。
+
+健康检查的核心目的是「快速识别明显故障」，而不是「确保所有依赖都正常」。思考一下：你的健康检查策略是否合理？
+
+---
+
+## 总结
+
+微服务高可用是一个系统工程，涉及到服务注册、健康检查、故障剔除、负载均衡等多个组件的协同工作。
+
+**关键要点回顾**：
+
+- **服务注册与发现**：解决「服务在哪里」的问题，支持客户端发现和服务端发现两种模式
+- **健康检查**：主动感知服务实例状态，分为心跳检查和健康端点检查
+- **故障剔除**：自动将不健康实例从服务列表中移除，防止请求打到故障实例
+- **服务列表同步**：保证消费者能及时感知到服务变化
+
+好的微服务高可用设计，让系统在面对故障时「自愈」，而不是「崩溃」。

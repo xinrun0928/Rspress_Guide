@@ -1,0 +1,662 @@
+# 消息积压排查：消费者挂掉的应急处理
+
+import { Badge } from '@rspress/core/theme';
+
+周五下午四点，你正准备收拾东西下班，告警平台突然弹出一条消息：
+
+```
+【紧急告警】MQ 消息积压告警
+Topic: order-payment
+当前积压量: 127,843 条
+消费者数量: 0（异常！正常应为 6）
+积压增长速率: +5000 条/分钟
+影响范围: 所有新订单无法完成支付
+```
+
+你的心一下子提到了嗓子眼。消息积压 12 万条，而且消费者数量为零——这意味着消费者进程可能已经崩溃，或者有什么东西阻止了消费。
+
+如果不能在短时间内恢复，大量订单将超时取消，直接影响用户体验和公司收入。
+
+这就是消息队列积压的真实场景。
+
+消息队列是分布式系统的「异步解耦」利器，但也是故障的高发地带。消费者挂掉、消息堆积、消费速度跟不上生产速度……这些问题一旦发生，往往会造成严重的业务影响。
+
+这一节，我们来系统性地解决消息积压问题。
+
+## 一、消息队列的基础认知：为什么会有积压
+
+### 1.1 消息队列的核心原理
+
+在深入排查之前，先理解消息队列的基本工作原理。
+
+消息队列的核心模型：
+
+```
+Producer → Broker → Consumer Group
+                  ↓
+            Topic/Queue
+```
+
+- **Producer（生产者）**：产生消息，发送到 Broker
+- **Broker（代理）**：存储消息，保证消息持久化
+- **Consumer（消费者）**：从 Broker 拉取消息，处理业务
+
+正常情况下，消息的「生产速度」应该和「消费速度」保持平衡。如果消费速度跟不上生产速度，消息就会逐渐堆积。
+
+### 1.2 消息积压的本质
+
+消息积压的本质是：**消费速度 < 生产速度**。
+
+积压的可能原因：
+
+| 原因类型 | 具体场景 | 排查难度 |
+|---|---|---|
+| 消费者崩溃 | 进程退出、OOM、OOM | 低 |
+| 消费者异常 | 业务异常未捕获、消息格式错误 | 中 |
+| 消费逻辑慢 | 数据库瓶颈、复杂计算、网络延迟 | 中 |
+| 消费者数量少 | 分区数增加但消费者未增加 | 低 |
+| 网络问题 | 消费者与 Broker 网络中断 | 中 |
+| 分区分配错误 | 消费者未正确订阅分区 | 低 |
+
+### 1.3 消息积压的影响
+
+消息积压会导致：
+
+**业务层面**：
+
+- 订单超时取消（支付消息积压）
+- 用户收不到通知（通知消息积压）
+- 数据同步延迟（同步消息积压）
+
+**系统层面**：
+
+- 消息堆积占用磁盘空间
+- 内存压力增加（Kafka 积压占用 Page Cache）
+- 消息过期失效（TTL 到期自动删除）
+
+**用户体验**：
+
+- 页面操作无响应
+- 订单状态不更新
+- 通知延迟
+
+## 二、消息积压排查六步法
+
+### 2.1 第一步：确认积压范围——哪个 Topic、哪个分区
+
+收到告警后，第一步是确认积压的范围和严重程度。
+
+**Kafka 排查命令**：
+
+```bash
+# 查看所有 Topic 的积压情况
+kafka-topics.sh --bootstrap-server localhost:9092 --list
+
+# 查看特定 Topic 的详情
+kafka-topics.sh --bootstrap-server localhost:9092 --describe --topic order-payment
+
+# 查看消费者组状态
+kafka-consumer-groups.sh --bootstrap-server localhost:9092 --group payment-consumer --describe
+```
+
+输出示例：
+
+```
+GROUP, TOPIC, PARTITION, CURRENT-OFFSET, LOG-END-OFFSET, LAG, CONSUMER-ID, HOST, CLIENT-ID
+payment-consumers, order-payment, 0, 50000, 127843, 77843, consumer-1, /192.168.1.100, client-1
+payment-consumers, order-payment, 1, 48000, 125843, 77843, consumer-2, /192.168.1.101, client-2
+payment-consumers, order-payment, 2, 51000, 128843, 77843, consumer-1, /192.168.1.100, client-1
+```
+
+从这个输出可以看到：
+
+- `LAG` 列显示每个分区的积压量，都在 77,843 条左右
+- `LOG-END-OFFSET` 是最新消息的偏移量
+- `CURRENT-OFFSET` 是消费者已消费的偏移量
+
+**RabbitMQ 排查命令**：
+
+```bash
+# 查看队列状态
+rabbitmqctl list_queues name messages messages_ready messages_unacked consumers
+
+# 查看消费者状态
+rabbitmqctl list_consumers
+```
+
+输出示例：
+
+```
+Listing queues ...
+name    messages  messages_ready  messages_unacked  consumers
+order-payment  127843   127843        0               0
+```
+
+`messages_ready` 表示等待消费的消息数量，`consumers` 为 0 说明没有消费者。
+
+### 2.2 第二步：检查消费者状态——是否还在运行
+
+确认积压后，第二步是检查消费者进程是否正常运行。
+
+```bash
+# 查看消费者进程
+ps -ef | grep consumer
+
+# 查看进程状态
+systemctl status payment-consumer
+
+# 查看进程日志（是否有异常）
+tail -n 100 /data/logs/payment-consumer.log
+```
+
+常见消费者异常：
+
+| 状态 | 原因 | 表现 |
+|---|---|---|
+| 进程不存在 | 被 kill 或崩溃 | 无进程，无日志 |
+| 进程僵死 | 死锁或无限等待 | 进程存在，CPU 0% |
+| OOM | 内存不足 | 进程被 OOM Killer 杀死 |
+| 异常退出 | 未捕获异常 | 进程退出，日志有异常 |
+
+### 2.3 第三步：查看消费者日志——寻找错误线索
+
+消费者日志是排查问题的金矿。
+
+```bash
+# 查看最近的错误日志
+grep -i error /data/logs/payment-consumer.log | tail -n 100
+
+# 查看最近 100 行日志
+tail -n 100 /data/logs/payment-consumer.log
+
+# 实时查看日志
+tail -f /data/logs/payment-consumer.log
+```
+
+常见错误类型：
+
+| 错误类型 | 原因 | 日志关键词 |
+|---|---|---|
+| 数据库连接超时 | 数据库慢、连接池满 | `Connection timeout`, `SQLException` |
+| OOM | 内存不足 | `OutOfMemoryError`, `Java heap space` |
+| 消息格式错误 | 生产者发送了畸形消息 | `MessageFormatException`, `JsonParseException` |
+| 业务异常 | 消息内容不符合预期 | `IllegalArgumentException`, 业务自定义异常 |
+| 网络异常 | 与 Broker 连接断开 | `NetworkException`, `KafkaTimeoutException` |
+
+### 2.4 第四步：紧急扩容——先止血
+
+找到根因之前，先做紧急处理，避免积压继续增长。
+
+**扩容消费者的方法**：
+
+```bash
+# 方式一：增加消费者进程（如果有多个实例）
+# 在 Kubernetes 中
+kubectl scale deployment payment-consumer --replicas=6
+
+# 方式二：临时增加消费者线程（如果使用多线程消费）
+# 修改配置，增加消费线程数
+spring:
+  kafka:
+    consumer:
+      max-poll-records: 500  # 增加每次拉取的消息数
+
+# 方式三：消费者端限流（临时措施）
+# 降级非核心消费逻辑
+```
+
+:::warning 扩容的注意事项
+
+扩容消费者时，要注意：
+1. 消费者数量不能超过分区数（Kafka）
+2. 扩容后需要等待 rebalance 完成
+3. 紧急扩容后，要尽快找到根因并修复
+:::
+
+### 2.5 第五步：分析根因——从表象到本质
+
+找到积压的真正原因，才能彻底解决问题。
+
+**常见根因分析**：
+
+**根因一：消费者 OOM**
+
+```bash
+# 查看进程是否因为 OOM 被 kill
+dmesg | grep -i "killed process"
+
+# 或者查看系统日志
+journalctl -xe | grep "Memory"
+```
+
+**根因二：数据库瓶颈**
+
+```bash
+# 查看数据库连接池状态
+# MySQL
+SHOW STATUS LIKE 'Threads_connected';
+SHOW STATUS LIKE 'Max_used_connections';
+
+# 查看慢查询
+SHOW FULL PROCESSLIST;
+```
+
+**根因三：消费逻辑异常**
+
+检查代码中是否有：
+- 异常未捕获导致消费中断
+- 消息格式解析失败
+- 业务逻辑死循环
+
+### 2.6 第六步：长期修复——预防再次发生
+
+找到根因后，进行代码级修复。
+
+## 三、实战案例：三个典型的消息积压场景
+
+### 案例一：消费者 OOM 导致消息积压
+
+**背景**：某订单支付系统，消费者进程在运行 3 天后突然退出，消息积压超过 50 万条。
+
+**排查过程**：
+
+1. `kafka-consumer-groups.sh` 查看消费者状态，发现所有消费者都已离线
+2. `ps -ef | grep consumer` 确认进程不存在
+3. 查看系统日志 `dmesg | grep java`，发现进程被 OOM Killer 杀死
+4. 查看进程日志，发现内存使用率持续上升，最后一条日志是 `OutOfMemoryError: Java heap space`
+5. 生成历史 Heap Dump 分析，发现 `ConcurrentHashMap` 缓存持续增长，没有清理机制
+
+**根因代码**：
+
+```java
+// 错误写法：本地缓存无限增长
+private static final Map<String, PaymentRecord> paymentCache = new ConcurrentHashMap<>();
+
+public void processPayment(PaymentMessage message) {
+    PaymentRecord record = paymentCache.get(message.getOrderId());
+    if (record == null) {
+        record = loadFromDB(message.getOrderId());
+        paymentCache.put(message.getOrderId(), record); // 只进不出
+    }
+    // 处理支付...
+}
+```
+
+**修复方案**：
+
+```java
+// 使用带容量限制的缓存
+private static final LoadingCache<String, PaymentRecord> paymentCache = Caffeine.newBuilder()
+    .maximumSize(10000)                    // 最大 1 万条
+    .expireAfterWrite(10, TimeUnit.MINUTES) // 10 分钟过期
+    .build(orderId -> loadFromDB(orderId));
+```
+
+---
+
+### 案例二：数据库慢查询导致消费延迟
+
+**背景**：某通知系统，消息积压持续增长，消费延迟从秒级变成分钟级。
+
+**排查过程**：
+
+1. 查看消费者日志，发现大量 `SQLException: Connection timeout`
+2. 查看数据库连接池状态，`HikariCP` 活跃连接数达到最大值
+3. `SHOW FULL PROCESSLIST` 发现多个慢查询，单次查询超过 5 秒
+4. 查看慢查询日志，发现某张表的 `COUNT(*)` 查询没有索引
+
+**根因代码**：
+
+```java
+// 错误写法：每次消费都查询数据库
+public void sendNotification(OrderMessage message) {
+    // 查询用户信息（每次都查）
+    User user = userMapper.selectById(message.getUserId());
+    // 查询订单详情（每次都查）
+    Order order = orderMapper.selectById(message.getOrderId());
+    // 发送通知...
+}
+```
+
+**修复方案**：
+
+```java
+// 批量查询 + 本地缓存
+private static final LoadingCache<Long, User> userCache = Caffeine.newBuilder()
+    .maximumSize(5000)
+    .expireAfterWrite(5, TimeUnit.MINUTES)
+    .build(userId -> userMapper.selectById(userId));
+
+public void sendNotification(OrderMessage message) {
+    // 使用缓存
+    User user = userCache.get(message.getUserId());
+    Order order = orderMapper.selectById(message.getOrderId());
+    // 发送通知...
+}
+```
+
+---
+
+### 案例三：分区分配错误导致消费不均衡
+
+**背景**：Kafka 集群分区数从 6 增加到 12，但消费速度没有提升，反而有一半分区消息积压。
+
+**排查过程**：
+
+1. `kafka-consumer-groups.sh` 查看消费者分配情况
+2. 发现 12 个分区中只有 6 个被分配给消费者
+3. 代码审查发现，消费者应用只配置了 6 个线程，无法消费额外的分区
+
+**根因**：
+
+Kafka 分区数增加后，新分区没有消费者订阅，需要手动触发 rebalance 或重启消费者。
+
+**修复方案**：
+
+```yaml
+# Kafka 消费者配置
+spring:
+  kafka:
+    consumer:
+      max-poll-records: 500
+    listener:
+      concurrency: 12  # 必须与分区数一致
+```
+
+## 四、消息队列的高可用设计
+
+### 4.1 消费者可靠性设计
+
+**幂等性设计**：
+
+消息重复消费是常见场景，必须保证幂等。
+
+```java
+// 错误写法：重复消费会导致重复处理
+public void processOrder(OrderMessage message) {
+    orderService.createOrder(message);
+}
+
+// 正确写法：使用订单号作为幂等键
+public void processOrder(OrderMessage message) {
+    // 先检查订单是否已存在
+    if (orderService.existsByOrderId(message.getOrderId())) {
+        log.info("订单 {} 已存在，跳过", message.getOrderId());
+        return;
+    }
+    orderService.createOrder(message);
+}
+```
+
+**异常处理设计**：
+
+```java
+@KafkaListener(topics = "order-topic")
+public void consumeOrder(String message) {
+    try {
+        OrderMessage orderMessage = JSON.parseObject(message, OrderMessage.class);
+        processOrder(orderMessage);
+    } catch (Exception e) {
+        log.error("处理订单消息失败: {}", message, e);
+        // 不要轻易抛出异常，否则会导致消费中断
+        // 记录到死信队列，人工处理
+        sendToDeadLetterQueue(message, e);
+    }
+}
+```
+
+### 4.2 消息积压的预防措施
+
+| 措施 | 说明 |
+|---|---|
+| 消费者健康检查 | 定期检查消费者状态，自动告警 |
+| 消费延迟监控 | 监控消费 lag，超过阈值告警 |
+| 消费者限流 | 防止消费者崩溃影响上游 |
+| 消息 TTL | 设置消息过期时间，避免无限积压 |
+| 死信队列 | 异常消息进入死信队列，不阻塞正常消费 |
+| 熔断降级 | 消费失败时自动降级 |
+
+### 4.3 死信队列（DLQ）设计
+
+```yaml
+# Kafka DLQ 配置
+spring:
+  kafka:
+    listener:
+      default-retry-topic:
+        enabled: true
+        retry:
+          initial-interval: 1000
+          max-attempts: 3
+          multiplier: 2.0
+      dead-letter:
+        topic: order-topic-dlt  # 死信队列 Topic
+```
+
+```java
+// 死信消息处理
+@KafkaListener(topics = "order-topic-dlt")
+public void consumeDeadLetter(String message) {
+    log.error("收到死信消息: {}", message);
+    // 人工处理或告警通知
+    alertService.alert("订单消息处理失败，需要人工介入");
+}
+```
+
+## 五、监控与告警体系
+
+### 5.1 消费者 Lag 监控
+
+```bash
+# Kafka Lag 监控脚本
+#!/bin/bash
+GROUP=$1
+TOPIC=$2
+BROKER="localhost:9092"
+
+kafka-consumer-groups.sh --bootstrap-server $BROKER \
+    --group $GROUP \
+    --topic $TOPIC \
+    --describe | awk '
+    /LAG/ {
+        lag_sum += $5
+        count++
+    }
+    END {
+        if (count > 0) {
+            avg_lag = lag_sum / count
+            print "Total Lag:", lag_sum, "Avg Lag:", avg_lag
+        }
+    }'
+```
+
+### 5.2 Prometheus + Grafana 监控
+
+```yaml
+# Prometheus 抓取 Kafka 指标
+- job_name: 'kafka'
+  static_configs:
+    - targets: ['localhost:7071']
+  metrics_path: /metrics
+```
+
+关键监控指标：
+
+| 指标 | 说明 | 告警阈值 |
+|---|---|---|
+| consumer_lag | 消费延迟 | > 10000 |
+| messages_consumed_rate | 消费速率 | < 100/s |
+| messages_produced_rate | 生产速率 | > 消费速率 |
+| producer_error_rate | 生产错误率 | > 0.1% |
+
+### 5.3 告警配置建议
+
+```yaml
+# 告警规则
+groups:
+  - name: kafka_consumer
+    rules:
+      - alert: ConsumerLagHigh
+        expr: kafka_consumer_lag_sum > 100000
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "消费者延迟过高"
+          description: "消费者延迟 {{ $value }} 条，超过 10 万"
+
+      - alert: ConsumerDown
+        expr: kafka_consumer_count == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "消费者已离线"
+          description: "Topic {{ $labels.topic }} 消费者数量为 0"
+```
+
+## 六、生产环境问题处理流程
+
+### 6.1 应急响应 checklist
+
+```
+□ 确认积压范围和严重程度
+□ 检查消费者状态（进程、日志）
+□ 紧急扩容消费者
+□ 开启死信队列接收异常消息
+□ 分析根因（OOM、慢查询、网络、代码 bug）
+□ 修复问题
+□ 验证消费恢复
+□ 监控积压清空
+□ 编写故障报告
+```
+
+### 6.2 常见问题与解决方案对照表
+
+| 问题 | 原因 | 解决方案 |
+|---|---|---|
+| 消费者数量为 0 | 进程崩溃、OOM | 重启消费者，增加内存 |
+| 消费速度很慢 | 数据库瓶颈、网络延迟 | 优化数据库，增加缓存 |
+| 消息重复消费 | 消费者重启触发 rebalance | 保证消费逻辑幂等 |
+| 消息顺序错乱 | 多消费者并发消费 | 使用单分区或保序消费 |
+| 消息丢失 | 手动提交 offset 失败 | 使用自动提交或做好提交确认 |
+
+## 七、面试追问：消息队列相关高频问题
+
+### 问题一：如何保证消息不被重复消费？
+
+**参考答案**：
+
+消息重复消费的原因：
+- 生产者重试导致消息重复发送
+- 消费者重启触发 rebalance，offset 未提交
+
+解决方案：
+
+1. **业务幂等**：在消费逻辑中实现幂等，如使用订单号作为去重键
+2. **唯一消息 ID**：每条消息携带唯一 ID，消费前先查询是否已处理
+3. **分布式锁**：使用 Redis/ZooKeeper 保证同一消息只被处理一次
+
+```java
+// 幂等实现示例
+public void processOrder(OrderMessage message) {
+    String key = "order:processed:" + message.getOrderId();
+    Boolean success = redisTemplate.opsForValue().setIfAbsent(key, "1", 30, TimeUnit.MINUTES);
+    if (!success) {
+        log.info("订单已处理，跳过: {}", message.getOrderId());
+        return;
+    }
+    orderService.createOrder(message);
+}
+```
+
+### 问题二：如何保证消息的顺序性？
+
+**参考答案**：
+
+Kafka 保证分区内有序，但不保证 Topic 全局有序。
+
+实现有序消费的方案：
+
+1. **单分区**：所有消息发送到同一个分区，消费者单线程消费
+2. **按业务键分区**：将相同业务 ID 的消息发送到同一分区
+3. **多消费者保序**：在消费端使用单线程串行处理
+
+```java
+// 按订单号分区，保证同一订单的消息有序
+kafkaTemplate.send("order-topic", message.getOrderId(), message);
+```
+
+### 问题三：消息积压如何处理？
+
+**参考答案**：
+
+**紧急处理**：
+1. 扩容消费者，提高消费能力
+2. 开启死信队列，避免异常消息阻塞
+3. 临时降级非核心消费逻辑
+
+**根因排查**：
+1. 检查消费者进程状态
+2. 查看消费者日志，寻找错误
+3. 分析数据库、网络等依赖是否正常
+
+**长期优化**：
+1. 优化消费逻辑，减少不必要的外部调用
+2. 增加缓存，减少数据库查询
+3. 批量消费，提高吞吐量
+4. 监控告警，提前发现积压趋势
+
+### 问题四：Kafka 和 RabbitMQ 的区别？如何选型？
+
+**参考答案**：
+
+| 维度 | Kafka | RabbitMQ |
+|---|---|---|
+| 吞吐量 | 极高（百万级/秒） | 较高（万级/秒） |
+| 延迟 | 低（毫秒级） | 低（毫秒级） |
+| 消息可靠性 | at-least-once | at-least-once / exactly-once |
+| 消息顺序 | 分区内有序 | 队列内有序 |
+| 消息回溯 | 支持（基于 offset） | 不支持 |
+| 消息积压 | 强（基于磁盘） | 弱（内存优先） |
+| 事务支持 | 支持 | 支持 |
+
+**选型建议**：
+- **Kafka**：日志收集、大数据流处理、需要高吞吐量的场景
+- **RabbitMQ**：业务消息、复杂路由、需要灵活性的场景
+
+## 延伸思考
+
+### 思考题一：消息积压 vs 消息丢失
+
+**问题**：消息积压和消息丢失，哪个更严重？从业务角度分析。
+
+**提示**：考虑订单支付、用户通知、日志采集等不同场景。
+
+### 思考题二：如何设计一个零积压的消息系统
+
+**问题**：如果要设计一个消息系统，保证永远不会积压，需要什么条件？现实吗？
+
+**提示**：考虑生产速度、消费速度、系统资源等限制。
+
+### 思考题三：消息队列的容量规划
+
+**问题**：如果预估每日消息量为 1000 万条，峰值 QPS 为 5000，需要如何规划 Kafka 集群？
+
+**提示**：考虑分区数、消费者数量、磁盘 IO 等因素。
+
+---
+
+## 总结
+
+消息积压是消息队列系统的常见故障，排查的核心在于「快速止血 → 定位根因 → 修复预防」。
+
+关键要点回顾：
+
+- **积压本质**：消费速度 < 生产速度
+- **排查流程**：确认范围 → 检查消费者 → 查看日志 → 紧急扩容 → 分析根因 → 长期修复
+- **三大根因**：消费者崩溃、数据库瓶颈、消费逻辑异常
+- **预防措施**：幂等消费、死信队列、监控告警
+
+记住：消息队列是异步系统的一环，任何一个环节出问题都会影响整体。做好监控、及时告警、快速响应，才能保证消息系统的稳定运行。
+

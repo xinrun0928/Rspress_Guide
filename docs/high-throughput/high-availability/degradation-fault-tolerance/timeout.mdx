@@ -1,0 +1,696 @@
+import { Badge } from '@rspress/core/theme';
+
+# 超时处理：超时传递与最佳实践
+
+双十一零点，你守在电脑前准备抢购那款心仪已久的商品。点击下单的那一刻，页面开始转圈。一秒、两秒、三秒……你开始焦虑，五秒、十秒、二十秒……你决定刷新页面重试，结果收到「订单已提交」的提示。然后你又点了一次……
+
+这就是超时问题带来的用户体验灾难。更可怕的是，站在系统层面，这个问题可能会像多米诺骨牌一样，从一个接口蔓延到整个系统，最终导致雪崩式的故障。
+
+超时是分布式系统的「慢性毒药」——它不会立即让系统崩溃，但会在不知不觉中消耗系统资源，最终拖垮整个系统。这篇文章，我会从超时的本质讲起，带你理解超时传递的问题，掌握超时配置的最佳实践，并给出具体的代码实现。
+
+## 一、超时为什么重要——分布式系统的「时间陷阱」
+
+### 1.1 超时问题的本质
+
+在分布式系统中，每个请求都会经过多个服务节点。假设你有如下调用链：
+
+```
+用户请求 → 网关 → 认证服务 → 订单服务 → 库存服务 → 支付服务
+```
+
+如果库存服务变慢了（响应时间从 10ms 变成 500ms），会发生什么？
+
+- 支付服务调用库存服务，会等待 500ms
+- 订单服务调用支付服务，会等待 500ms + 自己的处理时间
+- 认证服务调用订单服务，会等待更久
+- 网关调用认证服务，会等待更更久
+- 用户端会看到页面一直转圈
+
+这就是**超时传递**——下游的延迟会传导到上游，最终由用户来承担。
+
+### 1.2 超时 vs 截止时间：两个相似却不同的概念
+
+很多人分不清超时（Timeout）和截止时间（Deadline）的区别：
+
+| 概念 | 含义 | 应用场景 | 计算方式 |
+|---|---|---|---|
+| **超时（Timeout）** | 等待多长时间后放弃 | 同步调用、RPC 请求 | `开始时间 + 固定时长` |
+| **截止时间（Deadline）** | 什么时间之前必须完成 | 有时间约束的任务、批处理 | `当前时间 + 剩余时间` |
+
+```java
+// 超时模式：固定等待 3 秒
+CompletableFuture.supplyAsync(() -> doSomething())
+    .get(3, TimeUnit.SECONDS);
+
+// 截止时间模式：用户给的总时间是 10 秒，已经用了 7 秒，剩余 3 秒
+long deadline = userDeadline - System.currentTimeMillis();
+if (deadline > 0) {
+    CompletableFuture.supplyAsync(() -> doSomething())
+        .get(deadline, TimeUnit.MILLISECONDS);
+}
+```
+
+:::tip 超时传递的最佳实践
+
+在调用链中，越靠近用户的服务，给下游的超时时间应该越短。可以用一个简单的公式：
+
+```
+下游超时时间 = (总超时时间 - 已消耗时间) × 衰减系数
+```
+
+这样可以确保在调用链末端，还有足够的超时时间来完成任务。
+
+:::
+
+### 1.3 超时问题的严重后果
+
+超时问题如果处理不好，会导致以下后果：
+
+**资源耗尽**：超时等待会占用线程资源。如果大量请求超时等待，线程池会被耗尽，新的请求无法处理。
+
+**级联故障**：下游的延迟会传导到上游，导致整个调用链变慢，最终用户端超时。
+
+**重试风暴**：超时后会触发重试，如果重试配置不当，会产生大量重复请求，进一步拖垮系统。
+
+**数据不一致**：超时后如果继续处理（比如扣库存后支付失败），可能导致数据不一致。
+
+## 二、超时级联失败：超时传递的灾难
+
+### 2.1 超时传递的原理
+
+假设 A 服务调用 B 服务，B 服务调用 C 服务，依次类推。调用链如下：
+
+```
+A (100ms 超时) → B (100ms 超时) → C (100ms 超时) → D (100ms 超时)
+```
+
+如果 D 服务响应变慢，耗时 500ms，那么：
+
+1. C 服务等待 D 服务 100ms 后超时，C 向 B 返回超时错误
+2. B 服务等待 C 服务 100ms 后超时，B 向 A 返回超时错误
+3. A 服务等待 B 服务 100ms 后超时，A 向用户返回超时错误
+
+但实际上，D 服务可能在 500ms 后成功返回了结果，只是 C 已经超时关闭了连接。这就是**无效等待**——系统白白等待了 500ms，却没有用到结果。
+
+### 2.2 超时传递的计算
+
+考虑一个实际的调用链：
+
+```
+用户 → 网关(50ms) → 订单服务(100ms) → 库存服务(200ms) → 仓储服务(500ms)
+```
+
+如果仓储服务响应时间从 100ms 变成 1000ms，会发生什么？
+
+| 服务 | 设置的超时 | 实际等待 | 结果 |
+|---|---|---|---|
+| 库存服务 | 200ms | 200ms | 超时 |
+| 订单服务 | 100ms | 200ms | 超时 |
+| 网关 | 50ms | 300ms | 超时 |
+| 用户 | 30s | 300ms | 收到超时错误 |
+
+可以看到，**下游的延迟会被上游的短超时「截断」**，导致真正有用的响应被丢弃。
+
+### 2.3 如何避免超时级联
+
+**方法一：合理分配超时时间**
+
+```java
+public class TimeoutCalculator {
+
+    // 用户侧总超时时间
+    private static final int TOTAL_TIMEOUT_MS = 30000;
+
+    // 调用链中的服务数量
+    private static final int SERVICE_COUNT = 5;
+
+    // 预留的缓冲时间（用于响应传输、GC 暂停等）
+    private static final int BUFFER_MS = 5000;
+
+    // 每个服务的超时时间 = (总超时 - 缓冲) / 服务数量
+    private static int calculateTimeoutPerService() {
+        return (TOTAL_TIMEOUT_MS - BUFFER_MS) / SERVICE_COUNT;
+    }
+
+    // 根据链路深度动态计算超时
+    public static int calculateTimeout(int depth) {
+        int baseTimeout = calculateTimeoutPerService();
+        // 每深入一层，可减少 10% 的超时时间
+        return (int) (baseTimeout * Math.pow(0.9, depth));
+    }
+}
+```
+
+**方法二：使用截止时间传递**
+
+```java
+public class DeadlinePropagation {
+
+    public CompletableFuture<Result> callWithDeadline(String service, Runnable task, long deadlineMs) {
+        long remainingTime = deadlineMs - System.currentTimeMillis();
+        if (remainingTime <= 0) {
+            return CompletableFuture.completedFuture(
+                new Result(false, "Deadline exceeded before call"));
+        }
+
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        CompletableFuture<Result> future = CompletableFuture.supplyAsync(() -> {
+            try {
+                task.run();
+                return new Result(true, "Success");
+            } catch (Exception e) {
+                return new Result(false, e.getMessage());
+            }
+        }, executor);
+
+        try {
+            return future.get(remainingTime, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            future.cancel(true);
+            return CompletableFuture.completedFuture(
+                new Result(false, "Timeout after " + remainingTime + "ms"));
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+}
+```
+
+## 三、超时配置的最佳实践
+
+### 3.1 如何设置合理的超时时间
+
+超时时间设置是一个技术活，太短会误判，太长会拖累系统。以下是设置超时时间的几个原则：
+
+**考虑依赖服务的 P99 响应时间**：超时时间应该大于 P99 响应时间，而不是平均值。平均值会被极端值拉低，P99 更能反映真实情况。
+
+**考虑网络的 RTT（Round Trip Time）**：在设置超时前，先测量一下网络延迟。国内服务间的 RTT 通常在 1-10ms 之间，国际服务可能达到 100-300ms。
+
+**考虑业务的容忍度**：不同业务对延迟的容忍度不同。支付类业务可能愿意等 30 秒，搜索类业务可能只能等 500ms。
+
+**考虑错误处理方式**：超时后是重试还是降级？如果是重试，超时时间需要考虑重试次数。
+
+```java
+@Configuration
+public class TimeoutConfig {
+
+    @Value("${timeout.user.total:30000}")
+    private int totalTimeout;
+
+    @Value("${timeout.service.p99:100}")
+    private Map<String, Integer> serviceP99Timeout;
+
+    @Value("${timeout.network.rtt:5}")
+    private int networkRtt;
+
+    public TimeoutProperties getTimeoutProperties(String service) {
+        int p99 = serviceP99Timeout.getOrDefault(service, 100);
+
+        // 超时时间 = P99 × 2 + 网络 RTT × 2 + 缓冲
+        int timeout = p99 * 2 + networkRtt * 2 + 50;
+
+        return new TimeoutProperties(timeout, p99);
+    }
+}
+```
+
+### 3.2 超时配置层级
+
+超时配置应该在多个层级设置：
+
+| 配置层级 | 范围 | 说明 | 示例 |
+|---|---|---|---|
+| **全局默认** | 整个应用 | 为所有调用设置默认超时 | Ribbon 默认超时 1000ms |
+| **服务级别** | 单个服务 | 为特定服务设置超时 | 用户服务 500ms，订单服务 1000ms |
+| **方法级别** | 特定方法 | 为特定方法设置超时 | 获取用户详情 200ms，搜索用户 1000ms |
+| **调用级别** | 每次调用 | 动态调整超时 | 紧急操作延长超时 |
+
+```yaml
+# application.yml
+hystrix:
+  command:
+    # 全局默认配置
+    default:
+      execution:
+        timeout:
+          enabled: true
+        isolation:
+          thread:
+            timeoutInMilliseconds: 1000
+
+    # 服务级别配置
+    ProductService:
+      execution:
+        isolation:
+          thread:
+            timeoutInMilliseconds: 500
+
+    OrderService:
+      execution:
+        isolation:
+          thread:
+            timeoutInMilliseconds: 1000
+
+    # 方法级别配置
+    ProductService#getDetail:
+      execution:
+        isolation:
+          thread:
+            timeoutInMilliseconds: 200
+```
+
+### 3.3 超时反模式
+
+以下是几种常见的超时反模式：
+
+**反模式一：没有超时**
+
+```java
+// 错误写法：没有超时限制
+public String callService() {
+    return restTemplate.getForObject("http://service/api", String.class);
+}
+
+// 正确写法：设置超时
+public String callService() {
+    SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
+    factory.setConnectTimeout(3000);
+    factory.setReadTimeout(5000);
+
+    RestTemplate restTemplate = new RestTemplate(factory);
+    return restTemplate.getForObject("http://service/api", String.class);
+}
+```
+
+**反模式二：超时时间过长**
+
+```java
+// 错误写法：超时时间过长，相当于没有超时
+@HystrixProperty(name = "hystrix.command.default.execution.isolation.thread.timeoutInMilliseconds", value = "60000")
+public String callService() {
+    return restTemplate.getForObject("http://service/api", String.class);
+}
+
+// 正确写法：超时时间应该合理
+@HystrixProperty(name = "hystrix.command.default.execution.isolation.thread.timeoutInMilliseconds", value = "2000")
+public String callService() {
+    return restTemplate.getForObject("http://service/api", String.class);
+}
+```
+
+**反模式三：上下游超时时间一致**
+
+```java
+// 错误写法：上下游超时时间相同，下游延迟会直接传递到上游
+// A → B → C → D，超时都是 1 秒
+// 如果 D 耗时 800ms，B 的超时就已经很紧了
+
+// 正确写法：越靠近底层，超时时间越短
+// 用户 → 网关(30s) → 订单服务(10s) → 库存服务(3s) → 数据库(1s)
+@Configuration
+public class TieredTimeoutConfig {
+    public Map<String, Integer> calculateTimeouts(int depth) {
+        Map<String, Integer> timeouts = new HashMap<>();
+        timeouts.put("gateway", 30000);
+        timeouts.put("order-service", 10000);
+        timeouts.put("inventory-service", 3000);
+        timeouts.put("database", 1000);
+        return timeouts;
+    }
+}
+```
+
+## 四、超时与线程池隔离
+
+### 4.1 线程池隔离原理
+
+Hystrix 的线程池隔离是超时处理的重要手段。当一个服务变慢时，只会耗尽该服务的线程池，不会影响其他服务。
+
+```java
+@HystrixCommand(
+    groupKey = "ProductService",
+    commandKey = "getProduct",
+    threadPoolKey = "product-pool",
+    commandProperties = {
+        @HystrixProperty(name = "execution.isolation.thread.timeoutInMilliseconds", value = "500")
+    },
+    threadPoolProperties = {
+        @HystrixProperty(name = "coreSize", value = "10"),
+        @HystrixProperty(name = "maxQueueSize", value = "20"),
+        @HystrixProperty(name = "keepAliveTimeMinutes", value = "1"),
+        @HystrixProperty(name = "queueSizeRejectionThreshold", value = "15")
+    }
+)
+public Product getProduct(Long id) {
+    return productApi.getProduct(id);
+}
+```
+
+线程池隔离的关键参数：
+
+| 参数 | 说明 | 建议值 |
+|---|---|---|
+| `coreSize` | 核心线程数 | 10-20 |
+| `maxQueueSize` | 最大队列长度 | 10-20 |
+| `queueSizeRejectionThreshold` | 队列满时的拒绝阈值 | `maxQueueSize - 5` |
+| `keepAliveTimeMinutes` | 空闲线程存活时间 | 1-5 分钟 |
+
+### 4.2 超时与线程中断
+
+当超时发生后，Hystrix 会中断正在执行的线程。理解线程中断机制对于排查问题至关重要。
+
+```java
+@HystrixCommand(
+    commandProperties = {
+        @HystrixProperty(name = "execution.isolation.thread.timeoutInMilliseconds", value = "1000"),
+        @HystrixProperty(name = "execution.isolation.thread.interruptOnTimeout", value = "true")
+    }
+)
+public String callService() {
+    try {
+        // 模拟耗时操作
+        Thread.sleep(2000);
+        return "success";
+    } catch (InterruptedException e) {
+        // 线程被中断
+        Thread.currentThread().interrupt();
+        throw new RuntimeException("Thread interrupted");
+    } finally {
+        // 清理资源
+        if (Thread.currentThread().isInterrupted()) {
+            log.warn("Thread was interrupted during execution");
+        }
+    }
+}
+```
+
+:::warning 正确处理线程中断
+
+如果你的代码会阻塞等待，一定要在 `catch` 中重新设置中断标志：`Thread.currentThread().interrupt()`。否则，调用方无法知道线程被中断过。
+
+:::
+
+### 4.3 超时与信号量隔离
+
+除了线程池隔离，Hystrix 还支持信号量隔离。信号量隔离适合非阻塞的快速操作。
+
+```java
+@HystrixCommand(
+    commandProperties = {
+        // 使用信号量隔离
+        @HystrixProperty(name = "execution.isolation.strategy", value = "SEMAPHORE"),
+        @HystrixProperty(name = "execution.isolation.semaphore.maxConcurrentRequests", value = "20"),
+        @HystrixProperty(name = "execution.isolation.thread.timeoutInMilliseconds", value = "200")
+    }
+)
+public String getProductFast(Long id) {
+    // 信号量隔离适合这种非阻塞、快速的调用
+    return localCache.get(id);
+}
+```
+
+信号量隔离与线程池隔离的对比：
+
+| 维度 | 线程池隔离 | 信号量隔离 |
+|---|---|---|
+| 线程 | 独占线程 | 共享线程 |
+| 开销 | 较大（线程切换） | 较小（CAS 操作） |
+| 阻塞 | 支持（可超时中断） | 不支持（无法中断） |
+| 并发控制 | 线程数 | 信号量数量 |
+| 适用场景 | 远程调用、可能阻塞 | 本地调用、快速返回 |
+
+## 五、超时与熔断、重试的配合
+
+### 5.1 超时 + 重试
+
+超时后触发重试是最常见的组合。但需要注意重试策略：
+
+```java
+@Configuration
+public class TimeoutWithRetryConfig {
+
+    @Bean
+    public RetryTemplate retryTemplate() {
+        SimpleRetryPolicy retryPolicy = new SimpleRetryPolicy();
+        retryPolicy.setMaxAttempts(3);
+
+        ExponentialBackOffPolicy backOffPolicy = new ExponentialBackOffPolicy();
+        backOffPolicy.setInitialInterval(100);
+        backOffPolicy.setMultiplier(2.0);
+        backOffPolicy.setMaxInterval(5000);
+
+        RetryTemplate template = new RetryTemplate();
+        template.setRetryPolicy(retryPolicy);
+        template.setBackOffPolicy(backOffPolicy);
+        return template;
+    }
+
+    @HystrixCommand(
+        commandProperties = {
+            @HystrixProperty(name = "execution.isolation.thread.timeoutInMilliseconds", value = "2000"),
+            @HystrixProperty(name = "metrics.rollingStats.timeInMilliseconds", value = "10000")
+        }
+    )
+    public String callWithRetryAndTimeout() {
+        return retryTemplate.execute(context -> {
+            // 这里会重试 3 次
+            return restTemplate.getForObject("http://service/api", String.class);
+        });
+    }
+}
+```
+
+### 5.2 超时 + 熔断
+
+超时率达到一定比例后，触发熔断：
+
+```java
+@Configuration
+public class TimeoutWithCircuitBreakerConfig {
+
+    @HystrixCommand(
+        commandProperties = {
+            // 超时时间
+            @HystrixProperty(name = "execution.isolation.thread.timeoutInMilliseconds", value = "2000"),
+            // 熔断器相关配置
+            @HystrixProperty(name = "circuitBreaker.requestVolumeThreshold", value = "20"),
+            @HystrixProperty(name = "circuitBreaker.sleepWindowInMilliseconds", value = "5000"),
+            @HystrixProperty(name = "circuitBreaker.errorThresholdPercentage", value = "50")
+        }
+    )
+    public String callWithTimeoutAndCircuitBreaker() {
+        return restTemplate.getForObject("http://service/api", String.class);
+    }
+}
+```
+
+熔断器会统计超时错误，当超时比例超过 50% 且请求量达到 20 时，熔断器打开，后续请求直接失败，不再调用下游服务。
+
+### 5.3 三者配合的最佳实践
+
+```java
+@Service
+public class ResilientService {
+
+    @Autowired
+    private RestTemplate restTemplate;
+
+    @HystrixCommand(
+        fallbackMethod = "fallback",
+        commandProperties = {
+            // 1. 超时配置
+            @HystrixProperty(name = "execution.isolation.thread.timeoutInMilliseconds", value = "2000"),
+            // 2. 熔断器配置
+            @HystrixProperty(name = "circuitBreaker.requestVolumeThreshold", value = "10"),
+            @HystrixProperty(name = "circuitBreaker.errorThresholdPercentage", value = "50"),
+            @HystrixProperty(name = "circuitBreaker.sleepWindowInMilliseconds", value = "10000"),
+            // 3. 统计窗口
+            @HystrixProperty(name = "metrics.rollingStats.timeInMilliseconds", value = "10000")
+        },
+        threadPoolProperties = {
+            @HystrixProperty(name = "coreSize", value = "10"),
+            @HystrixProperty(name = "maxQueueSize", value = "10")
+        }
+    )
+    public String resilientCall(String param) {
+        return restTemplate.getForObject("http://service/api?param=" + param, String.class);
+    }
+
+    public String fallback(String param) {
+        // 降级逻辑
+        log.warn("Service call failed, returning fallback response for param: {}", param);
+        return "{\"status\": \"degraded\", \"message\": \"Service temporarily unavailable\"}";
+    }
+}
+```
+
+## 六、Resilience4j 的超时处理
+
+### 6.1 Resilience4j Timeout
+
+Resilience4j 是 Hystrix 的继任者，提供了更现代化的超时处理：
+
+```java
+@Configuration
+public class Resilience4jTimeoutConfig {
+
+    @Bean
+    public TimeoutRegistry timeoutRegistry() {
+        TimeoutConfig config = TimeoutConfig.custom()
+            .timeoutDuration(Duration.ofSeconds(2))
+            .cancelRunningFuture(true)
+            .build();
+
+        return TimeoutRegistry.of(config);
+    }
+
+    @Bean
+    public TimeoutConfig globalTimeoutConfig() {
+        return TimeoutConfig.custom()
+            .timeoutDuration(Duration.ofSeconds(2))
+            .cancelRunningFuture(true)
+            .build();
+    }
+}
+```
+
+### 6.2 使用注解定义超时
+
+```java
+@Service
+public class ProductServiceWithResilience4j {
+
+    private final RestTemplate restTemplate;
+
+    public ProductServiceWithResilience4j(RestTemplate restTemplate) {
+        this.restTemplate = restTemplate;
+    }
+
+    @io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker(name = "productService")
+    @io.github.resilience4j.timeout.annotation.Timelimit(name = "productService")
+    public Product getProduct(Long id) {
+        return restTemplate.getForObject("http://product-service/product/" + id, Product.class);
+    }
+
+    // 异步版本的超时
+    @io.github.resilience4j.timeout.annotation.Timelimit(name = "productService", fallbackMethod = "getProductFallback")
+    public CompletableFuture<Product> getProductAsync(Long id) {
+        return CompletableFuture.supplyAsync(() ->
+            restTemplate.getForObject("http://product-service/product/" + id, Product.class));
+    }
+
+    private Product getProductFallback(Long id, Throwable throwable) {
+        log.warn("Timeout or error for product {}, fallback triggered", id);
+        return Product.defaultProduct(id);
+    }
+}
+```
+
+---
+
+## 面试追问：超时相关高频问题
+
+### 问题一：如何设置合理的超时时间？
+
+**参考答案**：
+
+设置超时时间需要考虑以下几个因素：
+
+**依赖服务的 P99 响应时间**：超时时间应该大于 P99，而不是平均值。建议设置为 `P99 × 2 + 网络 RTT`。
+
+**业务的容忍度**：不同业务对延迟的容忍度不同。支付类业务可能愿意等 30 秒，搜索类业务可能只能等 500ms。
+
+**错误处理方式**：超时后是重试还是降级？如果是重试，超时时间需要考虑重试次数和退避时间。
+
+**调用链深度**：越靠近底层，超时时间应该越短。可以用公式：`下游超时 = (总超时 - 已消耗时间) × 衰减系数`。
+
+**推荐的超时设置策略**：
+- 快速失败：设置较短的超时时间，让失败的请求快速失败
+- 动态调整：根据实时监控数据动态调整超时时间
+- 分层配置：在服务级别、方法级别、调用级别分别设置超时
+
+### 问题二：超时传递的原理是什么？
+
+**参考答案**：
+
+超时传递是指下游服务的延迟会影响到上游服务的现象。在分布式系统中，调用链往往是同步的：
+
+```
+用户 → A → B → C → D
+```
+
+如果 D 服务响应变慢（从 10ms 变成 500ms），那么：
+- C 服务等待 D 服务的响应，会延迟 500ms
+- B 服务等待 C 服务的响应，会延迟 500ms + B 的处理时间
+- A 服务等待 B 服务的响应，会延迟更久
+- 用户端会看到页面一直转圈
+
+**超时传递的灾难性后果**：
+1. 大量请求超时等待，占用线程资源
+2. 线程池被耗尽，新的请求无法处理
+3. 上游服务也可能超时，导致级联故障
+4. 真正有用的响应被丢弃（下游可能已经成功）
+
+**避免超时传递的方法**：
+1. 合理分配超时时间（越靠近底层，超时越短）
+2. 使用截止时间传递（每层计算剩余可用时间）
+3. 设置熔断器（超时率达到阈值后快速失败）
+4. 线程池隔离（单个服务变慢不影响其他服务）
+
+### 问题三：超时和线程池隔离的关系？
+
+**参考答案**：
+
+超时和线程池隔离是相辅相成的关系：
+
+**超时是「时间」维度的保护**：确保每个调用不会无限等待，在规定时间内完成或失败。
+
+**线程池隔离是「空间」维度的保护**：确保一个服务的故障不会耗尽所有资源，影响其他服务。
+
+两者的配合：
+- 如果没有超时限制，线程池可能会被长时间占用的请求耗尽
+- 如果没有线程池隔离，一个服务的超时可能会影响其他服务的响应时间
+- 线程池隔离确保了即使超时发生，也只有该服务的线程被阻塞
+
+**最佳实践**：
+1. 为每个依赖服务配置独立的线程池
+2. 为每个线程池设置合理的超时时间
+3. 配置队列大小和拒绝策略
+4. 监控线程池的使用情况
+
+:::tip 延伸思考
+
+超时是一种「被动」的防御手段。如果能够提前预判服务的健康状态，是否可以「主动」调整超时时间？比如，当监控系统发现服务响应时间正在逐渐变长时，提前缩短超时时间，让问题更快暴露，而不是等到真正超时？
+
+:::
+
+---
+
+## 留给你的思考题
+
+### 题目一：超时时间与重试的平衡
+
+假设你调用一个远程服务，该服务的响应时间分布如下：
+- 90% 的请求在 100ms 内返回
+- 5% 的请求在 100-500ms 返回
+- 5% 的请求超过 500ms（可能是失败的）
+
+**问题**：
+1. 如果超时时间设为 200ms，会导致多少比例的正常请求失败？
+2. 如果超时时间设为 500ms，会有什么问题？
+3. 如何在「误判率」和「等待时间」之间找到平衡？
+
+### 题目二：调用链超时分配
+
+假设用户侧的超时时间是 30 秒，调用链上有 5 个服务：网关、认证服务、订单服务、库存服务、仓储服务。
+
+**问题**：如何给每个服务分配合理的超时时间？请给出具体的计算逻辑。
+
+### 题目三：超时与数据一致性
+
+假设有一个订单流程：
+1. 扣减库存（超时了，但库存已经扣减了）
+2. 创建订单
+3. 支付
+
+**问题**：如果第一步超时了，应该如何处理？库存已经扣减了，但订单还没创建，系统应该如何恢复到一致状态？

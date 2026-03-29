@@ -1,0 +1,704 @@
+# CPU 飙高排查：定位热点代码与性能瓶颈
+
+import { Badge } from '@rspress/core/theme';
+
+周一下午三点，你正在处理一个需求变更，监控平台突然弹出一条告警：
+
+```
+【严重告警】订单服务 CPU 使用率 98%，已持续 3 分钟
+当前 QPS: 1500 | RT P99: 8500ms
+受影响用户: 约 2300 人
+```
+
+你立刻打开监控大盘，发现 CPU 使用率从正常水平的 30% 飙升到了 98%。与此同时，接口响应时间 P99 从 50ms 飙升到了 8 秒。用户开始抱怨页面加载缓慢，客服电话被打爆。
+
+这不是你第一次遇到 CPU 飙高，但每次发生都让人紧张。CPU 100% 意味着什么？是什么代码导致的？如何快速定位？这些问题，你必须能在第一时间回答。
+
+别慌。这一节，我们来系统性地解决 CPU 飙高问题。
+
+## 一、CPU 飙高的本质：理解系统资源的争夺
+
+### 1.1 为什么 CPU 会飙高
+
+CPU 是计算机的核心计算资源。当一个或多个线程持续占用 CPU 进行计算时，CPU 使用率就会上升。
+
+正常情况下，CPU 使用率高的场景包括：
+
+- 大量计算密集型任务（如复杂算法、数据加密解密）
+- 高并发请求处理
+- 复杂的数据库查询
+- JIT 编译（热点代码编译）
+
+但 CPU 使用率飙高到 90% 甚至 100%，通常意味着有问题：
+
+| 场景 | 说明 |
+|---|---|
+| 死循环 | 代码逻辑错误，某个线程陷入无限循环 |
+| 正则表达式 | 复杂正则或贪婪匹配导致回溯 |
+| 序列化/反序列化 | 大对象序列化消耗 CPU |
+| GC 压力 | GC 线程占用大量 CPU |
+| 加密/解密 | 大量 HTTPS 请求导致 SSL 握手 |
+| JIT 编译 | 热点代码编译占用 CPU（通常短暂） |
+
+### 1.2 CPU 飙高的影响
+
+CPU 飙高不是小事，它会引发一系列连锁反应：
+
+**请求响应变慢**：CPU 资源被占满，正常请求无法获得足够的 CPU 时间片，响应时间急剧上升。
+
+**线程阻塞增加**：线程竞争 CPU 资源加剧，可能导致线程池饱和。
+
+**超时和熔断**：上游服务超时，触发熔断降级。
+
+**用户体验下降**：页面加载缓慢，用户流失增加。
+
+### 1.3 CPU 飙高排查的特点
+
+与 OOM 不同，CPU 飙高通常是瞬时的，问题消失后证据也可能消失。所以 CPU 排查的关键是「快」——在问题发生时快速定位，快速修复。
+
+## 二、CPU 飙高排查六步法
+
+### 2.1 第一步：确认进程——top 定位是哪个进程
+
+收到 CPU 告警后，第一步是确认是哪个进程导致的问题。
+
+```bash
+# 查看系统整体 CPU 使用情况
+top
+
+# 按 CPU 使用率排序
+top -c
+
+# 关键字段说明
+# PID: 进程 ID
+# %CPU: CPU 使用率
+# COMMAND: 进程命令
+```
+
+输出示例：
+
+```
+top - 15:30:25 up 45 days,  3:22,  2 users,  load average: 8.92, 4.56, 2.34
+Tasks: 302 total,   1 running, 300 sleeping,   0 stopped,   1 zombie
+%Cpu(s): 98.3 us,  0.5 sy,  0.0 ni,  1.2 id,  0.0 wa,  0.0 hi,  0.0 si,  0.0 st
+KiB Mem:  32768048 total,  12345678 free,  15234567 used,   5187803 buff/cache
+KiB Swap:        0 total,        0 free,        0 used.  12345678 avail Mem
+
+  PID USER      PR  NI  %CPU    %MEM     TIME+ COMMAND
+31543 tomcat    20   0  85.2   3.2  12:34.56 java -jar order-service.jar
+ 2345 mysql     20   0   5.2   1.5   8:23.45 /usr/sbin/mysqld
+   789 nginx     20   0   2.1   0.5   1:23.45 nginx: worker
+```
+
+从这个输出可以看到，`java` 进程（PID 31543）CPU 使用率高达 85.2%，是主要问题来源。
+
+:::tip load average 的含义
+
+load average 有三个数字，分别代表 1 分钟、5 分钟、15 分钟的系统负载。如果 CPU 有 8 核，load average 为 8.92 意味着系统处于过载状态（8.92 / 8 = 111%）。
+
+:::
+
+### 2.2 第二步：定位线程——top -H 找到高 CPU 线程
+
+确认是 Java 进程的问题后，下一步是找到是哪个线程在消耗 CPU。
+
+```bash
+# 查看 Java 进程的所有线程，按 CPU 使用率排序
+top -Hp <PID>
+
+# 关键字段
+# PID: 线程 ID
+# %CPU: 线程 CPU 使用率
+```
+
+输出示例：
+
+```
+top - 15:31:05 up 45 days,  3:23,  2 users,  load average: 8.92, 4.56, 2.34
+PID USER      PR  NI  %CPU    %MEM     TIME+ COMMAND
+31544 tomcat    20   0  45.2   3.2  10:23.45 [GC task thread]
+31545 tomcat    20   0  35.1   3.2   8:45.67 [GC task thread]
+31546 tomcat    20   0  12.5   3.2   2:34.56 java
+31547 tomcat    20   0   5.2   3.2   1:23.45 java
+```
+
+从这个输出可以看到，两个 GC 线程（GC task thread）分别占用了 45.2% 和 35.1% 的 CPU。这说明 GC 是导致 CPU 飙高的原因。
+
+如果看到的是普通业务线程，需要进一步分析。
+
+### 2.3 第三步：线程 ID 转十六进制
+
+`jstack` 输出中的线程 ID 是十六进制格式，需要将线程 ID 转换。
+
+```bash
+# 将线程 ID 31546 转换为十六进制
+printf '%x\n' 31546
+# 输出: 7b3a
+
+# 或者使用 echo 和 xxd
+echo "31546" | xxd -p
+```
+
+转换后的十六进制是 7b3a，接下来的 `jstack` 输出中会用到。
+
+### 2.4 第四步：导出线程栈——jstack 分析调用栈
+
+```bash
+# 导出线程栈
+jstack <PID> > /tmp/jstack_<PID>.log
+
+# 查找特定线程的调用栈
+grep -A 50 "nid=0x7b3a" /tmp/jstack_<PID>.log
+```
+
+输出示例：
+
+```
+"http-nio-8080-exec-10" #123 daemon prio=5 os_prio=0 tid=0x00007f8d4a123400 nid=0x7b3a runnable [0x00007f8d5a234000]
+   java.lang.Thread.State: RUNNABLE
+    at java.util.regex.Pattern$CharProperty.match(Pattern.java:3770)
+    at java.util.regex.Pattern$Branch.match(Pattern.java:4132)
+    at java.util.regex.Pattern$Curly.match0(Pattern.java:3780)
+    at java.util.regex.Pattern$Curly.match0(Pattern.java:3780)
+    at java.util.regex.Pattern$GroupHead.match(Pattern.java:4652)
+    at java.util.regex.Pattern$GroupHead.match(Pattern.java:4652)
+    at java.util.regex.Pattern$GroupTail.match(Pattern.java:4672)
+    at java.util.regex.Pattern$Curly.match0(Pattern.java:3780)
+    at java.util.regex.Pattern$Curly.match0(Pattern.java:3780)
+    at java.util.regex.Pattern$GroupHead.match(Pattern.java:4652)
+    at java.util.regex.Pattern$GroupHead.match(StackTraceElement.java:4351)
+    at com.example.order.service.OrderService.validatePhone(OrderService.java:156)
+    at com.example.order.service.OrderService.createOrder(OrderService.java:89)
+    at com.example.order.controller.OrderController.create(OrderController.java:45)
+```
+
+从这个输出可以看到，线程正在执行 `validatePhone` 方法，核心问题是 `Pattern.match()`——正则表达式匹配导致的 CPU 消耗。
+
+### 2.5 第五步：定位热点代码——Arthas trace
+
+`jstack` 告诉你的是哪个线程有问题，但要找到具体是哪个方法耗时最长，需要用 Arthas。
+
+```bash
+# 启动 Arthas
+java -jar arthas-boot.jar
+
+# 使用 trace 命令定位耗时方法
+trace com.example.order.service.OrderService validatePhone '#cost > 100'
+```
+
+输出示例：
+
+```
+`---[3542ms] com.example.order.service.OrderService:validatePhone
+    +---[3210ms] java.util.regex.Pattern:matches
+    +---[200ms] java.lang.String:equals
+    +---[132ms] com.example.order.mapper.PhoneMapper:checkPhone
+```
+
+可以看到 `validatePhone` 方法总耗时 3542ms，其中 `Pattern.matches()` 占了 3210ms——这就是罪魁祸首。
+
+### 2.6 第六步：生成火焰图——直观展示 CPU 消耗
+
+火焰图（Flame Graph）是性能分析的神器，能直观展示 CPU 时间消耗的分布。
+
+```bash
+# 使用 async-profiler 生成火焰图
+# 1. 下载 async-profiler
+wget https://github.com/jvm-profiling-tools/async-profiler/releases/download/v2.9/async-profiler-2.9-linux-x64.tar.gz
+tar -xzf async-profiler-2.9-linux-x64.tar.gz
+
+# 2. 找到 Java 进程 ID
+jps -l
+
+# 3. 生成火焰图（CPU 模式，30 秒采样）
+./profiler.sh -d 30 -f /tmp/cpu.svg <PID>
+
+# 4. 下载到本地查看
+scp user@server:/tmp/cpu.svg ./
+```
+
+火焰图生成后，用浏览器打开。每一层代表一个调用栈，宽度代表 CPU 消耗时间。越宽的「火焰」越可能是性能瓶颈。
+
+:::tip 在线生成火焰图
+
+如果服务器无法直接访问，可以使用 `arthas` 的 `profiler` 命令生成火焰图：
+
+```bash
+# Arthas 中执行
+profiler start --duration 30
+profiler stop --format html --file /tmp/flame.html
+```
+
+:::
+
+## 三、CPU 飙高的六大元凶
+
+### 3.1 死循环：代码逻辑错误
+
+死循环是 CPU 飙高的最常见原因之一。往往是因为代码逻辑错误，导致某个操作不断重复执行。
+
+典型场景：
+
+```java
+// 错误写法：死循环
+public void processOrders() {
+    while (true) {
+        List<Order> orders = orderMapper.selectPending();
+        for (Order order : orders) {
+            processOrder(order);
+        }
+        // 忘记 sleep，导致死循环
+    }
+}
+
+// 正确写法：添加 sleep
+public void processOrders() {
+    while (true) {
+        List<Order> orders = orderMapper.selectPending();
+        for (Order order : orders) {
+            processOrder(order);
+        }
+        try {
+            Thread.sleep(1000); // 每秒处理一次
+        } catch (InterruptedException e) {
+            break;
+        }
+    }
+}
+```
+
+**排查特征**：`jstack` 显示线程状态为 `RUNNABLE`，调用栈中有明确的循环方法。
+
+### 3.2 正则表达式：贪婪匹配的回溯陷阱
+
+正则表达式是 CPU 杀手，尤其是复杂的正则或贪婪匹配会导致大量回溯。
+
+典型场景：
+
+```java
+// 危险写法：贪婪匹配 + 复杂正则
+public boolean validatePhone(String phone) {
+    String pattern = "1[3-9]\\d{10}.*"; // .* 会导致回溯
+    return Pattern.matches(pattern, phone);
+}
+
+// 更危险的写法
+public boolean validateEmail(String email) {
+    String pattern = "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}.*$";
+    // {2,} 后面的 .* 可能导致灾难性回溯
+    return Pattern.matches(pattern, email);
+}
+```
+
+```java
+// 正确写法：使用链式调用限定
+public boolean validatePhone(String phone) {
+    String pattern = "1[3-9]\\d{10}"; // 不需要 .*
+    return Pattern.matches(pattern, phone);
+}
+
+// 或者使用预编译
+private static final Pattern PHONE_PATTERN = Pattern.compile("1[3-9]\\d{10}");
+private static final Pattern EMAIL_PATTERN = Pattern.compile(
+    "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$" // 去掉 .*
+);
+
+public boolean validatePhone(String phone) {
+    return PHONE_PATTERN.matcher(phone).matches();
+}
+```
+
+:::warning 正则回溯的灾难
+
+一个看似简单的正则 `^(a+)+b$`，当输入 `aaaaaaaaaaaaaaaaX` 时，会导致指数级的回溯。攻击者可以利用这个特性发起 ReDoS（Regular Expression Denial of Service）攻击。
+
+:::
+
+### 3.3 HashMap 在并发环境下的死循环
+
+JDK 7 的 HashMap 在高并发扩容时，可能导致链表成环，形成死循环。这是经典的 CPU 100% 问题。
+
+```java
+// JDK 7 HashMap 并发问题演示
+// 多线程同时 put，触发扩容，可能导致链表成环
+Map<String, Object> cache = new HashMap<>(); // 非线程安全
+
+// 多线程并发写入
+for (int i = 0; i < 100; i++) {
+    new Thread(() -> {
+        for (int j = 0; j < 1000; j++) {
+            cache.put("key" + (j % 100), "value" + j);
+        }
+    }).start();
+}
+```
+
+**修复方案**：使用 ConcurrentHashMap 替代 HashMap。
+
+```java
+Map<String, Object> cache = new ConcurrentHashMap<>();
+```
+
+### 3.4 GC 压力导致的 CPU 飙高
+
+GC 过程中，GC 线程会占用大量 CPU。如果频繁发生 Full GC，CPU 会持续处于高位。
+
+```bash
+# 查看 GC 情况
+jstat -gcutil <PID> 1000
+
+# 查看 GC 日志
+tail -f /data/logs/gc.log
+```
+
+典型 GC 日志：
+
+```
+2026-03-29T15:30:25.123+0800: [Full GC (Allocation Failure) [CMS: 1572864K->1048576K(1572864K), 5.2345678 secs] 2097152K->1258291K(2097152K), [Metaspace: 123456K->123456K], 5.2345678 secs]
+```
+
+从这个日志可以看到：
+- Full GC 耗时 5.23 秒，非常长
+- Old 区回收效果不佳（只回收了约 500MB）
+- Allocation Failure 说明是对象分配失败触发的 Full GC
+
+**修复方案**：
+- 分析 Heap Dump，找出内存泄漏点
+- 调整堆大小和 GC 参数
+- 优化对象分配速率
+
+### 3.5 JIT 编译导致的 CPU 瞬时飙升
+
+Java 程序启动后，JIT 编译器会对热点代码进行编译优化。编译过程中会占用大量 CPU。
+
+```bash
+# 关闭 JIT 分层编译（仅测试用，不推荐生产环境）
+-XX:-TieredCompilation
+
+# 或者只编译到 C1
+-XX:TieredStopAtLevel=1
+```
+
+JIT 编译导致的 CPU 飙高通常是短暂的，不会持续很长时间。
+
+### 3.6 序列化/反序列化：JSON 处理
+
+大量对象序列化/反序列化会消耗大量 CPU，尤其是使用低效的序列化方式。
+
+```java
+// 低效写法：每次请求都创建新 ObjectMapper
+public String toJson(Object obj) {
+    ObjectMapper mapper = new ObjectMapper(); // 每次创建新的
+    return mapper.writeValueAsString(obj);
+}
+
+// 正确写法：复用 ObjectMapper
+private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
+
+public String toJson(Object obj) throws JsonProcessingException {
+    return OBJECT_MAPPER.writeValueAsString(obj);
+}
+```
+
+## 四、实战案例：从告警到根因定位
+
+### 案例一：正则表达式导致的 CPU 100%
+
+**背景**：某用户注册接口，平时响应时间 20ms，某天突然飙升到 2000ms+，CPU 使用率飙高到 98%。
+
+**排查过程**：
+
+1. `top` 确认是 Java 进程问题
+2. `top -Hp <PID>` 找到高 CPU 线程
+3. `jstack <PID>` 导出线程栈
+4. 发现线程在执行 `validatePhone` 方法，调用栈中有大量 `Pattern.match` 调用
+5. `Arthas trace` 确认 `Pattern.matches()` 占用了 95% 的时间
+
+**根因代码**：
+
+```java
+public boolean validatePhone(String phone) {
+    // 复杂正则，匹配失败时回溯严重
+    String pattern = "1[3-9]\\d{10}.*";
+    return Pattern.matches(pattern, phone); // 每次都编译正则
+}
+```
+
+**修复方案**：
+
+```java
+// 预编译正则
+private static final Pattern PHONE_PATTERN = Pattern.compile("1[3-9]\\d{10}$");
+
+public boolean validatePhone(String phone) {
+    return PHONE_PATTERN.matcher(phone).matches(); // 直接匹配，无需 .*
+}
+```
+
+**效果**：CPU 使用率恢复正常，响应时间从 2000ms 降到 15ms。
+
+---
+
+### 案例二：HashMap 并发导致的服务假死
+
+**背景**：某缓存服务在并发量增加后，所有请求都超时，CPU 使用率 100%，服务完全不可用。
+
+**排查过程**：
+
+1. `jstack` 发现大量线程处于 `BLOCKED` 状态
+2. 线程栈显示在等待 HashMap 的锁
+3. Heap Dump 分析发现 HashMap 内部链表结构异常，存在环形链表
+
+**根因**：
+
+JDK 7 的 HashMap 在并发扩容时，可能形成环形链表，导致 get() 操作死循环。
+
+**修复方案**：
+
+```java
+// 使用 ConcurrentHashMap
+private static final ConcurrentHashMap<String, Object> cache = new ConcurrentHashMap<>();
+
+public Object get(String key) {
+    return cache.get(key); // 线程安全
+}
+```
+
+---
+
+### 案例三：GC overhead 导致的服务不可用
+
+**背景**：某服务运行一周后，GC 越来越频繁，CPU 越来越高，最终完全不可用。
+
+**排查过程**：
+
+1. `jstat -gcutil <PID> 1000` 发现 Full GC 频率从 1 次/小时飙升到 1 次/分钟
+2. `jstat -gc <PID> 1000 10` 发现 Old 区使用率始终在 95% 以上
+3. 生成 Heap Dump，MAT 分析发现 `ConcurrentHashMap` 占用了 70% 的堆内存
+4. 代码审查发现，这是一个用户会话缓存，永不过期
+
+**根因**：缓存无上限增长，每次 Full GC 后 Old 区使用率几乎不变（因为缓存不能回收），最终触发频繁 Full GC。
+
+**修复方案**：
+
+```java
+// 使用带容量限制的缓存
+private static final LoadingCache<String, Session> sessionCache = Caffeine.newBuilder()
+    .maximumSize(10000)                    // 最大 1 万会话
+    .expireAfterWrite(30, TimeUnit.MINUTES) // 30 分钟过期
+    .build(key -> loadSession(key));
+```
+
+## 五、预防 CPU 飙高的最佳实践
+
+### 5.1 代码层面
+
+| 最佳实践 | 说明 |
+|---|---|
+| 避免死循环 | 循环中务必有终止条件或 sleep |
+| 预编译正则 | 正则表达式预编译，避免每次编译 |
+| 使用线程安全集合 | 并发场景使用 ConcurrentHashMap |
+| 避免大对象序列化 | 使用分页、游标等技术 |
+| 对象复用 | 使用对象池、线程本地变量 |
+
+### 5.2 JVM 参数层面
+
+```bash
+# 堆内存配置
+-Xms4g -Xmx4g
+
+# G1 配置（适合低延迟场景）
+-XX:+UseG1GC
+-XX:MaxGCPauseMillis=200
+
+# 元空间配置
+-XX:MetaspaceSize=256m
+-XX:MaxMetaspaceSize=512m
+
+# JIT 配置
+-XX:+TieredCompilation
+-XX:CompileThreshold=10000  # 热点方法编译阈值
+
+# GC 日志
+-Xloggc:/data/logs/gc.log
+-XX:+PrintGCDetails
+```
+
+### 5.3 监控层面
+
+| 监控指标 | 告警阈值 |
+|---|---|
+| CPU 使用率 | > 80% 持续 5 分钟 |
+| CPU load average | > CPU 核心数 |
+| Full GC 频率 | > 1 次/5 分钟 |
+| 接口响应时间 P99 | > 1000ms |
+| 线程池活跃线程数 | > 80% 最大线程数 |
+
+## 六、Arthas 命令速查
+
+### 6.1 线程相关
+
+```bash
+# 查看所有线程
+thread
+
+# 查看 CPU 占用最高的线程
+thread -n 10
+
+# 查看指定线程详情
+thread <thread-id>
+
+# 查看阻塞状态的线程
+thread -b
+
+# 查看线程堆栈
+thread <thread-id> --all
+```
+
+### 6.2 trace 命令
+
+```bash
+# 追踪方法调用时间
+trace com.example.service.OrderService createOrder
+
+# 只显示耗时大于 100ms 的调用
+trace com.example.service.OrderService * '#cost > 100'
+
+# 显示调用次数
+trace com.example.service.OrderService * '#cost > 0' -n 5
+```
+
+### 6.3 profiler 命令
+
+```bash
+# 启动 CPU 采样
+profiler start
+
+# 停止并生成火焰图
+profiler stop --format html --file /tmp/flame.html
+
+# 指定采样时间
+profiler start --duration 30
+```
+
+### 6.4 dashboard 命令
+
+```bash
+# 查看系统整体状况
+dashboard
+
+# 每 5 秒刷新一次
+dashboard -i 5000
+```
+
+## 七、面试追问：CPU 飙高相关高频问题
+
+### 问题一：CPU 使用率和 load average 的区别？
+
+**参考答案**：
+
+| 指标 | 含义 | 区别 |
+|---|---|---|
+| %CPU | CPU 使用率，0-100% | 表示 CPU 的繁忙程度 |
+| load average | 系统负载，表示等待 CPU 的任务数 | 包括运行中和等待调度的任务 |
+
+举例：
+- 单核 CPU，load average = 1.0：CPU 满载
+- 8 核 CPU，load average = 8.0：CPU 满载
+- 8 核 CPU，load average = 4.0：50% 负载
+
+load average > CPU 核心数 说明系统过载。
+
+### 问题二：如何快速判断 CPU 高是 GC 导致的还是业务代码导致的？
+
+**参考答案**：
+
+**方法一：查看 GC 日志**
+
+```bash
+tail -f /data/logs/gc.log
+```
+
+如果 GC 日志显示 Full GC 频率很高，且 CPU 飙高发生在 GC 期间，基本可以确认是 GC 问题。
+
+**方法二：jstack 线程栈分析**
+
+查看线程栈中是否有 `[GC task thread]` 占用高 CPU。如果 GC 线程 CPU 高，说明 GC 是主因。
+
+**方法三：jstat GC 监控**
+
+```bash
+jstat -gcutil <PID> 1000
+```
+
+如果 `FGC`（Full GC 次数）持续增长，而 Old 区使用率居高不下，说明是内存问题导致的 GC 压力。
+
+### 问题三：生产环境如何安全地进行性能分析？
+
+**参考答案**：
+
+生产环境性能分析的关键是「安全」，不能影响服务正常运行。
+
+**原则一：优先使用低影响工具**
+
+| 工具 | 影响 | 安全性 |
+|---|---|---|
+| `jstat` | 极低 | 非常安全 |
+| `jstack` | 低 | 安全 |
+| Arthas `trace` | 中 | 需限制采样时间 |
+| `jmap -dump` | 中高 | 可能导致停顿 |
+| `jmap -F` | 高 | 危险，慎用 |
+
+**原则二：使用采样而非全量**
+
+```bash
+# 限制 trace 输出次数
+trace com.example.service.OrderService * '#cost > 100' -n 5
+
+# 使用 profiler 采样而非精确计数
+profiler start --duration 30
+```
+
+**原则三：避开高峰期**
+
+尽量在业务低峰期进行性能分析，减少对服务的影响。
+
+**原则四：做好回滚准备**
+
+性能分析前确保可以快速回滚到之前的版本。
+
+## 延伸思考
+
+### 思考题一：CPU 使用率 100% 但 load average 很低
+
+**问题**：某服务 CPU 使用率 100%，但 load average 只有 0.5（4 核 CPU）。这说明什么？
+
+**提示**：考虑单线程死循环的场景。
+
+### 思考题二：如何设计一个 CPU 保护机制
+
+**问题**：如果让你设计一个服务保护机制，当 CPU 持续过高时自动触发降级，你会怎么做？
+
+**提示**：考虑限流、熔断、线程池隔离等策略。
+
+### 思考题三：火焰图的阅读技巧
+
+**问题**：如何阅读火焰图？从火焰图中你能获得哪些信息？
+
+**提示**：火焰图的宽度代表 CPU 消耗时间，越宽越是热点。火焰的「顶尖」是最耗时的调用。
+
+---
+
+## 总结
+
+CPU 飙高是生产环境的常见问题，排查的核心在于「快速定位 → 热点分析 → 根因修复」。
+
+关键要点回顾：
+
+- **排查流程**：top 确认进程 → top -Hp 定位线程 → jstack 分析栈 → Arthas trace 定位热点 → Flame Graph 可视化
+- **六大元凶**：死循环、正则回溯、HashMap 并发、GC 压力、JIT 编译、序列化
+- **预防措施**：代码规范、参数调优、监控告警
+- **工具熟练度**：jstack、jstat、Arthas、async-profiler
+
+记住：CPU 飙高是信号，不是原因。找到消耗 CPU 的代码，理解为什么会消耗 CPU，才能从根本上解决问题。
+

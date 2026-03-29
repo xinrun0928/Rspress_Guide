@@ -1,0 +1,928 @@
+import { Badge } from '@rspress/core/theme';
+
+# 信息流系统设计：推拉结合与 Timeline 优化
+
+刷微博、刷抖音、刷朋友圈……你有没有想过，这些「刷」的背后，数据是怎么来的？
+
+用户 A 关注了 1000 个人，这 1000 个人在一天内发了 5000 条微博。用户 B 打开微博，要看到这 5000 条微博，还要按时间排序、过滤、去掉已读的……
+
+这个「Timeline」的生成，远比你想象的复杂。
+
+## 一、信息流系统的本质
+
+### 1.1 什么是 Timeline
+
+Timeline（时间线）是信息流系统的核心概念。简单来说，就是「一个用户应该看到哪些内容、按什么顺序展示」。
+
+```
+用户 B 的 Timeline = {关注的人} ∩ {发布的微博} ∪ {推荐的内容}
+                   按时间排序
+```
+
+### 1.2 信息流 vs 传统 Feed
+
+| 维度 | 信息流 | 传统 Feed |
+|---|---|---|
+| 数据来源 | 用户关注的人 + 推荐 | 主动订阅 |
+| 排序方式 | 智能排序（时间/热度/关系） | 时间倒序 |
+| 数据量 | 海量（关注 1000 人 × 每天发 10 条） | 订阅量 |
+| 实时性 | 高（新增内容秒级可见） | 中等 |
+
+### 1.3 核心挑战
+
+| 挑战 | 说明 |
+|---|---|
+| **写放大** | 大 V 发一条微博，要推送给 millions 粉丝 |
+| **读放大** | 用户打开 App，要拉取 thousands 条微博 |
+| **存储成本** | 每个用户的 Timeline 都要单独存储 |
+| **排序复杂** | 时间序 vs 热度序 vs 智能序 |
+
+---
+
+## 二、三种 Timeline 模型
+
+### 2.1 推模型（Fan-out on Write）
+
+**原理**：用户发微博时，主动「推送」给所有粉丝。
+
+```
+用户 A 发微博
+    │
+    ├──▶ 粉丝 B 的 Timeline 列表
+    ├──▶ 粉丝 C 的 Timeline 列表
+    ├──▶ 粉丝 D 的 Timeline 列表
+    └──▶ ...
+```
+
+**优点**：
+
+- 用户读取 Timeline 很快（直接读取自己的列表）
+- 实现简单，适合粉丝量级均衡的场景
+
+**缺点**：
+
+- 大 V 发一条微博，要写 millions 条（写放大）
+- 存储成本高（每个粉丝都要存一份）
+- 新粉丝关注的早期内容看不到
+
+```java
+@Service
+public class PushTimelineService {
+    
+    @Autowired
+    private FanoutService fanoutService;
+    
+    @Autowired
+    private TimelineRedisService timelineRedisService;
+    
+    /**
+     * 发布微博（推送给所有粉丝）
+     */
+    public void publish(Post post) {
+        // 1. 保存微博内容
+        postMapper.insert(post);
+        
+        // 2. 推送给所有粉丝
+        Long userId = post.getUserId();
+        Set<Long> followers = followService.getFollowers(userId);
+        
+        for (Long followerId : followers) {
+            // 异步推送，避免阻塞
+            fanoutService.fanoutAsync(followerId, post);
+        }
+    }
+    
+    /**
+     * 异步推送给单个粉丝
+     */
+    @Async
+    public void fanoutAsync(Long followerId, Post post) {
+        String timelineKey = "timeline:" + followerId;
+        
+        // 写入粉丝的 Timeline（使用 Sorted Set，按时间排序）
+        timelineRedisService.addToTimeline(
+            timelineKey, 
+            post.getId(), 
+            post.getCreatedAt().getTime()
+        );
+        
+        // 控制 Timeline 长度，超过 1000 条删旧
+        timelineRedisService.trimTimeline(timelineKey, 1000);
+    }
+}
+```
+
+### 2.2 拉模型（Fan-out on Read）
+
+**原理**：用户读取 Timeline 时，「拉取」关注的人的最新微博。
+
+```
+用户 B 打开 App
+    │
+    ├── 获取关注列表 {A, C, D, E, ...}
+    │
+    ├── 拉取 A 最近 N 条微博
+    ├── 拉取 C 最近 N 条微博
+    ├── 拉取 D 最近 N 条微博
+    └── 拉取 E 最近 N 条微博
+    │
+    └── 合并、排序、去重
+    │
+    └── 返回 Timeline
+```
+
+**优点**：
+
+- 没有写放大（大 V 发微博只需要写一条）
+- 新粉丝能看到所有历史内容
+- 存储成本低
+
+**缺点**：
+
+- 读取慢（要合并多个来源的数据）
+- 热点问题（大 V 的微博读取量大）
+- 实现复杂（要去重、排序）
+
+```java
+@Service
+public class PullTimelineService {
+    
+    @Autowired
+    private PostMapper postMapper;
+    @Autowired
+    private FollowService followService;
+    
+    /**
+     * 获取用户 Timeline（拉模型）
+     */
+    public List<Post> getTimeline(Long userId, int page, int pageSize) {
+        // 1. 获取关注列表
+        List<Long> followingIds = followService.getFollowing(userId);
+        if (followingIds.isEmpty()) {
+            return Collections.emptyList();
+        }
+        
+        // 2. 限制关注数量（防止拉取太多）
+        if (followingIds.size() > 500) {
+            followingIds = followingIds.subList(0, 500);
+        }
+        
+        // 3. 并行拉取关注列表的最新微博
+        List<List<Post>> postsPerUser = followingIds.parallelStream()
+            .map(followingId -> postMapper.selectLatestPosts(followingId, 20))
+            .collect(Collectors.toList());
+        
+        // 4. 合并、去重、排序
+        List<Post> allPosts = postsPerUser.stream()
+            .flatMap(List::stream)
+            .distinct()
+            .sorted(Comparator.comparing(Post::getCreatedAt).reversed())
+            .collect(Collectors.toList());
+        
+        // 5. 分页
+        int start = page * pageSize;
+        return allPosts.subList(start, Math.min(start + pageSize, allPosts.size()));
+    }
+}
+```
+
+### 2.3 混合模型（Hybrid）
+
+**原理**：对于普通用户用推模型，对于大 V 用户用拉模型。
+
+```
+普通用户发微博 ──▶ 推送给粉丝（推模型）
+
+大 V 发微博 ──▶ 只写一条微博（大 V 自己的 feed）
+
+用户读取 Timeline:
+    ├── 合并推过来的微博
+    └── 拉取大 V 的最新微博
+    └── 合并排序
+```
+
+```java
+@Service
+public class HybridTimelineService {
+    
+    // 大 V 阈值：粉丝数超过 10 万
+    private static final long BIG_V_THRESHOLD = 100_000;
+    
+    @Autowired
+    private PostMapper postMapper;
+    @Autowired
+    private FollowService followService;
+    @Autowired
+    private TimelineRedisService timelineRedisService;
+    
+    /**
+     * 发布微博（混合模型）
+     */
+    public void publish(Post post) {
+        // 1. 保存微博内容
+        postMapper.insert(post);
+        
+        Long userId = post.getUserId();
+        
+        // 2. 判断是否是大 V
+        long followerCount = followService.getFollowerCount(userId);
+        
+        if (followerCount >= BIG_V_THRESHOLD) {
+            // 大 V：只写一条到自己的 feed
+            String userFeedKey = "user:feed:" + userId;
+            timelineRedisService.addToTimeline(userFeedKey, post.getId(), post.getCreatedAt().getTime());
+        } else {
+            // 普通用户：推送给所有粉丝
+            Set<Long> followers = followService.getFollowers(userId);
+            for (Long followerId : followers) {
+                String timelineKey = "timeline:" + followerId;
+                timelineRedisService.addToTimeline(timelineKey, post.getId(), post.getCreatedAt().getTime());
+            }
+        }
+    }
+    
+    /**
+     * 获取 Timeline（混合模型）
+     */
+    public List<Post> getTimeline(Long userId, int page, int pageSize) {
+        String timelineKey = "timeline:" + userId;
+        
+        // 1. 获取推过来的微博（ZREVRANGE）
+        List<Long> pushedPostIds = timelineRedisService.getTimeline(timelineKey, page * pageSize, pageSize);
+        
+        // 2. 获取关注列表中的大 V
+        List<Long> bigVs = followService.getFollowingBigVs(userId);
+        
+        // 3. 拉取大 V 的最新微博
+        List<Long> bigVPostIds = new ArrayList<>();
+        for (Long bigV : bigVs) {
+            List<Long> posts = timelineRedisService.getLatestFromUserFeed("user:feed:" + bigV, 10);
+            bigVPostIds.addAll(posts);
+        }
+        
+        // 4. 合并、去重
+        Set<Long> allPostIds = new LinkedHashSet<>(pushedPostIds);
+        allPostIds.addAll(bigVPostIds);
+        
+        // 5. 批量获取微博详情
+        return postMapper.selectByIds(new ArrayList<>(allPostIds));
+    }
+}
+```
+
+---
+
+## 三、Timeline 存储设计
+
+### 3.1 Redis Sorted Set 存储
+
+使用 Sorted Set 存储每个用户的 Timeline：
+
+```bash
+# key: timeline:userId
+# score: 发布时间戳（毫秒）
+# member: 微博 ID
+
+ZADD timeline:12345 1704067200000 "post:1001"
+ZADD timeline:12345 1704067201000 "post:1002"
+ZADD timeline:12345 1704067202000 "post:1003"
+
+# 获取最新 10 条
+ZREVRANGE timeline:12345 0 9
+
+# 获取时间范围内的微博
+ZRANGEBYSCORE timeline:12345 1704000000000 1704100000000
+```
+
+```java
+@Service
+public class TimelineRedisService {
+    
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+    
+    /**
+     * 添加到 Timeline
+     */
+    public void addToTimeline(String timelineKey, Long postId, long timestamp) {
+        redisTemplate.opsForZSet().add(timelineKey, postId.toString(), timestamp);
+    }
+    
+    /**
+     * 获取 Timeline（分页）
+     */
+    public List<Long> getTimeline(String timelineKey, int offset, int limit) {
+        Set<String> postIds = redisTemplate.opsForZSet()
+            .reverseRange(timelineKey, offset, offset + limit - 1);
+        
+        return postIds.stream()
+            .map(Long::parseLong)
+            .collect(Collectors.toList());
+    }
+    
+    /**
+     * 获取 Timeline（按时间范围）
+     */
+    public List<Long> getTimelineByTimeRange(String timelineKey, long startTime, long endTime) {
+        Set<String> postIds = redisTemplate.opsForZSet()
+            .rangeByScore(timelineKey, startTime, endTime);
+        
+        return postIds.stream()
+            .map(Long::parseLong)
+            .collect(Collectors.toList());
+    }
+    
+    /**
+     * 裁剪 Timeline（保留最新 N 条）
+     */
+    public void trimTimeline(String timelineKey, int maxSize) {
+        Long size = redisTemplate.opsForZSet().size(timelineKey);
+        if (size != null && size > maxSize) {
+            redisTemplate.opsForZSet().removeRange(timelineKey, 0, size - maxSize - 1);
+        }
+    }
+    
+    /**
+     * 获取 Timeline 长度
+     */
+    public long getTimelineSize(String timelineKey) {
+        Long size = redisTemplate.opsForZSet().size(timelineKey);
+        return size == null ? 0 : size;
+    }
+}
+```
+
+### 3.2  Cassandra 存储（海量场景）
+
+当用户量达到亿级时，Redis 的内存成本会很高。Cassandra 的 LSM Tree 结构非常适合这种写入密集型场景。
+
+```sql
+-- Cassandra Timeline 表设计
+CREATE TABLE user_timeline (
+    user_id bigint,
+    post_id bigint,
+    created_at timestamp,
+    PRIMARY KEY (user_id, created_at, post_id)
+) WITH CLUSTERING ORDER BY (created_at DESC);
+```
+
+```java
+@Service
+public class CassandraTimelineService {
+    
+    @Autowired
+    private CassandraTemplate cassandraTemplate;
+    
+    /**
+     * 添加到 Timeline
+     */
+    public void addToTimeline(Long userId, Long postId) {
+        TimelineEntity entity = new TimelineEntity();
+        entity.setUserId(userId);
+        entity.setPostId(postId);
+        entity.setCreatedAt(LocalDateTime.now());
+        
+        cassandraTemplate.insert(entity);
+    }
+    
+    /**
+     * 获取 Timeline（分页）
+     */
+    public List<Long> getTimeline(Long userId, int page, int pageSize) {
+        String cql = "SELECT post_id FROM user_timeline " +
+                     "WHERE user_id = ? " +
+                     "ORDER BY created_at DESC " +
+                     "LIMIT ? OFFSET ?";
+        
+        List<TimelineEntity> results = cassandraTemplate
+            .select(cql, TimelineEntity.class, userId, pageSize, page * pageSize);
+        
+        return results.stream()
+            .map(TimelineEntity::getPostId)
+            .collect(Collectors.toList());
+    }
+}
+```
+
+---
+
+## 四、分页与翻页策略
+
+### 4.1 Cursor-Based 分页
+
+传统 Offset 分页在数据量大时性能很差：
+
+```sql
+-- 性能差：跳过前 10000 条后取 20 条
+SELECT * FROM posts ORDER BY created_at DESC LIMIT 20 OFFSET 10000
+```
+
+更好的方式是使用 Cursor（游标）分页：
+
+```java
+/**
+ * Cursor 分页参数
+ */
+public class TimelineCursor {
+    private Long lastPostId;      // 上一页最后一条微博的 ID
+    private Long lastTimestamp;   // 上一页最后一条微博的时间戳
+    
+    // 首次加载时为空，后续分页时传入
+}
+```
+
+```java
+@Service
+public class TimelinePaginationService {
+    
+    /**
+     * 首次加载 Timeline
+     */
+    public TimelineResult getTimelineInitial(Long userId, int pageSize) {
+        List<Long> postIds = timelineRedisService.getTimeline("timeline:" + userId, 0, pageSize);
+        List<Post> posts = postMapper.selectByIds(postIds);
+        
+        // 构建下一页的 cursor
+        TimelineCursor nextCursor = null;
+        if (!posts.isEmpty()) {
+            Post lastPost = posts.get(posts.size() - 1);
+            nextCursor = new TimelineCursor(lastPost.getId(), lastPost.getCreatedAt().getTime());
+        }
+        
+        return new TimelineResult(posts, nextCursor);
+    }
+    
+    /**
+     * Cursor 翻页
+     */
+    public TimelineResult getTimelineByCursor(Long userId, TimelineCursor cursor, int pageSize) {
+        // 获取 cursor 之后的微博
+        List<Long> postIds = timelineRedisService.getTimelineByTimeRange(
+            "timeline:" + userId, 
+            0,  // 某个足够早的时间
+            cursor.getLastTimestamp()
+        );
+        
+        // 过滤掉 cursor 之前的微博
+        List<Long> filteredIds = postIds.stream()
+            .filter(id -> id < cursor.getLastPostId())
+            .limit(pageSize)
+            .collect(Collectors.toList());
+        
+        List<Post> posts = postMapper.selectByIds(filteredIds);
+        
+        TimelineCursor nextCursor = null;
+        if (!posts.isEmpty()) {
+            Post lastPost = posts.get(posts.size() - 1);
+            nextCursor = new TimelineCursor(lastPost.getId(), lastPost.getCreatedAt().getTime());
+        }
+        
+        return new TimelineResult(posts, nextCursor);
+    }
+}
+```
+
+### 4.2 无限滚动实现
+
+```javascript
+// 前端无限滚动
+let cursor = null;
+let loading = false;
+
+async function loadMore() {
+    if (loading) return;
+    loading = true;
+    
+    const params = cursor ? `?cursor=${encodeURIComponent(JSON.stringify(cursor))}` : '';
+    const response = await fetch(`/api/timeline${params}`);
+    const result = await response.json();
+    
+    // 渲染新内容
+    renderPosts(result.posts);
+    
+    // 更新 cursor
+    cursor = result.nextCursor;
+    loading = false;
+    
+    // 如果还有下一页，继续加载
+    if (cursor) {
+        observeScroll();
+    }
+}
+
+// 监听滚动
+window.addEventListener('scroll', () => {
+    if (isNearBottom() && !loading) {
+        loadMore();
+    }
+});
+```
+
+---
+
+## 五、Feed Ranking：排序优化
+
+### 5.1 基础排序策略
+
+| 策略 | 说明 | 适用场景 |
+|---|---|---|
+| **时间序** | 按发布时间倒序 | 纯社交场景 |
+| **热度序** | 按点赞/评论数排序 | 资讯类场景 |
+| **智能序** | 综合时间、热度、关系、互动 | 大多数 Feed |
+| **PUSH 推送** | PGM 算法、EdgeRank | Facebook |
+
+### 5.2 EdgeRank 改进算法
+
+Facebook 的 EdgeRank 算法公式：
+
+```
+Score = Σ(EdgeWeight × AffinityWeight × TimeDecay)
+```
+
+- **EdgeWeight**：不同互动类型的权重（评论 > 点赞 > 分享）
+- **AffinityWeight**：用户与发布者的亲密度（互动越多越容易看到）
+- **TimeDecay**：时间衰减（新内容权重更高）
+
+```java
+@Service
+public class FeedRankingService {
+    
+    /**
+     * 计算 Feed 分数
+     */
+    public double calculateFeedScore(Long userId, Long postId) {
+        Post post = postMapper.selectById(postId);
+        User author = userMapper.selectById(post.getUserId());
+        
+        // 1. 互动权重
+        double interactionScore = calculateInteractionScore(post);
+        
+        // 2. 亲密度权重
+        double affinityScore = calculateAffinityScore(userId, author.getUserId());
+        
+        // 3. 时间衰减
+        double timeDecay = calculateTimeDecay(post.getCreatedAt());
+        
+        // 4. 作者权重（大 V 加权）
+        double authorWeight = author.isVerified() ? 1.5 : 1.0;
+        
+        // 综合分数
+        return interactionScore * affinityScore * timeDecay * authorWeight;
+    }
+    
+    /**
+     * 互动分数：评论 × 3 + 点赞 × 1 + 分享 × 5
+     */
+    private double calculateInteractionScore(Post post) {
+        return post.getCommentCount() * 3.0 
+             + post.getLikeCount() * 1.0 
+             + post.getShareCount() * 5.0;
+    }
+    
+    /**
+     * 亲密度分数：根据用户互动历史计算
+     */
+    private double calculateAffinityScore(Long userId, Long authorId) {
+        // 查看是否经常互动
+        String key = "affinity:" + userId + ":" + authorId;
+        String affinity = redisTemplate.opsForValue().get(key);
+        return affinity == null ? 1.0 : Double.parseDouble(affinity);
+    }
+    
+    /**
+     * 时间衰减：指数衰减，半天前的微博权重减半
+     */
+    private double calculateTimeDecay(LocalDateTime createdAt) {
+        long hours = ChronoUnit.HOURS.between(createdAt, LocalDateTime.now());
+        return Math.pow(0.5, hours / 12.0);  // 每 12 小时减半
+    }
+    
+    /**
+     * 获取排序后的 Timeline
+     */
+    public List<Post> getRankedTimeline(Long userId, int page, int pageSize) {
+        // 1. 获取原始 Timeline
+        List<Long> postIds = timelineRedisService.getTimeline("timeline:" + userId, 0, 100);
+        
+        // 2. 计算分数
+        List<ScoredPost> scoredPosts = postIds.stream()
+            .map(postId -> new ScoredPost(postId, calculateFeedScore(userId, postId)))
+            .sorted(Comparator.comparingDouble(ScoredPost::getScore).reversed())
+            .collect(Collectors.toList());
+        
+        // 3. 分页
+        int start = page * pageSize;
+        return scoredPosts.subList(start, Math.min(start + pageSize, scoredPosts.size()))
+            .stream()
+            .map(sp -> postMapper.selectById(sp.getPostId()))
+            .collect(Collectors.toList());
+    }
+}
+```
+
+---
+
+## 六、热点问题：大 V 的 Kardashian Index
+
+### 6.1 问题背景
+
+2011 年，Facebook 工程师提出「Kardashian Index」：粉丝数极高的用户（如 Kardashian），他们的内容在粉丝的 Feed 中占比极低。
+
+```
+用户关注 500 人，其中 1 个大 V 有 1000 万粉丝
+用户每次刷新 Feed，大 V 的内容只占 1/500
+
+如果 Timeline 只有 100 条，大 V 的内容出现的概率很低
+```
+
+### 6.2 解决方案
+
+**方案一：热点隔离**
+
+```java
+@Configuration
+public class HotUserConfig {
+    
+    private static final long HOT_USER_THRESHOLD = 1_000_000;  // 100 万粉丝
+    
+    @Bean
+    public Set<Long> hotUserIds() {
+        // 从数据库加载热点用户列表
+        return new HashSet<>(userMapper.selectHotUsers(HOT_USER_THRESHOLD));
+    }
+}
+```
+
+**方案二：优先推送**
+
+```java
+@Service
+public class HotUserFanoutService {
+    
+    @Autowired
+    private HotUserConfig hotUserConfig;
+    
+    /**
+     * 大 V 发微博时，优先推送给最近活跃的粉丝
+     */
+    public void fanoutHotUser(Post post) {
+        Long authorId = post.getUserId();
+        Set<Long> followers = followService.getFollowers(authorId);
+        
+        // 只推送给最近 7 天活跃的粉丝
+        Set<Long> activeFollowers = followers.stream()
+            .filter(this::isRecentActive)
+            .collect(Collectors.toSet());
+        
+        // 异步推送
+        for (Long followerId : activeFollowers) {
+            timelineRedisService.addToTimeline("timeline:" + followerId, post.getId(), post.getCreatedAt().getTime());
+        }
+    }
+    
+    private boolean isRecentActive(Long userId) {
+        String key = "user:last_active:" + userId;
+        String lastActive = redisTemplate.opsForValue().get(key);
+        if (lastActive == null) return false;
+        
+        long daysSinceActive = ChronoUnit.DAYS.between(
+            Instant.ofEpochMilli(Long.parseLong(lastActive)),
+            Instant.now()
+        );
+        return daysSinceActive <= 7;
+    }
+}
+```
+
+---
+
+## 七、异步处理与 MQ 解耦
+
+### 7.1 写入流程异步化
+
+```
+发布微博
+    │
+    ▼
+保存内容 ──▶ 异步 ──▶ 推送 Timeline
+    │                      │
+    ▼                      ▼
+返回成功              MQ 消息 ──▶ 消费者处理
+```
+
+```java
+@Service
+public class AsyncFeedService {
+    
+    @Autowired
+    private RocketMQTemplate rocketMQTemplate;
+    
+    /**
+     * 发布微博（异步处理）
+     */
+    public void publishAsync(Post post) {
+        // 1. 同步保存微博内容
+        postMapper.insert(post);
+        
+        // 2. 发送异步消息，触发 Fanout
+        FanoutMessage message = FanoutMessage.builder()
+            .postId(post.getId())
+            .authorId(post.getUserId())
+            .createdAt(post.getCreatedAt())
+            .followerCount(followService.getFollowerCount(post.getUserId()))
+            .build();
+        
+        rocketMQTemplate.convertAndSend("feed-fanout-topic", message);
+    }
+}
+```
+
+```java
+@Component
+@RocketMQMessageListener(
+    topic = "feed-fanout-topic",
+    consumerGroup = "feed-fanout-consumer-group",
+    concurrency = "50"
+)
+public class FanoutConsumer implements RocketMQListener<FanoutMessage> {
+    
+    @Override
+    public void onMessage(FanoutMessage message) {
+        Long authorId = message.getAuthorId();
+        
+        if (message.getFollowerCount() >= BIG_V_THRESHOLD) {
+            // 大 V：写到自己 feed
+            writeToUserFeed(message);
+        } else {
+            // 普通用户：推送给粉丝
+            pushToFollowers(message);
+        }
+    }
+    
+    private void writeToUserFeed(FanoutMessage message) {
+        String feedKey = "user:feed:" + message.getAuthorId();
+        timelineRedisService.addToTimeline(feedKey, message.getPostId(), message.getCreatedAt().getTime());
+    }
+    
+    private void pushToFollowers(FanoutMessage message) {
+        Set<Long> followers = followService.getFollowers(message.getAuthorId());
+        
+        // 批量处理，避免内存溢出
+        for (List<Long> batch : Lists.partition(new ArrayList<>(followers), 1000)) {
+            pushBatchToTimeline(batch, message);
+        }
+    }
+    
+    private void pushBatchToTimeline(List<Long> followerIds, FanoutMessage message) {
+        for (Long followerId : followerIds) {
+            String timelineKey = "timeline:" + followerId;
+            timelineRedisService.addToTimeline(timelineKey, message.getPostId(), message.getCreatedAt().getTime());
+        }
+    }
+}
+```
+
+---
+
+## 八、缓存预热
+
+### 8.1 为什么需要预热
+
+新用户关注了很多人，打开 App 时 Timeline 是空的。要拉取所有关注者的微博，耗时长、压力大。
+
+### 8.2 预热策略
+
+```java
+@Service
+public class TimelineWarmupService {
+    
+    /**
+     * 用户关注时，异步预热 Timeline
+     */
+    @Async
+    public void warmupOnFollow(Long followerId, Long followeeId) {
+        // 1. 获取被关注者最近的微博
+        List<Post> recentPosts = postMapper.selectLatestPosts(followeeId, 20);
+        
+        // 2. 添加到用户的 Timeline
+        String timelineKey = "timeline:" + followerId;
+        for (Post post : recentPosts) {
+            timelineRedisService.addToTimeline(timelineKey, post.getId(), post.getCreatedAt().getTime());
+        }
+    }
+    
+    /**
+     * 用户登录时，全量预热
+     */
+    public void warmupOnLogin(Long userId) {
+        // 1. 获取所有关注者
+        List<Long> followingIds = followService.getFollowing(userId);
+        
+        // 2. 批量拉取关注者的微博
+        for (List<Long> batch : Lists.partition(followingIds, 100)) {
+            List<List<Post>> postsPerUser = batch.parallelStream()
+                .map(userId -> postMapper.selectLatestPosts(userId, 20))
+                .collect(Collectors.toList());
+            
+            // 3. 合并到 Timeline
+            for (List<Post> posts : postsPerUser) {
+                for (Post post : posts) {
+                    timelineRedisService.addToTimeline("timeline:" + userId, post.getId(), post.getCreatedAt().getTime());
+                }
+            }
+        }
+    }
+}
+```
+
+---
+
+## 九、容量规划
+
+### 9.1 存储估算
+
+| 指标 | 数值 | 说明 |
+|---|---|---|
+| DAU | 1 亿 | |
+| 平均关注人数 | 200 | |
+| 每天发微博数（人均） | 5 | |
+| Timeline 保留条数 | 1000 | |
+| 单条数据大小 | 16 字节 | postId(long) + timestamp(long) |
+| Redis 单节点容量 | 64GB | |
+
+### 9.2 存储方案对比
+
+| 方案 | 优点 | 缺点 | 适用规模 |
+|---|---|---|---|
+| Redis Sorted Set | 性能高，支持范围查询 | 内存成本高 | 千万级用户 |
+| Cassandra | 海量存储，成本低 | 延迟稍高 | 亿级用户 |
+| MySQL | 简单，运维成本低 | 性能差 | 小规模 |
+| 混合存储 | 冷热分离 | 复杂 | 亿级+ |
+
+---
+
+## 十、面试高频问题
+
+### 问题一：推模型和拉模型各适合什么场景？
+
+**参考答案**：
+
+| 场景 | 推荐模型 | 原因 |
+|---|---|---|
+| 粉丝量级均衡（< 1000） | 推模型 | 写放大不明显，读取快 |
+| 大 V 场景（粉丝分布不均） | 拉模型或混合模型 | 避免大 V 写放大 |
+| 实时性要求高 | 混合模型 | 热点内容优先推送 |
+| 历史内容重要 | 拉模型 | 新粉丝可看到全部历史 |
+
+### 问题二：如何防止 Timeline 刷爆？
+
+**参考答案**：
+
+1. **Timeline 长度限制**：每个用户最多保留 1000-2000 条
+2. **推送频率限制**：同一作者的内容，5 分钟内最多推送一次
+3. **热点隔离**：大 V 内容单独处理
+4. **降级策略**：Timeline 过长时，降级为热门内容推荐
+
+### 问题三：如何实现「不看某人」功能？
+
+**参考答案**：
+
+1. **写入时过滤**：推送给粉丝时，跳过「不看」列表中的用户
+2. **读取时过滤**：读取 Timeline 时，过滤掉「不看」作者的内容
+3. **缓存清理**：设置「不看」后，清理相关用户的 Timeline 缓存
+
+---
+
+## 延伸思考
+
+### 思考题一：如何设计一个「评论可见」功能？
+
+如果用户发微博时，可以设置「仅粉丝可见」或「仅互关好友可见」，Timeline 生成逻辑需要如何调整？
+
+**提示**：考虑推模型和拉模型的不同处理方式。
+
+### 思考题二：如何实现 Timeline 去重？
+
+如果用户关注了两个人 A 和 B，A 转发了 B 的内容，Timeline 中会出现两条重复内容。如何设计去重机制？
+
+**提示**：考虑内容指纹、作者过滤等技术。
+
+---
+
+## 总结
+
+信息流系统的设计，核心在于平衡「读性能」和「写放大」：
+
+- **推模型**：读快写慢，适合粉丝均衡场景
+- **拉模型**：写快读慢，适合大 V 场景
+- **混合模型**：根据用户类型选择策略
+
+关键优化点：
+
+1. **Timeline 存储**：Redis Sorted Set 或 Cassandra
+2. **分页策略**：使用 Cursor 替代 Offset
+3. **排序优化**：EdgeRank 类算法
+4. **热点隔离**：大 V 内容单独处理
+5. **异步化**：MQ 解耦写操作
+
+理解了这五点，你就掌握了信息流系统的精髓。
