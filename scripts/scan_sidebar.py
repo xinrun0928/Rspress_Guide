@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 读取 docs 目录下（含子目录）所有 _meta.json，递归构建完整的 JSON 层级结构，
-按一级模块分别保存到 theme_config/sidebar/ 目录下。
+按一级模块分别保存到 theme_config/sidebar_extract/ 目录下。
 
 Usage:
     python scripts/scan_sidebar.py [docs_path] [--output OUTPUT_DIR]
@@ -238,9 +238,9 @@ def main() -> None:
         "--output",
         "-o",
         dest="output",
-        default="theme_config/sidebar",
+        default="theme_config/sidebar_extract",
         metavar="DIR",
-        help="输出目录，默认为 theme_config/sidebar",
+        help="输出目录，默认为 theme_config/sidebar_extract",
     )
     parser.add_argument(
         "--indent",

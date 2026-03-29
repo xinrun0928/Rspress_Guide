@@ -3,6 +3,9 @@ import * as path from 'node:path';
 // 导入 Rspress 核心配置定义函数，提供类型提示和配置校验
 import { defineConfig } from '@rspress/core';
 
+import { nav } from './theme_config/nav'
+import { sidebar } from './theme_config/sidebar'
+
 // Rspress 文档站点核心配置导出
 export default defineConfig({
   // ==============================================
@@ -67,6 +70,12 @@ export default defineConfig({
   // 主题外观配置（导航、侧边栏、搜索、页脚等）
   // ==============================================
   themeConfig: {
+
+    // 顶部导航栏配置
+    nav: nav,
+ 
+    // 侧边栏配置
+    sidebar: sidebar,
 
     /**
      * 搜索框开关

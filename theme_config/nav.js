@@ -1,0 +1,15 @@
+export const nav = [
+  {
+    "text": "面试准备",
+    "link": "/interview/"
+  },
+  {
+    "text": "三高架构",
+    "link": "/high-throughput/",
+    "items": [
+      { "text": "📈 高性能优化", "link": "/high-throughput/high-performance" },
+      { "text": "🔥 高并发设计", "link": "/high-throughput/high-concurrency" },
+      { "text": "🏆 高可用架构", "link": "/high-throughput/high-availability" }
+    ]
+  }
+]
