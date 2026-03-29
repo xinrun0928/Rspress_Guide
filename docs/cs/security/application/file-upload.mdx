@@ -1,0 +1,451 @@
+---
+title: 文件上传漏洞与防护
+description: 文件上传漏洞的原理、常见利用方式、防御策略及安全上传的实现方案
+---
+
+# 文件上传漏洞与防护
+
+用户上传了一张「头像」，你的服务器可能已经沦陷了。
+
+文件上传功能几乎是每个 Web 应用的标配，但它的实现稍有不慎，就会成为攻击者的入口。上传一个 PHP 脚本，你的服务器就变成了攻击者的「肉鸡」。这个漏洞之所以常见，是因为开发者往往只关注「能不能上传」，而忽略了「上传后会发生什么」。
+
+## 文件上传漏洞原理
+
+### 攻击原理
+
+```
+攻击流程：
+1. 上传恶意文件（webshell.php）
+2. 服务器保存到可访问目录
+3. 攻击者访问上传的文件
+4. 通过 webshell 执行任意命令
+```
+
+**典型的 WebShell：**
+
+```php
+<?php
+// 简单的 webshell
+system($_GET['cmd']);
+?>
+
+<?php
+// 更隐蔽的 webshell
+eval($_POST['x']);
+?>
+
+<?php
+// 冰蝎等工具的特征
+@error_reporting(0);
+session_start();
+$p = 'pass';
+$k = 'key';
+// ...加密通信的 webshell
+?>
+```
+
+**攻击者利用：**
+
+```bash
+# 访问 webshell，执行命令
+curl https://target.com/uploads/shell.php?cmd=whoami
+
+# 使用中国菜刀/冰蝎等工具连接webshell
+```
+
+## 常见上传漏洞类型
+
+### 1. 无限制文件上传
+
+```java
+// 最危险的代码：没有任何验证
+@PostMapping("/upload")
+public String upload(@RequestParam("file") MultipartFile file) {
+    String path = uploadDir + file.getOriginalFilename();
+    file.transferTo(new File(path));  // 直接保存
+    return "uploaded: " + path;
+}
+
+// 上传 shell.php，直接获得服务器权限
+```
+
+### 2. MIME 类型绕过
+
+**客户端验证（可绕过）：**
+
+```html
+<!-- HTML 表单只检查文件扩展名 -->
+<input type="file" accept=".jpg,.png">
+<!-- 或者 JavaScript 验证 -->
+<input type="file" onchange="checkExt(this)">
+```
+
+```javascript
+// 前端验证很容易绕过
+function checkExt(file) {
+    const allowed = ['jpg', 'png'];
+    const ext = file.name.split('.').pop().toLowerCase();
+    if (!allowed.includes(ext)) {
+        alert('Only images allowed');
+        return false;
+    }
+}
+// 攻击者可以：
+// 1. 禁用 JavaScript
+// 2. 拦截请求修改文件
+// 3. 使用 curl 直接上传
+curl -F "file=@shell.php" https://target.com/upload
+```
+
+**服务端检查 Content-Type：**
+
+```java
+// 只检查 MIME 类型（可被绕过）
+if ("image/jpeg".equals(file.getContentType()) ||
+    "image/png".equals(file.getContentType())) {
+    // 保存文件
+} else {
+    throw new SecurityException("Only images allowed");
+}
+
+// 攻击：
+curl -F "file=@shell.php" \
+     -H "Content-Type: image/png" \
+     https://target.com/upload
+// 把 PHP 文件伪装成 PNG
+```
+
+### 3. 文件扩展名绕过
+
+**黑名单绕过：**
+
+```java
+// 黑名单方式：容易被绕过
+String[] blocked = {".php", ".php3", ".php4", ".php5", ".phtml"};
+
+for (String ext : blocked) {
+    if (filename.toLowerCase().endsWith(ext)) {
+        throw new SecurityException("File type not allowed");
+    }
+}
+
+// 绕过方式：
+// .phar, .pht, .phps, .phhtml, .pHp
+// 大小写绕过：.PhP, .PHP3
+// 双扩展名：shell.php.jpg
+```
+
+**Apache 多后缀解析：**
+
+```bash
+# Apache httpd.conf 可能配置了 AddHandler
+AddType application/x-httpd-php .php
+# 这会导致所有包含 .php 的文件被当作 PHP 执行
+# shell.php.jpg 会被解析为 PHP
+```
+
+**Nginx 畸形解析：**
+
+```
+Nginx 配置不当可能导致：
+1. shell.jpg%00.php 被解析为 PHP
+2. /upload/shell.jpg/xxx.php 被解析为 PHP
+```
+
+### 4. 文件内容检查绕过
+
+**只检查文件头：**
+
+```java
+// 简单检查文件头（可绕过）
+byte[] header = new byte[4];
+file.getInputStream().read(header);
+if (header[0] == (byte)0xFF && header[1] == (byte)0xD8) {
+    // 以为是 JPEG
+    // 但可以构造：GIF89a...<?php system($_GET['cmd']); ?>
+}
+```
+
+### 5. 竞争条件上传
+
+**时间窗口攻击：**
+
+```java
+// 先保存，后检查（存在时间窗口）
+String path = uploadDir + filename;
+file.transferTo(new File(path));  // 先上传
+
+if (!isValidImage(file)) {
+    new File(path).delete();      // 后检查，可能来不及
+}
+
+// 攻击：
+// 1. 快速上传 webshell.php
+// 2. 在删除前立即访问执行
+// 使用多线程并发请求
+```
+
+## 文件上传防御策略
+
+### 1. 扩展名白名单
+
+```java
+// 白名单方式（推荐）
+private static final Set<String> ALLOWED_EXTENSIONS = Set.of(
+    "jpg", "jpeg", "png", "gif", "webp"
+);
+
+public void validateExtension(String filename) {
+    String ext = getExtension(filename).toLowerCase();
+    if (!ALLOWED_EXTENSIONS.contains(ext)) {
+        throw new SecurityException("File type not allowed");
+    }
+}
+
+private String getExtension(String filename) {
+    int lastDot = filename.lastIndexOf('.');
+    if (lastDot < 0) {
+        throw new SecurityException("No extension");
+    }
+    return filename.substring(lastDot + 1);
+}
+```
+
+### 2. MIME 类型白名单
+
+```java
+private static final Set<String> ALLOWED_MIME_TYPES = Set.of(
+    "image/jpeg",
+    "image/png",
+    "image/gif",
+    "image/webp"
+);
+
+public void validateMimeType(MultipartFile file) {
+    String contentType = file.getContentType();
+    if (contentType == null || !ALLOWED_MIME_TYPES.contains(contentType)) {
+        throw new SecurityException("Invalid MIME type");
+    }
+}
+```
+
+### 3. 文件内容验证（Magic Number）
+
+```java
+public class MagicNumberValidator {
+
+    private static final Map<String, byte[]> MAGIC_NUMBERS = Map.of(
+        "image/jpeg", new byte[]{(byte)0xFF, (byte)0xD8, (byte)0xFF},
+        "image/png",  new byte[]{(byte)0x89, (byte)0x50, (byte)0x4E, (byte)0x47},
+        "image/gif",  new byte[]{(byte)0x47, (byte)0x49, (byte)0x46}
+    );
+
+    public boolean validateImage(MultipartFile file) {
+        try {
+            InputStream input = file.getInputStream();
+            byte[] header = new byte[4];
+            input.read(header);
+
+            // 检查文件头
+            for (Map.Entry<String, byte[]> entry : MAGIC_NUMBERS.entrySet()) {
+                byte[] magic = entry.getValue();
+                if (matchesHeader(header, magic)) {
+                    return true;
+                }
+            }
+            return false;
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+    private boolean matchesHeader(byte[] header, byte[] magic) {
+        for (int i = 0; i < magic.length; i++) {
+            if (header[i] != magic[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+}
+```
+
+### 4. 图片深度检测
+
+```java
+import javax.imageio.ImageIO;
+import java.awt.image.BufferedImage;
+
+public class ImageValidator {
+
+    public boolean isValidImage(MultipartFile file) {
+        try {
+            BufferedImage image = ImageIO.read(file.getInputStream());
+            if (image == null) {
+                return false;  // 不是有效图片
+            }
+
+            // 检查图片尺寸是否合理
+            if (image.getWidth() < 1 || image.getHeight() > 10000) {
+                return false;
+            }
+
+            // 重新编码图片，去除元数据和恶意内容
+            BufferedImage cleanImage = new BufferedImage(
+                image.getWidth(),
+                image.getHeight(),
+                BufferedImage.TYPE_INT_RGB
+            );
+            cleanImage.getGraphics().drawImage(image, 0, 0, null);
+
+            // 保存为其他格式（如PNG），去除 EXIF 等元数据
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            ImageIO.write(cleanImage, "png", baos);
+            return baos.size() > 0;
+
+        } catch (IOException e) {
+            return false;
+        }
+    }
+}
+```
+
+### 5. 上传目录安全配置
+
+```java
+public class SafeUploadConfig {
+
+    // 上传目录放在 Web 根目录之外
+    @Value("${upload.base-dir:/var/app/uploads}")
+    private String uploadBaseDir;
+
+    @Bean
+    public ResourceHandlerRegistration resourceHandler() {
+        return new ResourceHandlerRegistration("/uploads/**")
+            .addResourceLocations("file:" + uploadBaseDir + "/");
+    }
+
+    // 上传时重命名文件
+    public String generateSafeFilename(String originalFilename) {
+        String ext = getExtension(originalFilename);
+        String uuid = UUID.randomUUID().toString();
+        return uuid + "." + ext;  // 随机文件名，不使用用户提供的名称
+    }
+
+    // 文件保存路径
+    public Path getUploadPath(String safeFilename) {
+        // 按日期分目录，减少单目录文件数量
+        String datePath = LocalDate.now().format(DateTimeFormatter.ofPattern("yyyy/MM/dd"));
+        Path dir = Paths.get(uploadBaseDir, datePath);
+        dir.toFile().mkdirs();
+        return dir.resolve(safeFilename);
+    }
+}
+```
+
+```xml
+<!-- Tomcat web.xml：禁止执行权限 -->
+<Context docBase="/var/app/uploads" path="/uploads">
+    <!-- 不允许执行 JSP -->
+    <JarScanner>
+        <JarScanFilter defaultPlugaingClassName="" defaultPlugaingType="false"/>
+    </JarScanner>
+</Context>
+```
+
+### 6. 存储分离
+
+```java
+// 最佳实践：上传文件存储到 OSS/CDN，与应用服务器分离
+@Service
+public class OssUploadService {
+
+    @Autowired
+    private OSS ossClient;
+
+    @Value("${oss.bucket-name}")
+    private String bucketName;
+
+    public String upload(MultipartFile file) {
+        // 1. 生成安全文件名
+        String key = "avatars/" + UUID.randomUUID() + getExtension(file.getOriginalFilename());
+
+        // 2. 设置访问权限（私有）
+        ObjectMetadata metadata = new ObjectMetadata();
+        metadata.setContentType(file.getContentType());
+
+        // 3. 上传到 OSS
+        ossClient.putObject(bucketName, key, file.getInputStream(), metadata);
+
+        // 4. 生成签名 URL（临时访问）
+        Date expiration = new Date(System.currentTimeMillis() + 3600 * 1000);
+        URL url = ossClient.generatePresignedUrl(bucketName, key, expiration);
+
+        return url.toString();
+    }
+}
+```
+
+### 7. 完整的上传验证流程
+
+```java
+@Service
+public class SecureFileUploadService {
+
+    private final Set<String> allowedExtensions = Set.of("jpg", "jpeg", "png", "gif", "webp");
+    private final Set<String> allowedMimeTypes = Set.of("image/jpeg", "image/png", "image/gif", "image/webp");
+    private final MagicNumberValidator magicValidator = new MagicNumberValidator();
+    private final ImageValidator imageValidator = new ImageValidator();
+
+    public String uploadImage(MultipartFile file) {
+        // 1. 非空检查
+        if (file.isEmpty()) {
+            throw new IllegalArgumentException("File is empty");
+        }
+
+        // 2. 文件大小限制
+        if (file.getSize() > 5 * 1024 * 1024) {  // 5MB
+            throw new IllegalArgumentException("File too large");
+        }
+
+        // 3. 扩展名验证
+        String filename = file.getOriginalFilename();
+        String ext = getExtension(filename).toLowerCase();
+        if (!allowedExtensions.contains(ext)) {
+            throw new SecurityException("Extension not allowed: " + ext);
+        }
+
+        // 4. MIME 类型验证
+        String mimeType = file.getContentType();
+        if (!allowedMimeTypes.contains(mimeType)) {
+            throw new SecurityException("MIME type not allowed: " + mimeType);
+        }
+
+        // 5. Magic Number 验证
+        if (!magicValidator.validateImage(file)) {
+            throw new SecurityException("Invalid file content");
+        }
+
+        // 6. 图片真实性验证
+        if (!imageValidator.isValidImage(file)) {
+            throw new SecurityException("Invalid image");
+        }
+
+        // 7. 生成安全文件名
+        String safeFilename = UUID.randomUUID() + "." + ext;
+
+        // 8. 上传到 OSS
+        return ossUploadService.upload(file, safeFilename);
+    }
+}
+```
+
+## 面试追问方向
+
+- 文件上传漏洞的防御策略有哪些？
+- 为什么上传目录不能放在 Web 根目录下？
+- 什么是 Magic Number？如何用它验证文件类型？
+- 如何防止竞争条件下的文件上传攻击？
+- 为什么说将文件存储到 OSS/CDN 是最佳实践？
+
+> 文件上传功能是「便利性」与「安全性」矛盾最突出的地方。**永远不要相信用户上传的文件**，验证、重命名、隔离存储——每一步都不能少。

@@ -1,0 +1,409 @@
+---
+title: Linux 网络协议栈
+description: Linux 网络协议栈架构、socket 编程、网卡到应用的路径
+---
+
+# Linux 网络协议栈
+
+数据包从网卡到应用程序，经历了什么？
+
+当你在服务器上运行一个 HTTP 服务，数据包经过网卡、驱动、协议栈、socket 缓冲区，最终到达应用程序。理解这个路径，是排查网络问题的基础。
+
+## 网络协议栈架构
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         Linux 网络协议栈                              │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  ┌───────────────────────────────────────────────────────────────┐ │
+│  │                         应用程序                               │ │
+│  │                      socket()                                 │ │
+│  │                      bind()                                   │ │
+│  │                      listen()                                 │ │
+│  │                      accept()                                 │ │
+│  │                      connect()                                │ │
+│  │                      send/recv()                              │ │
+│  └───────────────────────────┬───────────────────────────────────┘ │
+│                              │                                      │
+│  ┌──────────────────────────▼───────────────────────────────────┐ │
+│  │                      Socket 层                                │ │
+│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐            │ │
+│  │  │ TCP Socket │  │ UDP Socket │  │ Raw Socket  │            │ │
+│  │  │   Buffer   │  │   Buffer   │  │   Buffer    │            │ │
+│  │  └─────────────┘  └─────────────┘  └─────────────┘            │ │
+│  └───────────────────────────┬───────────────────────────────────┘ │
+│                              │                                      │
+│  ┌──────────────────────────▼───────────────────────────────────┐ │
+│  │                      协议层                                    │ │
+│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐            │ │
+│  │  │    TCP     │  │    UDP     │  │   ICMP     │            │ │
+│  │  │  可靠传输   │  │  不可靠传输  │  │   诊断     │            │ │
+│  │  └─────────────┘  └─────────────┘  └─────────────┘            │ │
+│  └───────────────────────────┬───────────────────────────────────┘ │
+│                              │                                      │
+│  ┌──────────────────────────▼───────────────────────────────────┐ │
+│  │                      IP 层                                     │ │
+│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐            │ │
+│  │  │  路由查找   │  │  分片重组   │  │  Netfilter │            │ │
+│  │  │             │  │             │  │   (iptables) │           │ │
+│  │  └─────────────┘  └─────────────┘  └─────────────┘            │ │
+│  └───────────────────────────┬───────────────────────────────────┘ │
+│                              │                                      │
+│  ┌──────────────────────────▼───────────────────────────────────┐ │
+│  │                    网络设备层                                  │ │
+│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐            │ │
+│  │  │   驱动     │  │  sk_buff   │  │  NIC       │            │ │
+│  │  │  接口      │  │   管理     │  │  发送接收  │            │ │
+│  │  └─────────────┘  └─────────────┘  └─────────────┘            │ │
+│  └───────────────────────────┬───────────────────────────────────┘ │
+│                              │                                      │
+└──────────────────────────────┼──────────────────────────────────────┘
+                               │
+                               ▼
+                    ┌─────────────────────┐
+                    │      网卡 (NIC)      │
+                    │    (硬件中断/DMA)    │
+                    └─────────────────────┘
+```
+
+## sk_buff 结构
+
+sk_buff（socket buffer）是网络数据的核心数据结构：
+
+```c
+// sk_buff 结构（简化）
+struct sk_buff {
+    // 数据指针
+    struct sk_buff* next;          // 下一个 skb
+    struct sk_buff* prev;          // 上一个 skb
+    
+    struct sock* sk;               // 所属 socket
+    struct net_device* dev;        // 网络设备
+    
+    // 缓冲区指针
+    unsigned char* head;           // 缓冲区起始
+    unsigned char* data;           // 数据起始
+    unsigned char* tail;           // 数据结束
+    unsigned char* end;            // 缓冲区结束
+    
+    // 长度信息
+    unsigned int len;              // 数据长度
+    unsigned int data_len;         // 线性数据长度
+    unsigned int mac_len;          // MAC 头长度
+    
+    // 协议头指针
+    struct ethhdr* mac_header;     // MAC 头
+    struct iphdr* ip_header;       // IP 头
+    struct tcphdr* tcp_header;     // TCP 头
+    struct udphdr* udp_header;     // UDP 头
+    
+    // 元信息
+    unsigned int priority;         // 优先级
+    __be32 mark;                   // 标记
+    u16 protocol;                 // 协议类型
+    
+    // 时间戳
+    struct timespec64 tstamp;      // 到达/发送时间
+    
+    // ...
+};
+```
+
+```
+sk_buff 内存布局:
+┌─────────────────────────────────────────────────────────────────┐
+│                                                                  │
+│  head ──► ┌─────────┬──────────┬─────────────────┬─────────┐ │
+│           │ MAC 头   │ IP 头    │  TCP/UDP 头    │  数据   │ │
+│           │ (14B)   │ (20B)   │   (20B)        │         │ │
+│           └─────────┴──────────┴─────────────────┴─────────┘ │
+│                ▲            ▲              ▲              ▲   │
+│           mac_header   ip_header      tcp_header      data   │
+│                                                                  │
+│                                          ▲                 ▲    │
+│                                         tail              tail  │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## socket 编程
+
+### TCP socket 服务器
+
+```c
+// TCP 服务器示例
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <unistd.h>
+#include <string.h>
+
+#define PORT 8080
+#define BUFFER_SIZE 1024
+
+int main() {
+    int server_fd, client_fd;
+    struct sockaddr_in address;
+    int opt = 1;
+    char buffer[BUFFER_SIZE] = {0};
+    
+    // 1. 创建 socket
+    server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) {
+        perror("socket failed");
+        return 1;
+    }
+    
+    // 2. 设置 socket 选项（重用地址）
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    
+    // 3. 绑定地址
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(PORT);
+    
+    if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
+        perror("bind failed");
+        return 1;
+    }
+    
+    // 4. 监听连接
+    if (listen(server_fd, 10) < 0) {
+        perror("listen failed");
+        return 1;
+    }
+    
+    printf("Server listening on port %d\n", PORT);
+    
+    // 5. 接受连接
+    while (1) {
+        client_fd = accept(server_fd, NULL, NULL);
+        if (client_fd < 0) {
+            perror("accept failed");
+            continue;
+        }
+        
+        // 读取数据
+        int bytes_read = read(client_fd, buffer, BUFFER_SIZE);
+        if (bytes_read > 0) {
+            printf("Received: %s\n", buffer);
+            
+            // 发送响应
+            char* response = "HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nHello, World!";
+            send(client_fd, response, strlen(response), 0);
+        }
+        
+        close(client_fd);
+    }
+    
+    close(server_fd);
+    return 0;
+}
+```
+
+### UDP socket
+
+```c
+// UDP 服务器示例
+int main() {
+    int sock_fd;
+    struct sockaddr_in server_addr, client_addr;
+    char buffer[1024];
+    socklen_t addr_len = sizeof(client_addr);
+    
+    // 1. 创建 UDP socket
+    sock_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    
+    // 2. 绑定
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(8080);
+    server_addr.sin_addr.s_addr = INADDR_ANY;
+    bind(sock_fd, (struct sockaddr*)&server_addr, sizeof(server_addr));
+    
+    // 3. 接收数据
+    while (1) {
+        int n = recvfrom(sock_fd, buffer, 1024, 0,
+                        (struct sockaddr*)&client_addr, &addr_len);
+        buffer[n] = '\0';
+        printf("Received from %s:%d: %s\n",
+               inet_ntoa(client_addr.sin_addr),
+               ntohs(client_addr.sin_port), buffer);
+        
+        // 4. 发送响应
+        sendto(sock_fd, buffer, n, 0,
+               (struct sockaddr*)&client_addr, addr_len);
+    }
+    
+    close(sock_fd);
+    return 0;
+}
+```
+
+## socket 缓冲区
+
+```c
+// socket 接收缓冲区
+struct sk_buff_head rx_queue;    // 接收队列
+
+// socket 发送缓冲区
+struct sk_buff_head tx_queue;    // 发送队列
+
+// socket 缓冲区管理
+// /proc/sys/net/core/rmem_default  默认接收缓冲区
+// /proc/sys/net/core/wmem_default  默认发送缓冲区
+// /proc/sys/net/core/rmem_max     最大接收缓冲区
+// /proc/sys/net/core/wmem_max     最大发送缓冲区
+```
+
+```bash
+# 查看 socket 缓冲区大小
+ss -ltn
+
+# 调整缓冲区（临时）
+sysctl -w net.core.rmem_max=26214400
+sysctl -w net.core.wmem_max=26214400
+
+# 永久调整
+echo "net.core.rmem_max=26214400" >> /etc/sysctl.conf
+sysctl -p
+```
+
+## 网络协议栈路径
+
+### 数据接收路径
+
+```
+网卡接收数据:
+┌─────────────────────────────────────────────────────────────────────┐
+│                                                                       │
+│  1. 网卡 DMA 把数据放入环形缓冲区 (Ring Buffer)                       │
+│                                                                       │
+│  2. 网卡产生中断                                                      │
+│                                                                       │
+│  3. 驱动中断处理程序:                                                  │
+│     - NAPI/polling 机制 (减少中断)                                    │
+│     - 分配 sk_buff                                                   │
+│     - 从 DMA 缓冲区复制数据                                           │
+│                                                                       │
+│  4. 协议栈处理:                                                       │
+│     ┌─────────────────────────────────────────────────────────────┐ │
+│     │  eth_type_trans()        → 解析 MAC 头                       │ │
+│     │  netif_receive_skb()    → 分发到协议栈                       │ │
+│     │  ip_rcv()               → 解析 IP 头                         │ │
+│     │  ip_local_deliver()     → 发送到本地                         │ │
+│     │  tcp_v4_rcv()          → 解析 TCP 头                        │ │
+│     │  sk->sk_data_ready()    → 唤醒等待的 socket                  │ │
+│     └─────────────────────────────────────────────────────────────┘ │
+│                                                                       │
+│  5. 应用读取:                                                         │
+│     - recv() / read() 从 socket 缓冲区读取数据                        │
+│                                                                       │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 数据发送路径
+
+```
+应用发送数据:
+┌─────────────────────────────────────────────────────────────────────┐
+│                                                                       │
+│  1. 应用调用 send() / write()                                        │
+│                                                                       │
+│  2. socket 层:                                                       │
+│     - 检查 socket 缓冲区                                              │
+│     - 如果需要，分段数据                                              │
+│     - 放入发送队列                                                    │
+│                                                                       │
+│  3. 协议栈处理:                                                       │
+│     ┌─────────────────────────────────────────────────────────────┐ │
+│     │  tcp_sendmsg()           → 构造 TCP 段                      │ │
+│     │  ip_queue_xmit()         → 构造 IP 包                       │ │
+│     │  ip_local_out()         → 发送                             │ │
+│     │  dst_output()           → 路由查找                          │ │
+│     │  neigh_output()         → ARP 解析                         │ │
+│     │  dev_queue_xmit()       → 排队到网卡                        │ │
+│     └─────────────────────────────────────────────────────────────┘ │
+│                                                                       │
+│  4. 网卡发送:                                                         │
+│     - 从 sk_buff 复制到 DMA 缓冲区                                    │
+│     - 网卡发送数据                                                   │
+│                                                                       │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+## Netfilter 与 iptables
+
+Netfilter 是 Linux 的包过滤框架：
+
+```bash
+# iptables 规则链
+# PREROUTING → 路由决策前
+# INPUT      → 进入本地进程前
+# FORWARD    → 转发时
+# OUTPUT     → 本地进程输出后
+# POSTROUTING → 路由决策后
+
+# 示例规则
+# 允许 80 端口入站
+iptables -A INPUT -p tcp --dport 80 -j ACCEPT
+
+# 禁止 ping
+iptables -A INPUT -p icmp --icmp-type echo-request -j DROP
+
+# 端口转发
+iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-port 8080
+
+# 查看规则
+iptables -L -n -v
+```
+
+## 网络监控命令
+
+```bash
+# ss: 查看 socket 状态
+ss -s          # 统计
+ss -ltn        # 监听 TCP
+ss -lun        # 监听 UDP
+ss -tnp        # TCP + 进程
+
+# netstat: 经典网络工具
+netstat -tulpn       # 监听端口
+netstat -tnp         # 连接状态
+
+# ip: 现代网络配置
+ip addr show          # IP 地址
+ip route show         # 路由表
+ip link show          # 网卡状态
+
+# tcpdump: 抓包
+tcpdump -i eth0 port 80
+tcpdump -i eth0 host 192.168.1.100
+
+# /proc/net/*: 网络统计
+cat /proc/net/tcp
+cat /proc/net/dev
+```
+
+## 面试高频问题
+
+**Q1：TCP 和 UDP 的区别？**
+
+TCP 是面向连接的可靠传输，提供流量控制、拥塞控制、数据校验。UDP 是无连接的不可靠传输，更轻量，适合实时性要求高的场景（如视频流、DNS）。
+
+**Q2：什么是 socket 缓冲区？**
+
+socket 缓冲区是内核为每个 socket 维护的队列，用于存放发送/接收的网络数据。接收缓冲区存放到达的数据直到应用读取，发送缓冲区存放应用写入的数据直到发送出去。
+
+**Q3：NAPI 是什么？**
+
+NAPI（New API）是 Linux 网络驱动的新接口，用轮询替代中断来处理高负载时的数据包，减少中断风暴，提高性能。
+
+**Q4：sk_buff 的作用是什么？**
+
+sk_buff 是 Linux 网络子系统的核心数据结构，表示网络数据包。它包含数据缓冲区的指针和元信息，支持零拷贝操作和协议头指针的灵活调整。
+
+**Q5：如何排查网络连接问题？**
+
+先用 `ping` 检查连通性，再用 `telnet` 或 `nc` 测试端口可达。查看 `ss -tnp` 或 `netstat -tnp` 检查 socket 状态。用 `tcpdump` 抓包分析具体问题。
+
+理解 Linux 网络协议栈，是理解网络编程和问题排查的基础。

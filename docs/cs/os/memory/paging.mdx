@@ -1,0 +1,409 @@
+---
+title: 分页机制与页表结构
+description: 分页机制原理、页表结构、多级页表、TLB、倒排页表等优化技术
+---
+
+# 分页机制与页表结构
+
+32 位系统，4GB 虚拟地址空间，4KB 页大小。你能算出需要多少个页表项吗？
+
+答案是 2^20 = 1,048,576 个页表项。每个页表项假设 4 字节，就是 4MB。
+
+这听起来不多，但如果有 100 个进程同时运行呢？400MB 的页表！这显然不可接受。
+
+这就是为什么需要多级页表、TLB、倒排页表等各种优化技术。
+
+## 分页机制原理
+
+### 基本概念
+
+**页框（Frame）：** 物理内存被划分成的固定大小的块，通常是 4KB。
+
+**页面（Page）：** 虚拟内存被划分成的固定大小的块，大小与页框相同。
+
+**页表（Page Table）：** 记录虚拟页面到物理页框映射关系的数据结构。
+
+```
+虚拟地址空间                    物理内存
+┌─────────────┐                ┌─────────────┐
+│  Page 0     │ ─────┐        │  Frame 3     │
+├─────────────┤      │        ├─────────────┤
+│  Page 1     │      │        │  Frame 1     │
+├─────────────┤      ├───────► │  Frame 5     │
+│  Page 2     │      │        ├─────────────┤
+├─────────────┤      │        │  Frame 7     │
+│  Page 3     │ ─────┘        ├─────────────┤
+├─────────────┤               │  ...         │
+│  ...        │               └─────────────┘
+└─────────────┘
+
+页表: Page 0 → Frame 3
+      Page 1 → Frame 5
+      Page 2 → Frame 1
+      Page 3 → Frame 7
+```
+
+### 地址转换
+
+虚拟地址由**页号（VPN）**和**页内偏移（Offset）**组成：
+
+```
+  虚拟地址 (32位)
+┌──────────────────┬────────────┐
+│    页号 (VPN)     │   偏移量    │
+│    20 位          │   12 位    │
+└──────────────────┴────────────┘
+     ↓
+   页表查找
+     ↓
+┌──────────────────┬────────────┐
+│   物理页框号      │   偏移量    │
+│   (PFN)          │   12 位    │
+└──────────────────┴────────────┘
+  物理地址 (32位)
+```
+
+```c
+// 地址转换公式
+#define PAGE_BITS 12
+#define PAGE_SIZE (1 << PAGE_BITS)  // 4096 = 4KB
+#define PAGE_MASK (PAGE_SIZE - 1)   // 0xFFF
+
+// 虚拟地址分解
+unsigned int vpn = virtual_addr >> PAGE_BITS;
+unsigned int offset = virtual_addr & PAGE_MASK;
+
+// 页表查找
+unsigned int pfn = page_table[vpn];
+
+// 物理地址合成
+unsigned int physical_addr = (pfn << PAGE_BITS) | offset;
+```
+
+### 页表项的结构
+
+每个页表项不只是存储物理页框号，还包含一些控制位：
+
+```
+┌──────────────────────────────────────────────────────────┐
+│                    页表项结构 (32位)                       │
+├────┬────┬────┬────┬────┬────┬───────────────────┬───────┤
+│ 有效│ 访问│ 修改│ 缓存│ 保护│   物理页框号        │  ...  │
+│ 位  │ 位  │ 位  │ 控制│ 位  │   (20-31位)        │       │
+└────┴────┴────┴────┴────┴────┴───────────────────┴───────┘
+
+详细说明:
+- 有效位 (Valid/Bit): 该页是否在内存中
+- 访问位 (Accessed): 该页最近是否被访问过（用于置换算法）
+- 修改位 (Dirty/Modified): 该页是否被修改过（脏位，换出时是否需要写回）
+- 缓存控制: 是否允许缓存、缓存策略
+- 保护位: 读/写/执行权限
+```
+
+### 缺页中断
+
+当访问的页面不在内存中时，触发缺页中断：
+
+```c
+void page_fault_handler(unsigned int fault_addr) {
+    // 1. 根据虚拟地址找到对应的页表项
+    unsigned int vpn = fault_addr >> PAGE_BITS;
+    struct PageTableEntry* pte = &page_table[vpn];
+    
+    // 2. 如果页面从未加载（越界访问）
+    if (!pte->present) {
+        // 发送 SIGSEGV 信号终止进程
+        kill_process(current_process, SIGSEGV);
+        return;
+    }
+    
+    // 3. 页面不在内存中，需要换入
+    // 选择一个物理页框
+    unsigned int victim_frame = select_victim_frame();
+    
+    // 4. 如果被选中换出的页是脏页，需要写回磁盘
+    if (pte->dirty) {
+        write_page_to_disk(victim_frame, pte->disk_location);
+    }
+    
+    // 5. 从磁盘读取所需页面到物理页框
+    read_page_from_disk(victim_frame, fault_addr);
+    
+    // 6. 更新页表项
+    pte->frame_number = victim_frame;
+    pte->present = 1;
+    pte->accessed = 1;
+    
+    // 7. 返回继续执行
+    return_from_page_fault();
+}
+```
+
+## 页表优化
+
+### 一级页表的问题
+
+32 位系统，4KB 页：
+- 虚拟地址空间：2^32 = 4GB
+- 页数：2^32 / 2^12 = 2^20 = 1,048,576 页
+- 每个页表项 4 字节
+- 页表大小：4MB
+
+**问题：** 即使进程只用了 10MB 虚拟内存，也要维护完整的 4MB 页表。
+
+### 二级页表
+
+把一级页表再分页：顶级页目录 + 页表页。
+
+```
+虚拟地址结构（32位）:
+┌────────────┬────────────┬────────────┐
+│  页目录索引 │   页表索引  │   页内偏移  │
+│   10 位     │   10 位    │   12 位    │
+└────────────┴────────────┴────────────┘
+    │            │            │
+    ▼            ▼            ▼
+页目录项 ──► 页表项 ──► 物理页框
+```
+
+**为什么能节省空间？**
+
+如果进程只使用了部分虚拟地址空间，只需要为用到的区域分配页表页。连续的虚拟地址区域可以共享页表页。
+
+```c
+// 二级页表查找
+unsigned int page_dir_index = (virtual_addr >> 22) & 0x3FF;    // 高 10 位
+unsigned int page_table_index = (virtual_addr >> 12) & 0x3FF; // 中 10 位
+unsigned int offset = virtual_addr & 0xFFF;                    // 低 12 位
+
+// 查页目录
+struct PageDirEntry* pde = &page_dir[page_dir_index];
+
+if (!pde->present) {
+    // 页目录项无效，分配新的页表页
+    pde->frame = allocate_frame();
+    pde->present = 1;
+}
+
+// 查页表
+struct PageTableEntry* pte = &page_tables[pde->frame][page_table_index];
+
+if (!pte->present) {
+    page_fault();
+}
+
+// 物理地址
+physical_addr = (pte->frame << 12) | offset;
+```
+
+### 多级页表
+
+64 位系统下，二级页表也不够用了，需要更多级。
+
+```
+x86-64 的四级页表结构:
+┌────────┬────────┬────────┬────────┬────────┬────────────┐
+│  PML4  │  PDPT  │   PD   │   PT   │ 偏移   │            │
+│  9 位  │  9 位  │  9 位  │  9 位  │ 12 位  │            │
+└────────┴────────┴────────┴────────┴────────┴────────────┘
+
+虚拟地址被分成 5 部分：
+- PML4（Page-Map Level 4）索引：9 位
+- PDPT（Page-Directory-Pointer Table）索引：9 位
+- PD（Page-Directory）索引：9 位
+- PT（Page Table）索引：9 位
+- Offset：12 位
+
+总共支持：2^48 = 256TB 虚拟地址空间
+```
+
+```c
+// 四级页表查找（简化版）
+uint64_t translate_address四级(uint64_t virtual_addr) {
+    // 分解虚拟地址
+    int pml4_idx = (virtual_addr >> 39) & 0x1FF;
+    int pdpt_idx = (virtual_addr >> 30) & 0x1FF;
+    int pd_idx = (virtual_addr >> 21) & 0x1FF;
+    int pt_idx = (virtual_addr >> 12) & 0x1FF;
+    int offset = virtual_addr & 0xFFF;
+    
+    // PML4 → PDPT
+    struct PML4Entry* pml4 = (struct PML4Entry*)get_cr3();
+    if (!pml4[pml4_idx].present) return -1;
+    uint64_t pdpt_base = pml4[pml4_idx].frame << 12;
+    
+    // PDPT → PD
+    struct PDPTEntry* pdpt = (struct PDPTEntry*)pdpt_base;
+    if (!pdpt[pdpt_idx].present) return -1;
+    uint64_t pd_base = pdpt[pdpt_idx].frame << 12;
+    
+    // PD → PT
+    struct PDE* pd_entry = (struct PDE*)pd_base;
+    if (!pd_entry[pd_idx].present) return -1;
+    uint64_t pt_base = pd_entry[pd_idx].frame << 12;
+    
+    // PT → 物理页框
+    struct PTE* pte = (struct PTE*)pt_base;
+    if (!pte[pt_idx].present) return -1;
+    uint64_t frame = pte[pt_idx].frame;
+    
+    return (frame << 12) | offset;
+}
+```
+
+### TLB（Translation Lookaside Buffer）
+
+即使是多级页表，每次内存访问也需要多次查表：页目录 → 页表 → 实际内存。
+
+**TLB 的本质：** 把热点页表项缓存到 CPU 内部，避免每次都查内存。
+
+```
+没有 TLB 时:
+虚拟地址访问 → 内存查页目录 → 内存查页表 → 实际内存访问
+                ↑              ↑
+            100 周期         100 周期
+
+有 TLB 时:
+虚拟地址访问 → TLB 命中 → 实际内存访问
+               ↑ (1 周期)
+           命中率高时快 100 倍
+```
+
+```c
+// TLB 查找
+uint64_t tlb_lookup(uint64_t vpn) {
+    // TLB 是关联寄存器，用 VPN 并行匹配所有 entry
+    for (int i = 0; i < TLB_SIZE; i++) {
+        if (tlb[i].valid && tlb[i].vpn == vpn) {
+            return tlb[i].pfn;  // 命中
+        }
+    }
+    return -1;  // 未命中
+}
+
+void tlb_insert(uint64_t vpn, uint64_t pfn) {
+    // 找到空闲或最不常用的 entry
+    int idx = find_victim();
+    tlb[idx].vpn = vpn;
+    tlb[idx].pfn = pfn;
+    tlb[idx].valid = 1;
+}
+
+// 虚拟地址访问
+uint64_t access_memory(uint64_t vaddr) {
+    uint64_t vpn = vaddr >> PAGE_BITS;
+    uint64_t offset = vaddr & PAGE_MASK;
+    
+    uint64_t pfn = tlb_lookup(vpn);
+    if (pfn == -1) {
+        // TLB 未命中，查找页表
+        pfn = page_table_walk(vpn);
+        tlb_insert(vpn, pfn);
+    }
+    
+    return (pfn << PAGE_BITS) | offset;
+}
+```
+
+**TLB 的特性：**
+- 硬件直接支持，操作系统感知不到
+- 容量很小（通常 64-1024 项）
+- 命中率极高（> 95%），因为程序的时间局部性
+- 上下文切换时需要刷新（或使用 ASID 标记）
+
+### 倒排页表（Inverted Page Table）
+
+传统页表是虚拟页号 → 物理页框，虚拟地址空间大，页表就大。
+
+倒排页表是**物理页框 → 虚拟页号**的映射：
+
+```c
+// 倒排页表
+struct InvertedPageTable {
+    uint64_t pid: 16;           // 进程 ID
+    uint64_t vpn: 36;           // 虚拟页号（64 位系统）
+    uint64_t referenced: 1;     // 访问位
+    uint64_t dirty: 1;          // 脏位
+    uint64_t valid: 1;         // 是否有效
+    uint64_t hash_next: 19;    // 哈希链表下一个
+};
+
+// 物理内存 4GB，4KB 页框
+// 倒排页表只有 4GB / 4KB = 1M 项
+// 每项 16 字节 = 16MB（远小于 4MB 的一级页表）
+```
+
+**优点：** 页表大小与物理内存成正比，而非虚拟地址空间。
+
+**缺点：** 查找效率低，需要哈希表辅助。
+
+```c
+// 倒排页表查找
+uint64_t invert_table_lookup(uint64_t pid, uint64_t vpn) {
+    // 哈希表快速定位
+    uint64_t bucket = hash(pid, vpn) % HASH_TABLE_SIZE;
+    
+    // 遍历哈希桶找匹配项
+    for (int i = hash_table[bucket]; i != -1; i = invert_table[i].hash_next) {
+        if (invert_table[i].pid == pid 
+            && invert_table[i].vpn == vpn 
+            && invert_table[i].valid) {
+            return i;  // 返回物理页框号
+        }
+    }
+    return -1;  // 未找到
+}
+```
+
+## 实际系统中的页表
+
+### Linux 的页表结构
+
+Linux 使用四级页表，兼容不同硬件：
+
+```
+x86-64 Linux 页表:
+┌──────────┬──────────┬──────────┬──────────┬─────────────┐
+│   PGD    │   PUD    │   PMD    │   PTE    │   Offset    │
+│ (全局目录)│(上层目录) │(中间目录) │(页表项)  │  (页内偏移)  │
+│  9 位    │  9 位    │  9 位    │  9 位    │  12 位      │
+└──────────┴──────────┴──────────┴──────────┴─────────────┘
+```
+
+Linux 用相同的代码框架（PGD → PUD → PMD → PTE），但不同架构可以跳过某些级别。
+
+### Windows 的页表结构
+
+Windows 也使用四级页表（相当于 Linux），但叫法不同：
+
+```
+Windows 页表:
+┌──────────┬──────────┬──────────┬──────────┬─────────────┐
+│   PML4   │  PDPT    │   PD     │   PT     │   Offset    │
+│ (页目录指针表索引) │(页目录指针表) │(页目录)  │(页表)       │  (页内偏移)  │
+└──────────┴──────────┴──────────┴──────────┴─────────────┘
+```
+
+## 面试高频问题
+
+**Q1：多级页表为什么能节省内存？**
+
+多级页表只保留需要的页表项。如果某个虚拟地址区域未被使用，对应的页表页就不需要分配。相比一级页表必须保留 1M 个页表项，多级页表可能只需要几十个页表页。
+
+**Q2：TLB 的作用是什么？为什么命中率很高？**
+
+TLB 是热点页表项的硬件缓存，避免每次内存访问都查多级页表。命中率高的原因是程序的时间局部性：最近访问的页很可能很快再次访问。
+
+**Q3：缺页中断和普通中断有什么区别？**
+
+普通中断可以在任意指令边界发生；缺页中断只能在访问内存的指令执行时发生。缺页中断处理完后，会**重新执行**触发缺页的指令。
+
+**Q4：为什么 64 位系统用四级页表而不是五级？**
+
+四级页表已经能支持 48 位虚拟地址（256TB），足够当前使用。更多级别意味着更多次内存访问，反而降低性能。
+
+**Q5：页表项的脏位和访问位有什么用？**
+
+脏位（Modified）表示页面被修改过，换出时需要写回磁盘（否则可以丢弃）。访问位（Referenced）用于页面置换算法，选择最近最少使用的页面淘汰。
+
+理解分页机制和页表结构，是理解虚拟内存的基础。

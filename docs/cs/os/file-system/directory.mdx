@@ -1,0 +1,412 @@
+---
+title: 目录实现与文件系统一致性
+description: 目录的线性列表/哈希表实现、文件系统一致性检查（fsck）、日志文件系统
+---
+
+# 目录实现与文件系统一致性
+
+你可能注意到一个有趣的事实：**目录本身也是一个文件**。
+
+在 Unix 系统中，一切皆文件。目录是一个包含目录项的特殊文件，目录项告诉你哪些文件名对应哪些 inode。
+
+这个设计简洁优雅，但随之而来的问题是：如何高效地组织目录项？如何保证文件系统的一致性？
+
+## 目录的底层实现
+
+### 目录项的结构
+
+目录本质上是一个文件，内容是一系列目录项。
+
+```c
+// 经典 UNIX 目录项（早期版本）
+struct old_dir_entry {
+    unsigned long inode;           // inode 号（0 表示空闲）
+    char name[14];                 // 文件名（14 字节）
+};
+
+// 现代目录项（ext2/ext3/ext4）
+struct ext2_dir_entry {
+    unsigned long inode;           // inode 号
+    unsigned short rec_len;        // 目录项长度
+    unsigned char name_len;        // 文件名长度
+    unsigned char file_type;       // 文件类型
+    char name[255];                // 文件名（最长 255）
+};
+```
+
+**目录项为什么需要 rec_len？**
+
+因为文件名长度可变，目录项长度也必须可变。`rec_len` 记录当前目录项占用的总字节数，便于遍历。
+
+```
+目录文件内容:
+┌──────────┬──────────────────────────────────────────┐
+│  "."    │            ".."                          │
+│  2 字节  │            2 字节                         │
+├──────────┼──────────────────────────────────────────┤
+│  inode   │  rec_len │ name_len │ type │ name     │
+│  4 字节   │  2 字节   │ 1 字节    │ 1 字节│ 变长    │
+└──────────┴──────────────────────────────────────────┘
+```
+
+### 目录的实现方式
+
+#### 1. 线性列表
+
+最简单的实现：目录项按顺序存储。
+
+```c
+// 查找文件
+int find_in_directory(int dir_fd, const char* name) {
+    struct dir_entry entry;
+    while (read(dir_fd, &entry, sizeof(entry)) == sizeof(entry)) {
+        if (entry.inode != 0 && strcmp(entry.name, name) == 0) {
+            return entry.inode;  // 找到
+        }
+    }
+    return -1;  // 没找到
+}
+```
+
+**问题：** 查找是 O(n)，n 是目录项数量。
+
+**优化：缓存**
+
+文件系统会缓存常用目录的 dentry（directory entry）结构到 dentry cache：
+
+```
+┌─────────────────────────────────────────────┐
+│              Dentry Cache                    │
+├─────────────────────────────────────────────┤
+│ /home/user/file.txt                         │
+│   ├─► inode: 12345                          │
+│   ├─► parent: dentry of "user"              │
+│   ├─► child: [dentry of other files]        │
+│   └─► cached: true, valid: true             │
+└─────────────────────────────────────────────┘
+```
+
+#### 2. 哈希表
+
+用哈希表组织目录项，查找是 O(1)。
+
+```c
+// 哈希目录实现
+struct hash_dir {
+    struct dir_entry* buckets[1024];  // 哈希桶
+    unsigned int hash(const char* name) {
+        unsigned int h = 0;
+        while (*name) {
+            h = h * 31 + *name++;
+        }
+        return h % 1024;
+    }
+};
+```
+
+**NTFS 使用 B+ 树**
+
+NTFS 用 B+ 树组织 MFT（Master File Table）中的目录，支持高效的插入、删除和查找。
+
+```
+B+ 树目录:
+                    ┌─────────────┐
+                    │  索引节点    │
+                    └──────┬──────┘
+                    ┌──────┴──────┐
+              ┌─────┴─────┐ ┌─────┴─────┐
+              │  A-M      │ │  N-Z      │
+              └─────┬─────┘ └─────┬─────┘
+              ┌─────┴─────┐ ┌─────┴─────┐
+              │ A B C D E │ │ N O P Q R │
+              │ F G H I J │ │ S T U V W │
+              │ K L M     │ │ X Y Z     │
+              └───────────┘ └───────────┘
+```
+
+#### 3. 磁性目录
+
+有些文件系统（如 ReiserFS）把目录项存在 B+ 树中，充分利用磁盘顺序访问的优势。
+
+### 不同文件系统的目录实现
+
+| 文件系统 | 目录实现 | 查找复杂度 |
+|---|---|---|
+| FAT | 线性列表 | O(n) |
+| ext2/ext3 | 线性列表 + HTree 索引（目录大时） | O(log n) |
+| ext4 | HTree（优化的 B+ 树） | O(log n) |
+| NTFS | B+ 树（MFT） | O(log n) |
+| XFS | B+ 树 | O(log n) |
+| Btrfs | B+ 树 | O(log n) |
+
+## 文件系统一致性
+
+### 为什么文件系统会不一致？
+
+正常关机时，操作系统会同步缓冲区到磁盘。但如果突然断电或崩溃，磁盘上可能留下不一致的状态。
+
+```
+不一致的场景:
+1. 写入了目录项，但还没有写入 inode
+   → 存在指向不存在 inode 的目录项
+   
+2. 更新了 inode，但还没有更新 bitmap
+   → inode 被使用但标记为空闲
+   
+3. 删除了文件，但没有释放所有数据块
+   → 数据块泄漏，无法再分配
+   
+4. 更新了 bitmap，但没有真正释放 inode
+   → inode 标记为空闲但实际还在使用
+```
+
+### fsck：文件系统检查与修复
+
+fsck（file system check）是 Unix 系统的文件系统一致性检查工具。
+
+```bash
+# 检查文件系统
+$ fsck /dev/sda1
+fsck from util-linux 2.36.1
+e2fsck 1.46.2 (29-Dec-2021)
+/dev/sda1: clean, 123456/1234567 files, 1234567/12345678 blocks
+
+# 如果文件系统有问题
+$ fsck /dev/sda1
+fsck from util-linux 2.36.1
+e2fsck 1.46.2 (29-Dec-2021)
+
+Free blocks count wrong for group #0 (12345, counted=12350).
+Fix<y>? yes
+
+Inode bitmap diff: position 1234 not set in bitmap.
+Fix<y>? yes
+```
+
+### fsck 的检查过程
+
+```c
+// fsck 的主要检查步骤
+void fsck_check(struct super_block* sb) {
+    // 1. 检查超级块
+    check_super_block(sb);
+    
+    // 2. 检查文件系统大小和块数
+    check_block_counts(sb);
+    
+    // 3. 检查 inode
+    check_inodes(sb);
+    
+    // 4. 检查目录结构
+    check_directories(sb);
+    
+    // 5. 检查链接计数
+    check_link_counts(sb);
+    
+    // 6. 检查空闲块/空闲 inode bitmap
+    check_bitmaps(sb);
+}
+```
+
+### fsck 的具体检查
+
+**1. 空闲块 bitmap 检查**
+
+遍历所有 inode，统计已分配的块，与 bitmap 对比。
+
+```c
+void check_block_bitmap(struct super_block* sb) {
+    unsigned long allocated_blocks = 0;
+    
+    // 遍历所有 inode
+    for each inode in inode_table {
+        if (inode is allocated) {
+            for each block in inode {
+                allocated_blocks++;
+            }
+        }
+    }
+    
+    // 与 bitmap 统计对比
+    unsigned long bitmap_blocks = count_set_bits(sb->block_bitmap);
+    
+    if (allocated_blocks != bitmap_blocks) {
+        // 不一致！需要修复
+        printf("Block bitmap mismatch: allocated=%lu, bitmap=%lu\n",
+               allocated_blocks, bitmap_blocks);
+    }
+}
+```
+
+**2. inode 引用计数检查**
+
+每个 inode 有链接计数（硬链接数）。检查是否有 inode 被引用但计数为 0，或计数与实际不符。
+
+```c
+void check_inode_refcounts(struct super_block* sb) {
+    unsigned int* link_counts = calloc(sb->inode_count, sizeof(int));
+    
+    // 遍历所有目录，统计每个 inode 的链接数
+    for each directory {
+        for each dir_entry {
+            link_counts[dir_entry.inode]++;
+        }
+    }
+    
+    // 对比 inode 中的链接计数
+    for each inode {
+        if (inode.link_count != link_counts[inode_num]) {
+            printf("Inode %d: link count mismatch\n", inode_num);
+        }
+    }
+}
+```
+
+**3. 目录结构检查**
+
+- 检查 `.` 和 `..` 是否正确
+- 检查 inode 是否存在
+- 检查是否有循环引用
+
+```c
+void check_directory_structure(struct super_block* sb) {
+    for each inode in directory_files {
+        struct dir_entry* entries = read_directory(inode);
+        
+        for each entry in entries {
+            // 检查 "." 指向自己
+            if (entry.name == "." && entry.inode != inode_num) {
+                // 错误：. 应该指向自己
+            }
+            
+            // 检查 ".." 指向父目录
+            if (entry.name == ".." && entry.inode != parent_inode) {
+                // 错误：.. 应该指向父目录
+            }
+            
+            // 检查引用的 inode 是否存在
+            if (entry.inode != 0 && !inode_exists(entry.inode)) {
+                // 错误：目录项指向不存在的 inode
+            }
+        }
+    }
+}
+```
+
+## 日志文件系统
+
+### 传统文件系统的问题
+
+fsck 需要扫描整个文件系统，在大磁盘上可能需要很长时间。
+
+**日志文件系统**的思想：**先把操作记录到日志区，标记「事务开始」，完成后再标记「事务结束」**。崩溃后只需重放日志，不用全盘扫描。
+
+### 日志的工作原理
+
+```
+正常写入:
+1. 日志区写入: [TxB: 开始事务] [操作 1] [操作 2] [TxE: 结束事务] [提交标记]
+2. 真正写入磁盘: 修改数据块
+3. 清理日志: 标记事务完成
+
+崩溃恢复:
+情况 1: 只有 TxB，没有 TxE → 事务未完成，忽略
+情况 2: 有 TxB 和 TxE，没有提交 → 重放日志
+情况 3: 有完整事务 → 跳过（已经写入）
+```
+
+### ext3/ext4 的日志模式
+
+```bash
+# ext3/ext4 有三种日志模式
+# data=writeback: 只记录元数据，操作可能乱序
+# data=ordered (默认): 元数据按顺序，文件内容先写数据再写元数据
+# data=journal: 记录所有数据，最安全但最慢
+
+# 查看当前模式
+$ tune2fs -l /dev/sda1 | grep "Journal mode"
+Journal mode:     ordered
+
+# 更改模式
+$ tune2fs -O has_journal -j /dev/sda1  # 启用日志
+$ tune2fs -J device=/dev/sdb1 /dev/sda1  # 使用独立日志设备
+```
+
+### 日志 vs 传统 fsck
+
+| 特性 | 传统文件系统 | 日志文件系统 |
+|---|---|---|
+| 崩溃恢复时间 | 很长（全盘扫描） | 很快（重放日志） |
+| 恢复可靠性 | 一般 | 更高 |
+| 写入性能 | 较快 | 稍慢（额外日志写入） |
+| 典型系统 | ext2 | ext3, ext4, NTFS, XFS |
+
+## 软链接与硬链接的处理
+
+### 硬链接一致性
+
+```c
+// 硬链接的链接计数
+struct inode {
+    unsigned short links_count;  // 硬链接计数
+};
+
+// 删除文件时（unlink）
+void unlink(const char* pathname) {
+    struct inode* inode = get_inode_by_path(pathname);
+    
+    // 从目录中移除目录项
+    remove_dir_entry(pathname);
+    
+    // 减少链接计数
+    inode->links_count--;
+    
+    // 如果计数为 0，且没有进程打开，释放资源
+    if (inode->links_count == 0 && inode->open_count == 0) {
+        free_inode(inode);
+    }
+}
+```
+
+### 软链接的特殊性
+
+```c
+// 软链接是一个特殊文件，内容是目标路径
+struct symlink_inode {
+    unsigned short mode;      // S_IFLNK 标志
+    char target_path[256];   // 目标路径
+};
+
+// 读取软链接
+char* readlink(const char* pathname) {
+    struct inode* inode = get_inode(pathname);
+    if (!S_ISLNK(inode->mode)) {
+        return NULL;  // 不是软链接
+    }
+    return inode->target_path;
+}
+```
+
+## 面试高频问题
+
+**Q1：目录是如何实现的？**
+
+目录本身是一个文件，内容是目录项列表。目录项包含 inode 号和文件名。目录项可以用线性列表、哈希表或 B+ 树组织。
+
+**Q2：什么是文件系统一致性？**
+
+文件系统一致性指磁盘上的数据（inode、目录、bitmap）之间的关系是正确的。一致性检查会验证链接计数、空闲块统计、目录结构等。
+
+**Q3：fsck 做了什么？**
+
+fsck 检查并修复文件系统：检查超级块、验证块/inode 计数、修复损坏的 inode、检查目录结构、清理孤儿文件等。
+
+**Q4：日志文件系统为什么更快恢复？**
+
+因为崩溃后只需读取日志区，检查哪些事务完成了、哪些没完成，然后重放未完成的事务。不用扫描整个磁盘。
+
+**Q5：目录项的 rec_len 有什么用？**
+
+因为文件名长度可变，目录项长度也必须可变。rec_len 记录当前目录项占用的总字节数，便于在遍历时跳到下一个目录项。
+
+理解目录实现和文件系统一致性，是理解文件系统完整设计的关键。
