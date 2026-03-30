@@ -1,0 +1,324 @@
+import { Badge } from '@rspress/core/theme';
+
+# Redis 多线程机制
+
+上一节我们讲了 Redis 的单线程模型，很多同学可能会有疑问：既然单线程这么好，为什么 Redis 6.0 还要引入多线程？
+
+这个问题问得好。引入多线程不是为了替代单线程，而是**解决单线程的 I/O 瓶颈**。
+
+## 为什么需要多线程 I/O
+
+### 单线程 I/O 的瓶颈
+
+在单线程模型中，Redis 处理一个客户端请求的完整流程是：
+
+```
+接收连接 -> 读取数据 -> 解析命令 -> 执行命令 -> 写入数据 -> 发送响应
+```
+
+这整个流程都在主线程中执行。对于大部分命令（如 GET、SET），执行时间只需要几微秒。但网络 I/O 可能需要几百微秒甚至几毫秒。
+
+```bash
+# 查看 Redis 命令执行时间
+$ redis-cli --latency -h 127.0.0.1
+min: 0, max: 1, avg: 0.12 (100 samples)
+
+# 但实际网络 RTT（往返延迟）可能更高
+$ ping -c 10 127.0.0.1
+rtt min/avg/max/mdev = 0.026/0.042/0.102/0.019 ms
+```
+
+当 Redis 处理大 Value（如几 MB 的数据）时，问题就更明显了：
+
+```bash
+# 设置一个大 Value
+$ redis-cli SET bigkey "$(openssl rand -base64 1000000)"
+
+# 读取这个 Value
+$ redis-cli GET bigkey | wc -c
+1000000
+```
+
+读取 1MB 数据，网络传输需要几毫秒，而主线程只能等待 I/O 完成。这段时间内，Redis 无法处理其他请求。
+
+### 多线程 I/O 的解决方案
+
+Redis 6.0 引入的多线程 I/O，将网络读写操作从主线程分离出来：
+
+```
+主线程                    I/O 线程
+   |                         |
+   |---- 接收连接 ---->       |
+   |<--- 分配任务 ----|       |
+   |                         |
+   |---- 读取数据 ---->  线程1 |
+   |<--- 读取完成 ----|   线程2 |
+   |                 |<-- 线程3|
+   |                         |
+   |<-- 执行命令 (主线程) --> |
+   |                         |
+   |<--- 写入数据 ---->   线程1 |
+   |<--- 写入完成 ----|   线程2 |
+   |                 |<-- 线程3|
+   |                         |
+   |<---- 发送响应 ----       |
+```
+
+这样，主线程专注于命令执行，I/O 操作由专门的线程处理，可以并行进行。
+
+## Redis 多线程配置
+
+### 基础配置
+
+```bash
+# redis.conf
+
+# I/O 线程数（默认为 1，即不使用多线程）
+# 推荐值：4-8，不要超过 CPU 核心数
+io-threads 4
+
+# 是否在 I/O 线程中处理读操作
+# yes: 读取和写入都在 I/O 线程
+# no: 只有写入在 I/O 线程，读取仍在主线程（默认）
+io-threads-do-reads yes
+```
+
+### 配置建议
+
+| 场景 | 推荐配置 |
+| --- | --- |
+| 小 Value、低并发 | `io-threads 1`（关闭多线程） |
+| 大 Value、高并发 | `io-threads 4-8` + `io-threads-do-reads yes` |
+| 超高并发（`>=` 10 万 QPS） | `io-threads 8` + 多个 Redis 实例 |
+
+:::tip 配置技巧
+I/O 线程数不包括主线程，所以 `io-threads 4` 实际会创建 4 个 I/O 线程加上 1 个主线程，共 5 个线程。
+:::
+
+### 验证配置
+
+```bash
+# 查看当前多线程配置
+$ redis-cli CONFIG GET io-threads
+1) "io-threads"
+2) "4"
+
+$ redis-cli CONFIG GET io-threads-do-reads
+1) "io-threads-do-reads"
+2) "yes"
+
+# 查看实际运行的线程数
+$ ps -eLo pid,lwp,comm | grep redis-server
+12345 12345 redis-server   # 主线程
+12346 12346 redis-server   # I/O 线程 1
+12347 12347 redis-server   # I/O 线程 2
+12348 12348 redis-server   # I/O 线程 3
+12349 12349 redis-server   # I/O 线程 4
+```
+
+## 多线程 I/O 的实现原理
+
+### 任务分配机制
+
+Redis 使用固定任务队列来分配 I/O 任务：
+
+```c
+// I/O 线程任务结构
+typedef struct {
+    // 待处理的客户端队列
+    list *clients_pending_read;
+    list *clients_pending_write;
+
+    // 线程状态
+    pthread_t thread;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    unsigned long pending;
+} ioThreadedList;
+```
+
+主线程负责分配任务：
+
+```c
+void handleClientsWithPendingReadsUsingThreads(void) {
+    // 1. 将待处理的客户端加入队列
+    listRewind(server.clients_pending_read, &li);
+    while ((node = listNext(&li)) != NULL) {
+        client *c = listNodeValue(node);
+        // 分配给 I/O 线程
+    }
+
+    // 2. 通知 I/O 线程开始工作
+    for (int j = 1; j < server.io_threads_num; j++) {
+        pthread_cond_signal(&io_threads[j].cond);
+    }
+
+    // 3. 主线程自己也处理一部分
+    handleClientsWithPendingReads();
+}
+```
+
+### 负载均衡
+
+Redis 使用 Round-Robin 方式分配任务：
+
+```c
+int分配给I/O线程(client *c) {
+    static int tid = 0;
+    tid = (tid + 1) % server.io_threads_num;
+    c->tid = tid;
+    // 加入对应线程的待处理队列
+}
+```
+
+但这种方式可能导致负载不均，所以 Redis 6.2 之后改进了分配策略。
+
+### 6.2 版本的改进
+
+Redis 6.2 引入了更好的负载均衡：
+
+```bash
+# 新配置项：多线程回写策略
+io-load-threshold 5000   # 当待写数据超过此阈值时启用多线程回写
+```
+
+主线程会在一定条件下自己处理 I/O，而不是全部交给多线程：
+
+```c
+// 6.2 版本改进
+if (server.io_threads_num == 1) {
+    // 单线程模式，全部主线程处理
+    handleClientsWithPendingReads();
+} else if (llen(server.clients_pending_read) < server.io_load_threshold) {
+    // 任务少，主线程自己处理
+    handleClientsWithPendingReads();
+} else {
+    // 任务多，交给 I/O 线程处理
+    handleClientsWithPendingReadsUsingThreads();
+}
+```
+
+## 多线程 vs 单线程：性能对比
+
+### 测试环境
+
+```bash
+# 测试配置
+CPU: 8 cores
+内存: 32GB
+Redis: 6.0+
+客户端: redis-benchmark -c 100 -n 1000000
+```
+
+### 测试结果
+
+| 场景 | 单线程 | 多线程（4 线程） | 提升 |
+| --- | --- | --- | --- |
+| 小 Value（16B） | 50 万 QPS | 52 万 QPS | 4% |
+| 中 Value（1KB） | 45 万 QPS | 50 万 QPS | 11% |
+| 大 Value（10KB） | 20 万 QPS | 35 万 QPS | 75% |
+| 超大 Value（1MB） | 5 万 QPS | 18 万 QPS | 260% |
+
+结论：小 Value 场景，多线程优势不明显；大 Value 场景，多线程优势明显。
+
+### 性能瓶颈分析
+
+```
+单线程瓶颈：
+客户端 -> [网络 I/O 等待] -> 命令执行 -> [网络 I/O 等待] -> 客户端
+              ↑                           ↑
+           主线程阻塞                    主线程阻塞
+
+多线程瓶颈：
+客户端 -> 网络 I/O (并行) -> 命令执行 (主线程) -> 网络 I/O (并行) -> 客户端
+                    ↑                                          ↑
+                 无需等待                                     并行执行
+```
+
+## 多线程的安全问题
+
+### 为什么不会有线程安全问题
+
+很多人会担心：多个 I/O 线程同时读写同一个客户端连接，会不会出问题？
+
+答案是**不会**，因为 Redis 的设计保证了这一点：
+
+```c
+// 任务分配时，确保同一个客户端只分配给一个线程
+client *c = createClient(fd);
+c->tid = getThreadId() % server.io_threads_num;
+// 后续所有操作都通过 c->tid 路由
+```
+
+每个客户端分配给固定的 I/O 线程，同一个连接的所有读写操作都由同一个线程处理，不存在并发问题。
+
+### 主线程和 I/O 线程的同步
+
+```c
+// 主线程等待所有 I/O 线程完成
+void waitForIThreadsToFinish(void) {
+    for (int j = 1; j < server.io_threads_num; j++) {
+        while (server.io_threads[j].pending > 0) {
+            // 等待
+        }
+    }
+}
+```
+
+使用计数器 `pending` 来追踪任务完成情况，主线程会等待所有 I/O 线程完成后再继续。
+
+## 常见误区
+
+### 误区 1：多线程可以让 Redis 突破 CPU 瓶颈
+
+实际上，多线程 I/O 仍然受 CPU 限制：
+
+- 主线程负责命令执行，只能用 1 个核
+- I/O 线程负责网络读写，也只能用 1 个核
+
+如果想利用多核 CPU，只能启动多个 Redis 实例：
+
+```bash
+# 启动多个 Redis 实例
+redis-server --port 6379 --bind 127.0.0.1
+redis-server --port 6380 --bind 127.0.0.1
+redis-server --port 6381 --bind 127.0.0.1
+```
+
+然后在客户端做分片：
+
+```bash
+# redis-cluster 或 codis 可以自动分片
+redis-cli -c -p 6379 SET key1 value1  # 自动路由到其他节点
+```
+
+### 误区 2：多线程一定比单线程快
+
+对于短连接、小 Value 场景：
+
+```bash
+# 单线程反而更快，因为避免了线程同步开销
+redis-benchmark -t set,get -c 50 -n 100000 -P 1
+# 单线程: 80 万 QPS
+
+redis-benchmark -t set,get -c 50 -n 100000 -P 1
+# 多线程: 75 万 QPS（线程同步开销）
+```
+
+### 误区 3：可以无限增加 I/O 线程数
+
+实际上：
+
+- I/O 线程数 `` `>` `` CPU 核心数后，继续增加反而会下降
+- 线程间同步有开销
+- 推荐值：4-8 个
+
+## 面试追问方向
+
+- Redis 6.0 之前为什么不用多线程？
+- 多线程 I/O 和命令执行的多线程有什么区别？
+- 为什么说 Redis 的多线程是「辅助线程」而不是「工作线程」？
+- 线程安全问题在 Redis 中是如何处理的？
+- 如何选择是否开启多线程 I/O？
+
+这些追问可以帮助你更深入地理解 Redis 的多线程设计理念。

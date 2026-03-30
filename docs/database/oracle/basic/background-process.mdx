@@ -1,0 +1,410 @@
+# Oracle 后台进程：DBWn、LGWR、CKPT、SMON、PMON
+
+如果说 SGA 和 PGA 是 Oracle 的"大脑"和"缓存"，那么后台进程就是 Oracle 的"心血管系统"——它们在幕后默默工作，确保数据正确写入、及时恢复、内存高效利用。没有这些后台进程，Oracle 数据库就是一个空壳。
+
+凌晨 5 点，数据库服务器意外断电。凌晨 5:02，电力恢复，DBA 启动数据库。短短几秒钟后，数据库恢复正常。SMON 进程自动完成了实例恢复，所有已提交的事务得以保留，所有未提交的事务被回滚。——这个过程是如何发生的？后台进程在其中扮演了什么角色？
+
+## 后台进程概述
+
+Oracle 实例启动时，会启动一系列后台进程。这些进程各司其职，共同维护数据库的正常运行。
+
+后台进程可以分为三大类：
+
+- **必需进程**：保证数据库基本功能的进程，如 PMON、SMON、DBWn、LGWR
+- **可选进程**：提供额外功能的进程，如 ARCn、MMON、CJQn
+- **从属进程**：由可选进程启动的子进程
+
+```text
+Oracle 后台进程架构
+
+┌──────────────────────────────────────────────────────────────┐
+│                        实例启动                              │
+├──────────────────────────────────────────────────────────────┤
+│  必需进程                                                   │
+│  ├── PMON ──── 进程监控，异常恢复                            │
+│  ├── SMON ──── 系统监控，实例恢复                            │
+│  ├── DBWn ──── 数据库写入，脏数据写盘                        │
+│  └── LGWR ──── 日志写入，重做记录持久化                      │
+├──────────────────────────────────────────────────────────────┤
+│  可选进程                                                   │
+│  ├── ARCn ──── 归档进程（ARCHIVELOG 模式）                  │
+│  ├── CKPT ──── 检查点进程                                    │
+│  ├── MMON ──── 性能监控，AWR 快照                           │
+│  ├── MMNL ──── 轻量级监控                                    │
+│  ├── CJQn ──── 作业队列协调器                                │
+│  └── RECO ──── 分布式事务恢复                                │
+├──────────────────────────────────────────────────────────────┤
+│  可选组件进程                                               │
+│  ├── LMDn ──── 全局锁服务守护（Oracle RAC）                  │
+│  ├── LMSn ──── 全局缓存服务（Oracle RAC）                    │
+│  └── DIAG ──── 诊断监控                                      │
+└──────────────────────────────────────────────────────────────┘
+```
+
+## 必需进程详解
+
+### DBWn：数据库写入进程（Database Writer）
+
+**核心职责**：将 Buffer Cache 中的脏数据块（已修改但尚未写入数据文件的缓冲区）批量写入磁盘。
+
+DBWn 是 Oracle 中最"懒惰"的进程——它尽可能少地写盘，利用 Buffer Cache 缓存尽可能多的数据。为什么这样设计？因为磁盘 I/O 是数据库最大的性能瓶颈，DBWn 通过批量写入策略，最大化利用内存缓存，同时尽可能减少磁盘写操作次数。
+
+**触发 DBWn 写盘的条件**：
+
+- 服务器进程找不到足够的空闲缓冲区
+- 脏缓冲区数量达到阈值
+- 增量检查点或完全检查点发生
+- 表空间被脱机或只读
+- RAC 实例需要刷新缓存
+- 超过 3 秒未执行写操作
+
+```sql
+-- 查看 DBWn 进程
+SELECT pid, name, description FROM V$BGPROCESS WHERE name LIKE 'DBW%';
+
+-- 查看 DBWn 的 I/O 统计
+SELECT name, waits, writes FROM V$DB_WRITER_CHARACTERISTICS;
+
+-- 查看脏缓冲区数量
+SELECT COUNT(*) AS dirty_buffers FROM X$BH WHERE state = 1;
+```
+
+Oracle 可以配置多个 DBWn 进程（DBW0 到 DBW9），在以下场景下有益：
+
+- 高并发写入的 OLTP 系统
+- 大量小数据文件的场景
+- 使用异步 I/O 仍存在性能瓶颈
+
+```sql
+-- 配置多个 DBWn 进程
+ALTER SYSTEM SET db_writer_processes = 4 SCOPE = SPFILE;
+```
+
+**DBWn 与检查点的协作**：DBWn 的写盘时机与检查点密切相关。检查点触发后，CKPT 进程通知 DBWn 将检查点之前的脏数据全部写入磁盘。这是保证数据库一致性的关键机制。
+
+### LGWR：日志写入进程（Log Writer）
+
+**核心职责**：将 Redo Log Buffer 中的重做记录写入联机重做日志文件。
+
+LGWR 是 Oracle 中最"勤快"的进程——它频繁地将内存中的重做日志写入磁盘。重做日志是数据库恢复的核心依据，LGWR 的可靠性直接关系到数据安全。
+
+**触发 LGWR 写盘的条件**：
+
+- 事务提交（COMMIT）时
+- Redo Log Buffer 达到 1/3 满
+- 超过 3 秒未执行写操作
+- DBWn 准备写脏数据之前（LGWR 必须先于 DBWn 完成）
+
+这种"LGWR 先写"机制保证了事务提交时，重做记录一定已经持久化到磁盘。如果 LGWR 在 DBWn 之前完成，那么即使 DBWn 还没来得及写盘就发生崩溃，LGWR 中的重做记录仍然可以用于恢复。
+
+```sql
+-- 查看 LGWR 进程
+SELECT pid, name, description FROM V$BGPROCESS WHERE name = 'LGWR';
+
+-- 查看 LGWR 的 I/O 统计
+SELECT name, waits, writes FROM V$SYSSTAT 
+WHERE name LIKE '%redo%';
+
+-- 查看日志切换频率
+SELECT sequence#, status, archived, 
+       blocks * block_size / 1024 / 1024 AS size_mb,
+       FIRST_TIME, NEXT_TIME
+FROM V$LOG_HISTORY
+ORDER BY sequence# DESC;
+```
+
+**重做日志的循环覆盖机制**：LGWR 采用循环写入的方式，当一个日志组写满时，执行日志切换（Log Switch），开始向下一个日志组写入。如果启用了归档模式，ARCn 进程会先将写满的日志复制为归档日志；如果未启用归档，日志组被覆盖后会丢失数据。
+
+```sql
+-- 强制日志切换
+ALTER SYSTEM SWITCH LOGFILE;
+
+-- 查看当前日志序列号
+SELECT sequence#, status, blocks FROM V$LOG WHERE status = 'CURRENT';
+```
+
+### PMON：进程监控进程（Process Monitor）
+
+**核心职责**：监控服务器进程的运行状态，在进程异常终止时执行清理工作。
+
+当一个用户会话异常断开（如客户端崩溃、网络中断），PMON 会自动检测并处理：
+
+1. 回滚未完成的事务（释放事务持有的锁）
+2. 释放该进程占用的 PGA 内存
+3. 释放该进程占用的资源（如会话内存）
+4. 更新资源使用统计
+
+PMON 还负责监控共享服务器进程和调度进程的运行状态，在进程异常时重启或重新调度。
+
+```sql
+-- 查看 PMON 进程
+SELECT pid, name, description FROM V$BGPROCESS WHERE name = 'PMON';
+
+-- 查看被 PMON 清理的进程统计
+SELECT * FROM V$SYSSTAT WHERE name LIKE '%pmon%';
+
+-- 查看被回滚的事务
+SELECT used_ublk, used_urec FROM V$TRANSACTION;
+```
+
+### SMON：系统监控进程（System Monitor）
+
+**核心职责**：执行实例恢复和系统级维护工作。
+
+SMON 是 Oracle 的"清道夫"和"急救医生"，负责以下关键任务：
+
+**实例恢复**：当数据库异常关闭（如断电、SHUTDOWN ABORT）后重新启动时，SMON 负责执行实例恢复。恢复过程分为两个阶段：
+
+1. **前滚（Roll Forward）**：读取联机重做日志，利用日志中的记录将数据恢复到崩溃时的状态（包括已提交和未提交的事务）
+2. **回滚（Roll Back）**：读取回滚段，将未提交事务的修改撤销
+
+```sql
+-- 查看 SMON 进程
+SELECT pid, name, description FROM V$BGPROCESS WHERE name = 'SMON';
+
+-- 查看实例恢复统计
+SELECT * FROM V$INSTANCE_RECOVERY;
+
+-- 手动触发临时段清理
+ALTER SYSTEM SET events 'immediate trace name SMON_TSK_DONE enable';
+```
+
+**临时段清理**：排序等操作使用的临时段，在操作完成后由 SMON 定期清理和释放空间。
+
+**空间碎片合并**：SMON 定期合并表空间中的空闲空间，减少碎片。
+
+**在 RAC 环境中**：每个实例都有一个 SMON 进程，除了执行本地实例恢复，还负责集群级别的实例恢复协调。
+
+## 可选进程详解
+
+### CKPT：检查点进程（Checkpoint Process）
+
+**核心职责**：通知 DBWn 执行检查点，并更新控制文件中的检查点信息。
+
+检查点（Checkpoint）是数据库一致性维护的关键机制。每个检查点都会触发以下操作：
+
+1. DBWn 将检查点位置之前的所有脏数据块写入磁盘
+2. CKPT 更新控制文件，记录检查点位置（日志序列号、日志块号）
+3. DBWn 更新数据文件头部，记录检查点位置
+
+检查点的作用有三个层面：
+
+**恢复一致性**：下次启动时，Oracle 知道从哪个日志位置开始应用重做，不需要重新处理检查点之前的所有日志。
+
+**缩短实例恢复时间**：检查点越频繁，崩溃后需要恢复的数据越少，恢复时间越短。
+
+**释放空间**：LGWR 循环使用日志组时，必须等日志组变为 INACTIVE（完成归档且检查点已过），才能被覆盖。
+
+```sql
+-- 查看 CKPT 进程
+SELECT pid, name, description FROM V$BGPROCESS WHERE name = 'CKPT';
+
+-- 查看检查点统计
+SELECT * FROM V$SYSSTAT WHERE name LIKE '%checkpoint%';
+
+-- 手动触发完全检查点
+ALTER SYSTEM CHECKPOINT;
+
+-- 查看当前检查点信息
+SELECT * FROM V$THREAD;
+SELECT checkpoint_change# FROM V$DATABASE;
+```
+
+**增量检查点 vs 完全检查点**：
+
+- **完全检查点（Full Checkpoint）**：`ALTER SYSTEM CHECKPOINT`、正常关闭数据库
+- **增量检查点（Incremental Checkpoint）**：CKPT 每 3 秒触发一次，逐步将脏数据写入磁盘，避免完全检查点带来的 I/O 突增
+
+### ARCn：归档进程（Archiver）
+
+**核心职责**：在归档模式下，将已写满的联机重做日志复制为归档日志文件。
+
+ARCn 是保证数据安全的最后一环。在 ARCHIVELOG 模式下，所有重做日志都被永久保存，即使联机日志被覆盖，也不会丢失任何变更历史。
+
+```sql
+-- 查看当前归档模式
+ARCHIVE LOG LIST;
+SELECT log_mode FROM V$DATABASE;
+
+-- 查看 ARCn 进程
+SELECT pid, name, description FROM V$BGPROCESS WHERE name LIKE 'ARC%';
+
+-- 查看归档日志
+SELECT sequence#, first_time, next_time, archived, status
+FROM V$ARCHIVED_LOG
+ORDER BY sequence# DESC;
+```
+
+Oracle 可以配置多个归档进程（ARC0 到 ARC9），并行处理归档任务：
+
+```sql
+-- 配置归档进程数
+ALTER SYSTEM SET log_archive_max_processes = 4;
+```
+
+**ARCH 和 LGWR 两种传输模式**：
+
+- **ARCH 模式**（默认）：ARCn 进程在日志切换后复制日志
+- **LGWR 模式**：LGWR 直接传输日志到备库，用于 Data Guard 的实时日志传输
+
+### MMON 和 MMNL：可管理性监控进程
+
+**MMON（Manageability Monitor）**：
+
+- 收集 AWR（Automatic Workload Repository）性能统计
+- 捕获段级统计信息
+- 生成警报（Alert）
+- 执行自动段 Advisor
+
+**MMNL（Memory Monitor Light）**：
+
+- 辅助 MMON 处理轻量级统计收集任务
+- 刷新 ASH（Active Session History）数据
+
+```sql
+-- 查看 MMON/MMNL 进程
+SELECT pid, name, description FROM V$BGPROCESS 
+WHERE name IN ('MMON', 'MMNL');
+
+-- 查看 AWR 快照
+SELECT snap_id, instance_number, startup_time, begin_interval_time, end_interval_time
+FROM dba_hist_snapshot
+ORDER BY snap_id DESC;
+```
+
+### CJQn 和 Job Queue Process：作业队列
+
+**CJQn（Coordinator Job Queue）**：作业队列协调器，负责调度定时作业。
+
+**Job Queue Process（J000~J999）**：由 CJQn 启动的工作进程，执行具体的定时任务。
+
+```sql
+-- 查看作业队列进程
+SELECT pid, name, description FROM V$BGPROCESS WHERE name LIKE 'J%';
+
+-- 查看定时作业
+SELECT job, log_user, what, next_date, interval
+FROM dba_jobs
+WHERE broken = 'N';
+```
+
+### RECO：分布式事务恢复进程
+
+**核心职责**：在分布式事务中，自动恢复处于可疑状态的事务。
+
+当网络中断或数据库不可达时，分布式事务可能卡在"可疑"状态。RECO 自动检测并解决这些可疑事务（通常回滚）。
+
+```sql
+-- 查看 RECO 进程
+SELECT pid, name, description FROM V$BGPROCESS WHERE name = 'RECO';
+```
+
+## RAC 环境下的特殊进程
+
+在 Oracle Real Application Clusters 环境下，增加了多个集群相关的后台进程：
+
+**LMDn（Lock Manager Daemon）**：全局锁管理，处理分布式锁请求。
+
+**LMSn（Lock Manager Server）**：全局缓存服务，负责在节点间传输数据块。
+
+**LCK0**：实例锁进程，管理实例级别的锁资源。
+
+**GSD（Global Service Daemon）**：提供 SRVCTL 工具与集群数据库的交互接口。
+
+**DIAG（Diagnostic Daemon）**：诊断监控进程。
+
+```sql
+-- 查看 RAC 环境下的后台进程
+SELECT inst_id, pid, name, description 
+FROM gv$BGPROCESS
+WHERE name IN ('LMD', 'LMS', 'LMON', 'LMS', 'DIAG')
+ORDER BY inst_id, name;
+```
+
+## 后台进程的协同工作
+
+Oracle 后台进程之间通过精妙的协作机制，确保数据库的高效运行和故障恢复能力。
+
+**数据写入的协同流程**：
+
+```text
+事务提交 → LGWR 写入重做日志 → DBWn 异步写入数据文件
+                    ↓
+           CKPT 更新检查点信息
+```
+
+**实例恢复的协同流程**：
+
+```text
+实例启动 → SMON 读取控制文件（检查点位置）
+                ↓
+        读取重做日志，前滚到检查点
+                ↓
+        读取回滚段，回滚未提交事务
+```
+
+**日志切换的协同流程**：
+
+```text
+日志组满 → LGWR 触发日志切换
+                ↓
+        CKPT 更新检查点（INACTIVE 日志组可被覆盖）
+                ↓
+        ARCn 归档日志（ARCHIVELOG 模式）
+```
+
+## 监控后台进程
+
+```sql
+-- 查看所有后台进程
+SELECT pid, name, description, trace_filename
+FROM V$BGPROCESS
+WHERE name IS NOT NULL
+ORDER BY name;
+
+-- 查看进程状态
+SELECT pid, program, username, status, event
+FROM V$PROCESS p
+LEFT JOIN V$SESSION s ON p.addr = s.paddr;
+
+-- 查看后台进程的等待事件
+SELECT name, wait_class, total_waits, time_waited
+FROM V$SYSTEM_EVENT
+WHERE event IN (
+    SELECT event FROM V$BGPROCESS_EVENT
+)
+ORDER BY time_waited DESC;
+
+-- 查看 DBWn 的 I/O 统计
+SELECT name, class, value
+FROM V$STATNAME n
+JOIN V$SESSTAT s ON n.statistic# = s.statistic#
+WHERE name LIKE '%dbwr%'
+ORDER BY value DESC;
+```
+
+## 常见面试问题
+
+**问：DBWn 为什么设计为懒惰写盘？**
+
+磁盘 I/O 是数据库最大的性能瓶颈。如果每次修改都立即写盘，数据库将频繁等待磁盘 I/O，性能急剧下降。DBWn 通过批量写盘策略，减少 I/O 次数；同时利用 Buffer Cache 缓存数据，让读操作尽可能命中内存。
+
+**问：LGWR 写日志和 DBWn 写数据，哪个先完成？**
+
+LGWR 必须先于 DBWn 完成。事务提交时，LGWR 首先将重做记录写入磁盘（持久化），DBWn 才开始异步写数据文件。这种"写日志优先"机制保证：如果 DBWn 写盘前发生崩溃，重做日志仍然可用于恢复。
+
+**问：检查点的作用是什么？**
+
+检查点有三个作用：1）缩短实例恢复时间，Oracle 从检查点位置开始恢复，不需要重做所有日志；2）保证数据一致性，检查点之后的数据文件是完整的；3）释放日志空间，日志组完成检查点后才能被覆盖。
+
+**问：SMON 在实例恢复中做了什么？**
+
+SMON 执行前滚（利用重做日志恢复数据）和回滚（利用回滚段撤销未提交事务）两个阶段。前滚将数据恢复到崩溃时的状态（包括已提交和未提交的），回滚将未提交的修改撤销。
+
+**问：ARCn 进程在什么情况下使用？**
+
+ARCn 在数据库运行于 ARCHIVELOG 模式时工作。联机重做日志写满后，ARCn 将日志复制为归档日志文件，确保所有变更历史永久保存，支持任意时间点恢复。
+
+## 总结
+
+Oracle 的后台进程是数据库稳定运行的幕后英雄。DBWn 通过批量写盘最大化缓存效率，LGWR 通过频繁写日志保证数据安全，PMON 和 SMON 处理异常恢复，CKPT 协调一致性检查点，ARCn 守护归档历史。这些进程各司其职、协同工作，构成了 Oracle 数据库高可靠性的基石。理解它们的职责和协作关系，是深入学习 Oracle 架构和故障排查的必要前提。

@@ -1,0 +1,493 @@
+import { Badge } from '@rspress/core/theme';
+
+# UV 统计与去重
+
+UV（Unique Visitor）是互联网统计的核心指标。用 Redis 的 HyperLogLog，可以高效统计海量数据的基数，而且内存占用极低。
+
+## 为什么需要 HyperLogLog
+
+传统的基数统计方式：
+
+| 方式 | 精确度 | 内存占用 | 说明 |
+| --- | --- | --- | --- |
+| Set | 精确 | 高 | 每个元素占一定内存 |
+| BitMap | 精确 | 中 | 元素 ID 范围决定内存 |
+| 哈希表 | 精确 | 高 | 每个元素一个 entry |
+| HyperLogLog | 近似 | 极低 | 固定 12KB，误差约 0.81% |
+
+HyperLogLog 的核心思想：用概率算法估算集合的基数，内存占用固定，但有一定误差。
+
+## HyperLogLog 原理
+
+HyperLogLog 基于**伯努利试验**的原理：
+
+```
+伯努利试验：抛硬币，直到出现正面
+
+抛 1 次就出现正面 → 概率 1/2
+抛 2 次才出现正面 → 概率 1/4
+抛 3 次才出现正面 → 概率 1/8
+...
+
+n 次试验后出现正面，最可能的试验次数 = n
+n 次试验中出现最长序列的头部 = k
+n ≈ 2^k
+
+例如：100 万人做过试验
+记录每个人抛硬币的最多连续正面次数
+假设最长连续正面是 20 次
+则估算 n = 2^20 ≈ 100 万
+```
+
+HyperLogLog 使用多个桶来提高精度：
+
+```
+Redis HyperLogLog：
+- 16384 个桶
+- 每个桶记录最多连续 0 的个数（6 位）
+- 根据桶的均值估算基数
+```
+
+## 基本操作
+
+```bash
+# 添加数据
+PFADD uv:2024-03-15 "user1" "user2" "user3"
+PFADD uv:2024-03-15 "user4" "user5"
+
+# 统计基数
+PFCOUNT uv:2024-03-15
+# (integer) 5
+
+# 合并多个 HyperLogLog
+PFADD uv:2024-03-16 "user3" "user6" "user7"
+PFMERGE uv:2024-03 uv:2024-03-15 uv:2024-03-16
+
+# 合并后的基数
+PFCOUNT uv:2024-03
+# (integer) 7
+```
+
+## UV 统计服务
+
+```java
+@Service
+public class UVStatService {
+    
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+    
+    /**
+     * 记录访问
+     */
+    public void recordVisit(String visitorId) {
+        String key = getDailyKey(LocalDate.now());
+        redisTemplate.opsForHyperLogLog().add(key, visitorId);
+    }
+    
+    /**
+     * 批量记录访问
+     */
+    public void recordVisits(String... visitorIds) {
+        String key = getDailyKey(LocalDate.now());
+        redisTemplate.opsForHyperLogLog().add(key, visitorIds);
+    }
+    
+    /**
+     * 获取日 UV
+     */
+    public long getDailyUV(LocalDate date) {
+        String key = getDailyKey(date);
+        Long uv = redisTemplate.opsForHyperLogLog().size(key);
+        return uv != null ? uv : 0;
+    }
+    
+    /**
+     * 获取周 UV
+     */
+    public long getWeeklyUV(LocalDate date) {
+        List<String> keys = new ArrayList<>();
+        for (int i = 0; i < 7; i++) {
+            keys.add(getDailyKey(date.minusDays(i)));
+        }
+        
+        String mergeKey = "uv:merge:" + date.toString();
+        
+        // 合并 7 天的数据
+        redisTemplate.opsForHyperLogLog().union(mergeKey, keys);
+        
+        Long uv = redisTemplate.opsForHyperLogLog().size(mergeKey);
+        
+        // 删除临时 key
+        redisTemplate.delete(mergeKey);
+        
+        return uv != null ? uv : 0;
+    }
+    
+    /**
+     * 获取月 UV
+     */
+    public long getMonthlyUV(LocalDate date) {
+        LocalDate startOfMonth = date.withDayOfMonth(1);
+        
+        List<String> keys = new ArrayList<>();
+        while (!startOfMonth.isAfter(date)) {
+            keys.add(getDailyKey(startOfMonth));
+            startOfMonth = startOfMonth.plusDays(1);
+        }
+        
+        String mergeKey = "uv:merge:" + date.toString();
+        
+        redisTemplate.opsForHyperLogLog().union(mergeKey, keys);
+        
+        Long uv = redisTemplate.opsForHyperLogLog().size(mergeKey);
+        
+        redisTemplate.delete(mergeKey);
+        
+        return uv != null ? uv : 0;
+    }
+    
+    private String getDailyKey(LocalDate date) {
+        return "uv:daily:" + date.format(DateTimeFormatter.ofPattern("yyyy-MM-dd"));
+    }
+}
+```
+
+## 页面 UV 统计
+
+```java
+@Service
+public class PageUVService {
+    
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+    
+    /**
+     * 记录页面访问
+     */
+    public void recordPageView(String pageId, String visitorId) {
+        String key = getPageUVKey(pageId, LocalDate.now());
+        redisTemplate.opsForHyperLogLog().add(key, visitorId);
+    }
+    
+    /**
+     * 获取页面 UV
+     */
+    public long getPageUV(String pageId, LocalDate date) {
+        String key = getPageUVKey(pageId, date);
+        Long uv = redisTemplate.opsForHyperLogLog().size(key);
+        return uv != null ? uv : 0;
+    }
+    
+    /**
+     * 获取多个页面的 UV
+     */
+    public Map<String, Long> getMultiplePageUV(List<String> pageIds, LocalDate date) {
+        Map<String, Long> result = new HashMap<>();
+        
+        for (String pageId : pageIds) {
+            result.put(pageId, getPageUV(pageId, date));
+        }
+        
+        return result;
+    }
+    
+    /**
+     * 获取页面 PV 和 UV
+     */
+    public PageStats getPageStats(String pageId, LocalDate date) {
+        String pvKey = "pv:page:" + pageId + ":" + date;
+        String uvKey = getPageUVKey(pageId, date);
+        
+        // PV
+        Long pv = redisTemplate.opsForValue().increment(pvKey);
+        
+        // UV
+        Long uv = redisTemplate.opsForHyperLogLog().size(uvKey);
+        
+        PageStats stats = new PageStats();
+        stats.setPv(pv != null ? pv : 0);
+        stats.setUv(uv != null ? uv : 0);
+        stats.setDate(date);
+        stats.setPageId(pageId);
+        
+        return stats;
+    }
+    
+    private String getPageUVKey(String pageId, LocalDate date) {
+        return "uv:page:" + pageId + ":" + date.format(DateTimeFormatter.ofPattern("yyyy-MM-dd"));
+    }
+}
+```
+
+## 实时 UV 统计
+
+```java
+@Service
+public class RealTimeUVService {
+    
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+    
+    @Autowired
+    private UVStatService uvStatService;
+    
+    private static final String REALTIME_KEY = "uv:realtime:";
+    
+    /**
+     * 记录实时访问
+     */
+    public void recordRealtimeVisit(String visitorId) {
+        LocalDateTime now = LocalDateTime.now();
+        String key = getRealtimeKey(now);
+        
+        // 同时记录到小时 UV 和分钟 UV
+        String hourKey = key.substring(0, key.lastIndexOf(':')) + ":hour";
+        String minuteKey = key;
+        
+        redisTemplate.opsForHyperLogLog().add(hourKey, visitorId);
+        redisTemplate.opsForHyperLogLog().add(minuteKey, visitorId);
+        
+        // 设置过期时间（保留 24 小时数据）
+        redisTemplate.expire(hourKey, 25, TimeUnit.HOURS);
+        redisTemplate.expire(minuteKey, 25, TimeUnit.HOURS);
+    }
+    
+    /**
+     * 获取当前小时的 UV
+     */
+    public long getCurrentHourUV() {
+        LocalDateTime now = LocalDateTime.now();
+        String key = REALTIME_KEY + now.format(DateTimeFormatter.ofPattern("yyyy-MM-dd-HH"));
+        
+        Long uv = redisTemplate.opsForHyperLogLog().size(key);
+        return uv != null ? uv : 0;
+    }
+    
+    /**
+     * 获取今日 UV 趋势（每小时）
+     */
+    public List<Long> getHourlyTrend(LocalDate date) {
+        List<Long> trend = new ArrayList<>();
+        
+        for (int hour = 0; hour < 24; hour++) {
+            String key = REALTIME_KEY + date.format(DateTimeFormatter.ofPattern("yyyy-MM-dd")) 
+                       + "-" + String.format("%02d", hour);
+            
+            Long uv = redisTemplate.opsForHyperLogLog().size(key);
+            trend.add(uv != null ? uv : 0);
+        }
+        
+        return trend;
+    }
+    
+    private String getRealtimeKey(LocalDateTime dateTime) {
+        return REALTIME_KEY + dateTime.format(
+            DateTimeFormatter.ofPattern("yyyy-MM-dd-HH-mm"));
+    }
+}
+```
+
+## UV 和精确去重
+
+HyperLogLog 有约 0.81% 的误差。如果需要精确去重，可以结合其他方式：
+
+```java
+@Service
+public class AccurateDedupeService {
+    
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+    
+    /**
+     * 精确去重：使用 Set + HyperLogLog
+     */
+    public boolean recordAndCheckDuplicate(String visitorId) {
+        String date = LocalDate.now().toString();
+        String setKey = "visitors:set:" + date;
+        String hllKey = "visitors:hll:" + date;
+        
+        // 1. 先用 Set 判断（精确）
+        Long added = redisTemplate.opsForSet().add(setKey, visitorId);
+        
+        if (added == 0) {
+            // 已存在，重复访问
+            return false;
+        }
+        
+        // 2. 同时添加到 HyperLogLog（用于统计）
+        redisTemplate.opsForHyperLogLog().add(hllKey, visitorId);
+        
+        // 3. 设置过期时间
+        redisTemplate.expire(setKey, 2, TimeUnit.DAYS);
+        redisTemplate.expire(hllKey, 2, TimeUnit.DAYS);
+        
+        return true;
+    }
+    
+    /**
+     * 获取精确 UV（使用 Set）
+     */
+    public long getAccurateUV(LocalDate date) {
+        String setKey = "visitors:set:" + date.toString();
+        Long size = redisTemplate.opsForSet().size(setKey);
+        return size != null ? size : 0;
+    }
+    
+    /**
+     * 获取估算 UV（使用 HyperLogLog）
+     */
+    public long getEstimatedUV(LocalDate date) {
+        String hllKey = "visitors:hll:" + date.toString();
+        Long size = redisTemplate.opsForHyperLogLog().size(hllKey);
+        return size != null ? size : 0;
+    }
+}
+```
+
+## 统计面板
+
+```java
+@RestController
+@RequestMapping("/api/stats")
+public class StatsController {
+    
+    @Autowired
+    private UVStatService uvStatService;
+    
+    @Autowired
+    private PageUVService pageUVService;
+    
+    @Autowired
+    private RealTimeUVService realtimeUVService;
+    
+    /**
+     * 获取 Dashboard 数据
+     */
+    @GetMapping("/dashboard")
+    public Result<Map<String, Object>> getDashboard() {
+        LocalDate today = LocalDate.now();
+        LocalDate yesterday = today.minusDays(1);
+        
+        Map<String, Object> data = new HashMap<>();
+        
+        // 今日 UV
+        data.put("todayUV", uvStatService.getDailyUV(today));
+        
+        // 昨日 UV
+        data.put("yesterdayUV", uvStatService.getDailyUV(yesterday));
+        
+        // 本周 UV
+        data.put("weeklyUV", uvStatService.getWeeklyUV(today));
+        
+        // 本月 UV
+        data.put("monthlyUV", uvStatService.getMonthlyUV(today));
+        
+        // 实时 UV
+        data.put("realtimeUV", realtimeUVService.getCurrentHourUV());
+        
+        // 今日趋势
+        data.put("hourlyTrend", realtimeUVService.getHourlyTrend(today));
+        
+        return Result.success(data);
+    }
+    
+    /**
+     * 获取页面统计
+     */
+    @GetMapping("/page/{pageId}")
+    public Result<PageStats> getPageStats(
+            @PathVariable String pageId,
+            @RequestParam LocalDate date) {
+        
+        PageStats stats = pageUVService.getPageStats(pageId, date);
+        return Result.success(stats);
+    }
+}
+```
+
+## 性能对比
+
+```java
+/**
+ * 性能对比测试
+ */
+public class UVComparison {
+    
+    public static void main(String[] args) {
+        // 模拟 1000 万用户 ID
+        List<String> userIds = new ArrayList<>();
+        for (int i = 0; i < 10000000; i++) {
+            userIds.add("user_" + i);
+        }
+        
+        long startTime, endTime;
+        
+        // 1. Set 方式
+        RedisTemplate<String, String> redis = new RedisTemplate<>();
+        Jedis jedis = new Jedis("localhost", 6379);
+        
+        startTime = System.currentTimeMillis();
+        String setKey = "test:set:uv";
+        jedis.del(setKey);
+        jedis.sadd(setKey, userIds.toArray(new String[0]));
+        Long setSize = jedis.scard(setKey);
+        endTime = System.currentTimeMillis();
+        
+        System.out.println("Set 方式:");
+        System.out.println("  数量: " + setSize);
+        System.out.println("  耗时: " + (endTime - startTime) + " ms");
+        
+        // 2. HyperLogLog 方式
+        startTime = System.currentTimeMillis();
+        String hllKey = "test:hll:uv";
+        jedis.del(hllKey);
+        jedis.pfadd(hllKey, userIds.toArray(new String[0]));
+        Long hllSize = jedis.pfcount(hllKey);
+        endTime = System.currentTimeMillis();
+        
+        System.out.println("\nHyperLogLog 方式:");
+        System.out.println("  数量: " + hllSize);
+        System.out.println("  耗时: " + (endTime - startTime) + " ms");
+        
+        // 3. 内存对比
+        System.out.println("\n内存占用:");
+        System.out.println("  Set: " + jedis.memoryUsage(setKey) + " bytes");
+        System.out.println("  HyperLogLog: " + jedis.memoryUsage(hllKey) + " bytes");
+    }
+}
+```
+
+结果示例：
+
+```
+Set 方式:
+  数量: 10000000
+  耗时: 15000 ms
+  内存: 约 800MB
+
+HyperLogLog 方式:
+  数量: 9987234（约 0.13% 误差）
+  耗时: 800 ms
+  内存: 约 12KB
+```
+
+## 面试追问方向
+
+- HyperLogLog 的原理是什么？
+- HyperLogLog 的误差是多少？
+- HyperLogLog 和 Set 相比有什么优缺点？
+- 什么场景适合用 HyperLogLog？
+- HyperLogLog 能合并吗？
+
+## 总结
+
+HyperLogLog 是海量数据基数统计的利器：
+
+1. **内存极低**：固定 12KB，可统计 2^64 个元素
+2. **性能极高**：O(n) 的添加，O(1) 的计数
+3. **有一定误差**：约 0.81%，大多数场景可接受
+4. **支持合并**：PFMERGE 合并多个 HyperLogLog
+5. **适合大数据**：PV/UV 统计、DAU/WAU/MAU
+
+HyperLogLog 让大数据统计变得简单高效，是面试和实战中的重要知识点。

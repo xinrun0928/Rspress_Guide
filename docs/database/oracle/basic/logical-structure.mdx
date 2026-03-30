@@ -1,0 +1,278 @@
+# Oracle 逻辑结构：表空间、段、区、块
+
+如果说物理结构是 Oracle 数据库的"硬件基础"，那么逻辑结构就是 Oracle 的"文件系统"。逻辑结构定义了数据如何被组织和管理的，不依赖于底层的物理文件组织形式。
+
+一个常见的 DBA 场景：根据业务增长预测，你需要在数据库上线前规划存储空间。表空间应该划分成多大？每个表空间的 extent 大小如何设置？数据文件要不要启用自动扩展？——这些问题都依赖于对逻辑结构的深入理解。
+
+## 逻辑结构的四个层次
+
+Oracle 的逻辑存储从大到小分为四个层次：**表空间（Tablespace） → 段（Segment） → 区（Extent） → 数据块（Block）**。
+
+这四者的关系可以这样理解：表空间是一个"仓库"，里面放着多个"货架"（段），每个货架由连续的木板（区）组成，而每块木板又被切割成固定大小的格子（数据块）。
+
+```text
+表空间 (Tablespace)
+    │
+    ├── 段 (Segment)  ── 表段
+    │                 ── 索引段
+    │                 ── 回滚段
+    │                 ── 临时段
+    │
+    └── 数据文件 (Data File)
+            │
+            ├── 区 (Extent) ── 连续数据块的集合
+            │
+            └── 数据块 (Block) ── 最基本的 I/O 单位
+```
+
+## 数据块：最小的 I/O 单位
+
+**数据块（Block）** 是 Oracle 最小的 I/O 单位，也是逻辑结构的基础。每个数据块对应磁盘上的一个物理区域。
+
+数据块的默认大小由 `db_block_size` 参数决定，通常为 8KB。企业级应用中，根据业务特点可能调整为 4KB（OLTP）或 16KB/32KB（OLAP）。数据块大小只能在数据库创建时确定，之后无法修改。
+
+数据块内部结构如下：
+
+```text
+┌────────────────────────────────────────────┐
+│         数据块 (Block)                       │
+├────────────────────────────────────────────┤
+│ 块头 (Header)                                │
+│  ├─ 块类型 (Table/Index/Data)              │
+│  ├─ 块地址 (DBA - Data Block Address)       │
+│  ├─ 事务槽位 (Transaction Slots)            │
+│  └─ 表目录 (Table Directory)               │
+├────────────────────────────────────────────┤
+│ 空闲空间 (Free Space)                       │
+│  └─ 用于 INSERT 和 UPDATE 操作              │
+├────────────────────────────────────────────┤
+│ 数据区 (Data Area)                          │
+│  └─ 存储实际数据行                           │
+└────────────────────────────────────────────┘
+```
+
+**PCTFREE 和 PCTUSED** 是控制数据块空间使用的两个关键参数：
+
+- **PCTFREE**：保留空间百分比，默认为 10%。当块的使用空间达到 `100% - PCTFREE` 时，不再允许新的 INSERT，只允许 UPDATE（使用保留空间）。防止行膨胀导致 UPDATE 无空间可用。
+- **PCTUSED**：启用空间百分比，默认为 40%。当块的使用空间降到 PCTUSED 以下时，块重新变为可插入状态。
+
+```sql
+-- 创建表时指定 PCTFREE 和 PCTUSED
+CREATE TABLE t1 (
+    id NUMBER,
+    name VARCHAR2(100)
+) TABLESPACE users
+PCTFREE 20
+PCTUSED 60;
+
+-- 修改已有表的参数
+ALTER TABLE t1 PCTFREE 30 PCTUSED 50;
+
+-- 查看表的存储参数
+SELECT table_name, tablespace_name, pct_free, pct_used
+FROM user_tables
+WHERE table_name = 'T1';
+```
+
+:::tip 调优建议
+高插入、低更新的表（如日志表）适合较大的 PCTFREE；高更新、低插入的表适合较小的 PCTFREE。频繁更新的表，PCTFREE 应预留足够空间以避免行迁移。
+:::
+
+## 区：空间分配的最小单位
+
+**区（Extent）** 是连续数据块的集合，是 Oracle 空间分配的最小单位。当创建一个段（表或索引）时，Oracle 至少分配一个区。
+
+区的分配发生在以下场景：
+
+- 创建表或索引时，分配初始区
+- 段的当前区满了，自动分配新区
+- 段的区数量达到临界值，自动批量分配多个区
+
+```sql
+-- 查看段的区信息
+SELECT segment_name, tablespace_name, extents, blocks,
+       bytes/1024/1024 AS size_mb
+FROM user_segments;
+
+-- 查看每个区的详细信息
+SELECT segment_name, extent_id, blocks, bytes/1024 AS size_kb
+FROM user_extents
+WHERE segment_name = 'EMPLOYEES'
+ORDER BY extent_id;
+```
+
+**区大小的递进策略**：当一个段持续扩展时，后续分配的区可以比初始区更大，这称为"递进区大小"（Uniform Extent Size）。默认情况下，区大小是统一的，由 `UNIFORM SIZE` 参数指定。
+
+```sql
+-- 创建表空间，指定统一区大小
+CREATE TABLESPACE app_data
+DATAFILE '/u01/oradata/orcl/app_data01.dbf' SIZE 100M
+EXTENT MANAGEMENT LOCAL UNIFORM SIZE 1M;
+
+-- 创建表空间，自动管理区大小
+CREATE TABLESPACE app_idx
+DATAFILE '/u01/oradata/orcl/app_idx01.dbf' SIZE 100M
+EXTENT MANAGEMENT LOCAL AUTOALLOCATE;
+```
+
+## 段：逻辑对象的物理存储
+
+**段（Segment）** 是表空间内逻辑对象（表、索引、回滚段、临时段等）的物理存储形式。每个段只属于一个表空间，但可以跨越该表空间的多个数据文件（通过区分配）。
+
+Oracle 中常见的段类型：
+
+| 段类型 | 说明 | 存储内容 |
+|---|---|---|
+| Table（表段） | 存储表数据 | 数据行 |
+| Table Partition（分区表） | 分区表的每个分区是一个独立段 | 分区数据 |
+| Index（索引段） | 存储索引数据 | 索引条目 |
+| Index Partition（分区索引） | 分区索引的每个分区是独立段 | 分区索引条目 |
+| Cluster（聚簇段） | 存储聚簇表数据 | 多表共享存储 |
+| Clustered Table（聚簇表） | 聚簇表数据存储 | 共享数据块 |
+| Rollback Segment（回滚段） | 存储回滚信息 | UNDO 数据（旧值） |
+| Temporary Segment（临时段） | 排序等操作中间结果 | 排序数据 |
+| LOB Segment（LOB 段） | 存储大对象 | CLOB/BLOB 内容 |
+
+```sql
+-- 查看各类型段的数量和大小
+SELECT segment_type, COUNT(*) AS segment_count,
+       SUM(bytes)/1024/1024 AS total_size_mb
+FROM user_segments
+GROUP BY segment_type
+ORDER BY total_size_mb DESC;
+```
+
+## 表空间：最大的逻辑存储单元
+
+**表空间（Tablespace）** 是 Oracle 中最大的逻辑存储单元，一个表空间可以包含多个数据文件和多个段。表空间是连接逻辑存储和物理存储的桥梁。
+
+### 系统表空间
+
+Oracle 安装后自动创建两个核心系统表空间：
+
+**SYSTEM 表空间**：存储数据字典（Data Dictionary），包括所有对象的定义、用户权限、约束信息等。SYSTEM 表空间在数据库创建时生成，对数据库运行至关重要。
+
+**SYSAUX 表空间**：Oracle 11g 引入的辅助表空间，用于存储 Oracle 组件和工具的数据，如 AWR 快照、统计信息、 Enterprise Manager 数据等。SYSAUX 降低了 SYSTEM 表空间的负载。
+
+:::warning 重要约束
+SYSTEM 和 SYSAUX 表空间不能脱机（OFFLINE），不能只读（READ ONLY），不能删除。在正常业务操作中，不应在这两个表空间中创建用户对象。
+:::
+
+### 常规表空间
+
+业务数据通常存放在独立的表空间中，便于管理和维护。
+
+```sql
+-- 创建永久表空间
+CREATE TABLESPACE users
+DATAFILE '/u01/oradata/orcl/users01.dbf' SIZE 1G
+AUTOEXTEND ON NEXT 100M MAXSIZE 10G
+LOGGING
+EXTENT MANAGEMENT LOCAL UNIFORM SIZE 1M
+SEGMENT SPACE MANAGEMENT AUTO;
+
+-- 创建临时表空间
+CREATE TEMPORARY TABLESPACE temp_temp
+TEMPFILE '/u01/oradata/orcl/temp01.dbf' SIZE 500M
+EXTENT MANAGEMENT LOCAL UNIFORM SIZE 10M;
+
+-- 创建 UNDO 表空间
+CREATE UNDO TABLESPACE undotbs1
+DATAFILE '/u01/oradata/orcl/undotbs01.dbf' SIZE 2G
+AUTOEXTEND ON;
+```
+
+### 表空间的段空间管理
+
+**ASSM（Automatic Segment Space Management）**：自动段空间管理，使用位图（Bitmap）跟踪数据块的使用状态。Oracle 10g 之后的推荐方式。
+
+**MSSM（Manual Segment Space Management）**：手动段空间管理，使用 freelist 管理空闲块。需要手动设置 PCTFREE 和 PCTUSED。
+
+```sql
+-- ASSM（推荐）
+CREATE TABLESPACE app_data
+... SEGMENT SPACE MANAGEMENT AUTO;
+
+-- MSSM
+CREATE TABLESPACE app_data
+... SEGMENT SPACE MANAGEMENT MANUAL;
+```
+
+### 脱机与联机
+
+表空间可以单独脱机，便于进行部分数据恢复或迁移。
+
+```sql
+-- 将表空间脱机
+ALTER TABLESPACE users OFFLINE;
+
+-- 将表空间联机
+ALTER TABLESPACE users ONLINE;
+
+-- 将表空间设为只读（便于备份）
+ALTER TABLESPACE users READ ONLY;
+
+-- 恢复读写
+ALTER TABLESPACE users READ WRITE;
+```
+
+## 空间管理视图
+
+```sql
+-- 查看表空间使用情况
+SELECT a.tablespace_name,
+       a.bytes/1024/1024 AS total_mb,
+       b.bytes/1024/1024 AS free_mb,
+       (a.bytes - b.bytes)/1024/1024 AS used_mb,
+       ROUND((a.bytes - b.bytes) / a.bytes * 100, 2) AS used_pct
+FROM (SELECT tablespace_name, SUM(bytes) bytes
+      FROM dba_data_files GROUP BY tablespace_name) a,
+     (SELECT tablespace_name, SUM(bytes) bytes
+      FROM dba_free_space GROUP BY tablespace_name) b
+WHERE a.tablespace_name = b.tablespace_name(+);
+
+-- 查看数据文件使用情况
+SELECT file_id, tablespace_name, file_name,
+       bytes/1024/1024 AS total_mb,
+       (bytes - NVL(maxbytes, bytes)) / bytes * 100 AS used_pct
+FROM dba_data_files;
+
+-- 查看高水标记（High Water Mark）
+SELECT table_name, blocks, empty_blocks
+FROM user_tables
+WHERE table_name = 'EMPLOYEES';
+```
+
+## 逻辑结构与物理结构的关系
+
+```text
+逻辑结构                              物理结构
+─────────────────────────────────────────────────────
+表空间 (Tablespace)         ←→       多个数据文件 (Data File)
+    │
+    ├── 段 (Segment)                  区跨文件存储
+    │       │
+    │       └── 区 (Extent)  ←→       连续数据块
+    │               │
+    │               └── 块 (Block) ←→  OS block (如 4KB/8KB)
+    │
+    └── 数据文件 ←→                   操作系统文件 (.dbf)
+```
+
+## 常见面试问题
+
+**问：描述 Oracle 逻辑存储的层次结构。**
+
+从大到小依次是：表空间（Tablespace）→ 段（Segment）→ 区（Extent）→ 数据块（Block）。表空间是最大逻辑单元，一个表空间可包含多个数据文件；段是表、索引等对象的物理存储形式；区是连续数据块的集合，是空间分配的最小单位；数据块是最基本的 I/O 单位。
+
+**问：PCTFREE 和 PCTUSED 的作用是什么？**
+
+PCTFREE 预留空间用于 UPDATE，当块使用率达到 `100% - PCTFREE` 后禁止 INSERT；PCTUSED 设定重新允许 INSERT 的阈值，当块使用率降至 PCTUSED 以下时重新允许 INSERT。两者配合控制块的空闲空间管理。
+
+**问：ASSM 和 MSSM 有什么区别？**
+
+ASSM（自动段空间管理）使用位图管理空闲空间，减少争用，适合高并发场景。Oracle 10g 之后推荐使用。MSSM（手动段空间管理）使用 freelist，需要手动配置 PCTFREE/PCTUSED，管理复杂但对某些场景更精细。
+
+## 总结
+
+Oracle 的逻辑结构建立了一个清晰的数据组织体系。数据块是 I/O 基本单位，区是空间分配单位，段是对象的物理存储形式，表空间是最大逻辑管理单元。理解这四者的关系和作用，是进行存储规划、空间管理和性能调优的基础。建议在实际环境中多查询相关数据字典，加深理解。

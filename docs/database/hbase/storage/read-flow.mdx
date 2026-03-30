@@ -1,0 +1,411 @@
+# HBase 读取流程：BlockCache + MemStore + HFile
+
+你可能觉得 HBase 的读取很简单——根据 RowKey 找到数据就行了。但实际上，HBase 的读取路径远比写入复杂。数据可能分散在 BlockCache、MemStore、多个 HFile 中，需要逐级查找、合并结果。
+
+理解读取流程，是进行 HBase 性能调优的基础。为什么读取比写入慢？如何提高缓存命中率？如何减少读取放大？
+
+本篇文章预计 3500 字，深入剖析 HBase 的读取流程。
+
+## 读取流程全景图
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        HBase 读取流程                                │
+│                                                                      │
+│   客户端请求                                                         │
+│      │                                                                 │
+│      ▼                                                                 │
+│   ┌──────────────────────────────────────────────────────────────┐   │
+│   │                     RegionServer                              │   │
+│   │                                                               │   │
+│   │   ┌─────────────────────────────────────────────────────┐    │   │
+│   │   │              BlockCache (L1: LruBlockCache)          │    │   │
+│   │   │   ┌──────────┐  ┌──────────┐  ┌──────────┐        │    │   │
+│   │   │   │ Block A  │  │ Block B  │  │ Block C  │        │    │   │
+│   │   │   │ (热点)   │  │ (热点)   │  │ (热点)   │        │    │   │
+│   │   │   └──────────┘  └──────────┘  └──────────┘        │    │   │
+│   │   └─────────────────────────────────────────────────────┘    │   │
+│   │                               │ 未命中                       │   │
+│   │                               ▼                              │   │
+│   │   ┌─────────────────────────────────────────────────────┐    │   │
+│   │   │                 MemStore (内存)                     │    │   │
+│   │   │   ┌──────────┐  ┌──────────┐  ┌──────────┐      │    │   │
+│   │   │   │ Segment1 │  │ Segment2 │  │ Segment3 │      │    │   │
+│   │   │   └──────────┘  └──────────┘  └──────────┘      │    │   │
+│   │   └─────────────────────────────────────────────────────┘    │   │
+│   │                               │ 未命中                       │   │
+│   │                               ▼                              │   │
+│   │   ┌─────────────────────────────────────────────────────┐    │   │
+│   │   │              HFile 集合 (磁盘)                      │    │   │
+│   │   │   ┌──────────┐  ┌──────────┐  ┌──────────┐        │    │   │
+│   │   │   │ HFile-1 │  │ HFile-2 │  │ HFile-3 │        │    │   │
+│   │   │   │ (旧)    │  │ (旧)    │  │ (最新)   │        │    │   │
+│   │   │   └──────────┘  └──────────┘  └──────────┘        │    │   │
+│   │   │   ┌───────────────────────────────────────────┐    │    │   │
+│   │   │   │        读取后放入 BlockCache              │    │    │   │
+│   │   │   └───────────────────────────────────────────┘    │    │   │
+│   │   └─────────────────────────────────────────────────────┘    │   │
+│   │                                                               │   │
+│   └───────────────────────────────────────────────────────────────┘   │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+## 第一级：BlockCache 读取
+
+BlockCache 是 HBase 的读缓存热点数据的地方，类似于 MySQL 的 InnoDB Buffer Pool。
+
+### BlockCache 的结构
+
+HBase 的 BlockCache 有两层：
+
+**L1: LruBlockCache（堆内缓存）**
+
+- 默认大小：堆内存的 25%（`hfile.block.cache.size`）
+- GC 影响：对象在堆内，容易触发 GC
+- 淘汰策略：LRU（Least Recently Used）
+
+**L2: BucketCache（可选，堆外缓存）**
+
+- 可以使用堆外内存（offheap）或磁盘文件
+- 减少 GC 压力
+- 配置方式：`hbase.bucketcache.ioengine = offheap`
+
+### BlockCache 的淘汰策略
+
+BlockCache 使用 LRU 淘汰策略，分为三个队列：
+
+**SingleAccess Queue**：只被访问过一次的 Block
+
+**MultiAccess Queue**：被访问过多次的 Block（更不容易被淘汰）
+
+**InMemory Queue**：从 HDFS 的 fsimage 加载的 Block（最先被淘汰）
+
+```
+BlockCache 淘汰流程：
+┌─────────────────────────────────────────────────────────────┐
+│  1. Block 被访问                                             │
+│     └─ 从当前队列移到 MultiAccess Queue                     │
+│                                                              │
+│  2. 缓存满时，触发淘汰                                       │
+│     └─ 优先淘汰 InMemory Queue 中的 Block                   │
+│     └─ 然后淘汰 SingleAccess Queue 中的 Block                │
+│     └─ 最后淘汰 MultiAccess Queue 中的 Block                │
+│                                                              │
+│  3. 被淘汰的 Block 标记为"已失效"                           │
+│     └─ 新的 Block 可以重用这块空间                           │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### BlockCache 的读取过程
+
+当一个 Block 被读取时，它会被放入 BlockCache：
+
+```java
+// BlockCache 读取过程
+public class HFileReaderV2 {
+    public Block readBlock(long offset, boolean cacheBlocks) {
+        // 1. 读取 HFile 中的 Block 数据
+        HFileBlock block = readBlockData(offset, size);
+        
+        // 2. 如果需要缓存
+        if (cacheBlocks) {
+            // 解压数据（Block 可能是压缩的）
+            HFileBlock decompressedBlock = block.decompress();
+            
+            // 3. 放入 BlockCache
+            cache.put(blockKey, decompressedBlock);
+        }
+        
+        return block;
+    }
+}
+```
+
+## 第二级：MemStore 读取
+
+如果 BlockCache 未命中，需要查 MemStore。
+
+MemStore 存储的是最近写入但还未 flush 到磁盘的数据。在高写入场景下，大部分读取可能都命中 MemStore。
+
+### MemStore 的数据结构
+
+MemStore 使用 SkipList 作为内部数据结构，这保证了：
+
+- 写入：O(log n)
+- 读取：O(log n)
+- 范围扫描：O(1)（相邻节点直接遍历）
+
+```java
+// MemStore 核心结构
+public class MemStore {
+    // 跳表实现的有序集合
+    private final ConcurrentNavigableMap<Cell, Cell> cellSet;
+    
+    // 时间戳范围（用于剪枝）
+    private final TimeRange timeRange;
+}
+```
+
+### MemStore 的读取
+
+MemStore 的读取很简单——按 RowKey 在跳表中查找：
+
+```java
+// MemStore 读取过程
+public List<Cell> get(KeyValue key) {
+    // 1. 检查时间戳范围
+    if (!timeRange.contains(key.getTimestamp())) {
+        return Collections.emptyList();
+    }
+    
+    // 2. 在跳表中查找
+    return cellSet.get(key);
+}
+```
+
+### MemStore 与读取时间戳
+
+MemStore 的 `timeRange` 信息非常重要，它告诉读取操作：MemStore 中的数据覆盖了哪个时间戳范围。
+
+```
+时间戳范围优化：
+┌─────────────────────────────────────────────────────────────┐
+│  MemStore 写入时间：t1 ~ t2                                │
+│  ┌─────────────────────────────────────────────────────┐  │
+│  │ t1                                                      │  │
+│  │  ├─ MemStore 写入                                    │  │
+│  │  │                                                    │  │
+│  │  │                                                    │  │
+│  │ t2├─ MemStore 写入                                    │  │
+│  └─────────────────────────────────────────────────────┘  │
+│                                                              │
+│  读取请求（时间戳 = t0，t0 < t1）：                         │
+│  └─ 直接跳过 MemStore，读取 HFile 即可                    │
+│                                                              │
+│  读取请求（时间戳 = t3，t3 > t2）：                         │
+│  └─ MemStore 中没有数据，需要读取 HFile                    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## 第三级：HFile 读取
+
+如果 BlockCache 和 MemStore 都未命中，需要从 HFile 读取。
+
+### 读取流程
+
+```
+HFile 读取流程：
+┌─────────────────────────────────────────────────────────────┐
+│  1. 定位 HFile                                             │
+│     └─ 使用 StoreScanner 定位需要扫描的 HFile                │
+│     └─ 利用布隆过滤器排除不包含 Key 的 HFile                │
+│                                                              │
+│  2. 在 HFile 中定位 Block                                   │
+│  └─ 加载 Block Index                                        │
+│  └─ 二分查找找到目标 Block 的偏移量                         │
+│                                                              │
+│  3. 读取 Block 数据                                         │
+│  └─ 从 HDFS 读取 Block（可能需要解压）                     │
+│  └─ 放入 BlockCache                                          │
+│                                                              │
+│  4. 在 Block 中查找 Key                                     │
+│  └─ 顺序扫描 Block                                          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### StoreScanner：合并多个 HFile 的结果
+
+一个 Region 中可能有多个 HFile，StoreScanner 的作用是合并它们的读取结果：
+
+```java
+// StoreScanner 的核心逻辑
+public class StoreScanner {
+    // 所有需要扫描的 HFile Scanner
+    private List<KeyValueScanner> scanners;
+    
+    // 所有需要扫描的 MemStore Scanner
+    private KeyValueScanner memStoreScanner;
+    
+    // 合并后的结果
+    public List<Cell> getNext() {
+        // 1. 从每个 Scanner 获取当前 Cell
+        Cell[] cells = new Cell[scanners.size()];
+        for (int i = 0; i < scanners.size(); i++) {
+            cells[i] = scanners.get(i).peek();
+        }
+        
+        // 2. 选择最小的 Cell（按 RowKey + CF + Qualifier + Timestamp 排序）
+        int minIndex = selectMin(cells);
+        
+        // 3. 跳过已删除和过期版本
+        Cell result = cells[minIndex];
+        while (isDeleted(result) || isExpired(result)) {
+            scanners.get(minIndex).next();
+            result = scanners.get(minIndex).peek();
+        }
+        
+        return result;
+    }
+}
+```
+
+### 读取放大问题
+
+由于一个 RowKey 的数据可能分布在多个 HFile 中，一次读取可能需要扫描多个 HFile，这就是"读取放大"问题。
+
+```
+读取放大示例：
+RowKey = user_001 的数据分布在 3 个 HFile 中：
+┌─────────────────────────────────────────────────────────────┐
+│  HFile-1 (最旧)                                             │
+│  user_001, info:name = "张三", t1                          │
+├─────────────────────────────────────────────────────────────┤
+│  HFile-2 (中等)                                             │
+│  user_001, info:name = "李四", t2                          │
+├─────────────────────────────────────────────────────────────┤
+│  HFile-3 (最新)                                             │
+│  user_001, info:name = "王五", t3                          │
+└─────────────────────────────────────────────────────────────┘
+
+读取 user_001 的最新数据时：
+1. 需要扫描所有 3 个 HFile
+2. 合并结果，取最新版本
+3. 返回 t3 版本的数据
+```
+
+### 读取放大的影响
+
+读取放大直接影响读取延迟：
+
+```
+读取放大与延迟的关系：
+┌─────────────────────────────────────────────────────────────┐
+│  HFile 数量    平均读取 HFile 数    预期延迟增加           │
+├─────────────────────────────────────────────────────────────┤
+│  1             1                   基准                     │
+│  5             2-3                 2-3x                     │
+│  10            4-6                 4-6x                     │
+│  20            8-12                8-12x                    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+减少读取放大的方法：
+1. **增加 Compaction 频率**：减少 HFile 数量
+2. **Major Compaction**：合并所有 HFile
+3. **优化 RowKey 设计**：避免同一 RowKey 的数据分散在多个 HFile
+
+## 三级读取的协调
+
+### 读取协调器：RegionScanner
+
+RegionScanner 负责协调一个 Region 中所有 Store 的读取：
+
+```java
+// RegionScanner 简化流程
+public class RegionScanner {
+    // 每个 Store 对应一个 StoreScanner
+    private Map<String, StoreScanner> storeScanners;
+    
+    public List<Cell> get(Get get) {
+        // 1. 定位目标 Store（根据 Column Family）
+        StoreScanner scanner = storeScanners.get(get.getColumnFamily());
+        
+        // 2. 协调三级读取
+        // BlockCache → MemStore → HFile
+        return scanner.get(get);
+    }
+}
+```
+
+### 结果合并
+
+当从多个数据源获取数据时，需要合并结果：
+
+```
+结果合并流程：
+┌─────────────────────────────────────────────────────────────┐
+│  BlockCache 未命中 ← 直接跳过                               │
+│                                                              │
+│  MemStore 命中 ← 返回 Cell，与 HFile 结果合并               │
+│                                                              │
+│  HFile 命中 ← 返回 Cell，与 MemStore 结果合并               │
+│                                                              │
+│  合并规则：                                                  │
+│  1. 取最新时间戳的版本                                       │
+│  2. 跳过已删除的版本                                         │
+│  3. 跳过过期的版本                                           │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## 读取性能调优
+
+### BlockCache 调优
+
+```
+BlockCache 相关参数：
+┌─────────────────────────────────────────────────────────────┐
+│  参数                                默认值        建议     │
+├─────────────────────────────────────────────────────────────┤
+│  hfile.block.cache.size             0.25 (25%)   0.4      │
+│  hbase.bucketcache.ioengine          无            offheap  │
+│  hbase.bucketcache.size             无            2048 MB  │
+│  hbase.rs.blockcache.memcache.share  false        true     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### BucketCache 配置
+
+BucketCache 可以使用堆外内存，减少 GC 影响：
+
+```xml
+<property>
+  <name>hbase.bucketcache.ioengine</name>
+  <value>offheap</value>
+</property>
+<property>
+  <name>hbase.bucketcache.size</name>
+  <value>4096</value>
+</property>
+```
+
+### Compaction 策略调优
+
+通过调整 Compaction 策略减少读取放大：
+
+```java
+// 选择合适的 Compaction 策略
+// StripeCompaction：适合大型 Region
+// DateTieredCompaction：适合时序数据
+```
+
+## 读取 vs 写入：性能不对称
+
+理解读取流程后，你会发现 HBase 的读写性能不对称：
+
+```
+写入路径：
+WAL (顺序写) → MemStore (内存写) → 返回
+写入速度：极快
+
+读取路径：
+BlockCache? → MemStore? → HFile(多) → 合并 → 返回
+读取速度：取决于缓存命中率和 HFile 数量
+```
+
+这是 LSM-Tree（Log-Structured Merge-Tree）架构的特点：
+- 写入极快：顺序写 WAL + 内存写 MemStore
+- 读取相对慢：可能需要扫描多个层级
+
+## 面试追问方向
+
+- HBase 的读取流程是怎样的？涉及哪些层级？
+- BlockCache 的结构和淘汰策略是什么？
+- MemStore 的数据结构是怎样的？为什么用 SkipList？
+- HFile 的读取过程是怎样的？如何定位 Block？
+- 什么是读取放大？如何减少读取放大？
+- 为什么 HBase 的读取比写入慢？
+- BlockCache 和 BucketCache 有什么区别？
+- 读取时如何合并多个数据源的结果？
+
+理解读取流程，你就能理解为什么 Compaction 对 HBase 性能如此重要。下一步，让我们看看 Compaction 的具体机制。

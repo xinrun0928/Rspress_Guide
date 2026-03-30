@@ -1,0 +1,278 @@
+import { Badge } from '@rspress/core/theme';
+
+# DDL 实现
+
+凌晨 2 点，你正在执行一条 `ALTER TABLE` 迁移表结构。传统的 MySQL 会锁表 30 分钟，而你希望业务不中断。
+
+这就是 TiDB 的 **Online DDL** 能力——在保持业务正常运行的同时，完成 schema 变更。
+
+---
+
+## 一、TiDB DDL 概述
+
+### 1.1 传统 DDL 的问题
+
+MySQL 的 DDL 操作在以下情况会锁表：
+
+| 操作 | 锁时间 | 影响 |
+|---|---|---|
+| 添加列 | 全表复制期间 | 业务中断 |
+| 添加索引 | 全表扫描期间 | 业务中断 |
+| 修改列类型 | 全表复制期间 | 业务中断 |
+
+### 1.2 TiDB 的解决方案
+
+TiDB 使用 **Online Schema Change** 策略：
+
+- 变更分多个版本执行
+- 每个版本只锁少量数据
+- 读写操作不受影响
+
+---
+
+## 二、DDL 架构
+
+### 2.1 组件角色
+
+```bash
+# TiDB DDL 架构
+TiDB Server-1 (Owner)     # 负责执行 DDL 变更
+TiDB Server-2            # 等待 Owner 执行完成
+TiDB Server-3            # 等待 Owner 执行完成
+
+PD                       # 存储 schema 版本号
+TiKV                     # 存储表数据
+```
+
+### 2.2 Owner 选举
+
+```sql
+-- Owner 节点负责执行所有 DDL
+SHOW PROCESSLIST;
+-- 一条记录会显示 "DDL Owner"
+
+-- TiDB 使用 Lease 机制选举 Owner
+-- Owner 故障后，其他节点重新选举
+```
+
+<Badge text="Owner" type="tip" /> 只有 Owner 节点才能执行 DDL，其他节点等待同步。
+
+---
+
+## 三、DDL 执行流程
+
+### 3.1 状态机
+
+TiDB 的 DDL 执行分为多个状态：
+
+```bash
+# DDL 状态流转
+None -> Write Only -> Public -> Done
+
+# 示例：添加列
+ALTER TABLE users ADD COLUMN phone VARCHAR(20);
+
+# 状态 1: Write Only
+# 列已存在，但写入被禁止读取返回 NULL
+INSERT INTO users VALUES (1, '张三', NULL);  -- 可以写入，但 phone 为 NULL
+SELECT phone FROM users;  -- 返回 NULL
+
+# 状态 2: Public
+# 列完全可用
+INSERT INTO users VALUES (1, '张三', '13800138000');  -- 正常写入
+SELECT phone FROM users;  -- 返回 '13800138000'
+```
+
+### 3.2 执行步骤
+
+```rust
+// DDL 执行流程
+fn execute_ddl(&mut self, stmt: DDLStmt) -> Result<()> {
+    // 1. 验证语法
+    self.validate_stmt(stmt)?;
+    
+    // 2. 创建 DDL Job
+    let job = DDLJob {
+        id: next_job_id(),
+        schema_id: self.schema_id,
+        table_id: self.table_id,
+        type_: stmt.type(),
+        schema_state: SchemaState::WriteOnly,
+        args: encode_args(stmt),
+    };
+    
+    // 3. 写入 DDL Job 队列
+    self.ddl_job_queue.push(job);
+    
+    // 4. Owner 执行 DDL
+    self.owner_manager.run_ddl(job)?;
+    
+    // 5. 各 TiDB Server 同步 schema
+    self.schema_manager.sync(job)?;
+    
+    Ok(())
+}
+```
+
+### 3.3 各个状态的行为
+
+```sql
+-- TiDB DDL 状态与 MySQL 锁对照
+SchemaState::None        # MySQL: COLUMN FORMAT
+SchemaState::DeleteOnly  # MySQL: WRITE (仅 delete)
+SchemaState::WriteOnly   # MySQL: WRITE (仅 write)
+SchemaState::Reorganization # MySQL: READ ONLY
+SchemaState::Public      # MySQL: 正常状态
+```
+
+---
+
+## 四、常见 DDL 操作
+
+### 4.1 添加列
+
+```sql
+-- 添加普通列
+ALTER TABLE users ADD COLUMN phone VARCHAR(20);
+
+-- 添加带默认值
+ALTER TABLE users ADD COLUMN status TINYINT DEFAULT 1;
+
+-- 添加多列
+ALTER TABLE users 
+  ADD COLUMN phone VARCHAR(20),
+  ADD COLUMN address VARCHAR(200);
+```
+
+### 4.2 添加索引
+
+```sql
+-- 添加普通索引
+ALTER TABLE orders ADD INDEX idx_user_id(user_id);
+
+-- 添加唯一索引
+ALTER TABLE users ADD UNIQUE INDEX idx_email(email);
+
+-- 添加联合索引
+ALTER TABLE orders ADD INDEX idx_user_date(user_id, create_time);
+
+-- 强制并行加索引（TiDB 特有）
+ALTER TABLE orders ADD INDEX idx_user_date(user_id, create_time), ALGORITHM=INPLACE, LOCK=NONE;
+```
+
+<Badge text="ALGORITHM" type="tip" /> TiDB 支持 `ALGORITHM=INPLACE`（原地修改）和 `ALGORITHM=COPY`（复制表），前者更快但有限制。
+
+### 4.3 删除列/索引
+
+```sql
+-- 删除列
+ALTER TABLE users DROP COLUMN phone;
+
+-- 删除索引
+ALTER TABLE orders DROP INDEX idx_user_id;
+
+-- 批量删除
+ALTER TABLE users DROP COLUMN col1, DROP COLUMN col2;
+```
+
+### 4.4 修改列
+
+```sql
+-- 修改默认值
+ALTER TABLE users ALTER COLUMN status SET DEFAULT 0;
+
+-- 修改列名
+ALTER TABLE users RENAME COLUMN name TO username;
+
+-- 不支持的操作
+ALTER TABLE users MODIFY COLUMN name VARCHAR(100);  -- 不支持修改列类型
+ALTER TABLE users CHANGE COLUMN name username VARCHAR(100);  -- 不支持
+```
+
+---
+
+## 五、DDL 限制
+
+### 5.1 不支持的 DDL
+
+| 操作 | 状态 | 说明 |
+|---|---|---|
+| 添加主键 | ✅ | TiDB 5.0+ 支持 |
+| 删除主键 | ❌ | 不支持 |
+| 修改列类型 | ❌ | 不支持 |
+| 添加外键 | ❌ | 不支持 |
+| 删除外键 | ❌ | 不支持 |
+| 全文索引 | ✅ | TiDB 5.3+ 部分支持 |
+| 空间索引 | 部分 | 支持部分类型 |
+
+### 5.2 大表 DDL 的注意事项
+
+```sql
+-- 对于大表（> 1GB）的 DDL，需要考虑：
+
+-- 1. 添加索引的并发控制
+SET GLOBAL tidb_ddl_reorg_worker_cnt = 4;  -- 调整 worker 数
+
+-- 2. 调整回滚速度
+SET GLOBAL tidb_ddl_reorg_priority = 'LOW';
+
+-- 3. 分批执行
+ALTER TABLE orders ADD COLUMN remark VARCHAR(500), ALGORITHM=INPLACE;
+```
+
+---
+
+## 六、DDL 性能调优
+
+### 6.1 关键参数
+
+```sql
+-- 调整 DDL worker 数量
+SET GLOBAL tidb_ddl_worker_cnt = 16;
+
+-- 调整 DDL 批次大小
+SET GLOBAL tidb_ddl_batch_size = 1024;
+
+-- 调整 DDL reorg 优先级
+SET GLOBAL tidb_ddl_reorg_priority = 'HIGH';
+```
+
+### 6.2 监控 DDL
+
+```sql
+-- 查看 DDL 进度
+ADMIN SHOW DDL JOBS;
+
+-- 结果
++--------+---------+------------+-----------------+--------------+-----------+
+| JOB_ID | DB_NAME | TABLE_NAME | TYPE            | STATE        | CURRENT...
++--------+---------+------------+-----------------+--------------+-----------+
+| 123    | app     | orders     | add index       | running      | 45%...
++--------+---------+------------+-----------------+--------------+-----------+
+
+-- 取消正在执行的 DDL
+ADMIN CANCEL DDL JOBS 123;
+```
+
+---
+
+## 七、面试追问
+
+- TiDB 的 DDL 状态机是怎么流转的？
+- Owner 节点故障后 DDL 会怎样？
+- Online DDL 和 pt-osc / gh-ost 的区别？
+- 哪些 DDL 操作会导致长时间锁表？
+- 大表添加索引如何优化？
+
+---
+
+## 总结
+
+TiDB 的 Online DDL 能力让 schema 变更不再阻塞业务：
+
+- **状态机**：变更分多状态执行，每个状态对应不同的读写限制
+- **Owner 机制**：只有 Owner 节点执行 DDL，其他节点同步
+- **并行加索引**：TiDB 原生支持并行建索引，无需第三方工具
+- **限制**：不支持修改列类型、删除主键等操作
+
+理解 DDL 机制，是安全运维 TiDB 的基础。

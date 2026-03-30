@@ -1,0 +1,403 @@
+import { Badge } from '@rspress/core/theme';
+
+# MaxScale 读写分离
+
+应用连接数据库时，读写都打到一个节点。这个节点的负担越来越重，读性能越来越差——这是没有读写分离的典型症状。
+
+MaxScale 是 MariaDB 官方提供的数据库代理，它能自动将 SELECT 路由到从库，让主库专注写入。配合 Galera Cluster 或主从复制，构建完整的读写分离架构。
+
+---
+
+## MaxScale 是什么
+
+MaxScale 位于应用和数据库之间，是一个**透明的代理层**：
+
+```
+┌──────────┐      ┌───────────┐      ┌──────────┐
+│  应用层  │ ───> │  MaxScale  │ ───> │  主库    │  (写请求)
+└──────────┘      │           │ ───> │  从库 1  │  (读请求)
+                   │  (代理)   │ ───> │  从库 2  │  (读请求)
+                   └───────────┘      └──────────┘
+```
+
+应用像连接普通数据库一样连接 MaxScale，不需要修改任何代码。MaxScale 解析 SQL，自动路由。
+
+### 核心能力
+
+- **读写分离**：SELECT 到从库，INSERT/UPDATE/DELETE 到主库
+- **连接池**：复用数据库连接，减少连接建立开销
+- **自动故障转移**：主库故障时，自动切换到新主库
+- **查询日志**：记录所有 SQL，便于审计和排查
+- **查询限流**：防止单个客户端占满所有连接
+
+---
+
+## 安装与基础配置
+
+### 安装 MaxScale
+
+```bash
+# CentOS/RHEL
+yum install maxscale
+
+# Debian/Ubuntu
+apt install maxscale
+```
+
+### 配置文件结构
+
+```ini title="/etc/maxscale.cnf"
+[maxscale]
+threads = auto          # 线程数，auto 表示等于 CPU 核心数
+log_augments = true     # 增强日志
+admin_auth = on         # 管理界面认证
+
+# 数据库服务器定义
+[galera-service]
+type = server
+address = 192.168.1.10
+port = 3306
+protocol = MariaDBBackend
+
+[server2]
+type = server
+address = 192.168.1.11
+port = 3306
+protocol = MariaDBBackend
+
+[server3]
+type = server
+address = 192.168.1.12
+port = 3306
+protocol = MariaDBBackend
+
+# 监控模块
+[galera-monitor]
+type = monitor
+module = galeramon
+servers = server2,server3,galera-service
+user = maxscale
+password = password
+monitor_interval = 10000
+
+# 读写分离路由
+[readwritesplit]
+type = filter
+module = readwritesplit
+servers = galera-service,server2,server3
+user = maxscale
+password = password
+
+# 监听端口（应用连接）
+[RW-Service]
+type = service
+router = readwritesplit
+servers = galera-service,server2,server3
+filters = readwritesplit
+
+# 监听端口定义
+[RW-Listener]
+type = listener
+service = RW-Service
+protocol = MariaDBClient
+port = 3306
+```
+
+### 创建监控账号
+
+MaxScale 需要连接数据库进行监控：
+
+```sql
+-- 在 MariaDB 上创建
+CREATE USER 'maxscale'@'192.168.1.%' IDENTIFIED BY 'password';
+GRANT SELECT ON mysql.* TO 'maxscale'@'192.168.1.%';
+GRANT REPLICATION CLIENT ON *.* TO 'maxscale'@'192.168.1.%';
+GRANT SUPER ON *.* TO 'maxscale'@'192.168.1.%';
+```
+
+---
+
+## 读写分离的原理
+
+### SQL 解析与路由
+
+MaxScale 内置 SQL 解析器，能识别 SQL 类型：
+
+```sql
+-- 路由到主库
+INSERT INTO users (name) VALUES ('Alice');
+UPDATE users SET email = 'new@example.com' WHERE id = 1;
+DELETE FROM orders WHERE id = 100;
+
+-- 路由到从库（随机选择）
+SELECT * FROM users WHERE id = 1;
+SELECT COUNT(*) FROM orders;
+```
+
+### 从库选择策略
+
+当 SELECT 路由到从库时，MaxScale 使用以下策略选择目标节点：
+
+| 策略 | 说明 |
+|---|---|
+| `leastbehind` | 选择延迟最小的从库 |
+| `random` | 随机选择 |
+| `master` | 强制走主库 |
+
+默认是 `leastbehind`，它比较各从库的 `Seconds_Behind_Master`，选择最接近 0 的节点。
+
+```ini
+[readwritesplit]
+router_options = master_failure_mode=failover
+                 slave_selection_criteria = leastbehind
+```
+
+### 事务内的路由
+
+事务内的 SQL 必须路由到同一个节点：
+
+```sql
+START TRANSACTION;
+SELECT * FROM users WHERE id = 1;  -- 从库
+UPDATE users SET name = 'Bob' WHERE id = 1;  -- 必须回到同一个从库
+COMMIT;
+```
+
+MaxScale 自动处理这个逻辑：事务开启后，后续所有 SQL 路由到同一节点，直到事务结束。
+
+---
+
+## 自动故障转移
+
+### Galera 模式下的故障转移
+
+当 Galera 集群的主节点故障时，MaxScale 会自动检测并重新路由：
+
+```
+故障前：
+MaxScale -> 节点 1 (主)  写入
+MaxScale -> 节点 2 (从)  读取
+MaxScale -> 节点 3 (从)  读取
+
+故障后（节点 1 崩溃）：
+MaxScale -> 节点 2 (新主) 写入  <-- 自动切换
+MaxScale -> 节点 2 (从)     读取
+MaxScale -> 节点 3 (从)     读取
+```
+
+### 主从复制模式下的故障转移
+
+对于传统主从复制：
+
+```ini
+[master-failover]
+type = filter
+module = avrorouter
+
+[replication-monitor]
+type = monitor
+module = mariadbmon
+servers = server1,server2,server3
+user = maxscale
+password = password
+master_failure_mode = failover
+switchover_on_role_change = true
+auto_rejoin = true
+```
+
+当主库故障，MaxScale 会：
+
+1. 检测到主库不可达
+2. 在从库中选择新的主库
+3. 将其他从库切换到新主库
+4. 更新连接路由
+
+---
+
+## 高级配置
+
+### 查询日志过滤器
+
+记录所有 SQL 用于审计：
+
+```ini
+[query-log]
+type = filter
+module = qlfilter
+filter = [qlf]
+log_query = true
+log_severity = 7
+
+[qlf]
+type = filter
+module = logfilefilter
+file = /var/log/maxscale/query.log
+```
+
+### 查询限流
+
+防止单个客户端耗尽连接：
+
+```ini
+[maxscale]
+max_sescmd_history = 100  # 会话命令历史大小
+max_sescmd_time = 3000   # 单个查询超时(ms)
+
+# 或使用专门的限流过滤器
+[rate-limit]
+type = filter
+module = ratelimit
+limit = 100
+burst = 200
+```
+
+### 连接池
+
+MaxScale 支持连接池，减少数据库连接建立销毁的开销：
+
+```ini
+[readwritesplit]
+router_options = server_connection_limit=100
+                 connection_timeout = 600
+                 idle_timeout = 300
+```
+
+- `server_connection_limit`：每个后端服务器的最大连接数
+- `connection_timeout`：连接超时时间
+- `idle_timeout`：空闲连接回收时间
+
+---
+
+## 监控与管理
+
+### 管理接口
+
+MaxScale 提供 REST API 和命令行工具：
+
+```bash
+# 查看节点状态
+maxadmin list servers
+
+# 查看服务状态
+maxadmin list services
+
+# 查看连接数
+maxadmin show connections
+
+# 查看统计
+maxadmin show sessions
+```
+
+### REST API
+
+```bash
+# 查看集群状态
+curl -u admin:password http://localhost:8989/v1/servers
+
+# 查看统计
+curl -u admin:password http://localhost:8989/v1/services
+```
+
+### Grafana 监控
+
+MaxScale 支持 Prometheus 格式的指标输出：
+
+```ini
+[Prometheus-Listener]
+type = listener
+service = MaxScale
+protocol = HTTP
+port = 9200
+```
+
+配合 Prometheus + Grafana 监控：
+
+```
+Prometheus -> 抓取 MaxScale 指标
+Grafana -> 展示监控面板
+```
+
+关键监控指标：
+
+| 指标 | 说明 |
+|---|---|
+| `maxscale_connections` | 当前连接数 |
+| `maxscale_routed_bytes` | 路由的数据量 |
+| `maxscale_errors` | 错误数 |
+| `maxscale_server_up` | 节点是否在线 |
+
+---
+
+## 性能调优
+
+### 线程数
+
+```ini
+[maxscale]
+threads = 16  # 通常设置为 CPU 核心数
+```
+
+### 网络优化
+
+MaxScale 内部使用零拷贝技术，减少 CPU 开销。对于高并发场景：
+
+```ini
+[maxscale]
+maxscale_config_editor = true  # 启用快速配置更新
+```
+
+### 与应用层的配合
+
+MaxScale 最佳部署方式是**与应用服务器同机柜部署**：
+
+```
+机柜 A: App Server 1 -> MaxScale 1 -> Galera 集群
+机柜 B: App Server 2 -> MaxScale 2 -> Galera 集群
+```
+
+两个 MaxScale 实例之间通过 `maxscale.cnf` 共享配置。
+
+---
+
+## 常见问题
+
+### 问题一：从库延迟导致读取旧数据
+
+**症状**：写入后立即读取，读取到旧数据。
+
+**原因**：主从延迟，MaxScale 把 SELECT 路由到了还没同步的从库。
+
+**解决方案**：
+
+```sql
+-- 方案一：显式走主库
+SET TRANSACTION READ ONLY;
+START TRANSACTION;
+-- 先写后读，确保一致性
+COMMIT;
+```
+
+```ini
+# 方案二：配置强制主库读
+[readwritesplit]
+router_options = master_accept_reads=true
+```
+
+### 问题二：连接数暴涨
+
+**症状**：MaxScale 连接数达到上限，后端数据库连接耗尽。
+
+**解决方案**：调整连接池配置，或增加 MaxScale 实例分摊负载。
+
+---
+
+## 总结
+
+MaxScale 是 MariaDB 生态中的关键组件：
+
+- **读写分离**：自动将 SELECT 路由到从库，减轻主库压力
+- **故障转移**：数据库故障时自动切换，应用无感知
+- **连接池**：复用数据库连接，提升性能
+- **监控运维**：提供丰富的监控接口
+
+<Badge text="架构建议" type="tip" /> 部署 MaxScale 时，建议至少部署两个实例，配置 Keepalived 做 VIP 漂移，避免 MaxScale 本身成为单点故障。

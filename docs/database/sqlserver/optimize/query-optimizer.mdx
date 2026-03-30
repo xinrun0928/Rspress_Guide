@@ -1,0 +1,433 @@
+import { Badge } from '@rspress/core/theme';
+
+# 查询优化器
+
+「为什么同样一条 SQL，有时候快，有时候慢？」
+
+答案在**查询优化器（Query Optimizer）**。它是 SQL Server 最复杂的组件之一，决定了每条 SQL 如何执行。
+
+理解优化器的工作原理，是深入掌握 SQL Server 的必经之路。
+
+## 优化器概述
+
+### 什么是查询优化器
+
+查询优化器是 SQL Server 的核心组件，负责：
+1. 将 SQL 语句转换为执行计划
+2. 评估各种执行方案的代价
+3. 选择代价最低的执行计划
+
+```
+SQL 文本
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                      查询优化器                                   │
+│  ┌─────────────┐                                               │
+│  │   解析器    │  生成解析树                                     │
+│  └──────┬──────┘                                               │
+│         │                                                       │
+│  ┌──────┴──────┐                                               │
+│  │   绑定器    │  解析名称、类型、权限                           │
+│  └──────┬──────┘                                               │
+│         │                                                       │
+│  ┌──────┴──────┐                                               │
+│  │   优化器    │  生成候选计划，评估代价                        │
+│  └──────┬──────┘                                               │
+│         │                                                       │
+│  ┌──────┴──────┐                                               │
+│  │   执行器    │  执行选定的计划                                │
+│  └─────────────┘                                               │
+└─────────────────────────────────────────────────────────────────┘
+    │
+    ▼
+执行计划
+```
+
+### 基于成本的优化（CBO）
+
+SQL Server 使用**基于成本的优化器**，根据统计信息估算代价。
+
+**代价因素**：
+- I/O 成本（磁盘读写）
+- CPU 成本（行处理）
+- 内存使用
+- 并行度
+
+```sql
+-- 查看执行计划成本
+-- 在 SSMS 中查看图形化计划的"总估计子树的成本"
+-- 或使用 SET SHOWPLAN_TEXT ON;
+```
+
+## 编译与重编译
+
+### 编译过程
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    语句编译过程                                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  1. 解析（Parsing）                                             │
+│     SQL 文本 ──▶ 解析树                                          │
+│                                                                 │
+│  2. 绑定（Binding）                                             │
+│     解析树 + 架构 ──▶ 逻辑查询计划                                │
+│                                                                 │
+│  3. 优化（Optimization）                                        │
+│     逻辑计划 ──▶ 候选物理计划 ──▶ 最佳物理计划                    │
+│                                                                 │
+│  4. 编译（Compilation）                                         │
+│     物理计划 ──▶ 执行计划                                        │
+│                                                                 │
+│  5. 执行（Execution）                                           │
+│     按计划执行                                                   │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 计划缓存
+
+编译后的执行计划存储在**计划缓存（Plan Cache）** 中，供后续重用。
+
+```sql
+-- 查看计划缓存
+SELECT 
+    cp.usecounts AS UseCount,
+    cp.size_in_bytes / 1024.0 AS SizeKB,
+    cp.objtype AS ObjectType,
+    cp.plan_handle,
+    qs.total_worker_time / 1000.0 AS TotalCPUTimeMS,
+    qs.total_elapsed_time / 1000.0 AS TotalDurationMS,
+    qs.total_logical_reads,
+    SUBSTRING(qt.text, qs.statement_start_offset / 2 + 1,
+        (CASE qs.statement_end_offset 
+            WHEN -1 THEN DATALENGTH(qt.text)
+            ELSE qs.statement_end_offset 
+        END - qs.statement_start_offset) / 2 + 1) AS QueryText
+FROM sys.dm_exec_cached_plans cp
+JOIN sys.dm_exec_query_stats qs ON cp.plan_handle = qs.plan_handle
+CROSS APPLY sys.dm_exec_sql_text(cp.plan_handle) qt
+WHERE cp.objtype IN ('Adhoc', 'Prepared')
+ORDER BY cp.usecounts DESC;
+
+-- 查看缓存大小
+SELECT 
+    COUNT(*) AS PlanCount,
+    SUM(cp.size_in_bytes) / 1024.0 / 1024.0 AS TotalSizeMB
+FROM sys.dm_exec_cached_plans cp;
+```
+
+### 重编译触发
+
+计划可能失效并需要重新编译：
+
+| 触发条件 | 说明 |
+|---|---|
+| 统计信息更新 | 统计信息变化超过阈值 |
+| 架构变更 | 表/索引结构变化 |
+| SET 选项变更 | 会话 SET 选项变化 |
+| 批处理中的第一个语句 | 常量表达式变化 |
+| 显式 RECOMPILE | 使用 OPTION (RECOMPILE) |
+
+```sql
+-- 查看计划重编译原因
+SELECT 
+    qs.creation_time,
+    qs.last_compile_start_time,
+    qs.last_execution_time,
+    qs.plan_generation_num AS CompileCount,
+    qs.execution_count,
+    SUBSTRING(qt.text, 1, 100) AS QueryText
+FROM sys.dm_exec_query_stats qs
+CROSS APPLY sys.dm_exec_sql_text(qs.plan_handle) qt
+WHERE qs.creation_time < DATEADD(HOUR, -1, GETDATE())
+ORDER BY qs.plan_generation_num DESC;
+```
+
+## 参数嗅探
+
+### 什么是参数嗅探
+
+参数嗅探是优化器使用参数的第一个值来生成执行计划的现象。
+
+```sql
+CREATE PROCEDURE usp_GetOrders
+    @CustomerID INT
+AS
+BEGIN
+    SELECT * FROM Orders 
+    WHERE CustomerID = @CustomerID;
+END;
+
+-- 第一次执行：CustomerID = 10000（只有 1 行）
+EXEC usp_GetOrders @CustomerID = 10000;
+-- 优化器生成小结果集计划（Index Seek + Key Lookup）
+
+-- 第二次执行：CustomerID = 1（有 100000 行）
+EXEC usp_GetOrders @CustomerID = 1;
+-- 使用相同的计划，效率极低！
+```
+
+### 参数嗅探问题
+
+| 问题 | 说明 |
+|---|---|
+| 第一值不典型 | 第一个参数值可能不是平均值 |
+| 数据分布不均 | 某些值行数多，某些少 |
+| 计划被缓存 | 错误的计划被所有调用重用 |
+
+### 解决方案
+
+```sql
+-- 方法 1：局部变量（禁用嗅探）
+CREATE PROCEDURE usp_GetOrders_Variable
+    @CustomerID INT
+AS
+BEGIN
+    DECLARE @CID INT = @CustomerID;  -- 赋值给变量
+    SELECT * FROM Orders 
+    WHERE CustomerID = @CID;  -- 使用变量
+END;
+
+-- 方法 2：RECOMPILE（每次重编译）
+CREATE PROCEDURE usp_GetOrders_Recompile
+    @CustomerID INT
+AS
+BEGIN
+    SELECT * FROM Orders 
+    WHERE CustomerID = @CustomerID
+    OPTION (RECOMPILE);
+END;
+
+-- 方法 3：OPTIMIZE FOR（固定参数值）
+CREATE PROCEDURE usp_GetOrders_Optimize
+    @CustomerID INT
+AS
+BEGIN
+    SELECT * FROM Orders 
+    WHERE CustomerID = @CustomerID
+    OPTION (OPTIMIZE FOR (@CustomerID = 1));  -- 优化特定值
+END;
+
+-- 方法 4：Query Store（SQL Server 2016+）
+ALTER DATABASE [YourDB] SET QUERY_STORE = ON;
+-- Query Store 自动收集计划，可强制使用特定计划
+```
+
+## 统计信息与优化
+
+### 统计信息的作用
+
+优化器依赖统计信息估计代价：
+
+```sql
+-- 查看表统计信息
+DBCC SHOW_STATISTICS ('Orders', 'IX_Orders_CustomerID');
+-- 输出：直方图、密度向量、行数等
+```
+
+### 统计信息过时
+
+统计信息过时导致错误估计：
+
+```sql
+-- 检查统计信息新旧
+SELECT 
+    OBJECT_NAME(s.object_id) AS TableName,
+    s.name AS StatName,
+    STATS_DATE(s.object_id, s.stats_id) AS LastUpdated,
+    sp.rows AS TotalRows,
+    sp.rows_sampled AS SampledRows,
+    CAST(100.0 * sp.rows_sampled / NULLIF(sp.rows, 0) AS DECIMAL(5,2)) AS SamplePercent
+FROM sys.stats s
+CROSS APPLY sys.dm_db_stats_properties_internal(s.object_id, s.stats_id) sp
+JOIN sys.objects o ON s.object_id = o.object_id
+WHERE o.type = 'U'
+ORDER BY STATS_DATE(s.object_id, s.stats_id);
+```
+
+### 强制执行计划
+
+```sql
+-- 查看 Query Store 中的计划
+SELECT 
+    q.query_id,
+    qt.query_text_id,
+    q.query_hash,
+    rs.plan_id,
+    rs.avg_duration,
+    rs.avg_cpu_time,
+    rs.avg_logical_io_reads,
+    rsi.execution_type_desc
+FROM sys.query_store_query q
+JOIN sys.query_store_query_text qt ON q.query_text_id = qt.query_text_id
+JOIN sys.query_store_runtime_stats rs ON q.query_id = rs.query_id
+JOIN sys.query_store_runtime_stats_interval rsi ON rs.runtime_stats_interval_id = rsi.runtime_stats_interval_id
+ORDER BY rs.avg_duration DESC;
+
+-- 强制执行计划
+EXEC sp_query_store_force_plan @query_id = 123, @plan_id = 456;
+
+-- 取消强制
+EXEC sp_query_store_unforce_plan @query_id = 123, @plan_id = 456;
+```
+
+## 优化提示（Hints）
+
+### 常用提示
+
+```sql
+-- 索引提示
+SELECT * FROM Orders WITH (INDEX(IX_Orders_CustomerID))
+WHERE CustomerID = 100;
+
+-- 连接顺序提示
+SELECT * FROM Orders o
+INNER LOOP JOIN Customers c ON o.CustomerID = c.CustomerID;  -- 强制嵌套循环
+
+-- 聚合提示
+SELECT CustomerID, COUNT(*) 
+FROM Orders
+GROUP BY CustomerID
+OPTION (HASH GROUP);  -- 强制哈希聚合
+
+-- 并行度提示
+SELECT * FROM Orders
+WHERE OrderDate > '2024-01-01'
+OPTION (MAXDOP 1);  -- 单线程
+
+-- 查询处理器提示
+SELECT * FROM Orders
+WHERE CustomerID = 100
+OPTION (USE HINT ('DISABLE_OPTIMIZED_NESTED_LOOP'));
+```
+
+### 提示的注意事项
+
+| 提示 | 风险 |
+|---|---|
+| `WITH (INDEX)` | 索引删除/修改后计划失效 |
+| `OPTION (MAXDOP 1)` | 禁用并行，可能变慢 |
+| `OPTION (RECOMPILE)` | 每次执行重编译，开销大 |
+| `FORCE ORDER` | 禁用连接重排序 |
+
+:::warning
+提示应该谨慎使用。优化器通常比开发者更了解数据分布。除非经过充分测试，否则不要强制执行计划。
+:::
+
+## 执行计划分析
+
+### 阅读执行计划
+
+```sql
+-- 获取 XML 执行计划
+SET STATISTICS XML ON;
+GO
+SELECT * FROM Orders WHERE CustomerID = 100;
+GO
+SET STATISTICS XML OFF;
+```
+
+### 关键操作符成本
+
+| 操作符 | 说明 | 性能影响 |
+|---|---|---|
+| Table Scan | 全表扫描 | 高（数据量大时） |
+| Index Scan | 索引全扫描 | 中 |
+| Index Seek | 索引查找 | 低 |
+| Key Lookup | 回表查找 | 中到高 |
+| Nested Loop | 嵌套循环 | 低（内表有索引） |
+| Hash Match | 哈希连接 | 中（大数据量） |
+| Merge Join | 合并连接 | 低（已排序输入） |
+
+### 识别问题
+
+```sql
+-- 估计行数 vs 实际行数
+-- 在图形化计划中查看：
+-- - Estimated Rows（估计）
+-- - Actual Rows（实际）
+-- 差距大 = 统计信息过时
+
+-- 隐式类型转换
+-- 在 XML 计划中查找：
+-- <RelOp ... PhysicalOp="Table Scan">
+--   <ScalarOperator ScalarString="...WHERE Flag=([@Flag])">
+--                     ↑
+--                     发现隐式转换！
+```
+
+## 优化案例
+
+### 案例 1：缺失索引
+
+```sql
+-- 问题查询
+SELECT OrderID, CustomerID, OrderDate
+FROM Orders
+WHERE CustomerID = 100 AND OrderDate > '2024-01-01';
+
+-- 诊断：查看缺失索引建议
+SELECT 
+    d.statement,
+    d.equality_columns,
+    d.included_columns,
+    d.avg_total_user_cost * d.user_seeks * d.avg_impact AS Score
+FROM sys.dm_db_missing_index_groups g
+JOIN sys.dm_db_missing_index_group_stats d ON g.index_group_handle = d.group_handle
+JOIN sys.dm_db_missing_index_details d2 ON g.index_handle = d2.index_handle
+WHERE d.database_id = DB_ID()
+ORDER BY Score DESC;
+
+-- 解决方案：创建建议的索引
+CREATE NONCLUSTERED INDEX IX_Orders_CustomerDate
+ON Orders(CustomerID, OrderDate)
+INCLUDE (OrderID);
+```
+
+### 案例 2：统计信息过时
+
+```sql
+-- 问题：估计行数与实际差距大
+-- 诊断：
+SELECT 
+    OBJECT_NAME(s.object_id) AS TableName,
+    s.name AS StatName,
+    STATS_DATE(s.object_id, s.stats_id) AS LastUpdated
+FROM sys.stats s
+WHERE OBJECTPROPERTY(s.object_id, 'IsUserTable') = 1
+    AND STATS_DATE(s.object_id, s.stats_id) < DATEADD(DAY, -7, GETDATE());
+
+-- 解决方案：更新统计信息
+UPDATE STATISTICS Orders;
+-- 或
+UPDATE STATISTICS Orders WITH FULLSCAN;
+```
+
+### 案例 3：参数嗅探
+
+```sql
+-- 问题：特定参数执行慢
+-- 诊断：对比不同参数的执行计划
+-- 使用 Query Store：
+SELECT 
+    q.query_id,
+    rsi.runtime_stats_interval_id,
+    rs.avg_duration,
+    rs.avg_cpu_time,
+    rs.avg_logical_io_reads,
+    p.plan_id,
+    p.query_plan
+FROM sys.query_store_query q
+JOIN sys.query_store_plan p ON q.query_id = p.query_id
+JOIN sys.query_store_runtime_stats rs ON p.plan_id = rs.plan_id
+JOIN sys.query_store_runtime_stats_interval rsi ON rs.runtime_stats_interval_id = rsi.runtime_stats_interval_id
+WHERE q.query_id = 123;
+
+-- 解决方案：强制好计划或添加提示
+EXEC sp_query_store_force_plan @query_id = 123, @plan_id = 456;
+```
+
+理解查询优化器的原理，能帮助你在性能调优时做出正确的决策。

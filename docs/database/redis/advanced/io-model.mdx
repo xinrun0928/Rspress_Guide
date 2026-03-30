@@ -1,0 +1,428 @@
+# I/O 模型：epoll 原理与事件循环
+
+很多人知道 Redis 是单线程的，但不知道 Redis 为什么选择单线程，更不知道 epoll 在其中扮演了什么角色。
+
+理解 Redis 的 I/O 模型，是理解 Redis 高性能的关键。
+
+## I/O 模型概述
+
+### 五种 I/O 模型
+
+| 模型 | 阻塞 | 非阻塞 | 多路复用 | 描述 |
+| --- | --- | --- | --- | --- |
+| 阻塞 I/O | 是 | 否 | 否 | 等待 I/O 完成才返回 |
+| 非阻塞 I/O | 否 | 是 | 否 | 立即返回，需要轮询 |
+| I/O 多路复用 | 否 | 否 | 是 | select/poll/epoll |
+| 信号驱动 I/O | 否 | 否 | 是 | SIGIO 通知 |
+| 异步 I/O | 否 | 否 | 是 | 完全异步，Windows IOCP |
+
+### 为什么 Redis 选择 I/O 多路复用
+
+Redis 的作者 antirez 解释过这个问题：
+
+> Redis 是 CPU 密集型而非 I/O 密集型。Redis 的操作是纯内存操作，执行速度极快（微秒级）。CPU 不是 Redis 的瓶颈，网络带宽和网卡才是。
+>
+> 因此，Redis 选择单线程 + I/O 多路复用，既能保证原子性，又能高效处理大量并发连接。
+
+```
+Redis 选择 I/O 多路复用的原因：
+
+1. 单线程避免锁竞争
+   - 原子操作，无需加锁
+   - 避免上下文切换开销
+
+2. I/O 多路复用处理并发
+   - 一个线程处理多个客户端连接
+   - 不需要为每个连接创建线程
+
+3. CPU 不是瓶颈
+   - 纯内存操作，执行时间短
+   - 网络 I/O 才是瓶颈
+```
+
+## epoll 原理详解
+
+### select 的问题
+
+在理解 epoll 之前，先看看 select 有什么问题：
+
+```c
+// select 的问题
+fd_set read_fds;
+int max_fd = 1024;  // FD_SETSIZE，默认 1024
+
+while (1) {
+    // 1. 每次调用都需要传入所有关注的 fd
+    FD_ZERO(&read_fds);
+    FD_SET(socket_fd, &read_fds);
+    
+    // 2. 线性扫描所有 fd，找到就绪的
+    select(max_fd + 1, &read_fds, NULL, NULL, NULL);
+    
+    // 3. 检查是哪个 fd 就绪
+    for (int i = 0; i < max_fd; i++) {
+        if (FD_ISSET(i, &read_fds)) {
+            // 处理 fd i
+        }
+    }
+}
+```
+
+**select 的问题**：
+
+1. **fd 数量限制**：最多 1024 个 fd
+2. **每次都要传递 fd 集合**：开销大
+3. **线性扫描所有 fd**：O(n) 复杂度
+4. **用户态/内核态拷贝**：开销大
+
+### epoll 的改进
+
+epoll 解决了 select 的问题：
+
+```c
+// epoll 改进
+
+// 1. 创建 epoll 实例（内核中）
+int epfd = epoll_create(1024);
+
+// 2. 注册要关注的 fd
+struct epoll_event ev;
+ev.events = EPOLLIN;  // 关注读事件
+ev.data.fd = socket_fd;
+epoll_ctl(epfd, EPOLL_CTL_ADD, socket_fd, &ev);
+
+// 3. 等待事件（只返回就绪的 fd）
+struct epoll_event events[1024];
+while (1) {
+    int n = epoll_wait(epfd, events, 1024, -1);
+    
+    // 4. n 是就绪的 fd 数量，直接遍历
+    for (int i = 0; i < n; i++) {
+        int fd = events[i].data.fd;
+        // 处理 fd
+    }
+}
+```
+
+**epoll 的优势**：
+
+1. **无 fd 数量限制**（受限于系统资源）
+2. **fd 只需注册一次**：不用每次都传递
+3. **只返回就绪的 fd**：O(1) 复杂度
+4. **内核直接管理 fd**：减少拷贝
+
+### epoll 的数据结构
+
+epoll 内部使用两个数据结构：
+
+```c
+// 红黑树：存储所有关注的 fd
+struct rb_root {
+    struct rb_node **rb_node;
+};
+// O(log n) 的插入、删除、查找
+
+// 就绪链表：存储已就绪的 fd
+struct list_head {
+    struct list_head *next, *prev;
+};
+// O(1) 的就绪通知
+```
+
+```
+epoll 数据结构：
+
+红黑树（关注列表）          就绪链表（就绪事件）
++------+                    +------+
+| fd 1 |                    | fd 2 | -> 已就绪
+| fd 2 | ->                 | fd 5 | -> 已就绪
+| fd 3 |                    +------+
+| fd 5 | ->
++------+
+
+工作流程：
+1. fd 注册到红黑树
+2. fd 就绪后，移动到就绪链表
+3. epoll_wait 返回就绪链表中的 fd
+```
+
+### epoll 的两种模式
+
+#### LT（Level Triggered，水平触发）
+
+```c
+// 默认模式
+// 只要条件满足，就一直通知
+
+// 场景：socket 有数据可读
+// 第一次通知后，应用没读取
+// 第二次 epoll_wait 仍会返回该 fd
+```
+
+#### ET（Edge Triggered，边沿触发）
+
+```c
+// 需要设置
+ev.events = EPOLLIN | EPOLLET;
+
+// 只有状态变化时才通知
+
+// 场景：socket 有数据可读
+// 第一次通知后，应用没读取
+// 第二次 epoll_wait 不会返回该 fd（除非有新数据）
+```
+
+**ET 的优势**：减少不必要的通知，更高效。
+
+**ET 的劣势**：需要一次性读完所有数据，容易遗漏。
+
+## Redis 事件循环
+
+### Redis 的事件处理框架
+
+Redis 使用 aeEventLoop 作为事件循环的核心结构：
+
+```c
+// Redis 事件循环结构
+typedef struct aeEventLoop {
+    int maxfd;              // 最大 fd
+    int setsize;            // fd 集合大小
+    int lastTime;           // 上次处理时间
+    aeFileEvent *events;    // 文件事件数组
+    aeTimeEvent *timeEventHead;  // 时间事件链表
+    void *apidata;          // 底层多路复用库（epoll/select/kqueue）
+    aeBeforeSleepProc *beforesleep;  // 事件处理前回调
+} aeEventLoop;
+```
+
+### Redis 支持的 I/O 多路复用
+
+Redis 根据不同平台选择不同的多路复用库：
+
+```c
+// ae.c 中的选择逻辑
+#ifdef HAVE_EVPORT
+    #include "ae_evport.c"    // Solaris evport
+#elif defined(HAVE_EPOLL)
+    #include "ae_epoll.c"    // Linux epoll
+#elif defined(HAVE_KQUEUE)
+    #include "ae_kqueue.c"    // macOS/FreeBSD kqueue
+#else
+    #include "ae_select.c"     // fallback: select
+#endif
+```
+
+### Redis 事件循环流程
+
+```
+Redis 主循环（aeMain）：
+
+while (!eventLoop->stop) {
+    // 1. 处理时间事件
+    aeProcessEvents(eventLoop, AE_TIME_EVENTS | AE_FILE_EVENTS);
+    
+    // 2. 处理文件事件
+    // 在 aeProcessEvents 内部
+}
+```
+
+### aeProcessEvents 详细流程
+
+```c
+int aeProcessEvents(aeEventLoop *eventLoop, int flags) {
+    // 1. 获取最近的时间事件（用于计算 epoll_wait 超时）
+    tv = aeSearchNearestTimer(eventLoop);
+    
+    // 2. 调用 epoll_wait 等待事件
+    numevents = epoll_wait(epfd, events, maxevents, tv);
+    
+    // 3. 遍历所有就绪事件
+    for (int i = 0; i < numevents; i++) {
+        fd = events[i].data.fd;
+        mask = events[i].events;
+        
+        // 4. 处理事件
+        if (mask & AE_READABLE) {
+            // 读事件：acceptTcpHandler / readQueryFromClient
+            aeFileEvent *fe = &eventLoop->events[fd];
+            fe->rFileProc(eventLoop, fd, client, mask);
+        }
+        
+        if (mask & AE_WRITABLE) {
+            // 写事件：sendReplyToClient
+            aeFileEvent *fe = &eventLoop->events[fd];
+            fe->wFileProc(eventLoop, fd, client, mask);
+        }
+    }
+    
+    // 5. 处理时间事件
+    processTimeEvents(eventLoop);
+}
+```
+
+### Redis 客户端处理流程
+
+```
+客户端连接流程：
+
+1. 客户端发起连接
+   |
+   v
+2. 服务器端 accept 连接
+   listen_fd = socket()
+   bind(listen_fd, ...)
+   listen(listen_fd, ...)
+   accept(listen_fd, ...)
+   |
+   v
+3. 注册读事件到 epoll
+   epoll_ctl(epfd, ADD, client_fd, EPOLLIN)
+   |
+   v
+4. epoll_wait 返回就绪事件
+   |
+   v
+5. 读取客户端请求
+   read(client_fd, ...)
+   |
+   v
+6. 执行命令，返回结果
+   redisCommand(client)
+   |
+   v
+7. 注册写事件（结果需要发送）
+   epoll_ctl(epfd, MOD, client_fd, EPOLLOUT)
+   |
+   v
+8. epoll_wait 返回写就绪
+   |
+   v
+9. 发送结果给客户端
+   write(client_fd, ...)
+```
+
+## Redis 单线程模型
+
+### 为什么是单线程
+
+Redis 选择单线程有以下几个原因：
+
+```
+1. 避免锁竞争
+   - 多线程需要加锁
+   - 加锁带来性能开销
+   - 单线程天然无锁
+
+2. 避免上下文切换
+   - 线程切换消耗 CPU
+   - 阻塞 I/O 不会阻塞其他线程
+
+3. CPU 不是瓶颈
+   - Redis 是内存密集型
+   - 操作时间微秒级
+   - 网络 I/O 才是瓶颈
+
+4. 简化实现
+   - 无需考虑线程安全
+   - 数据结构天然原子
+```
+
+### Redis 6.0 多线程
+
+Redis 6.0 引入了 **I/O 多线程**，但 **命令执行仍然是单线程**：
+
+```
+Redis 6.0 之前：
+主线程 -> accept -> read -> execute -> write -> accept -> ...
+
+Redis 6.0 之后：
+主线程 -> accept (单线程)
+           |
+           v
+I/O 线程池 -> read (多线程)
+           |
+           v
+主线程 -> execute (单线程)
+           |
+           v
+I/O 线程池 -> write (多线程)
+```
+
+```bash
+# 开启 I/O 多线程
+# redis.conf
+io-threads 4
+io-threads-do-reads yes
+```
+
+**配置建议**：
+
+```bash
+# 只有多核 CPU + 高并发场景才需要开启
+# 默认关闭（io-threads 1）
+
+# 如果 QPS > 10 万，可以考虑开启
+io-threads 4
+io-threads-do-reads yes
+```
+
+## 性能优化建议
+
+### 1. 使用连接池
+
+```python
+# 不推荐：每次请求创建新连接
+def bad_example():
+    r = redis.Redis()  # 创建连接
+    r.get('key')
+    # 关闭连接
+
+# 推荐：使用连接池
+pool = redis.ConnectionPool(host='localhost', port=6379, max_connections=50)
+r = redis.Redis(connection_pool=pool)
+```
+
+### 2. 批量操作
+
+```python
+# 不推荐：多次网络往返
+for key in keys:
+    r.get(key)
+
+# 推荐：Pipeline 批量操作
+pipe = r.pipeline()
+for key in keys:
+    pipe.get(key)
+results = pipe.execute()
+```
+
+### 3. 使用 Lua 脚本
+
+```lua
+-- 将多个命令打包为一个原子操作
+local key1 = KEYS[1]
+local key2 = KEYS[2]
+local value = redis.call('get', key1)
+redis.call('set', key2, value)
+return value
+```
+
+### 4. 合理设置缓冲区
+
+```bash
+# client-output-buffer-limit
+# 防止客户端缓冲区过大
+client-output-buffer-limit normal 256mb
+client-output-buffer-limit replica 64mb 8mb 60
+client-output-buffer-limit pubsub 32mb 8mb 60
+```
+
+## 面试追问方向
+
+- Redis 为什么选择单线程？
+- select、poll、epoll 的区别是什么？
+- epoll 的 LT 和 ET 模式有什么区别？
+- Redis 的事件循环是怎么工作的？
+- Redis 6.0 的多线程是什么？
+
+理解 Redis 的 I/O 模型，你就能理解 Redis 高性能的真正原因了。

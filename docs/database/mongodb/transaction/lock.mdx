@@ -1,0 +1,471 @@
+import { Badge } from '@rspress/core/theme';
+
+# MongoDB 锁机制
+
+「MongoDB 的锁是什么粒度的？」
+
+这是面试中经常被问到的问题。大多数人知道 MongoDB 使用锁，但追问下去——「是表级锁还是行级锁？」「WiredTiger 和 MMAPv1 的锁机制有什么不同？」「什么是意向锁？」「锁等待超时怎么处理？」——能答上来的就很少了。
+
+本文深入讲解 MongoDB 的锁机制，帮你彻底理解这个核心知识点。
+
+## 锁粒度概述
+
+### MongoDB 的锁粒度
+
+MongoDB 的锁粒度取决于存储引擎：
+
+| 存储引擎 | 锁粒度 | 说明 |
+|---|---|---|
+| WiredTiger（默认） | 文档级锁 | 同一集合可并发读写不同文档 |
+| MMAPv1 | 集合级锁 | 同一集合的写操作互斥 |
+
+```
+锁粒度对比：
+
+WiredTiger（文档级锁）：
+┌─────────────────────────────────────────┐
+│  集合 users                              │
+│  ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐       │
+│  │Doc A│ │Doc B│ │Doc C│ │Doc D│       │
+│  │ 🔒  │ │     │ │     │ │ 🔒  │       │
+│  └─────┘ └─────┘ └─────┘ └─────┘       │
+│   A和D可同时被不同事务锁定                │
+└─────────────────────────────────────────┘
+
+MMAPv1（集合级锁）：
+┌─────────────────────────────────────────┐
+│  集合 users                              │
+│  ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐       │
+│  │Doc A│ │Doc B│ │Doc C│ │Doc D│       │
+│  └─────┘ └─────┘ └─────┘ └─────┘       │
+│  ┌─────────────────────────────────┐   │
+│  │       🔒 Collection Lock        │   │
+│  │  整个集合同一时刻只能有一个写操作   │   │
+│  └─────────────────────────────────┘   │
+└─────────────────────────────────────────┘
+```
+
+## WiredTiger 锁机制
+
+### 文档级锁
+
+WiredTiger 使用**乐观并发控制**，文档级别的锁是其核心特性。
+
+```javascript
+// WiredTiger 文档锁示例
+// 两个事务同时修改不同文档 → 都可以成功
+
+// 事务A
+sessionA.startTransaction();
+await db.orders.updateOne(
+  { _id: "order_1" },  // 修改文档1
+  { $set: { status: "shipped" } }
+);
+
+// 事务B
+sessionB.startTransaction();
+await db.orders.updateOne(
+  { _id: "order_2" },  // 修改文档2（不同）
+  { $set: { status: "shipped" } }
+);
+
+// 两个事务可以同时进行，因为修改的是不同文档
+```
+
+### 锁的类型
+
+| 锁类型 | 说明 | 兼容性 |
+|---|---|---|
+| 共享锁（S） | 读取操作获取 | 与 S 兼容，与 X 互斥 |
+| 排他锁（X） | 写入操作获取 | 与 S、X 都互斥 |
+| 意向共享（IS） | 表示要获取 S 锁 | 与其他 IS 兼容 |
+| 意向排他（IX） | 表示要获取 X 锁 | 与 IS 兼容，与 S 互斥 |
+
+```
+意向锁层级结构：
+
+┌─────────────────────────────────────────┐
+│          Database Lock                   │
+│   IS ────────────────────────── IX       │
+│  ┌───────────┐           ┌───────────┐  │
+│  │Collection │           │Collection │  │
+│  │IS Lock    │           │IX Lock    │  │
+│  └─────┬─────┘           └─────┬─────┘  │
+│        │                     │          │
+│  ┌─────┴─────┐           ┌─────┴─────┐  │
+│  │Document   │           │Document   │  │
+│  │S Lock     │           │X Lock     │  │
+│  └───────────┘           └───────────┘  │
+└─────────────────────────────────────────┘
+```
+
+### 锁获取过程
+
+```javascript
+// WiredTiger 锁获取过程
+
+// 1. 读取操作
+{
+  // 获取数据库 IS 锁
+  // 获取集合 IS 锁
+  // 获取文档 S 锁
+  // 读取数据
+  // 释放所有锁
+}
+
+// 2. 写入操作
+{
+  // 获取数据库 IX 锁
+  // 获取集合 IX 锁
+  // 尝试获取文档 X 锁
+  //   - 成功：写入数据
+  //   - 失败：等待或重试
+  // 释放所有锁
+}
+```
+
+### 锁等待与超时
+
+```javascript
+// 锁等待配置
+// mongod.conf
+storage:
+  wiredTiger:
+    engineConfig:
+      lockTimeoutMS: 5000  // 锁等待超时，默认 5 秒
+
+// 锁超时错误
+try {
+  await db.collection.updateOne(
+    { _id: "locked_doc" },
+    { $set: { value: 100 } }
+  );
+} catch (error) {
+  if (error.hasErrorLabel("LockTimeout")) {
+    console.log("锁等待超时");
+  }
+}
+
+// 查看当前锁状态
+db.currentOp({
+  "waitingForLock": true
+})
+```
+
+## 锁与事务
+
+### 事务锁行为
+
+```javascript
+// 多文档事务的锁行为
+await session.withTransaction(async () => {
+  // 事务开始：获取所有需要的锁
+  // 事务期间：持有锁，不释放
+  // 事务提交/回滚：释放所有锁
+
+  await db.orders.updateOne({ _id: 1 }, { $set: { status: "shipped" } });
+  await db.inventory.updateOne({ product_id: "P001" }, { $inc: { stock: -1 } });
+
+  // 事务提交时自动释放锁
+});
+
+// 如果事务执行时间过长，可能导致其他操作等待
+```
+
+### 死锁避免
+
+```javascript
+// 死锁场景
+// 事务A：锁定文档1，等待文档2
+// 事务B：锁定文档2，等待文档1
+// → 死锁！
+
+// 避免死锁的方法：统一锁顺序
+// ✅ 正确：按文档 ID 顺序获取锁
+if (doc1_id < doc2_id) {
+  await db.collection.updateOne({ _id: doc1_id }, ...);
+  await db.collection.updateOne({ _id: doc2_id }, ...);
+} else {
+  await db.collection.updateOne({ _id: doc2_id }, ...);
+  await db.collection.updateOne({ _id: doc1_id }, ...);
+}
+
+// ✅ 使用事务：MongoDB 会自动检测死锁并回滚
+try {
+  await session.withTransaction(async () => {
+    // MongoDB 会检测死锁并抛出错误
+  });
+} catch (error) {
+  if (error.hasErrorLabel("TransientTransactionError")) {
+    console.log("死锁，事务自动回滚");
+  }
+}
+```
+
+## 锁与索引
+
+### 索引锁开销
+
+```javascript
+// 写入操作需要同时锁索引
+// 创建索引时会影响写入性能
+
+// ❌ 生产环境避免
+db.collection.createIndex({ field: 1 });  // 阻塞写入
+
+// ✅ 后台创建
+db.collection.createIndex(
+  { field: 1 },
+  { background: true }  // 后台创建，不阻塞写入
+);
+
+// ✅ 滚动创建索引（分片集群）
+```
+
+### 索引与锁粒度
+
+```javascript
+// 索引对锁的影响
+
+// 单键索引：文档锁 + 索引项锁
+db.users.createIndex({ email: 1 });
+await db.users.updateOne(
+  { email: "test@example.com" },
+  { $set: { name: "Test" } }
+);
+// 锁定文档 + 锁定索引项
+
+// 复合索引：可能影响多个索引项
+db.users.createIndex({ status: 1, created_at: -1 });
+await db.users.updateOne(
+  { status: "active", created_at: new Date() },
+  { $set: { name: "Test" } }
+);
+// 可能需要更新多个索引项
+```
+
+## 全局锁
+
+### 何时使用全局锁
+
+```javascript
+// 全局锁场景
+
+// 1. 数据库操作
+db.adminCommand({ lock: 1 });  // 获取全局写锁
+db.adminCommand({ lock: 1, lockTimeoutMS: 60000 });
+
+// 2. 修复操作
+db.repairDatabase();  // 需要全局锁
+
+// 3. 备份操作
+db.fsyncLock();  // 强制所有写入刷新并锁定
+db.fsyncUnlock();  // 解锁
+
+// 4. 滚动维护
+// 在副本集上进行滚动升级时，需要锁定单个节点
+```
+
+### 全局锁的影响
+
+<Badge text="警告" type="warning" /> 全局锁会阻塞所有读写操作，应尽量避免在生产环境使用。
+
+```
+全局锁影响：
+
+┌─────────────────────────────────────────┐
+│          Global Lock                     │
+│  🔒 阻塞所有读和写                         │
+│                                          │
+│  ┌─────────────────────────────────┐    │
+│  │  Database 1                     │    │
+│  │  Database 2                      │    │
+│  │  Database 3                      │    │
+│  └─────────────────────────────────┘    │
+│                                          │
+│  所有操作等待全局锁释放                     │
+└─────────────────────────────────────────┘
+```
+
+## 锁监控
+
+### 查看锁信息
+
+```javascript
+// 查看当前锁状态
+db.currentOp({ "locks": { "$gt": {} } })
+
+// 查看锁等待
+db.currentOp({
+  "waitingForLock": true
+})
+
+// 查看锁统计
+db.serverStatus().locks
+
+// 查看特定数据库的锁
+db.adminCommand({
+  top: 1
+})
+```
+
+### 锁统计输出示例
+
+```javascript
+// db.serverStatus().locks 输出
+{
+  "admin" : {
+    "acquireCount" : {
+      "r" : NumberLong(1234),   // 共享锁获取次数
+      "w" : NumberLong(567),    // 排他锁获取次数
+      "R" : NumberLong(10),    // 全局共享锁
+      "W" : NumberLong(5)       // 全局排他锁
+    }
+  },
+  "config" : {
+    "acquireCount" : {
+      // ...
+    }
+  },
+  "local" : {
+    "acquireCount" : {
+      // ...
+    }
+  }
+}
+```
+
+### 锁相关指标
+
+```javascript
+// 查看锁等待时间
+db.serverStatus().metrics.lock
+
+// 输出示例
+{
+  "deadlockCount" : NumberLong(0),      // 死锁次数
+  "timeAcquiringMicros" : {             // 获取锁等待时间
+    "read" : NumberLong(12345),
+    "write" : NumberLong(67890),
+    "readPending" : NumberLong(100),
+    "writePending" : NumberLong(50)
+  },
+  "acquireWaitCount" : {                // 等待锁的次数
+    "read" : NumberLong(10),
+    "write" : NumberLong(5)
+  }
+}
+```
+
+## 性能优化
+
+### 减少锁竞争
+
+```javascript
+// 1. 设计良好的文档结构
+// ❌ 大文档频繁更新，导致锁竞争激烈
+{
+  _id: 1,
+  counters: { a: 0, b: 0, c: 0, d: 0, e: 0 }  // 频繁更新的计数器
+}
+
+// ✅ 拆分文档，减少锁冲突
+{ _id: 1, type: "a", count: 0 }
+{ _id: 2, type: "b", count: 0 }
+{ _id: 3, type: "c", count: 0 }
+
+// 2. 使用合适的分片键
+// 将热点数据分散到不同分片，减少单节点锁竞争
+sh.shardCollection("app.orders", { user_id: "hashed" });
+
+// 3. 批量操作减少锁获取次数
+// ❌ 多次单文档操作
+for (const doc of docs) {
+  await db.collection.updateOne({ _id: doc._id }, { $set: { status: "done" } });
+}
+
+// ✅ 批量操作
+await db.collection.updateMany(
+  { _id: { $in: docs.map(d => d._id) } },
+  { $set: { status: "done" } }
+);
+
+// 4. 读写分离
+// 读取操作使用从节点
+db.collection.find({}, { readPreference: "secondaryPreferred" });
+```
+
+### 锁超时配置
+
+```javascript
+// mongod.conf 配置
+storage:
+  wiredTiger:
+    engineConfig:
+      lockTimeoutMS: 30000      // 锁超时 30 秒
+      maxCacheOverflowThreshold: 100  // 缓存溢出阈值
+
+// 运行时查看配置
+db.adminCommand({ getParameter: 1, lockTimeoutMS: 1 });
+
+// 修改锁超时（需要 admin 权限）
+db.adminCommand({ setParameter: 1, lockTimeoutMS: 30000 });
+```
+
+## 面试实战
+
+**面试官问**：「MongoDB 的锁粒度是什么？和 MySQL 有什么区别？」
+
+**深入回答**：
+
+> 核心区别：
+>
+> 1. **WiredTiger（MongoDB 默认）**：文档级锁，同一集合可并发读写不同文档
+>
+> 2. **MySQL InnoDB**：行级锁，但会有间隙锁和 Next-Key Lock
+>
+> 3. **锁开销**：MongoDB 文档锁开销较小，因为文档本身就是锁的目标
+>
+> 4. **索引锁**：两者都会锁索引，索引更新需要锁索引项
+
+**面试官问**：「什么是意向锁？MongoDB 是怎么用意向锁的？」
+
+**深入回答**：
+
+> 意向锁的作用：
+>
+> 1. **层级结构**：数据库 → 集合 → 文档，每个层级都有自己的意向锁
+>
+> 2. **快速判断**：获取文档锁前，先检查集合和数据库的意向锁，快速判断是否可以继续
+>
+> 3. **兼容性**：意向锁之间更容易兼容，如 IS 和 IX 可以共存
+>
+> 4. **避免死锁**：意向锁帮助系统提前发现潜在的锁冲突
+
+**面试官问**：「MongoDB 死锁是怎么处理的？」
+
+**深入回答**：
+
+> MongoDB 的死锁处理：
+>
+> 1. **死锁检测**：MongoDB 定期检测死锁（每几毫秒）
+>
+> 2. **死锁回滚**：检测到死锁后，回滚代价最小的事务
+>
+> 3. **TransientTransactionError**：事务回滚后会抛出此错误，客户端可以重试
+>
+> 4. **避免死锁**：开发者应按固定顺序获取锁
+
+## 总结
+
+MongoDB 锁机制要点：
+
+- **锁粒度**：WiredTiger 是文档级锁，MMAPv1 是集合级锁
+- **锁类型**：共享锁（S）、排他锁（X）、意向锁（IS/IX）
+- **锁层级**：数据库 → 集合 → 文档
+- **事务锁**：事务期间持有锁，提交/回滚时释放
+- **锁超时**：可配置 `lockTimeoutMS`
+- **死锁处理**：自动检测并回滚代价最小的事务
+- **锁监控**：`db.currentOp()` 和 `db.serverStatus().locks`
+
+理解锁机制，是优化 MongoDB 性能和避免死锁的基础。

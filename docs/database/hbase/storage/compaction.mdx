@@ -1,0 +1,446 @@
+# Compaction：Minor vs Major
+
+MemStore 刷写到 HDFS 后，生成了 HFile。但随着时间推移，一个 Region 中会产生越来越多的 HFile。过多的 HFile 会导致读取性能下降，这时候就需要 Compaction 来合并清理。
+
+Compaction 是 HBase 存储引擎中最复杂、影响最大的机制之一。它决定了存储空间的利用效率、读取性能、以及系统的资源消耗。理解 Compaction，是成为 HBase 专家的必经之路。
+
+## 为什么需要 Compaction？
+
+### HFile 碎片化
+
+每次 MemStore flush 都会生成新的 HFile，假设有以下场景：
+
+```
+第1次 flush：HFile-1 生成
+┌─────────────────────────────────────────────────────────────┐
+│ user_001, info:name = "张三", t1                          │
+│ user_002, info:name = "李四", t2                          │
+│ user_003, info:name = "王五", t3                          │
+└─────────────────────────────────────────────────────────────┘
+
+第2次 flush：HFile-2 生成
+┌─────────────────────────────────────────────────────────────┐
+│ user_001, info:name = "李四", t4  ← 同一 RowKey 的新版本  │
+│ user_004, info:name = "赵六", t5                          │
+└─────────────────────────────────────────────────────────────┘
+
+第3次 flush：HFile-3 生成
+┌─────────────────────────────────────────────────────────────┐
+│ user_002, info:name = "小李", t6  ← 同一 RowKey 的新版本  │
+│ user_005, info:name = "孙七", t7                          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+此时读取 `user_001` 的最新数据，需要扫描所有 3 个 HFile。这就是读取放大问题。
+
+### Compaction 的作用
+
+Compaction 将多个小 HFile 合并成一个大 HFile，解决以下问题：
+
+```
+Compaction 之前：
+┌─────────────┐  ┌─────────────┐  ┌─────────────┐
+│  HFile-1    │  │  HFile-2    │  │  HFile-3    │
+│  user_001   │  │  user_001   │  │  user_002   │
+│  user_002   │  │  user_004   │  │  user_005   │
+│  user_003   │  │             │  │             │
+└─────────────┘  └─────────────┘  └─────────────┘
+
+Compaction 之后：
+┌─────────────────────────────────────────────────────────────┐
+│                      HFile-merged                           │
+│  user_001, info:name = "李四", t4   ← 保留最新版本         │
+│  user_002, info:name = "小李", t6   ← 保留最新版本         │
+│  user_003, info:name = "王五", t3                          │
+│  user_004, info:name = "赵六", t5                          │
+│  user_005, info:name = "孙七", t7                          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Compaction 类型
+
+### Minor Compaction
+
+Minor Compaction 选取部分较小的 HFile 进行合并，通常是最早生成、文件较小的那几个。
+
+```
+Minor Compaction 选择策略：
+┌─────────────────────────────────────────────────────────────┐
+│  条件1：HFile 数量超过阈值（默认 3）                        │
+│  条件2：HFile 大小超过最小文件大小（默认 2 * blocksize）   │
+│                                                              │
+│  选择：最早生成的 N 个小文件                                 │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**特点**：
+- 只合并部分 HFile，不是全部
+- 保留所有版本（包括已删除的）
+- 执行时间短，对系统影响小
+- 不能彻底解决读取放大问题
+
+### Major Compaction
+
+Major Compaction 将一个 Store 中所有的 HFile 合并成一个。
+
+```
+Major Compaction 过程：
+┌─────────────────────────────────────────────────────────────┐
+│                                                              │
+│  HFile-1  ─┐                                                │
+│  HFile-2  ─┼─▶  Compaction  ──▶  HFile-new                 │
+│  HFile-3  ─┘                                                │
+│  ...        │                                                │
+│  HFile-N  ─┘                                                │
+│                                                              │
+│  新 HFile 包含：                                             │
+│  - 所有有效数据（最新版本）                                   │
+│  - 删除标记和过期数据被清除                                   │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**特点**：
+- 合并所有 HFile，只生成一个大文件
+- 删除标记和过期数据被物理删除
+- 释放磁盘空间
+- 执行时间长，资源消耗大
+
+**Major Compaction 的时间窗口**：
+
+Major Compaction 默认在夜间执行（`hbase.regionserver.compactionchecker.interval`），避免影响白天业务。
+
+## Compaction 触发条件
+
+### Minor Compaction 触发
+
+```java
+// 触发条件检查逻辑
+public class CompactionRequest {
+    // 条件1：HFile 数量超过阈值
+    public boolean needsCompaction(int numHFiles, int hfilesToCompact) {
+        return numHFiles > hfilesToCompact;
+    }
+    
+    // 条件2：HFile 足够小
+    public boolean isSmallFile(long fileSize, long minFileSize) {
+        return fileSize < minFileSize * 1.2;  // 允许 20% 的浮动
+    }
+}
+```
+
+配置参数：
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `hbase.hstore.compaction.min` | 3 | 最少 HFile 数量触发 Minor Compaction |
+| `hbase.hstore.compaction.max` | 10 | 最多参与 Minor Compaction 的 HFile 数 |
+| `hbase.hstore.compaction.min.size` | 128MB | HFile 小于此值一定会被 Compaction |
+| `hbase.hstore.compaction.max.size` | 10GB | HFile 大于此值不会被 Compaction |
+
+### Major Compaction 触发
+
+```java
+// Major Compaction 触发条件
+public class MajorCompactionChecker {
+    // 时间间隔（默认 7 天）
+    private long getMajorCompactionInterval() {
+        return 7 * 24 * 60 * 60 * 1000;  // 一周
+    }
+    
+    // 检查是否需要 Major Compaction
+    public boolean needsMajorCompaction(List<HFile> files) {
+        // 检查是否超过时间窗口
+        long oldestTime = getOldestFileTime(files);
+        long now = System.currentTimeMillis();
+        
+        return (now - oldestTime) > getMajorCompactionInterval();
+    }
+}
+```
+
+### 动态调整策略
+
+HBase 可以根据负载动态调整 Compaction：
+
+```java
+// 负载感知 Compaction
+public class ThroughputController {
+    // 高负载时，减少 Compaction 资源占用
+    public void adjustCompactionSpeed(double systemLoad) {
+        if (systemLoad > 0.8) {
+            // 高负载：降低 Compaction 优先级
+            setCompactionPriority(LOW);
+            setCompactionThroughput(100);  // MB/s
+        } else if (systemLoad < 0.3) {
+            // 低负载：加速 Compaction
+            setCompactionPriority(HIGH);
+            setCompactionThroughput(500);  // MB/s
+        }
+    }
+}
+```
+
+## Compaction 的代价
+
+Compaction 不是免费的，它有以下代价：
+
+### 写放大（Write Amplification）
+
+```
+写放大计算：
+┌─────────────────────────────────────────────────────────────┐
+│  场景：1GB 原始数据                                          │
+│                                                              │
+│  第一次 Minor Compaction：                                   │
+│  写入量 = 1GB + 0.5GB = 1.5GB（放大 1.5 倍）               │
+│                                                              │
+│  第二次 Minor Compaction：                                   │
+│  写入量 = 1.5GB + 0.5GB = 2GB（放大 2 倍）                 │
+│                                                              │
+│  Major Compaction：                                          │
+│  写入量 = 2GB + 1GB = 3GB（放大 3 倍）                     │
+│                                                              │
+│  最终：1GB 原始数据，经历了 6.5GB 的写入                    │
+│       写放大倍数 = 6.5x                                      │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 空间放大（Space Amplification）
+
+Compaction 期间需要额外空间：
+
+```
+空间放大计算：
+┌─────────────────────────────────────────────────────────────┐
+│  Compaction 前：                                             │
+│  - HFile-1: 500MB                                          │
+│  - HFile-2: 500MB                                          │
+│  - 总计：1GB                                                │
+│                                                              │
+│  Compaction 中（需要额外空间）：                             │
+│  - 新 HFile: 1GB（写入中）                                  │
+│  - 旧 HFile: 1GB（待删除）                                  │
+│  - 总计：2GB（空间放大 2 倍）                                │
+│                                                              │
+│  Compaction 后：                                             │
+│  - 新 HFile: 1GB                                            │
+│  - 总计：1GB                                                │
+└─────────────────────────────────────────────────────────────┘
+```
+
+:::warning 磁盘空间风险
+如果 Compaction 期间磁盘空间不足，可能导致 Compaction 失败，影响系统稳定性。建议保留至少 20% 的空闲磁盘空间。
+:::
+
+## Compaction 策略
+
+### 1. DefaultCompaction（默认策略）
+
+选择需要 Compaction 的 HFile：
+
+```
+DefaultCompaction 选择规则：
+┌─────────────────────────────────────────────────────────────┐
+│  1. 排序所有 HFile（按文件大小，从小到大）                   │
+│  2. 选择文件直到总大小达到阈值                               │
+│  3. 跳过超过 maxSize 的文件                                 │
+│                                                              │
+│  示例：                                                      │
+│  HFiles: [100MB, 100MB, 100MB, 500MB, 500MB]               │
+│  minFilesToCompact = 3, maxFilesToCompact = 10              │
+│  maxSize = 1GB                                              │
+│                                                              │
+│  选择：[100MB, 100MB, 100MB]                                │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 2. ExploringCompaction
+
+比 DefaultCompaction 更激进，尽可能多地合并文件：
+
+```java
+// ExploringCompaction 选择逻辑
+public List<HFile> selectCompactionFiles() {
+    // 1. 获取所有可合并的文件
+    List<HFile> candidates = getCompactableFiles();
+    
+    // 2. 遍历所有组合，找最优
+    List<HFile> best = null;
+    long bestSize = Long.MAX_VALUE;
+    
+    for (List<HFile> combo : generateCombinations(candidates)) {
+        long totalSize = calculateTotalSize(combo);
+        // 选择总大小最接近阈值的组合
+        if (totalSize < bestSize && totalSize > minSize) {
+            best = combo;
+            bestSize = totalSize;
+        }
+    }
+    
+    return best;
+}
+```
+
+### 3. StripeCompaction
+
+适合大型 Region 的 Compaction 策略，将 Region 按 Key 范围分成多个条带：
+
+```
+StripeCompaction 原理：
+┌─────────────────────────────────────────────────────────────┐
+│                    大型 Region                                │
+│  [A-G]      [G-N]      [N-T]      [T-Z]                    │
+│  ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐              │
+│  │ Stripe1│ │ Stripe2│ │ Stripe3│ │ Stripe4│              │
+│  │ A-G    │ │ G-N    │ │ N-T    │ │ T-Z    │              │
+│  └────────┘ └────────┘ └────────┘ └────────┘              │
+│                                                              │
+│  优势：                                                       │
+│  - 每个条带独立 Compaction                                   │
+│  - Compaction 资源分散                                       │
+│  - 避免全 Region Major Compaction 的巨大开销                │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 4. DateTieredCompaction（适合时序数据）
+
+针对时序数据优化的 Compaction 策略：
+
+```
+DateTieredCompaction 选择策略：
+┌─────────────────────────────────────────────────────────────┐
+│                                                              │
+│  时间分层：                                                   │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │ 最新数据层 │ 近期数据层 │ 旧数据层 │ 最旧数据层    │    │
+│  │  (0-1天)   │ (1-7天)   │ (7-30天) │ (>30天)      │    │
+│  │  高频率合并 │ 中频率合并 │ 低频率   │ 最低频率      │    │
+│  └─────────────────────────────────────────────────────┘    │
+│                                                              │
+│  优势：                                                       │
+│  - 最新数据合并频繁，减少读取放大                             │
+│  - 旧数据合并缓慢，节省资源                                   │
+│  - 非常适合监控、日志等时序场景                               │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Compaction 调优
+
+### 合理配置参数
+
+```xml
+<!-- hbase-site.xml -->
+<property>
+  <name>hbase.hstore.compaction.min</name>
+  <value>3</value>  <!-- 不要太小，否则频繁 Compaction -->
+</property>
+
+<property>
+  <name>hbase.hstore.compaction.max</name>
+  <value>10</value>  <!-- 不要太大，否则一次 Compaction 太慢 -->
+</property>
+
+<property>
+  <name>hbase.regionserver.thread.compaction.throttle</name>
+  <value>2684354560</value>  <!-- Compaction 吞吐量限制：2.5GB -->
+</property>
+
+<property>
+  <name>hbase.hstore.compaction.max.size</name>
+  <value>10737418240</value>  <!-- 10GB，大文件不参与 Minor Compaction -->
+</property>
+```
+
+### 监控 Compaction 状态
+
+```bash
+# 查看 Compaction 状态
+hbase> status 'simple'
+# 或
+hbase> status 'detailed'
+
+# 通过 Web UI 查看
+# http://regionserver:16030/rs-status
+```
+
+### 手动触发 Compaction
+
+```java
+// 手动触发 Compaction
+Admin admin = connection.getAdmin();
+
+// Compaction 单个表
+admin.compact(TableName.valueOf("my_table"));
+
+// Compaction 单个 Region
+admin.compact(TableName.valueOf("my_table"), Bytes.toBytes("region_name"));
+
+// Major Compaction（慎用，会造成大量 I/O）
+admin.majorCompact(TableName.valueOf("my_table"));
+```
+
+:::warning Major Compaction 的风险
+手动触发 Major Compaction 可能造成大量磁盘 I/O，建议：
+1. 在低峰期执行
+2. 逐个 Region 执行
+3. 监控磁盘 I/O 和延迟
+:::
+
+## Compaction 与删除
+
+### 删除标记的处理
+
+HBase 的删除不是立即物理删除，而是先打标记：
+
+```
+删除流程：
+┌─────────────────────────────────────────────────────────────┐
+│                                                              │
+│  1. 删除操作写入                                            │
+│     └─ Put 写入：info:name = "删除", KeyType = Delete       │
+│                                                              │
+│  2. 查询时检查删除标记                                      │
+│     └─ 如果发现删除标记，返回空                              │
+│                                                              │
+│  3. Major Compaction 时物理删除                             │
+│     └─ 删除标记和被删除数据一起清除                         │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### TTL 与 Version 的处理
+
+```java
+// TTL 和 Version 在 Major Compaction 时处理
+public class CompactionExecutor {
+    public void executeMajorCompaction() {
+        for (HFile file : files) {
+            for (Cell cell : file) {
+                // 检查 TTL
+                if (isExpired(cell)) {
+                    skip(cell);  // 不写入新文件
+                }
+                
+                // 检查 Version
+                if (exceedsMaxVersions(cell)) {
+                    skip(cell);  // 不写入新文件
+                }
+            }
+        }
+    }
+}
+```
+
+## 面试追问方向
+
+- Compaction 有哪几种类型？各自的特点是什么？
+- 为什么要 Compaction？它解决了什么问题？
+- Compaction 的代价有哪些？什么是写放大？
+- Minor 和 Major Compaction 的触发条件是什么？
+- HBase 有哪些 Compaction 策略？如何选择？
+- Compaction 期间磁盘空间不足会怎样？
+- 删除操作在 HBase 中是如何处理的？为什么需要 Major Compaction？
+- 如何调优 Compaction 参数？有什么建议？
+- 什么场景下需要手动触发 Major Compaction？
+
+理解 Compaction 的原理和调优，你就能掌控 HBase 的存储引擎性能。

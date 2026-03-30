@@ -1,0 +1,339 @@
+import { Badge } from '@rspress/core/theme';
+
+# RDB 持久化
+
+RDB（Redis Database）是一种快照持久化方式。它在指定的时间间隔内，将 Redis 在某个时间点的数据状态保存为一个 `.rdb` 文件。
+
+RDB 是 Redis 最早支持的持久化方式，也是很多项目的默认选择。
+
+## RDB 的工作原理
+
+### 核心思想
+
+RDB 的核心思想是：**在某个时刻，对内存中的所有数据做一个完整的快照**。
+
+这个快照会被写入一个二进制文件（默认是 `dump.rdb`）。当 Redis 重启时，读取这个文件就能恢复数据。
+
+```
+Redis 内存数据                    dump.rdb 文件
++------------------+            +------------------+
+|  key1: value1    |   save    |  [二进制数据]     |
+|  key2: value2    | --------> |  [二进制数据]     |
+|  key3: value3    |           |  [二进制数据]     |
++------------------+            +------------------+
+```
+
+### 触发方式
+
+RDB 快照有三种触发方式：
+
+1. **手动触发**：执行 SAVE 或 BGSAVE 命令
+2. **自动触发**：根据配置自动执行
+3. **定时触发**：通过外部脚本
+
+## 手动触发命令
+
+### SAVE 命令
+
+```bash
+> SAVE
+OK
+```
+
+SAVE 命令会**阻塞** Redis 服务器，直到 RDB 文件创建完成。
+
+```
+时间线：
+T0: 收到 SAVE 命令
+T1-Tn: 阻塞（无法处理其他请求）
+Tn+1: RDB 文件创建完成，恢复服务
+```
+
+:::danger 警告
+SAVE 命令会阻塞服务器，生产环境中**禁止使用**。它适用于在紧急备份时，在不接收请求的情况下做备份。
+:::
+
+### BGSAVE 命令
+
+```bash
+> BGSAVE
+Background saving started
+```
+
+BGSAVE（Background SAVE）会** fork 一个子进程**来处理 RDB 文件的创建，主进程继续处理请求。
+
+```
+主进程                    子进程
+   |                        |
+   |----- fork ---->        |
+   |                        |
+   |  处理请求              |  创建 RDB 文件
+   |  处理请求              |
+   |                        |  完成后退出
+   |<---- 通知完成 ----|
+   |
+```
+
+查看 BGSAVE 状态：
+
+```bash
+> LASTSAVE
+(integer) 1712000000
+
+> DBSIZE
+(integer) 100000
+```
+
+## 自动触发机制
+
+### 配置参数
+
+```bash
+# redis.conf
+
+# 900秒内至少1个key变化，触发BGSAVE
+save 900 1
+
+# 300秒内至少10个key变化，触发BGSAVE
+save 300 10
+
+# 60秒内至少10000个key变化，触发BGSAVE
+save 60 10000
+
+# 关闭自动触发
+save ""
+```
+
+多个条件是**或**的关系，满足任一条件就会触发。
+
+### 触发时机
+
+```c
+// Redis 内部逻辑（简化）
+void serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
+    // 检查是否满足 save 条件
+    for (int i = 0; i < server.saveparamslen; i++) {
+        if (server.dirty >= server.saveparams[i].changes &&
+            (server.unixtime - server.lastsave) >= server.saveparams[i].seconds) {
+            // 触发 BGSAVE
+            rdbSaveBackground(server.rdb_filename);
+            break;
+        }
+    }
+}
+```
+
+## fork 机制详解
+
+### 什么是 fork
+
+fork 是 Linux 系统的系统调用，它会创建一个**子进程**，子进程是父进程的副本。
+
+```c
+// fork 的返回值
+pid_t pid = fork();
+
+if (pid == 0) {
+    // 子进程：执行 RDB 保存
+    rdbSave();
+    exit(0);
+} else if (pid > 0) {
+    // 父进程：继续处理请求
+}
+```
+
+### Copy-On-Write 机制
+
+fork 之后，父进程和子进程共享同一份物理内存：
+
+```
+fork 前：
+进程内存
++------------------+
+|  Redis 数据      |  100MB
++------------------+
+
+fork 后（COW 前）：
+进程A (父)              进程B (子)
++------------------+    +------------------+
+|  Redis 数据 --|------|--> 共享内存       |  100MB
++------------------+    +------------------+
+
+fork 后（COW 后）：
+进程A (父)              进程B (子)
++------------------+    +------------------+
+|  Redis 数据 --|--+   |--+ Redis 数据    |
+|  (修改后)      |  |   |  | (RDB快照)    |
++------------------+  |   +------------------+
+                      |
+                      +---> 共享内存（未修改部分）
+```
+
+当父进程或子进程尝试**修改**数据时，才会复制物理内存页面。这就是 Copy-On-Write（写时复制）。
+
+### fork 的性能影响
+
+fork 的性能取决于：
+
+1. **fork 的耗时**：与 Redis 内存占用成正比
+2. **COW 的压力**：与父进程的数据修改量成正比
+
+```bash
+# 查看最近一次 fork 的耗时
+$ redis-cli INFO stats | grep latest_fork
+latest_fork_usec:54321
+```
+
+:::tip fork 优化建议
+- 内存占用越大，fork 耗时越长
+- 父进程修改数据越多，COW 开销越大
+- 使用较快的磁盘（如 SSD）可以加快 RDB 写入
+:::
+
+## RDB 文件结构
+
+RDB 文件是一个紧凑的二进制格式：
+
+```
++------------------+-------------------+-------------------+---------+
+|  REDIS (5字节)   |  db_version (4)  |  database (n)    |  EOF (1)|  checksum (8)
++------------------+-------------------+-------------------+---------+
+
+database:
++----------------+-------------------+-------------------+
+|  SELECTDB (1)  |  db_number (1-5)  |  key_value_pairs  |
++----------------+-------------------+-------------------+
+
+key_value_pairs:
++------------------+-------------------+-------------------+
+|  EXPIREAT (1)   |  key (n)          |  value (n)       |
+|  TYPE (1)       |  key (n)          |  value (n)       |
++------------------+-------------------+-------------------+
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| REDIS | 魔数，固定为 "REDIS" |
+| db_version | RDB 格式版本号 |
+| database | 数据库数据 |
+| EOF | 文件结束标记 |
+| checksum | CRC64 校验和 |
+
+## RDB 的优缺点
+
+### 优点
+
+**1. 文件紧凑，恢复速度快**
+
+```bash
+# RDB 文件通常比 AOF 小
+$ ls -lh dump.rdb dump.aof
+-rw-r--r--  1 user  staff  5.2M May 10 12:00 dump.rdb
+-rw-r--r--  1 user  staff   45M May 10 12:00 dump.aof
+
+# 恢复速度对比
+# RDB: 1-2 秒（直接加载二进制）
+# AOF: 30-60 秒（重放所有命令）
+```
+
+**2. 适合备份**
+
+可以在每天凌晨业务低峰期执行一次 BGSAVE，保留一份完整快照。
+
+**3. fork 子进程，不阻塞主进程**
+
+BGSAVE 由子进程执行，主进程可以继续处理请求。
+
+### 缺点
+
+**1. 可能丢失数据**
+
+如果配置为每 5 分钟触发一次，那么最近 5 分钟的数据可能丢失：
+
+```bash
+# 配置
+save 300 1  # 5分钟
+
+# 场景：
+# T0: BGSAVE 完成
+# T1-T5: 运行 5 分钟
+# T5: 系统崩溃
+# 丢失 T0-T5 的所有数据
+```
+
+**2. fork 操作耗时**
+
+当 Redis 内存占用很大时（如 50GB），fork 可能需要几秒钟。
+
+**3. 频繁 fork 影响性能**
+
+如果配置过于频繁，会导致 fork 频繁执行，影响正常请求处理。
+
+## 配置示例
+
+```bash
+# redis.conf
+
+# 自动保存策略
+save 900 1       # 900秒内至少1个key变化
+save 300 10      # 300秒内至少10个key变化
+save 60 10000    # 60秒内至少10000个key变化
+
+# RDB 文件名
+dbfilename dump.rdb
+
+# RDB 文件目录
+dir /var/lib/redis
+
+# 是否压缩
+rdbcompression yes
+
+# 保存时是否校验
+rdbchecksum yes
+
+# 复制相关：主从同步时是否先删除客户端
+replica-serve-stale-data yes
+```
+
+## 最佳实践
+
+### 备份策略
+
+```bash
+# 1. 开启 AOF 作为实时备份
+appendonly yes
+appendfsync everysec
+
+# 2. 配置 RDB 自动快照
+save 900 1
+save 300 10
+
+# 3. 定期备份 RDB 文件
+0 2 * * * redis-cli BGSAVE && cp /var/lib/redis/dump.rdb /backup/redis-$(date +\%Y\%m\%d).rdb
+
+# 4. 保留最近 7 天的备份
+find /backup -name "redis-*.rdb" -mtime +7 -delete
+```
+
+### 性能调优
+
+```bash
+# 使用较快的磁盘存储 RDB
+dir /mnt/ssd/redis
+
+# 如果内存很大，考虑使用 AOF 为主
+appendonly yes
+appendfsync everysec
+save ""  # 关闭自动 RDB
+```
+
+## 面试追问方向
+
+- RDB 的工作原理是什么？有哪些触发方式？
+- BGSAVE 和 SAVE 有什么区别？
+- 什么是 Copy-On-Write？为什么需要它？
+- RDB 文件的结构是怎样的？
+- RDB 的优缺点是什么？适合什么场景？
+- RDB 和 AOF 如何配合使用？
+
+这些追问将帮助你在面试中展示对 RDB 持久化的深入理解。

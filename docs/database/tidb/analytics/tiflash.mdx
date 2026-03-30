@@ -1,0 +1,319 @@
+# TiFlash 列式存储
+
+TiFlash 是 TiDB 的列式存储引擎，为 HTAP 场景提供高效的 OLAP 分析能力。
+
+## TiFlash 概述
+
+### 什么是 TiFlash
+
+TiFlash 是 TiDB 的列式存储组件，基于 ClickHouse 实现，提供高性能的分析查询能力。
+
+```
+TiFlash 架构：
+
+┌─────────────────────────────────────────────────────┐
+│                      TiDB Server                       │
+│                                                       │
+│   ┌─────────────────────────────────────────────┐   │
+│   │  SQL 层                                     │   │
+│   │  - 解析和优化                               │   │
+│   │  - 执行器选择（行存/列存）                    │   │
+│   └─────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────┘
+          │                           │
+          ▼                           ▼
+┌──────────────────┐      ┌──────────────────┐
+│      TiKV         │      │     TiFlash       │
+│    (行存储)        │      │    (列存储)        │
+│  OLTP 场景        │      │  OLAP 场景        │
+└──────────────────┘      └──────────────────┘
+```
+
+### TiFlash 特点
+
+| 特性 | 说明 |
+|---|---|
+| 列式存储 | 列式压缩，高效分析 |
+| 向量化执行 | SIMD 优化，高性能 |
+| 异步复制 | Raft Learner，快速同步 |
+| 强一致性 | 与 TiKV 同步，保证一致性 |
+
+## 数据同步
+
+### Raft Learner 同步
+
+TiFlash 通过 Raft Learner 机制从 TiKV 同步数据。
+
+```sql
+-- 1. 添加 TiFlash 副本
+ALTER TABLE orders SET TIFLASH REPLICA 2;
+
+-- 2. 查看同步状态
+SHOW TIFLASH REPLICA orders;
+
+-- 输出示例
+-- +-----------+----------------+------------------+-----------+
+-- | TABLE     | REPLICA_COUNT | LOCATION          | READY    |
+-- +-----------+----------------+------------------+-----------+
+-- | orders    | 2             | 192.168.1.1:3930 | 1        |
+-- | orders    | 2             | 192.168.1.2:3930 | 0        |
+-- +-----------+----------------+------------------+-----------+
+
+-- 3. 查看所有表的副本状态
+SELECT * FROM information_schema.tiflash_replica;
+```
+
+### 同步原理
+
+```
+数据同步流程：
+
+┌─────────────────────────────────────────────────────┐
+│                       TiKV                            │
+│                                                       │
+│   Region 副本                                          │
+│   ┌─────────────────────────────────────────────┐   │
+│   │  Raft Group                                │   │
+│   │  Leader ──── replicate ──── Follower       │   │
+│   │   (TiKV)           (TiFlash Learner)       │   │
+│   └─────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────┘
+                      │
+                      │ Raft 日志
+                      ▼
+┌─────────────────────────────────────────────────────┐
+│                      TiFlash                         │
+│                                                       │
+│   ┌─────────────────────────────────────────────┐   │
+│   │  数据转换                                    │   │
+│   │  行存储 ──→ 列存储                          │   │
+│   └─────────────────────────────────────────────┘   │
+│                                                       │
+│   ┌─────────────────────────────────────────────┐   │
+│   │  ClickHouse 存储                             │   │
+│   │  - DeltaTree 引擎                           │   │
+│   │  - 列式压缩                                 │   │
+│   └─────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────┘
+```
+
+## 查询执行
+
+### 执行器选择
+
+TiDB 自动选择使用 TiKV 还是 TiFlash 执行查询。
+
+```sql
+-- 强制使用 TiFlash
+SELECT /*+ read_from_storage(tiflash[orders]) */ * FROM orders;
+
+-- 查看执行计划
+EXPLAIN SELECT COUNT(*) FROM orders;
+
+-- 输出示例
+-- StreamAgg_6    │ root      │                    │
+-- └─TableReader_13│ root      │ data:ExchangeSender_12 │
+--   └─ExchangeSender_12 │ cop[tiflash] │              │
+--     └─ExchangeReceiver_5 │ cop[tiflash] │           │
+--       └─TableFullScan_4 │ cop[tiflash] │           │
+
+-- 查看是否使用 TiFlash
+EXPLAIN FORMAT = 'pretty' SELECT COUNT(*) FROM orders;
+```
+
+### MPP 模式
+
+TiFlash 支持 MPP（Massively Parallel Processing）模式，进一步提升分析性能。
+
+```sql
+-- 启用 MPP
+SET SESSION tidb_enforce_mpp = ON;
+
+-- 查看 MPP 执行计划
+EXPLAIN SELECT COUNT(*) FROM orders GROUP BY customer_id;
+
+-- 输出示例
+-- HashAgg_11            │ root      │                    │
+-- └─ExchangeReceiver_6  │ root      │                    │
+--   └─ExchangeSender_5  │ mpp[tiflash] │ partition:all │
+--     └─HashAgg_4       │ mpp[tiflash] │                │
+--       └─TableFullScan_3│ mpp[tiflash] │                │
+```
+
+## 列式存储原理
+
+### ClickHouse 列式存储
+
+TiFlash 基于 ClickHouse 的列式存储结构。
+
+```
+列式存储结构：
+
+行式存储（TiKV）：
+┌────┬────────┬──────┐
+│ id │ name   │ age  │
+├────┼────────┼──────┤
+│ 1  │ 张三    │ 25   │
+│ 2  │ 李四    │ 30   │
+│ 3  │ 王五    │ 28   │
+└────┴────────┴──────┘
+
+列式存储（TiFlash）：
+┌─────────────────────────┐
+│ id: [1, 2, 3]         │
+│ name: ["张三", "李四", "王五"] │
+│ age: [25, 30, 28]     │
+└─────────────────────────┘
+```
+
+### 向量化执行
+
+```sql
+-- TiFlash 向量化执行
+-- 将操作向量化，一次处理多个值
+
+-- 示例：计算总额
+SELECT SUM(price * quantity) FROM orders;
+
+-- 向量化执行过程：
+-- 1. 批量读取列数据
+-- 2. SIMD 批量计算 price * quantity
+-- 3. 批量累加 SUM
+```
+
+### 数据压缩
+
+TiFlash 使用多种压缩算法，减少存储空间。
+
+| 压缩算法 | 说明 | 适用场景 |
+|---|---|---|
+| LZ4 | 快速压缩 | 热数据 |
+| ZSTD | 高压缩比 | 冷数据 |
+| Gorilla | 时间序列压缩 | 时间戳数据 |
+
+## 使用场景
+
+### 适用场景
+
+```sql
+-- 1. 聚合分析
+SELECT
+    DATE(created_at) as date,
+    COUNT(*) as order_count,
+    SUM(amount) as total_amount,
+    AVG(amount) as avg_amount
+FROM orders
+GROUP BY DATE(created_at);
+
+-- 2. 大表关联
+SELECT
+    o.order_id,
+    c.customer_name,
+    p.product_name,
+    oi.quantity,
+    oi.price
+FROM orders o
+JOIN customers c ON o.customer_id = c.id
+JOIN order_items oi ON o.id = oi.order_id
+JOIN products p ON oi.product_id = p.id
+WHERE o.created_at >= '2024-01-01';
+
+-- 3. 时间序列分析
+SELECT
+    HOUR(created_at) as hour,
+    COUNT(*) as order_count
+FROM orders
+GROUP BY HOUR(created_at)
+ORDER BY hour;
+```
+
+### 不适用场景
+
+```sql
+-- 1. 高并发写入
+-- TiFlash 是只读的，不适合写入密集型
+
+-- 2. 实时单行查询
+-- TiKV 更适合高并发点查
+
+-- 3. 小数据量简单查询
+-- TiKV 足够，不需要额外的 TiFlash
+```
+
+## 性能优化
+
+### 表结构优化
+
+```sql
+-- 1. 分区表
+CREATE TABLE orders (
+    id BIGINT,
+    customer_id BIGINT,
+    created_at DATETIME,
+    amount DECIMAL(10,2)
+) PARTITION BY RANGE (YEAR(created_at)) (
+    PARTITION p2023 VALUES LESS THAN (2024),
+    PARTITION p2024 VALUES LESS THAN (2025)
+);
+
+-- 2. 合适的数据类型
+-- 避免使用 VARCHAR 存储大文本
+-- 使用合适精度的 DECIMAL
+
+-- 3. 创建索引
+CREATE INDEX idx_created_at ON orders(created_at);
+```
+
+### 查询优化
+
+```sql
+-- 1. 使用分区剪裁
+SELECT * FROM orders WHERE created_at >= '2024-01-01';
+
+-- 2. 避免 SELECT *
+SELECT order_id, customer_id, amount FROM orders;
+
+-- 3. 使用合适的聚合函数
+SELECT COUNT(*) FROM orders;  -- 快速
+SELECT COUNT(DISTINCT customer_id) FROM orders;  -- 较慢
+```
+
+## 监控与调优
+
+### 监控指标
+
+```sql
+-- TiFlash 相关监控
+-- 通过 Grafana 查看
+
+-- 关键指标：
+-- -tiflash_task_count: 任务数
+-- -tiflash_query_count: 查询数
+-- -tiflash_query_duration: 查询延迟
+-- -tiflash_storage_capacity: 存储容量
+-- -tiflash_storage_available: 可用空间
+```
+
+### 常见问题
+
+```sql
+-- 问题：TiFlash 副本同步慢
+-- 解决：检查网络，增加 TiFlash 节点
+
+-- 问题：查询不使用 TiFlash
+-- 解决：检查副本状态，确保 READY = 1
+
+-- 问题：MPP 模式未启用
+-- 解决：检查 tidb_enforce_mpp 配置
+SET SESSION tidb_enforce_mpp = ON;
+```
+
+## 总结
+
+TiFlash 要点：
+
+- **列式存储**：高效分析查询，减少 IO
+- **Raft Learner**：异步复制，数据同步
+- **向量化执行**：SIMD 优化，高性能
+- **MPP 模式**：多节点并行计算
+- **一致性**：与 TiKV 保持强一致

@@ -1,0 +1,419 @@
+# PostgreSQL MVCC 原理
+
+凌晨 2 点，你正在优化一个高并发订单系统的性能。你发现一个奇怪的现象：读操作的延迟偶尔会飙高，但表上并没有明显的锁等待。
+
+如果这是 MySQL，你可能会怀疑是 InnoDB 的锁问题。但这是 PostgreSQL，它的 MVCC 机制让读操作永远不会阻塞写操作——理论上不应该有这个问题。
+
+问题出在哪里？
+
+要回答这个问题，你需要深入理解 PostgreSQL 的 MVCC 实现。这不仅是一个面试高频考点，更是你进行性能调优、故障排查的基础。
+
+---
+
+## MVCC 的核心思想
+
+### 什么是 MVCC？
+
+MVCC（Multi-Version Concurrency Control，多版本并发控制）是一种并发控制机制。它的核心思想是：**每个事务看到的是数据库在某个时间点的快照，而不是实时的最新状态。**
+
+这带来两个关键特性：
+
+1. **读不阻塞写**：读操作看到的是快照，不需要等待其他事务的写操作完成
+2. **写不阻塞读**：写操作创建新版本，不影响其他事务读取旧版本
+
+### PostgreSQL vs 悲观锁
+
+传统数据库（如 Oracle 的早期版本）采用悲观锁策略：
+
+```
+事务 A：SELECT * FROM users WHERE id = 1; -- 锁定这行
+事务 B：SELECT * FROM users WHERE id = 1; -- 等待事务 A 释放
+事务 A：UPDATE users SET name = '张三' WHERE id = 1; -- 更新
+事务 A：COMMIT; -- 释放锁
+事务 B：终于拿到结果了 -- 等待了 N 秒
+```
+
+PostgreSQL 的 MVCC 策略：
+
+```
+事务 A：SELECT * FROM users WHERE id = 1; -- 看到快照版本 1
+事务 B：UPDATE users SET name = '张三' WHERE id = 1; -- 创建版本 2
+事务 B：COMMIT;
+事务 A：SELECT * FROM users WHERE id = 1; -- 仍然看到版本 1，毫秒级完成
+事务 A：COMMIT;
+```
+
+**关键区别**：PostgreSQL 的读操作不需要等待写操作，这在高并发场景下是巨大的性能优势。
+
+---
+
+## 元组结构：理解 MVCC 的基础
+
+### HeapTuple 的结构
+
+PostgreSQL 的数据存储在堆表中，每一行数据称为一个元组（tuple）。元组的结构如下：
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│ HeapTupleHeader (元组头)                                            │
+│ ┌──────────────────────────────────────────────────────────────────┐│
+│ │ t_xmin (4 bytes)   │ t_xmax (4 bytes) │ t_cid (4 bytes)        ││
+│ │ t_ctid (6 bytes)   │ t_infomask2 (2)  │ t_infomask (2)         ││
+│ └──────────────────────────────────────────────────────────────────┘│
+├────────────────────────────────────────────────────────────────────┤
+│ Null Bitmap (可为 NULL 的列)                                        │
+├────────────────────────────────────────────────────────────────────┤
+│ User Data (实际列数据)                                              │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+### 关键字段详解
+
+**t_xmin**：创建这条元组的事务 ID（Transaction ID，XID）
+
+当一个事务插入一条记录时，PostgreSQL 会将当前事务的 XID 写入 t_xmin。例如，事务 100 插入了一条用户记录，这条记录的 t_xmin `=` 100。
+
+**t_xmax**：删除/更新这条元组的事务 ID
+
+当一个事务删除或更新一条记录时，PostgreSQL 会将当前事务的 XID 写入被修改记录的 t_xmax。例如，事务 101 更新了那条用户记录，t_xmax `=` 101。
+
+**t_cid**：Command ID，事务内的命令序号
+
+一个事务可能执行多条 SQL，每条 SQL 有一个从 0 开始的序号。t_cid 记录了创建这条元组的是第几条 SQL。
+
+**t_ctid**：元组的物理位置
+
+t_ctid 是一个指向自身或其他元组的指针，格式为 `(block_number, offset_number)`。当元组被更新时，t_ctid 指向新版本的位置。
+
+### 示例
+
+```sql
+-- 初始状态
+BEGIN;
+INSERT INTO users (id, name) VALUES (1, '张三');
+-- 此时元组 1 的 t_xmin=100, t_xmax=0, t_ctid=(0,1)
+
+UPDATE users SET name = '李四' WHERE id = 1;
+-- 原元组 1 的 t_xmax=100, t_ctid=(0,2)
+-- 新元组 2 的 t_xmin=100, t_xmax=0, t_ctid=(0,2)
+-- 事务 100 创建了新版本
+
+COMMIT;
+```
+
+---
+
+## 事务 ID 和快照
+
+### 事务 ID
+
+PostgreSQL 为每个事务分配一个唯一的 64 位整数作为事务 ID（XID）。XID 是全局递增的，这意味着：
+
+- XID `A < B` 时，A 事务在 B 事务之前开始
+- 可以通过比较 XID 判断两个事务的先后顺序
+
+```sql
+-- 查看当前事务 ID
+SELECT txid_current();
+
+-- 查看当前快照
+SELECT txid_current_snapshot();
+```
+
+### 快照（Snapshot）
+
+快照是 MVCC 的核心概念。它记录了某个时间点数据库的"可见状态"。
+
+一个快照包含三个关键信息：
+
+| 字段 | 含义 |
+|---|---|
+| `xmin` | 正在进行的最早事务 ID，比它更早的事务都已提交 |
+| `xmax` | 下一个将被分配的事务 ID，比它更大 ID 的事务都未开始 |
+| `xip_list` | 正在进行的活跃事务 ID 列表 |
+
+```sql
+-- 快照格式：xmin:xmax:xip_list
+-- 例如：100:200:150,160,180
+-- 含义：
+-- - xmin=100：事务 100 之前的所有事务都已提交
+-- - xmax=200：事务 200 及之后的事务都未开始
+-- - xip_list=[150,160,180]：这三个事务正在进行中
+```
+
+### 快照的获取时机
+
+每个查询（SELECT）开始时，都会获取一个快照。这个快照决定了本次查询能看到哪些数据。
+
+```sql
+-- 事务 A
+BEGIN;
+SELECT * FROM users;  -- 获取快照 S1
+
+-- 事务 B（在事务 A 之后开始）
+BEGIN;
+INSERT INTO users VALUES (...);  -- 事务 B 提交
+COMMIT;
+
+-- 事务 A 继续
+SELECT * FROM users;  -- 仍然使用快照 S1，看不到事务 B 的插入
+```
+
+---
+
+## 可见性判断规则
+
+### 核心问题
+
+给定一条元组的 t_xmin、t_xmax 和当前事务的快照，如何判断这条元组是否对当前事务可见？
+
+### 可见性判断算法
+
+PostgreSQL 的可见性判断遵循以下规则：
+
+**规则 1：t_xmin 对当前事务不可见**
+
+如果 t_xmin 对当前事务是"不可见"的，则整条元组不可见。判断 t_xmin 是否可见：
+
+- t_xmin `=` 当前事务 ID：可见（自身事务创建的）
+- t_xmin 在快照的 xip_list 中：不可见（其他事务正在修改）
+- t_xmin `>=` 快照的 xmax：不可见（其他事务在快照之后才开始）
+- t_xmin `<` 快照的 xmin 且提交：可见（其他事务在快照之前已提交）
+- 其他情况：不可见
+
+**规则 2：t_xmax 对当前事务的影响**
+
+如果 t_xmax `=` 0，说明这条元组从未被删除/更新，整条可见。
+
+否则，检查 t_xmax 是否对当前事务可见：
+
+- t_xmax `=` 当前事务 ID：不可见（自身事务删除的，但在自己的事务内应该可见——这是特殊情况）
+- t_xmax 在快照的 xip_list 中：不可见（其他事务正在删除/更新）
+- t_xmax `>=` 快照的 xmax：不可见（其他事务在快照之后才开始）
+- 否则：如果 t_xmax 对当前事务可见，则元组不可见
+
+### 更精确的可见性判断
+
+PostgreSQL 使用以下函数判断元组是否可见：
+
+```c
+// 伪代码示意
+bool HeapTupleSatisfiesMVCC(HeapTuple tuple, Snapshot snapshot, Buffer buffer) {
+    // 检查 t_xmin
+    if (TransactionIdIsCurrentTransactionId(tuple->t_xmin)) {
+        // 自身事务创建，可见
+        return true;
+    }
+
+    if (TransactionIdInList(tuple->t_xmin, snapshot->xip_list)) {
+        // 其他事务正在修改，不可见
+        return false;
+    }
+
+    if (TransactionIdFollows(tuple->t_xmin, snapshot->xmax)) {
+        // 在快照之后才开始，不可见
+        return false;
+    }
+
+    // t_xmax 的判断
+    if (!TransactionIdIsZero(tuple->t_xmax)) {
+        if (TransactionIdIsCurrentTransactionId(tuple->t_xmax)) {
+            // 自身事务删除，取决于命令行 ID
+        }
+        if (TransactionIdInList(tuple->t_xmax, snapshot->xip_list)) {
+            // 其他事务正在删除，不可见
+            return false;
+        }
+        // ... 更多判断
+    }
+
+    return true;
+}
+```
+
+---
+
+## 实战示例
+
+### 场景 1：并发插入
+
+```
+时间顺序：
+T1: 事务 100 BEGIN
+T2: 事务 101 BEGIN
+T3: 事务 100 INSERT INTO users VALUES (1, '张三')
+T4: 事务 100 COMMIT
+T5: 事务 101 SELECT * FROM users
+```
+
+在 T5，事务 101 获取快照。此时：
+- 快照 xmin `=` 某个值（假设 95）
+- 快照 xmax `=` 102（下一个将被分配的 XID）
+- 快照 xip_list `=` [100, 101]
+
+事务 101 的 SELECT 看到的元组：
+- 事务 100 插入的元组：t_xmin `=` 100，`100` 不在 xip_list 中，且 `100 < 102`，可见！
+
+**结论**：事务 101 能看到事务 100 的插入，即使事务 101 在事务 100 之前开始。
+
+### 场景 2：脏读测试
+
+```
+时间顺序：
+T1: 事务 100 BEGIN
+T2: 事务 100 UPDATE users SET name = '李四' WHERE id = 1
+T3: 事务 101 BEGIN
+T4: 事务 101 SELECT * FROM users WHERE id = 1
+T5: 事务 100 COMMIT
+```
+
+在 T4，事务 101 获取快照。此时：
+- 事务 100 已修改了元组，但未提交
+- 元组的 t_xmax `=` 100
+- 快照的 xip_list `=` [100, 101]
+
+可见性判断：
+- 元组的 t_xmax `=` 100，在 xip_list 中
+- 结论：**不可见**，事务 101 看到的是事务 100 修改之前的值
+
+**结论**：PostgreSQL 不会发生脏读。即使事务 100 尚未提交，事务 101 也看不到未提交的修改。
+
+### 场景 3：不可重复读
+
+```
+时间顺序：
+T1: 事务 100 BEGIN
+T2: 事务 100 SELECT * FROM users WHERE id = 1  -- 看到 '张三'
+T3: 事务 101 BEGIN
+T4: 事务 101 UPDATE users SET name = '李四' WHERE id = 1
+T5: 事务 101 COMMIT
+T6: 事务 100 SELECT * FROM users WHERE id = 1  -- 看到什么？
+T7: 事务 100 COMMIT
+```
+
+在 T2 和 T6，事务 100 两次执行 SELECT，使用的是**同一个快照**（事务开始时获取的）。
+
+T2 时快照：xip_list `=` [100]
+T6 时快照：xip_list `=` [100]（仍然是同一个快照）
+
+事务 100 的两次 SELECT 结果相同——都是 '张三'。
+
+**结论**：PostgreSQL 的 Read Committed 隔离级别，对于同一个事务内的多次 SELECT，结果是相同的（可重复读）。但这与其他数据库的 Repeatable Read 不同——PostgreSQL 通过快照隔离实现了"可重复读"的效果。
+
+### 场景 4：幻读
+
+```
+时间顺序：
+T1: 事务 100 BEGIN
+T2: 事务 100 SELECT * FROM users WHERE age = 25  -- 空结果
+T3: 事务 101 INSERT INTO users VALUES (3, 25, '王五')
+T4: 事务 101 COMMIT
+T5: 事务 100 SELECT * FROM users WHERE age = 25  -- 有结果吗？
+T6: 事务 100 COMMIT
+```
+
+这是"幻读"场景——第一次查询没有结果，第二次查询有了结果。
+
+在 PostgreSQL 的 Read Committed 隔离级别下，T5 的 SELECT 会获取**新的快照**（因为 Read Committed 每次语句都获取新快照），因此能看到事务 101 的插入。
+
+**结论**：PostgreSQL 的 Read Committed 隔离级别下，会发生幻读。如果需要避免幻读，需要使用 Serializable 隔离级别。
+
+---
+
+## MVCC 的代价：表膨胀
+
+### 旧版本不会被立即删除
+
+MVCC 的一个关键特性是：旧版本的数据不会被立即删除。
+
+在上面的场景 4 中，事务 101 更新了 id=1 的记录，旧版本（元组的 t_xmax 被设置为 101）仍然存在于表中，只有当所有活跃事务都"看不见"它时，才能被清理。
+
+### 膨胀的成因
+
+当有大量更新/删除操作时，会产生大量旧版本元组：
+
+```sql
+-- 模拟大量更新
+UPDATE orders SET status = 'completed' WHERE status = 'pending';
+```
+
+这个 UPDATE 会：
+1. 为每条被更新的记录创建新版本
+2. 标记旧版本的 t_xmax
+3. 旧版本不会立即删除
+
+如果这个 UPDATE 涉及 100 万条记录，就会产生 100 万个旧版本元组，占用大量磁盘空间。
+
+### VACUUM 的作用
+
+VACUUM 是 PostgreSQL 的垃圾回收机制，负责清理这些旧版本元组：
+
+```sql
+-- 手动 VACUUM
+VACUUM orders;
+
+-- VACUUM + 重建表（会锁表，慎用）
+VACUUM FULL orders;
+```
+
+VACUUM 的详细机制会在后续章节深入讲解。
+
+---
+
+## MVCC 与性能的关系
+
+回到开头的问题：为什么 PostgreSQL 的读操作延迟偶尔会飙高？
+
+### 可能的原因
+
+**1. VACUUM 未及时执行**
+
+如果表上有大量过期元组，VACUUM 没有及时清理，查询时需要扫描更多页面，导致延迟增加。
+
+**2. 垃圾元组过多**
+
+如果一个表被频繁更新/删除，而 VACUUM 跟不上，表体积会膨胀到实际数据的数倍甚至数十倍，查询性能急剧下降。
+
+**3. 共享缓冲区命中率下降**
+
+过期元组占用了共享缓冲区（shared_buffers），导致热数据被挤出缓存，缓存命中率下降。
+
+**4. 索引膨胀**
+
+不仅仅是表数据会膨胀，索引也会膨胀。更新数据时，相关索引都需要插入新条目，旧条目不会被立即删除。
+
+### 监控 MVCC 状态
+
+```sql
+-- 查看表的膨胀程度
+SELECT
+    schemaname,
+    tablename,
+    pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename)) as total_size,
+    pg_size_pretty(pg_relation_size(schemaname||'.'||tablename)) as table_size,
+    n_dead_tup,
+    n_live_tup,
+    n_dead_tup / NULLIF(n_live_tup + n_dead_tup, 0) as dead_ratio
+FROM pg_stat_user_tables
+WHERE n_dead_tup > 1000
+ORDER BY n_dead_tup DESC;
+
+-- 查看 VACUUM 的状态
+SELECT * FROM pg_stat_progress_vacuum;
+```
+
+---
+
+## 总结
+
+PostgreSQL 的 MVCC 实现是面试的高频考点，也是性能调优的基础。
+
+**核心要点**：
+
+1. 每个元组有 t_xmin（创建事务）和 t_xmax（删除/更新事务）两个关键字段
+2. 快照决定了事务能看到哪些数据——xmin、xmax、xip_list
+3. 可见性判断基于事务 ID 和快照的比较
+4. MVCC 让读操作永远不阻塞写操作，写操作永远不阻塞读操作
+5. MVCC 的代价是表膨胀——旧版本元组需要 VACUUM 清理
+
+理解了 MVCC，你就能理解 PostgreSQL 的事务隔离级别实现、VACUUM 机制、以及各种性能问题的根源。这是 PostgreSQL 最重要的基础知识，没有之一。

@@ -1,0 +1,302 @@
+# PostgreSQL 事务隔离级别
+
+面试官问："PostgreSQL 的默认隔离级别是什么？和 MySQL 有什么区别？"
+
+很多人会说："都是 Read Committed。"这个答案对了一半。表面上看，MySQL 和 PostgreSQL 的默认隔离级别都是 Read Committed，但背后的实现机制完全不同。
+
+PostgreSQL 通过 MVCC 实现的 Read Committed，实际上更接近其他数据库的 Repeatable Read。理解这个差异，是深入掌握 PostgreSQL 的关键。
+
+---
+
+## 四种隔离级别
+
+SQL 标准定义了四种隔离级别，用于解决并发事务中的问题：
+
+| 问题 | 说明 |
+|---|---|
+| 脏读 | 读取到其他事务未提交的数据 |
+| 不可重复读 | 同一事务内两次读取同一行，数据不一致 |
+| 幻读 | 同一事务内两次查询，结果集不一致（多了或少了几行） |
+
+| 隔离级别 | 脏读 | 不可重复读 | 幻读 |
+|---|---|---|---|
+| Read Uncommitted | 可能 | 可能 | 可能 |
+| Read Committed | 不可能 | 可能 | 可能 |
+| Repeatable Read | 不可能 | 不可能 | 可能 |
+| Serializable | 不可能 | 不可能 | 不可能 |
+
+PostgreSQL 不支持 Read Uncommitted——设置为 Read Uncommitted 时，实际行为与 Read Committed 相同。
+
+---
+
+## PostgreSQL 的隔离级别实现
+
+### Read Committed（默认）
+
+PostgreSQL 的 Read Committed 隔离级别是默认设置，也是大多数应用使用的隔离级别。
+
+#### 工作原理
+
+Read Committed 每次语句执行时都会获取新快照。这意味着：
+
+- 每个 SELECT 语句开始时，会看到在此之前已提交的事务所做的修改
+- 同一事务内的不同 SELECT 语句，可能看到不同的数据（如果期间有其他事务提交）
+
+```sql
+-- 会话 1
+BEGIN;
+UPDATE orders SET status = 'shipped' WHERE id = 1;
+-- 不提交
+
+-- 会话 2
+BEGIN;
+SELECT * FROM orders WHERE id = 1;  -- 看到 status = 'pending'
+
+-- 会话 1
+COMMIT;
+
+-- 会话 2
+SELECT * FROM orders WHERE id = 1;  -- 看到 status = 'shipped'
+```
+
+#### Read Committed 下的异常
+
+Read Committed 隔离级别下可能发生以下异常：
+
+**丢失更新**：两个事务读取同一数据，都进行修改，后提交的事务覆盖了先提交的事务的修改。
+
+```sql
+-- 会话 1
+BEGIN;
+SELECT balance FROM accounts WHERE id = 1;  -- balance = 1000
+-- 计算：1000 + 100 = 1100
+
+-- 会话 2
+BEGIN;
+SELECT balance FROM accounts WHERE id = 1;  -- balance = 1000
+-- 计算：1000 + 200 = 1200
+UPDATE accounts SET balance = 1200 WHERE id = 1;
+COMMIT;
+
+-- 会话 1
+UPDATE accounts SET balance = 1100 WHERE id = 1;  -- 覆盖了会话 2 的修改
+COMMIT;
+
+-- 最终结果：balance = 1100，而不是期望的 1300
+```
+
+**不可重复读**：同一事务内两次读取同一行，结果可能不同（如果期间有其他事务修改并提交）。
+
+**幻读**：同一事务内两次查询，结果集可能不同（如果期间有其他事务插入或删除）。
+
+---
+
+### Repeatable Read
+
+PostgreSQL 的 Repeatable Read 隔离级别在快照隔离的基础上增加了对幻读的处理。
+
+#### 工作原理
+
+Repeatable Read 在事务开始时获取一个快照，整个事务期间使用同一个快照。
+
+```sql
+-- 会话 1
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT * FROM orders WHERE id = 1;  -- 获取快照 S
+
+-- 会话 2（在事务 1 之后）
+BEGIN;
+UPDATE orders SET status = 'shipped' WHERE id = 1;
+COMMIT;
+
+-- 会话 1
+SELECT * FROM orders WHERE id = 1;  -- 仍然使用快照 S，看到 status = 'pending'
+UPDATE orders SET status = 'cancelled' WHERE id = 1;
+-- 错误：could not serialize access due to concurrent update
+```
+
+#### Serializable Snapshot Isolation (SSI)
+
+PostgreSQL 11 之前，Repeatable Read 隔离级别下仍可能发生幻读。PostgreSQL 11 引入的 SSI（Serializable Snapshot Isolation）算法解决了这个问题。
+
+SSI 通过检测事务之间的读写依赖关系，在检测到序列化冲突时主动回滚事务，而不是像传统串行化那样强制串行执行。
+
+```sql
+-- 事务 1
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT COUNT(*) FROM orders WHERE status = 'pending';  -- 100
+
+-- 事务 2
+BEGIN;
+INSERT INTO orders VALUES (101, 'pending');
+COMMIT;
+
+-- 事务 1
+SELECT COUNT(*) FROM orders WHERE status = 'pending';  -- 仍然是 100（快照隔离）
+INSERT INTO orders VALUES (102, 'pending');
+-- 可能错误：could not serialize access due to concurrent update
+```
+
+---
+
+### Serializable
+
+PostgreSQL 的 Serializable 隔离级别底层使用与 Repeatable Read 相同的 SSI 算法，区别在于：
+
+- Serializable 对序列化的敏感度更高，检测更严格
+- 某些在 Repeatable Read 下能成功的事务，在 Serializable 下可能被回滚
+
+```sql
+BEGIN ISOLATION LEVEL SERIALIZABLE;
+
+-- 在高并发场景下，更容易遇到序列化冲突
+INSERT INTO orders SELECT ... FROM orders WHERE ...;
+
+COMMIT;  -- 可能失败：could not serialize access due to concurrent update
+```
+
+:::warning
+Serializable 隔离级别在高并发写入场景下可能导致大量事务回滚。使用前需要评估业务场景的并发程度。
+:::
+
+---
+
+## PostgreSQL 与 MySQL 的对比
+
+### 默认隔离级别
+
+| 数据库 | 默认隔离级别 |
+|---|---|
+| PostgreSQL | Read Committed |
+| MySQL (InnoDB) | Repeatable Read |
+
+### 实现机制
+
+**MySQL InnoDB**：通过 ReadView + undo log 实现 MVCC
+
+- 事务开始时创建 ReadView，记录当前活跃事务列表
+- 可见性判断：对比记录的事务 ID 和 ReadView
+
+**PostgreSQL**：通过 Snapshot + 元组头部的 xmin/xmax 实现 MVCC
+
+- 每个语句开始时获取新快照（Read Committed）
+- 或事务开始时获取快照（Repeatable Read/Serializable）
+- 可见性判断：对比元组的 t_xmin/t_xmax 和快照
+
+### 关键差异
+
+**PostgreSQL 的 Read Committed 更强**：
+
+- MySQL 的 Read Committed 可能出现不可重复读
+- PostgreSQL 的 Read Committed 每次语句获取新快照，但仍能避免脏读和不可重复读（对同一语句而言）
+
+**PostgreSQL 的 Repeatable Read 更强**：
+
+- MySQL 的 Repeatable Read + 间隙锁可以防止幻读
+- PostgreSQL 的 Repeatable Read（11+）通过 SSI 防止幻读
+- 两者实现机制不同，但效果类似
+
+```sql
+-- MySQL 幻读示例
+-- 会话 1
+BEGIN;
+SELECT * FROM orders WHERE status = 'pending';  -- 0 rows
+
+-- 会话 2
+INSERT INTO orders VALUES (1, 'pending');
+COMMIT;
+
+-- 会话 1
+SELECT * FROM orders WHERE status = 'pending';  -- 0 rows（InnoDB 间隙锁保护）
+INSERT INTO orders VALUES (1, 'pending');
+-- ERROR: Duplicate entry '1' for key 'PRIMARY'
+```
+
+---
+
+## 隔离级别的选择
+
+### 选择建议
+
+| 场景 | 推荐隔离级别 |
+|---|---|
+| 大多数 OLTP 应用 | Read Committed |
+| 金融交易、数据一致性要求高 | Serializable |
+| 报表生成、复杂分析 | Serializable |
+| 并发写入多的业务 | Read Committed |
+
+### 设置方法
+
+```sql
+-- 会话级别设置
+BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED;
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+
+-- 或
+SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
+
+-- 全局设置（postgresql.conf）
+-- default_transaction_isolation = 'read committed'
+```
+
+### 性能考虑
+
+隔离级别越高，并发性能越差。Serializable 隔离级别在高并发场景下可能导致大量事务回滚。
+
+```
+隔离级别性能（相对）：
+Read Committed >>> Repeatable Read > Serializable
+```
+
+---
+
+## 实战问题
+
+### 问题 1：长事务导致的膨胀
+
+长事务会阻止 VACUUM 清理过期元组：
+
+```sql
+-- 查看长时间运行的事务
+SELECT pid, usename, state, query_start, state_change
+FROM pg_stat_activity
+WHERE state != 'idle'
+  AND query_start < NOW() - INTERVAL '1 hour';
+```
+
+### 问题 2：序列化冲突
+
+```sql
+-- 查看序列化失败次数
+SELECT
+    datname,
+    confl_serializable,
+    confl_lock
+FROM pg_stat_database;
+
+-- 查看最近的序列化冲突日志
+SELECT * FROM pg_stat_activity
+WHERE wait_event_type = 'Lock'
+  AND wait_event = 'transactionid';
+```
+
+### 问题 3：脏读测试
+
+```sql
+-- PostgreSQL 不支持 Read Uncommitted，脏读不可能发生
+-- 验证：会话 1 修改未提交，会话 2 看不到修改
+```
+
+---
+
+## 总结
+
+PostgreSQL 的隔离级别实现有其独特之处：
+
+1. **Read Committed 是默认级别**，通过每次语句获取新快照实现
+2. **Repeatable Read** 使用事务级别的快照，加上 SSI 算法防止幻读
+3. **Serializable** 与 Repeatable Read 共享 SSI，但检测更严格
+4. **不存在脏读**，PostgreSQL 不支持 Read Uncommitted
+
+与 MySQL 相比，PostgreSQL 的 MVCC 实现更"纯粹"，通过元组的 t_xmin/t_xmax 和快照判断可见性，而不是通过 undo log。这使得 PostgreSQL 在大多数场景下的一致性和性能表现更稳定。

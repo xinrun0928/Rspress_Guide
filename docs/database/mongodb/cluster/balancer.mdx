@@ -1,0 +1,367 @@
+# MongoDB 均衡器与 Chunk 迁移
+
+均衡器（Balancer）是分片集群中自动管理数据分布的后台进程，确保所有分片的数据量保持均衡。
+
+## 均衡器概述
+
+### 什么是均衡器
+
+均衡器是运行在其中一个 Config Server 上的后台进程，负责监控和调整 Chunk 在各分片之间的分布。
+
+```javascript
+// 均衡器职责：
+// 1. 监控各分片的 Chunk 数量
+// 2. 检测数据不平衡
+// 3. 执行 Chunk 迁移
+// 4. 维护集群平衡
+```
+
+### 均衡器 vs 分片迁移
+
+```
+均衡过程示意：
+
+均衡前：
+┌─────────────────────────────────────────┐
+│ Shard1: 20 个 Chunk  ← 热点分片          │
+│ Shard2: 10 个 Chunk                      │
+│ Shard3: 5 个 Chunk   ← 数据较少          │
+└─────────────────────────────────────────┘
+
+均衡后：
+┌─────────────────────────────────────────┐
+│ Shard1: 12 个 Chunk                      │
+│ Shard2: 12 个 Chunk                      │
+│ Shard3: 11 个 Chunk                      │
+└─────────────────────────────────────────┘
+```
+
+## 均衡触发条件
+
+### Chunk 数量差异
+
+```javascript
+// 均衡器检测阈值：
+// 当最大分片和最小分片的 Chunk 数差异超过一定值时触发
+
+// 默认阈值规则（基于分片数量）：
+// 2 分片：2 个 Chunk
+// 3 分片：2 个 Chunk
+// 4+ 分片：8 个 Chunk
+
+// 查看当前 Chunk 分布
+db.getSiblingDB("config").chunks.aggregate([
+  { $group: { _id: "$shard", count: { $sum: 1 } } },
+  { $sort: { count: -1 } }
+])
+```
+
+### 手动检查
+
+```javascript
+// 查看均衡状态
+sh.isBalancerRunning()  // 是否正在运行
+sh.getBalancerState()   // 是否开启
+
+// 查看最近均衡操作
+db.getSiblingDB("config").changelog.find({
+  what: /move/i
+}).sort({ time: -1 }).limit(5)
+```
+
+## Chunk 迁移过程
+
+### 迁移流程
+
+```
+Chunk 迁移的详细过程：
+
+1. 触发条件
+   均衡器检测到分片间 Chunk 数量差异超过阈值
+
+2. 选择迁移源和目标
+   源分片：Chunk 数量最多的
+   目标分片：Chunk 数量最少的
+
+3. 生成迁移计划
+   ┌─────────────────────────────────────┐
+   │ 源分片: Shard1                       │
+   │ 目标分片: Shard3                      │
+   │ Chunk: [A, B)                        │
+   │ 大小: 64MB                           │
+   └─────────────────────────────────────┘
+
+4. 执行迁移（两阶段协议）
+   ┌─────────────────────────────────────┐
+   │ 阶段1：源分片复制                      │
+   │ - 源分片创建 Chunk 副本               │
+   │ - 复制期间允许读写                    │
+   │ - 记录复制过程中的增量操作            │
+   └─────────────────────────────────────┘
+               ↓
+   ┌─────────────────────────────────────┐
+   │ 阶段2：切换引用                        │
+   │ - Config Server 更新 Chunk 元数据      │
+   │ - 新写入路由到目标分片                 │
+   │ - 源分片删除 Chunk 副本                │
+   └─────────────────────────────────────┘
+
+5. 完成
+   - Chunk 已迁移到新分片
+   - 元数据已更新
+```
+
+### 迁移命令
+
+```javascript
+// 手动迁移 Chunk
+db.adminCommand({
+  moveChunk: "shop.orders",           // 集合命名空间
+  find: { customer_id: "C001" },     // 属于该 Chunk 的任意文档
+  to: "shard0002",                    // 目标分片
+  _secondaryThrottle: true,           // 等待从节点确认
+  waitForDelete: false                // 迁移完成后是否删除源数据
+})
+
+// 查看迁移状态
+db.adminCommand({ collStats: "shop.orders" })
+```
+
+## 均衡器配置
+
+### 开启/关闭均衡器
+
+```javascript
+// 开启均衡器
+sh.startBalancer()
+
+// 关闭均衡器（用于维护）
+sh.stopBalancer()
+
+// 或者
+db.adminCommand({ balancerStop: 1 })
+db.adminCommand({ balancerStart: 1 })
+```
+
+### 均衡时间窗口
+
+```javascript
+// 设置均衡时间窗口（限制均衡发生的时间范围）
+// mongos.conf 或启动参数
+sharding:
+  balancer:
+    activeWindow:
+      start: "23:00"   // 北京时间 23:00 开始
+      stop: "06:00"    // 北京时间 06:00 结束
+
+// 在指定集合上开启/关闭均衡
+sh.enableBalancing("shop.orders")
+sh.disableBalancing("shop.orders")
+```
+
+### 均衡器参数
+
+```javascript
+// 查看均衡器参数
+db.getSiblingDB("config").settings.find()
+
+// 修改 Chunk 大小（默认 64MB）
+db.getSiblingDB("config").settings.updateOne(
+  { _id: "chunksize" },
+  { $set: { value: 128 }},  // 128MB
+  { upsert: true }
+)
+
+// 修改均衡器参数
+db.getSiblingDB("config").settings.updateOne(
+  { _id: "balancer" },
+  {
+    $set: {
+      _secondaryThrottle: true,
+      _secondaryThrottleMaxWaitMS: 3600000
+    }
+  },
+  { upsert: true }
+)
+```
+
+## Chunk 大小
+
+### 配置 Chunk 大小
+
+```javascript
+// 设置 Chunk 大小（单位：MB）
+// 默认 64MB，最大 1024MB
+
+// 方法1：配置文件
+storage:
+  wiredTiger:
+    collectionConfig:
+      blockCompressor: zstd
+
+// 方法2：通过 sh.updateBalancerRouterConfig
+// 实际上，Chunk 大小只能通过初始化配置设置
+
+// 查看当前 Chunk 大小
+db.getSiblingDB("config").settings.findOne({ _id: "chunksize" })
+```
+
+### Chunk 大小的权衡
+
+| Chunk 大小 | 优点 | 缺点 |
+|---|---|---|
+| 小（32MB） | 均衡粒度细，迁移快 | 元数据多，路由开销大 |
+| 大（64MB） | 元数据少，路由快 | 均衡粒度粗，可能不均衡 |
+| 很大（256MB+） | 适合大文档 | 迁移时间长，影响性能 |
+
+### 大文档处理
+
+```javascript
+// 当文档大于 Chunk 大小时，会创建 Jumbo Chunk
+// 查看 Jumbo Chunk
+db.getSiblingDB("config").chunks.find(
+  { jumbo: true }
+)
+
+// Jumbo Chunk 无法分裂或迁移
+// 解决方案：增大 Chunk 大小，或重新设计分片键
+```
+
+## 预分割数据
+
+### 为什么要预分割
+
+```javascript
+// 场景：已知数据分布，预分割可以避免初始写入热点
+// 例如：按地区分片，初始数据集中在某些地区
+
+// 预分割示例
+for (var i = 0; i <= 100; i++) {
+  db.adminCommand({
+    split: "shop.orders",
+    middle: { region: i * 1000 }
+  })
+}
+
+// 查看分割点
+db.getSiblingDB("config").chunks.count({ ns: "shop.orders" })
+```
+
+### 手动迁移 Chunk
+
+```javascript
+// 将 Chunk 迁移到指定分片
+db.adminCommand({
+  moveChunk: "shop.orders",
+  find: { region: 5000 },
+  to: "shard0002"
+})
+
+// 批量迁移
+// 将所有 Chunk 迁移到新分片
+db.adminCommand({
+  moveCollection: "shop.archive",
+  to: "shard0003"
+})
+```
+
+## 监控均衡器
+
+### 查看均衡状态
+
+```javascript
+// 查看均衡器状态
+sh.status()
+
+// 查看均衡器是否运行
+sh.isBalancerRunning()
+
+// 查看最近均衡日志
+db.getSiblingDB("config").changelog.find({
+  what: "moveChunk.commit"
+}).sort({ time: -1 }).limit(10)
+```
+
+### 均衡性能监控
+
+```javascript
+// 查看迁移中的 Chunk
+db.adminCommand({ currentOp: 1, desc: "moveChunk" })
+
+// 查看迁移详情
+db.getSiblingDB("config").changelog.find({
+  what: "moveChunk.start"
+}).sort({ time: -1 }).limit(1)
+
+// 输出示例
+{
+  "time": ISODate("2024-01-01T10:00:00Z"),
+  "what": "moveChunk.start",
+  "ns": "shop.orders",
+  "details": {
+    "shardFrom": "shard0001",
+    "shardTo": "shard0002",
+    "min": { "customer_id": 100 },
+    "max": { "customer_id": 200 }
+  }
+}
+```
+
+## 常见问题
+
+### 均衡器不运行
+
+```javascript
+// 检查步骤
+// 1. 查看均衡器是否开启
+sh.getBalancerState()
+
+// 2. 查看是否有锁
+db.getSiblingDB("config").locks.find()
+
+// 3. 查看均衡器进程
+db.adminCommand({ connPoolSync: 1 })
+
+// 4. 检查 Config Server 健康状态
+rs.status()
+```
+
+### 迁移影响性能
+
+```javascript
+// 优化迁移性能
+
+// 1. 设置迁移时间窗口（低峰期）
+// mongos.conf
+sharding:
+  balancer:
+    activeWindow:
+      start: "02:00"
+      stop: "05:00"
+
+// 2. 控制并发迁移数
+db.getSiblingDB("config").settings.updateOne(
+  { _id: "balancer" },
+  { $set: { maxChunksToMoveAtOnce: 1 } },
+  { upsert: true }
+)
+
+// 3. 设置从节点同步延迟
+db.getSiblingDB("config").settings.updateOne(
+  { _id: "balancer" },
+  { $set: { _secondaryThrottle: true } },
+  { upsert: true }
+)
+```
+
+## 总结
+
+均衡器核心要点：
+
+- **作用**：自动管理 Chunk 在分片间的分布
+- **触发条件**：分片间 Chunk 数量差异超过阈值
+- **迁移过程**：两阶段协议，先复制后切换
+- **配置**：可设置时间窗口，控制并发
+- **Chunk 大小**：默认 64MB，影响均衡粒度
+
+正确配置和管理均衡器，是保持分片集群性能的关键。

@@ -1,0 +1,331 @@
+import { Badge } from '@rspress/core/theme';
+
+# 查询优化器
+
+你写了一条 SQL，TiDB 有 n 种执行方式。它怎么知道哪一种最快？
+
+答案是 **CBO（Cost-Based Optimizer）**——基于代价的查询优化器。它像是一个经验丰富的老 DBA，能从众多执行计划中选择最优的那个。
+
+---
+
+## 一、优化器概述
+
+### 1.1 优化器类型
+
+| 类型 | 说明 | 代表 |
+|---|---|---|
+| RBO | 基于规则 | Oracle 早期版本 |
+| CBO | 基于代价 | TiDB、现代数据库 |
+
+```sql
+-- RBO：规则固定，不考虑数据分布
+-- 总是先做 Selection，再做 Projection
+
+-- CBO：考虑数据分布，选择最优
+-- 如果 Selection 过滤 99% 数据，可能先做 Selection
+-- 如果 Projection 减少大量数据，可能先做 Projection
+```
+
+### 1.2 TiDB 优化器架构
+
+```rust
+// 优化器架构
+Query
+   ↓ Parser
+AST
+   ↓ Logical Optimize
+Logical Plan
+   ↓ Physical Optimize
+Physical Plan
+   ↓ Executor
+Result
+```
+
+---
+
+## 二、逻辑优化
+
+### 2.1 谓词下推
+
+将 Filter 尽可能下推到数据源：
+
+```sql
+SELECT * FROM orders o 
+JOIN users u ON o.user_id = u.id
+WHERE o.amount > 100 AND u.status = 1;
+```
+
+```bash
+# 优化前
+Join (o.user_id = u.id)
+  ├─ TableScan(orders)       # 全表扫描
+  └─ TableScan(users)        # 全表扫描
+       └─ Filter(o.amount > 100 AND u.status = 1)  # 最后过滤
+
+# 优化后
+Join (o.user_id = u.id)
+  ├─ Filter(o.amount > 100)  # 先过滤
+  │   └─ TableScan(orders)
+  └─ Filter(u.status = 1)    # 先过滤
+      └─ TableScan(users)
+```
+
+### 2.2 列裁剪
+
+只读取需要的列：
+
+```sql
+SELECT name FROM users WHERE id = 1;
+```
+
+```bash
+# 优化前
+TableScan(users)  # 读取所有列
+
+# 优化后
+TableScan(users)  # 只读取 id, name 两列
+```
+
+### 2.3 常量折叠
+
+```sql
+SELECT * FROM users WHERE id = 1 AND 1 = 1;
+```
+
+```bash
+# 优化前
+WHERE id = 1 AND 1 = 1
+
+# 优化后
+WHERE id = 1  # 1 = 1 被折叠为 true
+```
+
+---
+
+## 三、物理优化
+
+### 3.1 代价模型
+
+```rust
+// TiDB 代价模型
+struct CostModel {
+    // 扫描代价
+    scan_cpu_cost: f64,        // CPU 扫描每行代价
+    scan_disk_cost: f64,       // 磁盘读取每字节代价
+    network_cost_per_byte: f64,// 网络传输每字节代价
+    
+    // 算子代价
+    hash_build_cost: f64,     // Hash 构建代价
+    hash_probe_cost: f64,     // Hash 探测代价
+    sort_cost_per_row: f64,   // 排序每行代价
+    
+    // 内存代价
+    memory_cost_per_byte: f64,// 每字节内存代价
+}
+```
+
+### 3.2 统计信息
+
+代价估算依赖统计信息：
+
+```sql
+-- 收集统计信息
+ANALYZE TABLE users;
+
+-- 查看统计信息
+SHOW STATS_HISTOGRAMS WHERE table_name = 'users';
+-- +---------------+------------+----------+--------------+-------------+
+-- | Db_name       | Table_name | Column  | Type         | Distincts   |
+-- +---------------+------------+----------+--------------+-------------+
+-- | app           | users      | id      | Int64        | 100000      |
+-- | app           | users      | age     | Int64        | 50          |
+-- | app           | users      | name    | String       | 80000       |
+-- +---------------+------------+----------+--------------+-------------+
+```
+
+<Badge text="统计信息" type="warning" /> 统计信息不准确会导致优化器选错执行计划。如果发现查询变慢，第一时间检查统计信息是否过期。
+
+### 3.3 代价估算
+
+```rust
+// 全表扫描代价
+fn estimate_table_scan(&self, table: &Table) -> Cost {
+    let row_count = table.stats.row_count;
+    let avg_row_size = table.stats.avg_row_size;
+    
+    Cost {
+        cpu: row_count * self.scan_cpu_cost,
+        disk: row_count * avg_row_size * self.scan_disk_cost,
+    }
+}
+
+// 索引扫描代价
+fn estimate_index_scan(&self, index: &Index, ranges: &[Range]) -> Cost {
+    let index_rows = self.estimate_range_rows(index, ranges);
+    
+    Cost {
+        cpu: index_rows * self.scan_cpu_cost,
+        // 索引扫描比全表扫描 CPU 代价低
+        disk: index_rows * index.avg_key_size * self.scan_disk_cost,
+    }
+}
+```
+
+---
+
+## 四、执行计划生成
+
+### 4.1 算子选择
+
+```sql
+EXPLAIN SELECT * FROM orders WHERE user_id = 100;
+```
+
+```bash
+# 可能的选择：
+
+# 选择 1: 全表扫描
+TableScan -> Selection(user_id = 100)
+cost: 100000 * 1.0 = 100000
+
+# 选择 2: 索引扫描
+IndexScan(idx_user_id) -> Selection(user_id = 100)
+cost: 500 * 1.0 = 500
+
+# 优化器选择索引扫描
+```
+
+### 4.2 Join 顺序
+
+```sql
+EXPLAIN SELECT * FROM orders o 
+JOIN users u ON o.user_id = u.id
+JOIN products p ON o.product_id = p.id;
+```
+
+```bash
+# Join 顺序的代价估算
+
+# 顺序 1: ((orders JOIN users) JOIN products)
+cost = cost(orders JOIN users) + cost(result JOIN products)
+
+# 顺序 2: ((users JOIN products) JOIN orders)
+cost = cost(users JOIN products) + cost(result JOIN orders)
+
+# 优化器选择代价最小的顺序
+```
+
+### 4.3 Join 算法
+
+| 算法 | 适用场景 | 代价 |
+|---|---|---|
+| Hash Join | 大表 JOIN 小表 | O(n) |
+| Merge Join | 已排序的大表 | O(n log n) |
+| Index Join | 小表 + 大表索引 | O(n log m) |
+| NL Join | 小结果集 | O(n * m) |
+
+---
+
+## 五、Hint 用法
+
+### 5.1 索引 Hint
+
+```sql
+-- 强制使用某个索引
+SELECT * FROM users USE INDEX (idx_age) WHERE age > 25;
+
+-- 忽略某个索引
+SELECT * FROM users IGNORE INDEX (idx_age) WHERE age > 25;
+
+-- 强制使用索引范围扫描
+SELECT * FROM orders FORCE INDEX (idx_user_date) WHERE user_id BETWEEN 100 AND 200;
+```
+
+### 5.2 Join Hint
+
+```sql
+-- 强制 Hash Join
+SELECT /*+ HASH_JOIN(u) */ *
+FROM orders o
+JOIN users u ON o.user_id = u.id;
+
+-- 强制 Merge Join
+SELECT /*+ MERGE_JOIN(u) */ *
+FROM orders o
+JOIN users u ON o.user_id = u.id;
+
+-- 强制 NL Join
+SELECT /*+ INL_JOIN(u) */ *
+FROM orders o
+JOIN users u ON o.user_id = u.id;
+```
+
+### 5.3 执行器 Hint
+
+```sql
+-- 强制 MPP
+SELECT /*+ MPP_MODE() */ *
+FROM orders o
+JOIN users u ON o.user_id = u.id;
+
+-- 指定 TiFlash
+SELECT /*+ READ_FROM_STORAGE(TIFLASH[users]) */ *
+FROM users WHERE age > 25;
+```
+
+---
+
+## 六、常见问题
+
+### 6.1 统计信息过期
+
+```sql
+-- 现象：查询变慢，但数据量没变
+-- 原因：统计信息过期
+
+-- 解决
+ANALYZE TABLE users;  -- 重新收集
+```
+
+### 6.2 选错索引
+
+```sql
+-- 现象：走了错误的索引
+-- 解决：使用 Hint 指定索引
+
+SELECT * FROM orders USE INDEX (idx_user_date) 
+WHERE user_id = 100 AND create_time > '2024-01-01';
+```
+
+### 6.3 内存不足
+
+```sql
+-- 现象：Hash Join 内存溢出
+-- 解决：增加内存或改用其他算法
+
+SET tidb_hash_join_spill_ratio = 0.6;  -- 允许磁盘溢出
+SET tidb_executor_concurrency = 4;       -- 减少并发
+```
+
+---
+
+## 七、面试追问
+
+- CBO 和 RBO 的区别？
+- TiDB 的代价模型是怎么设计的？
+- 统计信息包括哪些内容？
+- Hash Join 和 Index Join 的适用场景？
+- Hint 的优先级是什么？
+
+---
+
+## 总结
+
+TiDB 的 CBO 优化器是查询性能的核心：
+
+- **逻辑优化**：谓词下推、列裁剪、常量折叠
+- **物理优化**：基于代价选择算子和 Join 顺序
+- **统计信息**：代价估算的基础
+- **Hint**：人工干预执行计划
+
+理解优化器的工作原理，是调优 TiDB 查询性能的关键。

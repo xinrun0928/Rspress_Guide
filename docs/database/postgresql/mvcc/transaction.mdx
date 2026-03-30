@@ -1,0 +1,394 @@
+# PostgreSQL 事务回滚与 Savepoint
+
+"事务执行到一半，发现前面的操作有问题，能不能只回滚一部分？"
+
+这是很多开发者的常见需求。PostgreSQL 通过 Savepoint 完美地支持了部分回滚——你可以在事务中设置保存点，然后有选择性地回滚到某个保存点，而不影响之前的操作。
+
+---
+
+## 事务控制基础
+
+### 事务的生命周期
+
+```
+BEGIN
+   ↓
+执行 SQL
+   ↓
+  ┌──── COMMIT ────→ 事务成功，所有修改永久保存
+  │
+  ↓
+ ROLLBACK ────→ 事务失败，所有修改回滚
+```
+
+### 基本语法
+
+```sql
+-- 开启事务
+BEGIN;
+-- 或
+START TRANSACTION;
+
+-- 提交事务
+COMMIT;
+-- 或
+END;
+
+-- 回滚事务
+ROLLBACK;
+```
+
+### 自动提交模式
+
+在 psql 或某些客户端中，默认是自动提交模式：
+
+```sql
+-- 每个语句自动包装在事务中
+INSERT INTO orders VALUES (...);  -- 自动提交
+
+-- 显式开启事务
+BEGIN;
+INSERT INTO orders VALUES (...);
+COMMIT;
+```
+
+---
+
+## Savepoint：部分回滚
+
+### 什么是 Savepoint
+
+Savepoint 允许你在事务中设置标记点，可以回滚到标记点，而不影响之前的操作。
+
+```
+事务执行：
+BEGIN
+    INSERT A  -- 成功
+    SAVEPOINT sp1
+    INSERT B  -- 成功
+    ROLLBACK TO SAVEPOINT sp1  -- 回滚到 sp1，B 被撤销
+    INSERT C  -- 成功
+COMMIT  -- 最终提交：A 和 C，A 已提交
+```
+
+### 基本语法
+
+```sql
+-- 定义保存点
+SAVEPOINT savepoint_name;
+
+-- 回滚到保存点（不关闭事务）
+ROLLBACK TO SAVEPOINT savepoint_name;
+
+-- 释放保存点（释放后不能再回滚到该点）
+RELEASE SAVEPOINT savepoint_name;
+```
+
+### 实战示例
+
+#### 场景：批量插入，部分失败
+
+```sql
+BEGIN;
+
+-- 插入订单
+INSERT INTO orders (customer_id, total) VALUES (1, 100);
+SAVEPOINT sp_order;
+
+-- 插入订单明细
+INSERT INTO order_items (order_id, product_id, qty) VALUES
+    (currval('orders_id_seq'), 101, 1),
+    (currval('orders_id_seq'), 102, 2);
+
+-- 如果明细插入失败，回滚到保存点
+-- ROLLBACK TO SAVEPOINT sp_order;
+
+-- 继续插入（如果上面回滚了，需要重新插入明细）
+INSERT INTO order_items (order_id, product_id, qty)
+    VALUES (currval('orders_id_seq'), 103, 1);
+
+COMMIT;
+```
+
+#### 场景：试探性更新
+
+```sql
+BEGIN;
+
+-- 读取当前值
+SELECT balance FROM accounts WHERE id = 1;  -- balance = 1000
+
+-- 设置保存点
+SAVEPOINT sp_update;
+
+-- 尝试更新
+UPDATE accounts SET balance = balance - 500 WHERE id = 1;
+
+-- 检查结果
+SELECT balance FROM accounts WHERE id = 1;  -- balance = 500
+
+-- 如果余额不足，回滚
+ROLLBACK TO SAVEPOINT sp_update;
+
+-- 使用另一种方式
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;
+
+COMMIT;  -- 最终余额 = 900
+```
+
+---
+
+## Savepoint 的限制
+
+### 名称不能重复
+
+同一个事务内，不能有同名的保存点：
+
+```sql
+BEGIN;
+SAVEPOINT sp1;
+ROLLBACK TO SAVEPOINT sp1;
+SAVEPOINT sp1;  -- 错误！这个 sp1 已经不存在了
+```
+
+### 隐式释放
+
+ROLLBACK TO SAVEPOINT 会隐式释放该保存点之后的所有保存点：
+
+```sql
+BEGIN;
+SAVEPOINT sp1;
+SAVEPOINT sp2;
+ROLLBACK TO SAVEPOINT sp1;  -- sp2 也被释放了
+```
+
+### 自动回滚整个事务的错误
+
+某些错误会导致整个事务回滚，无法使用 Savepoint：
+
+```sql
+BEGIN;
+INSERT A;
+SAVEPOINT sp1;
+INSERT B;
+-- 如果发生以下错误，整个事务回滚
+-- - 语法错误
+-- - 约束冲突（UNIQUE、FOREIGN KEY 等，除非使用了异常处理）
+COMMIT;  -- 不会执行到这里
+```
+
+---
+
+## PL/pgSQL 中的异常处理
+
+在存储过程中，可以使用异常处理来实现部分回滚：
+
+```sql
+CREATE OR REPLACE FUNCTION transfer_funds(
+    from_account BIGINT,
+    to_account BIGINT,
+    amount NUMERIC
+) RETURNS VOID AS $$
+BEGIN
+    -- 扣除金额
+    UPDATE accounts SET balance = balance - amount WHERE id = from_account;
+
+    -- 检查余额
+    IF (SELECT balance FROM accounts WHERE id = from_account) < 0 THEN
+        RAISE EXCEPTION 'Insufficient balance';
+    END IF;
+
+    -- 增加金额
+    UPDATE accounts SET balance = balance + amount WHERE id = to_account;
+
+EXCEPTION
+    WHEN OTHERS THEN
+        -- 发生任何错误时，回滚并重新抛出
+        RAISE;
+END;
+$$ LANGUAGE plpgsql;
+```
+
+### 使用 EXCEPTION 实现条件回滚
+
+```sql
+CREATE OR REPLACE FUNCTION safe_update(
+    user_id BIGINT,
+    new_email VARCHAR
+) RETURNS VOID AS $$
+BEGIN
+    UPDATE users SET email = new_email WHERE id = user_id;
+
+    -- 如果 email 格式无效，捕获异常
+EXCEPTION
+    WHEN check_violation THEN
+        RAISE NOTICE 'Invalid email format, rolling back...';
+        -- 异常处理块中，事务已处于回滚状态
+        -- 可以在这里执行其他逻辑
+END;
+$$ LANGUAGE plpgsql;
+```
+
+---
+
+## 嵌套事务
+
+### PostgreSQL 没有真正的嵌套事务
+
+PostgreSQL 不支持真正的嵌套事务（不像 Oracle 的 SAVEPOINT 或 SQL Server 的 BEGIN TRANSACTION 可嵌套）。
+
+```sql
+-- 这不是真正的嵌套事务
+BEGIN;  -- 事务 1
+    INSERT A;
+
+    -- 这只是一个保存点，不是新事务
+    SAVEPOINT nested;
+
+    INSERT B;
+    ROLLBACK TO SAVEPOINT nested;  -- 只回滚 B
+    INSERT C;
+
+COMMIT;  -- 提交：A 和 C
+```
+
+### 使用函数模拟嵌套事务
+
+如果需要更复杂的嵌套事务逻辑，可以使用函数：
+
+```sql
+CREATE OR REPLACE FUNCTION nested_transaction() RETURNS VOID AS $$
+BEGIN
+    -- 函数内部总是有新事务
+    -- 但可以与外部事务配合
+    INSERT INTO logs (message) VALUES ('函数执行');
+END;
+$$ LANGUAGE plpgsql;
+
+BEGIN;
+    INSERT A;
+    PERFORM nested_transaction();  -- 独立事务
+    INSERT B;
+COMMIT;
+```
+
+---
+
+## 事务与锁
+
+### 事务持有锁的时间
+
+事务持有的锁直到事务结束（COMMIT 或 ROLLBACK）才释放：
+
+```sql
+BEGIN;
+SELECT * FROM orders WHERE id = 1 FOR UPDATE;
+-- 这里 SELECT FOR UPDATE 会持有行锁
+-- 其他事务尝试 UPDATE 这行会等待
+
+-- 如果这个事务执行很久
+-- 会阻塞其他事务
+
+COMMIT;  -- 锁释放
+```
+
+### 长事务的危害
+
+长事务会持有锁，阻塞其他事务：
+
+```sql
+-- 事务 1：长时间运行
+BEGIN;
+SELECT * FROM orders WHERE id = 1 FOR UPDATE;
+-- 执行一些耗时的操作...
+-- sleep 30 seconds
+COMMIT;
+
+-- 事务 2：尝试修改
+BEGIN;
+UPDATE orders SET status = 'shipped' WHERE id = 1;
+-- 被事务 1 阻塞
+COMMIT;
+```
+
+### 最佳实践
+
+1. **保持事务简短**：事务越短，锁持有时间越短
+2. **避免在事务中等待用户输入**：用户思考时间就是锁持有时间
+3. **减少在事务中的网络交互**：每次 SELECT 都是一次网络往返
+
+```sql
+-- 好：事务简短
+BEGIN;
+INSERT INTO orders (...) VALUES (...);
+UPDATE inventory SET qty = qty - 1 WHERE product_id = ...;
+INSERT INTO order_items (...) VALUES (...);
+COMMIT;
+
+-- 不好：长事务
+BEGIN;
+-- 先查询（可能很慢）
+SELECT * FROM products WHERE ...
+-- 等用户确认
+-- 用户想了想，改了需求
+-- 等用户再次确认
+COMMIT;
+```
+
+---
+
+## 事务隔离级别与 Savepoint
+
+### Read Committed 下的 Savepoint
+
+默认隔离级别，每次语句看到最新的已提交数据：
+
+```sql
+BEGIN ISOLATION LEVEL READ COMMITTED;
+
+SAVEPOINT sp1;
+INSERT INTO orders VALUES (1, 'pending');
+-- 下一条 SELECT 可以看到这个插入
+
+ROLLBACK TO SAVEPOINT sp1;
+-- 插入被回滚
+
+COMMIT;
+```
+
+### Repeatable Read 下的 Savepoint
+
+整个事务使用同一个快照：
+
+```sql
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+
+SAVEPOINT sp1;
+INSERT INTO orders VALUES (1, 'pending');
+-- 这个插入对当前事务可见
+-- 但其他事务看不到
+
+ROLLBACK TO SAVEPOINT sp1;
+-- 插入被回滚
+
+COMMIT;
+```
+
+---
+
+## 总结
+
+Savepoint 是 PostgreSQL 事务处理的重要工具：
+
+1. **部分回滚**：只回滚事务的一部分，而不是全部
+2. **异常处理**：在存储过程中捕获异常，实现条件回滚
+3. **试探性操作**：先尝试操作，不满意就回滚
+4. **嵌套逻辑**：实现复杂的条件逻辑
+
+使用 Savepoint 时需要注意：
+
+- 保持事务简短，避免长事务持有锁
+- 注意保存点的隐式释放行为
+- 某些错误会导致整个事务回滚，无法使用 Savepoint
+
+合理使用事务控制和 Savepoint，可以让数据库操作更加灵活，同时保证数据一致性。

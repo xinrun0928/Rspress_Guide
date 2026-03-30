@@ -1,0 +1,333 @@
+# 缓存穿透：布隆过滤器 + 缓存空值
+
+你的系统在正常运转，突然间数据库 CPU 飙升，系统响应变慢。排查后发现：有人在疯狂请求一个根本不存在的数据。
+
+这就是缓存穿透。
+
+## 什么是缓存穿透
+
+缓存穿透是指：**查询一个既不存在于缓存中、也不存在于数据库中的数据**。
+
+```
+正常请求流程：
+客户端 -> Redis（命中） -> 直接返回数据
+
+缓存穿透流程：
+客户端 -> Redis（未命中） -> MySQL（查不到） -> 返回空
+         |
+         ↓
+    每次都查数据库
+```
+
+**为什么会发生？**
+
+1. **业务漏洞**：前端没有做参数校验，请求了负数 ID 或恶意构造的 ID
+2. **恶意攻击**：攻击者故意大量请求不存在的数据，试图击垮数据库
+3. **数据误删**：数据库数据被误删，但缓存未清理
+
+## 穿透的危害
+
+如果每次查询都穿透到数据库：
+
+- 数据库 QPS 飙升
+- 响应时间变长
+- 数据库可能宕机
+- 连带影响其他业务
+
+```bash
+# 正常情况
+1000 请求/秒 -> Redis 99% 命中 -> 数据库只有 10 QPS
+
+# 穿透情况
+1000 请求/秒 -> 全部穿透 -> 数据库 1000 QPS -> 数据库被打垮
+```
+
+## 解决方案一：缓存空值
+
+### 原理
+
+当数据库查询返回「数据不存在」时，在缓存中存储一个空值（null）：
+
+```python
+def get_user(user_id):
+    # 1. 查询缓存
+    cache_key = f"user:{user_id}"
+    user = redis.get(cache_key)
+    
+    if user is not None:
+        if user == b'NULL':  # 空值标记
+            return None
+        return json.loads(user)
+    
+    # 2. 缓存未命中，查询数据库
+    user = db.query("SELECT * FROM users WHERE id = ?", user_id)
+    
+    if user is None:
+        # 3. 数据库也没有，设置空值
+        # 注意：过期时间要短一些
+        redis.setex(cache_key, 60, 'NULL')  # 60 秒后过期
+        return None
+    
+    # 4. 数据库有，写入缓存
+    redis.setex(cache_key, 3600, json.dumps(user))
+    return user
+```
+
+### 优缺点
+
+**优点**：
+- 实现简单
+- 对正常数据有效
+
+**缺点**：
+- 如果大量不同的非法 key，会存储大量无意义的空值
+- 需要设置较短的过期时间，否则会影响正常数据的缓存
+
+### 代码实现
+
+```python
+import json
+import redis
+from db import Database
+
+class CacheService:
+    def __init__(self):
+        self.redis = redis.Redis(host='localhost', port=6379)
+        self.db = Database()
+        self.null_ttl = 60  # 空值过期时间：60 秒
+        self.normal_ttl = 3600  # 正常数据过期时间：1 小时
+    
+    def get(self, key):
+        # 查询缓存
+        value = self.redis.get(key)
+        
+        if value is not None:
+            # 空值标记
+            if value == b'NULL':
+                return None
+            return json.loads(value)
+        
+        # 缓存未命中，查询数据库
+        data = self.db.query(key)
+        
+        if data is None:
+            # 存储空值
+            self.redis.setex(key, self.null_ttl, 'NULL')
+            return None
+        
+        # 存储正常数据
+        self.redis.setex(key, self.normal_ttl, json.dumps(data))
+        return data
+```
+
+## 解决方案二：布隆过滤器
+
+### 原理
+
+布隆过滤器是一种**概率型数据结构**，用于判断一个元素「可能存在」还是「一定不存在」。
+
+```
+布隆过滤器工作原理：
+
+插入元素：
+元素 -> 多个哈希函数 -> 多个位置 -> 置为 1
+
+查询元素：
+元素 -> 多个哈希函数 -> 多个位置
+           |
+           v
+      全部为 1？ -> 可能存在（存在误判）
+      有 0？    -> 一定不存在
+```
+
+**Redis + 布隆过滤器**：
+
+在查询数据库之前，先用布隆过滤器判断数据是否可能存在：
+
+```python
+from bloom_filter import BloomFilter
+
+# 初始化布隆过滤器
+bf = BloomFilter(capacity=1000000, error_rate=0.01)
+
+def get_user(user_id):
+    cache_key = f"user:{user_id}"
+    
+    # 1. 布隆过滤器判断
+    if not bf.exists(user_id):
+        # 一定不存在，直接返回
+        return None
+    
+    # 2. 查询缓存
+    value = self.redis.get(cache_key)
+    if value:
+        return json.loads(value)
+    
+    # 3. 查询数据库
+    user = db.query(user_id)
+    if user:
+        redis.setex(cache_key, 3600, json.dumps(user))
+    return user
+```
+
+### 布隆过滤器的误判
+
+```python
+# 布隆过滤器的特点：
+# - 说「存在」：可能是误判（false positive）
+# - 说「不存在」：一定不存在（false negative）
+
+# 误判示例：
+if not bf.exists(user_id):
+    return None  # 一定不存在，可以直接返回
+
+# 如果 exists() 返回 True
+# 可能是真的存在，也可能是误判
+# 需要继续查数据库确认
+```
+
+### Redis 布隆过滤器插件
+
+Redis 4.0+ 支持布隆过滤器插件：
+
+```bash
+# 安装 Redis Bloom 模块
+redis-server --loadmodule /path/to/redisbloom.so
+
+# 使用布隆过滤器命令
+> BF.ADD user:bloom "12345"
+:1
+
+> BF.EXISTS user:bloom "12345"
+:1
+
+> BF.EXISTS user:bloom "99999"
+:0
+```
+
+### 布隆过滤器实现
+
+```python
+import redis
+import mmh3  # MurmurHash 实现
+
+class BloomFilter:
+    def __init__(self, host='localhost', port=6379, key='bloom', size=1000000):
+        self.redis = redis.Redis(host=host, port=port)
+        self.key = key
+        self.size = size  # 位数组大小
+        self.seeds = [7, 11, 13, 17, 19, 23, 29, 31]  # 哈希种子
+    
+    def _hashes(self, value):
+        """生成多个哈希值"""
+        h = mmh3.hash128(str(value), seed=0)
+        return [(h >> (i * 4)) & 0xFFFFFFFF for i in range(8)]
+    
+    def add(self, value):
+        """添加元素"""
+        for seed in self.seeds:
+            offset = mmh3.hash(str(value), seed) % self.size
+            self.redis.setbit(self.key, offset, 1)
+    
+    def exists(self, value):
+        """检查元素是否存在"""
+        for seed in self.seeds:
+            offset = mmh3.hash(str(value), seed) % self.size
+            if not self.redis.getbit(self.key, offset):
+                return False
+        return True
+```
+
+## 组合方案：布隆过滤器 + 缓存空值
+
+实际生产环境中，通常组合使用两种方案：
+
+```python
+def get_user(user_id):
+    # 1. 布隆过滤器判断
+    if not bloom_filter.exists(user_id):
+        # 一定不存在，直接返回
+        return None
+    
+    # 2. 查询缓存
+    cache_key = f"user:{user_id}"
+    value = self.redis.get(cache_key)
+    
+    if value is not None:
+        if value == b'NULL':
+            return None
+        return json.loads(value)
+    
+    # 3. 查询数据库
+    user = self.db.query(user_id)
+    
+    if user is None:
+        # 4. 存储空值，防止穿透
+        self.redis.setex(cache_key, 60, 'NULL')
+        return None
+    
+    # 5. 存储正常数据
+    self.redis.setex(cache_key, 3600, json.dumps(user))
+    return user
+```
+
+## 方案对比
+
+| 方案 | 适用场景 | 优点 | 缺点 |
+| --- | --- | --- | --- |
+| 缓存空值 | 数据确实会不存在 | 实现简单 | 需要存储大量空值 |
+| 布隆过滤器 | 数据量巨大、空值多 | 节省内存 | 存在误判，不能删除 |
+| 组合方案 | 生产环境推荐 | 兼顾两者优点 | 实现稍复杂 |
+
+## 最佳实践
+
+### 1. 参数校验
+
+```python
+# 在网关层做参数校验
+def validate_request(user_id):
+    if not user_id or user_id <= 0:
+        raise InvalidParameterError("Invalid user_id")
+    if len(str(user_id)) > 20:
+        raise InvalidParameterError("user_id too long")
+```
+
+### 2. 设置合理的过期时间
+
+```python
+# 空值过期时间要短于正常数据
+NULL_TTL = 60  # 空值 60 秒
+NORMAL_TTL = 3600  # 正常数据 1 小时
+```
+
+### 3. 布隆过滤器初始化
+
+```python
+# 系统启动时，从数据库加载所有合法 key
+def init_bloom_filter():
+    # 查询所有用户 ID
+    user_ids = db.query_all("SELECT id FROM users")
+    
+    # 添加到布隆过滤器
+    for user_id in user_ids:
+        bf.add(user_id)
+```
+
+### 4. 监控布隆过滤器的状态
+
+```bash
+# 监控穿透请求数量
+# 如果大量请求在布隆过滤器判断后仍返回空
+# 说明数据需要更新到布隆过滤器中
+```
+
+## 面试追问方向
+
+- 什么是缓存穿透？有什么危害？
+- 布隆过滤器的工作原理是什么？
+- 布隆过滤器为什么不能删除元素？
+- 布隆过滤器的误判率如何计算？
+- 缓存空值方案有什么缺点？
+- 如何组合使用布隆过滤器和缓存空值？
+
+理解缓存穿透问题，展示了你对缓存系统安全性的理解。

@@ -1,0 +1,454 @@
+import { Badge } from '@rspress/core/theme';
+
+# 跳跃表
+
+跳跃表（Skip List）是一种可以在 O(log n) 时间内完成插入、删除和搜索的有序链表。它是 Redis ZSet 类型的底层实现之一，也是面试中的高频考点。
+
+很多人第一次看到跳跃表的概念时都觉得它很复杂，但当你理解它的设计思想后，会发现它是一个非常优雅的数据结构。
+
+## 为什么需要跳跃表
+
+### 有序数组的问题
+
+有序数组可以使用二分查找，搜索效率是 O(log n)：
+
+```python
+# 二分查找
+def binary_search(arr, target):
+    left, right = 0, len(arr) - 1
+    while left <= right:
+        mid = (left + right) // 2
+        if arr[mid] == target:
+            return mid
+        elif arr[mid] < target:
+            left = mid + 1
+        else:
+            right = mid - 1
+    return -1
+```
+
+但有序数组的插入和删除是 O(n)，因为需要移动元素。
+
+### 普通链表的问题
+
+链表插入和删除是 O(1)，但搜索是 O(n)：
+
+```python
+# 链表搜索
+def search_linked_list(head, target):
+    current = head
+    while current:
+        if current.value == target:
+            return current
+        current = current.next
+    return None
+```
+
+### 跳跃表的解决方案
+
+跳跃表通过建立多级索引，在插入/删除/搜索之间取得平衡：
+
+- 搜索：O(log n)，通过多级索引快速定位
+- 插入：O(log n)，搜索位置后插入
+- 删除：O(log n)，搜索位置后删除
+
+## 跳跃表的工作原理
+
+### 直观理解
+
+想象你在一栋 100 层的楼里找人：
+
+**普通链表**：从 1 楼开始，一层一层往上找，最坏要到 100 楼。
+
+**跳跃表**：建立多个"电梯"：
+
+```
+电梯 A：直达 25 楼
+电梯 B：直达 50 楼
+电梯 C：直达 75 楼
+
+找 68 楼的某人：
+1. 先坐电梯 C 到 75 楼
+2. 从 75 楼下楼走到 50 楼（太低了）
+3. 坐电梯 B 到 50 楼（还是低）
+4. 从 50 楼爬到 68 楼
+```
+
+这样，原本要爬 100 层，现在只需要坐几次电梯就够了。
+
+### 结构图示
+
+```
+Level 2:  ---->  1 ---->  5 ---->  9 ---->  NULL
+               |        |        |
+Level 1:  ---->  1 ---->  5 ---->  7 ---->  9 ---->  NULL
+               |        |        |        |        |
+Level 0:  ---->  1 ---->  3 ---->  5 ---->  7 ---->  9 ---->  11 ---->  NULL
+```
+
+Level 0 是原始链表，包含所有元素。Level 1、Level 2 是索引层，每隔几个元素建一个索引。
+
+### 搜索过程
+
+搜索元素 7：
+
+```
+1. 从 Level 2 开始：1 -> 5（小于7） -> 9（大于7），下降到 Level 1
+2. Level 1：5 -> 7，找到！
+```
+
+### 插入过程
+
+插入元素 6：
+
+```
+1. 搜索位置：找到 5 和 7 之间的位置
+2. 抛硬币决定层数：
+   - 硬币 = 正面 -> 继续抛
+   - 硬币 = 反面 -> 停止
+   假设硬币序列：正、正、反，生成 2 层索引
+3. 在 Level 0 和 Level 1 中插入 6
+4. 更新相应层的指针
+```
+
+:::tip 随机层数
+跳跃表的层数由随机函数决定。Redis 使用以下算法：
+
+```c
+int randomLevel() {
+    int level = 1;
+    while (random() < 0.25) {  // 25% 概率升层
+        level++;
+    }
+    return level < MAX_LEVEL ? level : MAX_LEVEL;
+}
+```
+
+平均每 4 个元素会有一个晋升到上一层。
+:::
+
+## Redis 中跳跃表的实现
+
+### Redis 的数据结构
+
+```c
+// 跳跃表节点
+typedef struct zskiplistNode {
+    // 元素（SDS 字符串）
+    sds ele;
+
+    // 分值
+    double score;
+
+    // 后退指针
+    struct zskiplistNode *backward;
+
+    // 层结构数组
+    struct zskiplistLevel {
+        struct zskiplistNode *forward;  // 前进指针
+        unsigned int span;               // 跨度（用于计算 rank）
+    } level[];
+} zskiplistNode;
+
+// 跳跃表
+typedef struct zskiplist {
+    // 表头和表尾
+    struct zskiplistNode *header, *tail;
+
+    // 表中节点数量
+    unsigned long length;
+
+    // 表中最大层数
+    int level;
+} zskiplist;
+```
+
+### 关键设计：span 字段
+
+每个 level 都有一个 span 字段，记录当前节点到下一个节点的跨度：
+
+```
+Level 1:  [span=2] ->  [span=1] ->  [span=3] ->  NULL
+           |           |           |
+Level 0:  ->  1  ->  3  ->  5  ->  7  ->  9  ->  NULL
+```
+
+span 的作用是快速计算元素的排名：
+
+```c
+// 通过 span 计算排名
+unsigned long getRank(zskiplist *zsl, double score, sds ele) {
+    unsigned long rank = 0;
+    zskiplistNode *x = zsl->header;
+
+    for (int i = zsl->level - 1; i >= 0; i--) {
+        while (x->level[i].forward) {
+            if (score > x->level[i].forward->score ||
+                (score == x->level[i].forward->score &&
+                 compareStringObjects(x->level[i].forward->ele, ele) >= 0)) {
+                rank += x->level[i].span;
+                x = x->level[i].forward;
+            } else {
+                break;
+            }
+        }
+    }
+
+    // 加上最后一步
+    return rank + 1;
+}
+```
+
+### Redis ZSet 的完整结构
+
+ZSet 同时使用跳跃表和字典：
+
+```c
+typedef struct zset {
+    dict *dict;        // 元素名 -> 分值的哈希表
+    zskiplist *zsl;   // 分值 -> 元素名的跳跃表
+} zset;
+```
+
+```
+zset 结构：
+dict: {"Alice": 95, "Bob": 88, "Charlie": 92}
+zsl:  88(Bob) <-> 92(Charlie) <-> 95(Alice)
+```
+
+两种数据结构配合，保证所有操作都是 O(log n)：
+
+| 操作 | dict | zsl |
+| --- | --- | --- |
+| ZADD score member | O(log n) | O(log n) |
+| ZSCORE member | O(1) | - |
+| ZRANK member | - | O(log n) |
+| ZRANGE | - | O(log n) |
+
+:::tip 为什么同时使用两种结构
+- dict 保证 O(1) 的分数查询（通过成员名）
+- zsl 保证有序遍历和范围查询
+
+这实际上是空间换时间的设计：用额外的内存换取更快的操作。
+:::
+
+## 跳跃表 vs 红黑树
+
+面试中经常被问到：为什么 Redis 选择跳跃表而不是红黑树？
+
+### 两者对比
+
+| 特性 | 跳跃表 | 红黑树 |
+| --- | --- | --- |
+| 搜索复杂度 | O(log n) | O(log n) |
+| 插入复杂度 | O(log n) | O(log n) |
+| 删除复杂度 | O(log n) | O(log n) |
+| 有序遍历 | 自然支持 | 需要中序遍历 |
+| 范围查询 | 容易实现 | 需要额外操作 |
+| 实现复杂度 | 简单 | 复杂 |
+| 内存占用 | 略高（多个指针） | 较低（固定指针） |
+| 并发安全 | 区间锁即可 | 需要整棵树或复杂锁 |
+
+### Redis 选择跳跃表的原因
+
+**1. 实现简单**
+
+红黑树的插入和删除需要复杂的旋转和再平衡操作：
+
+```c
+// 红黑树的旋转操作
+void rotateLeft(rbtree *T, node *x) {
+    node *y = x->right;
+    x->right = y->left;
+    if (y->left != T->nil) {
+        y->left->parent = x;
+    }
+    // ... 大量边界处理
+}
+
+// 跳跃表的插入
+zskiplistNode *zslInsert(zskiplist *zsl, double score, sds ele) {
+    // 1. 计算随机层数
+    // 2. 创建节点
+    // 3. 更新指针
+    // 4. 完事
+}
+```
+
+**2. 范围查询更高效**
+
+ZRANGE 操作需要遍历一段范围内的所有元素：
+
+```python
+# 跳跃表范围查询
+def zrange(zsl, start, stop):
+    # 从 start 开始顺序遍历即可
+    node = getByRank(zsl, start)
+    while node and rank <= stop:
+        yield node
+        node = node.forward
+
+# 红黑树范围查询
+def zrange(zsl, start, stop):
+    # 需要：找到 start 节点 -> 中序遍历直到 stop
+    # 复杂度更高
+```
+
+**3. 更容易实现**
+
+Redis 作者 antirez（原名 Salvatore Sanfilippo）的原话：
+
+> "There's a simpler data structure that's as fast as balanced tree: skip list."
+
+**4. 内存开销可接受**
+
+跳跃表的内存开销是可以预测的：
+
+- 平均每个节点有 1.33 层（1/(1-0.25)）
+- 每层 2 个指针 + 1 个 span
+
+对于中等规模数据，内存开销增加约 20-30%，是可以接受的。
+
+## 跳跃表的操作实现
+
+### ZADD：添加元素
+
+```c
+zskiplistNode* zslInsert(zskiplist *zsl, double score, sds ele) {
+    // 1. 计算随机层数
+    int level = randomLevel();
+
+    // 2. 创建节点
+    zskiplistNode *update[ZSKIPLIST_MAXLEVEL];
+    unsigned long rank[ZSKIPLIST_MAXLEVEL];
+
+    // 3. 找到每层的插入位置
+    zskiplistNode *x = zsl->header;
+    for (int i = zsl->level - 1; i >= 0; i--) {
+        rank[i] = i == (zsl->level - 1) ? 0 : rank[i + 1];
+        while (x->level[i].forward &&
+               (x->level[i].forward->score < score ||
+                (x->level[i].forward->score == score &&
+                 compareStringObjects(x->level[i].forward->ele, ele) < 0))) {
+            rank[i] += x->level[i].span;
+            x = x->level[i].forward;
+        }
+        update[i] = x;
+    }
+
+    // 4. 创建新节点
+    x = zslCreateNode(level, score, ele);
+
+    // 5. 更新每层的指针
+    for (int i = 0; i < level; i++) {
+        x->level[i].forward = update[i]->level[i].forward;
+        update[i]->level[i].forward = x;
+        x->level[i].span = update[i]->level[i].span - (rank[0] - rank[i]) + 1;
+        update[i]->level[i].span = (rank[0] - rank[i]) + 1;
+    }
+
+    // 6. 更新未涉及层的 span
+    for (int i = level; i < zsl->level; i++) {
+        update[i]->level[i].span++;
+    }
+
+    // 7. 更新其他字段
+    x->backward = (update[0] == zsl->header) ? NULL : update[0];
+    if (x->level[0].forward)
+        x->level[0].forward->backward = x;
+    else
+        zsl->tail = x;
+
+    zsl->length++;
+    return x;
+}
+```
+
+### ZRANK：获取排名
+
+```c
+unsigned long zslGetRank(zskiplist *zsl, double score, sds ele) {
+    unsigned long rank = 0;
+    zskiplistNode *x = zsl->header;
+
+    for (int i = zsl->level - 1; i >= 0; i--) {
+        while (x->level[i].forward &&
+               (x->level[i].forward->score < score ||
+                (x->level[i].forward->score == score &&
+                 compareStringObjects(x->level[i].forward->ele, ele) < 0))) {
+            rank += x->level[i].span;
+            x = x->level[i].forward;
+        }
+
+        if (x->level[i].forward &&
+            x->level[i].forward->score == score &&
+            equalStringObjects(x->level[i].forward->ele, ele)) {
+            return rank + x->level[i].span;
+        }
+    }
+
+    return 0;
+}
+```
+
+## 跳跃表在 Redis 中的应用
+
+### 排行榜实现
+
+```bash
+# 游戏排行榜
+ZADD game:rank 1500 "player1"
+ZADD game:rank 2000 "player2"
+ZADD game:rank 1800 "player3"
+
+# 获取前 3 名
+ZREVRANGE game:rank 0 2 WITHSCORES
+> 1) "player2"
+> 2) "2000"
+> 3) "player3"
+> 4) "1800"
+> 5) "player1"
+> 6) "1500"
+
+# 获取玩家排名
+ZREVRANK game:rank "player2"
+> (integer) 0  # 第 1 名（从 0 开始）
+```
+
+### 延迟队列实现
+
+利用 ZSet 按分值（时间戳）排序的特性：
+
+```bash
+# 添加延迟任务（10分钟后执行）
+ZADD delay:queue 1712000600 '{"task":"send_email","user_id":1001}'
+
+# 消费者：获取已到期的任务
+ZRANGEBYSCORE delay:queue -inf 1712000600
+> 1) '{"task":"send_email","user_id":1001}'
+
+# 执行后删除
+ZREM delay:queue '{"task":"send_email","user_id":1001}'
+```
+
+### IP 限流实现
+
+滑动窗口限流：
+
+```bash
+# 每分钟限制 100 次请求
+ZADD rate:limit:192.168.1.1 1712000000 "1712000000001"
+ZREMRANGEBYSCORE rate:limit:192.168.1.1 -inf 1711999940
+ZCARD rate:limit:192.168.1.1
+```
+
+## 面试追问方向
+
+- 跳跃表的时间复杂度如何计算？
+- Redis 为什么选择跳跃表而不是红黑树？
+- 跳跃表的层数是如何决定的？
+- 跳跃表的随机层数算法有什么讲究？
+- ZSet 为什么同时使用跳跃表和字典？
+- 跳跃表的内存开销如何优化？
+
+这些追问将帮助你在面试中深入展示对跳跃表的理解。

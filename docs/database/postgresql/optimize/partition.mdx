@@ -1,0 +1,420 @@
+# PostgreSQL 分区表
+
+想象一下，你的订单表有 10 年数据，1 亿条记录。用户查询"最近一个月的订单"，PostgreSQL 需要扫描 1 亿条记录才能找到结果。
+
+分区表可以解决这个问题——把大表拆分成多个小表，每个分区只包含一部分数据。查询时只需要扫描相关分区，而不需要扫描整个表。
+
+---
+
+## 分区表基础
+
+### 什么是分区表
+
+分区表是一组逻辑上是一个表、物理上是多个表的集合。PostgreSQL 自动将查询路由到正确的分区。
+
+```
+分区前：
+┌─────────────────────────────────────────┐
+│              orders (1亿条)              │
+│  2014-01 ~ 2024-03                       │
+└─────────────────────────────────────────┘
+
+分区后：
+┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐
+│ orders_2014     │ │ orders_2015     │ │ ...             │
+│  2014年的订单    │ │  2015年的订单    │ │                 │
+└─────────────────┘ └─────────────────┘ └─────────────────┘
+        ↓                   ↓
+    扫描 ~1000万        扫描 ~1000万
+```
+
+### 分区类型
+
+| 类型 | 说明 | 示例 |
+|---|---|---|
+| Range | 按范围分区 | 按时间、按 ID |
+| List | 按列表分区 | 按地区、按状态 |
+| Hash | 按哈希分区 | 均匀分布 |
+
+---
+
+## 创建分区表
+
+### Range 分区（按时间）
+
+```sql
+-- 创建分区表
+CREATE TABLE orders (
+    id BIGSERIAL,
+    customer_id BIGINT,
+    status VARCHAR(20),
+    total NUMERIC,
+    created_at TIMESTAMPTZ NOT NULL
+) PARTITION BY RANGE (created_at);
+
+-- 创建月度分区
+CREATE TABLE orders_2024_01 PARTITION OF orders
+    FOR VALUES FROM ('2024-01-01') TO ('2024-02-01');
+
+CREATE TABLE orders_2024_02 PARTITION OF orders
+    FOR VALUES FROM ('2024-02-01') TO ('2024-03-01');
+
+-- ... 其他月份
+
+-- 创建未来分区（捕获超出范围的数据）
+CREATE TABLE orders_future PARTITION OF orders
+    FOR VALUES FROM ('2025-01-01') TO (MAXVALUE);
+```
+
+### List 分区（按状态）
+
+```sql
+-- 按状态分区
+CREATE TABLE orders (
+    id BIGSERIAL,
+    customer_id BIGINT,
+    status VARCHAR(20),
+    total NUMERIC,
+    created_at TIMESTAMPTZ NOT NULL
+) PARTITION BY LIST (status);
+
+CREATE TABLE orders_pending PARTITION OF orders
+    FOR VALUES IN ('pending', 'processing');
+
+CREATE TABLE orders_completed PARTITION OF orders
+    FOR VALUES IN ('shipped', 'delivered');
+
+CREATE TABLE orders_closed PARTITION OF orders
+    FOR VALUES IN ('cancelled', 'refunded');
+```
+
+### Hash 分区
+
+```sql
+-- 按哈希分区
+CREATE TABLE orders (
+    id BIGSERIAL,
+    customer_id BIGINT,
+    status VARCHAR(20),
+    total NUMERIC
+) PARTITION BY HASH (id);
+
+-- 创建 4 个哈希分区
+CREATE TABLE orders_0 PARTITION OF orders
+    FOR VALUES WITH (MODULUS 4, REMAINDER 0);
+
+CREATE TABLE orders_1 PARTITION OF orders
+    FOR VALUES WITH (MODULUS 4, REMAINDER 1);
+
+CREATE TABLE orders_2 PARTITION OF orders
+    FOR VALUES WITH (MODULUS 4, REMAINDER 2);
+
+CREATE TABLE orders_3 PARTITION OF orders
+    FOR VALUES WITH (MODULUS 4, REMAINDER 3);
+```
+
+---
+
+## 分区裁剪
+
+### 什么是分区裁剪
+
+分区裁剪是分区表最重要的优化——查询只扫描相关分区，忽略其他分区。
+
+```sql
+-- 查询
+SELECT * FROM orders
+WHERE created_at BETWEEN '2024-01-01' AND '2024-01-31';
+
+-- 无分区裁剪：扫描 1 亿条
+-- 有分区裁剪：只扫描 orders_2024_01，约 1000 万条
+```
+
+### 验证分区裁剪
+
+```sql
+EXPLAIN SELECT * FROM orders
+WHERE created_at BETWEEN '2024-01-01' AND '2024-01-31';
+```
+
+```
+Append  (cost=0.00..100.00 rows=1000)
+  ->  Seq Scan on orders_2024_01  (cost=0.00..100.00 rows=1000)
+        Filter: (created_at >= '2024-01-01' AND created_at < '2024-02-01')
+```
+
+### 分区裁剪的条件
+
+分区裁剪只在以下条件下生效：
+
+1. WHERE 条件直接使用分区键
+2. 分区键与常量比较
+3. 使用 PARTITION = () 明确指定分区
+
+```sql
+-- 裁剪生效
+SELECT * FROM orders WHERE created_at = '2024-01-15';
+SELECT * FROM orders WHERE created_at >= '2024-01-01' AND created_at < '2024-02-01';
+
+-- 裁剪可能不生效
+SELECT * FROM orders WHERE DATE_TRUNC('month', created_at) = '2024-01-01';
+SELECT * FROM orders WHERE created_at + INTERVAL '1 day' > NOW();
+```
+
+---
+
+## 分区表索引
+
+### 分区级索引
+
+```sql
+-- 在分区上创建索引
+CREATE INDEX idx_orders_2024_01_customer ON orders_2024_01(customer_id);
+CREATE INDEX idx_orders_2024_02_customer ON orders_2024_02(customer_id);
+
+-- 或者：创建索引时自动应用到所有分区（PostgreSQL 11+）
+CREATE INDEX idx_orders_customer ON orders(customer_id);
+```
+
+### 分区索引的注意点
+
+1. **PostgreSQL 10**：每个分区需要单独建索引
+2. **PostgreSQL 11+**：分区索引自动继承
+3. **唯一索引**：必须包含分区键
+
+```sql
+-- 分区表的主键必须包含分区键
+CREATE TABLE orders (
+    id BIGINT,
+    created_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (id, created_at)  -- 必须包含 created_at
+) PARTITION BY RANGE (created_at);
+
+-- 分区表的唯一索引必须包含分区键
+CREATE UNIQUE INDEX ON orders(id, created_at);
+```
+
+---
+
+## 分区表维护
+
+### 分区管理
+
+```sql
+-- 分离分区
+ALTER TABLE orders DETACH PARTITION orders_2014;
+
+-- 附加分区
+ALTER TABLE orders ATTACH PARTITION orders_2024_12
+    FOR VALUES FROM ('2024-12-01') TO ('2025-01-01');
+
+-- 删除分区
+DROP TABLE orders_2014;
+
+-- 将分区转换为普通表
+ALTER TABLE orders_2014 SET WITHOUT OIDS;
+ALTER TABLE orders_2014 SET LOGGED;  -- 如果之前是 UNLOGGED
+```
+
+### 分区裁剪优化
+
+```sql
+-- 查看分区信息
+SELECT
+    relname,
+    pg_size_pretty(pg_relation_size(relid)) AS size
+FROM pg_stat_user_tables
+WHERE relname LIKE 'orders_%'
+ORDER BY relname;
+```
+
+### 定期创建新分区
+
+```sql
+-- 创建存储过程自动创建分区
+CREATE OR REPLACE FUNCTION create_monthly_partition(
+    table_name TEXT,
+    partition_date DATE
+) RETURNS VOID AS $$
+DECLARE
+    partition_name TEXT;
+    start_date DATE;
+    end_date DATE;
+BEGIN
+    partition_name := table_name || '_' || TO_CHAR(partition_date, 'YYYY_MM');
+    start_date := DATE_TRUNC('month', partition_date);
+    end_date := start_date + INTERVAL '1 month';
+
+    EXECUTE format(
+        'CREATE TABLE IF NOT EXISTS %I PARTITION OF %I FOR VALUES FROM (%L) TO (%L)',
+        partition_name, table_name, start_date, end_date
+    );
+END;
+$$ LANGUAGE plpgsql;
+
+-- 每月调用一次
+SELECT create_monthly_partition('orders', '2025-01-01');
+```
+
+---
+
+## 分区表性能调优
+
+### 分区键选择
+
+分区键的选择至关重要：
+
+1. **高选择列**：查询大部分数据都被裁剪掉
+2. **均匀分布**：避免某个分区过大
+3. **常用查询列**：大多数查询都使用分区键
+
+```sql
+-- 好：created_at 作为分区键
+-- 查询按月检索
+SELECT * FROM orders WHERE created_at BETWEEN '2024-01-01' AND '2024-01-31';
+
+-- 不好：status 作为分区键
+-- 状态分布不均匀，大部分是 completed
+```
+
+### 分区数量控制
+
+```sql
+-- 太多分区会有问题
+-- - 元数据开销增加
+-- - 全局索引难以维护
+-- - 连接多个分区可能变慢
+
+-- 建议：保持 100-1000 个分区
+-- 时间分区：月度分区可保留 8-10 年
+```
+
+### 本地索引 vs 全局索引
+
+| 类型 | 特点 | 适用场景 |
+|---|---|---|
+| 本地索引 | 每个分区独立索引 | 单分区查询 |
+| 全局索引 | 跨所有分区 | 跨分区查询 |
+
+```sql
+-- 本地索引（默认）
+CREATE INDEX ON orders_2024_01(customer_id);
+
+-- PostgreSQL 11+ 支持分区上的全局索引
+CREATE INDEX ON orders(customer_id) LOCAL;
+```
+
+---
+
+## 分区表与分区裁剪的深入理解
+
+### 静态裁剪 vs 动态裁剪
+
+```sql
+-- 静态裁剪：编译时确定分区
+EXPLAIN SELECT * FROM orders WHERE created_at = '2024-01-15';
+-- 结果：直接扫描 orders_2024_01
+
+-- 动态裁剪：执行时确定分区
+EXPLAIN SELECT * FROM orders WHERE created_at > CURRENT_DATE - INTERVAL '1 month';
+-- 结果：扫描最近几个分区
+```
+
+### 分区裁剪的触发条件
+
+```sql
+-- 裁剪生效
+WHERE partition_key = constant
+WHERE partition_key > constant
+WHERE partition_key BETWEEN constant AND constant
+WHERE partition_key IN (constant, constant, ...)
+
+-- 裁剪不生效
+WHERE function(partition_key) = constant
+WHERE partition_key + 1 > constant
+```
+
+### 分区裁剪的深入案例
+
+```sql
+-- 问题：分区裁剪不生效
+SELECT * FROM orders
+WHERE DATE_TRUNC('month', created_at) = '2024-01-01';
+
+-- 解决：直接使用分区键
+SELECT * FROM orders
+WHERE created_at >= '2024-01-01' AND created_at < '2024-02-01';
+
+-- 或者：使用分区裁剪提示（PostgreSQL 14+）
+SELECT * FROM orders
+WHERE created_at >= '2024-01-01' AND created_at < '2024-02-01'
+  AND tableoid = 'orders_2024_01'::regclass;
+```
+
+---
+
+## 分区表最佳实践
+
+### 1. 何时使用分区表
+
+- 表数据量超过 100GB
+- 查询通常只涉及部分数据
+- 数据有天然的分区维度（时间、地区等）
+- 需要高效删除过期数据
+
+### 2. 何时不使用分区表
+
+- 表数据量较小（小于 10GB）
+- 查询经常需要全表扫描
+- 分区维度选择不当
+- 分区数量失控
+
+### 3. 分区策略
+
+```sql
+-- 按时间分区是最佳选择
+CREATE TABLE logs (
+    id BIGSERIAL,
+    created_at TIMESTAMPTZ NOT NULL,
+    message TEXT
+) PARTITION BY RANGE (created_at);
+
+-- 如果有多个查询维度，考虑复合分区
+CREATE TABLE events (
+    id BIGSERIAL,
+    event_type VARCHAR(50),
+    created_at TIMESTAMPTZ NOT NULL
+) PARTITION BY RANGE (created_at);
+
+-- 按月分区
+CREATE TABLE events_2024_01 PARTITION OF events
+    FOR VALUES FROM ('2024-01-01') TO ('2024-02-01');
+```
+
+### 4. 监控分区
+
+```sql
+-- 查看分区大小
+SELECT
+    parent.relname AS parent_table,
+    child.relname AS partition,
+    pg_size_pretty(pg_relation_size(child.oid)) AS size
+FROM pg_inherits
+JOIN pg_class parent ON pg_inherits.inhparent = parent.oid
+JOIN pg_class child ON pg_inherits.inhrelid = child.oid
+ORDER BY parent.relname, child.relname;
+```
+
+---
+
+## 总结
+
+分区表是处理大数据的利器：
+
+1. **分区类型**：Range、List、Hash
+2. **分区裁剪**：查询只扫描相关分区
+3. **索引策略**：本地索引为主，需要包含分区键
+4. **维护工作**：定期创建新分区、删除旧分区
+5. **最佳实践**：选择合适的分区键、控制分区数量
+
+合理的分区设计可以让查询性能提升几十甚至上百倍。但分区表也有复杂度，需要权衡利弊。

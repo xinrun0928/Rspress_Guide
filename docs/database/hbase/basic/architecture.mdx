@@ -1,0 +1,401 @@
+# HBase 整体架构
+
+凌晨 2 点，你盯着监控系统：大数据写入洪峰来袭，HBase 集群的写入延迟突然飙升。ZooKeeper 的节点接连告警，RegionServer 的 CPU 打满，GC 频繁 Full GC。你开始排查——是热点 Region 导致负载不均？还是 MemStore 刷新策略出了问题？或者 Compaction 的后台任务抢占了正常请求的资源？
+
+要回答这些问题，你必须对 HBase 的整体架构有足够深入的理解。HBase 不是一个黑盒子，它的每一个组件——ZooKeeper、HMaster、RegionServer、Region、WAL——都在系统中扮演着明确角色。理解它们之间的协作关系，是排查生产问题的前提，也是进行性能调优的基础。
+
+本篇文章将近 5000 字，系统剖析 HBase 的架构设计，适合作为 HBase 进阶学习的必读内容。
+
+## 一、整体架构概览
+
+HBase 采用经典的 Master-Slave 架构，但这里的 Master 并不是性能瓶颈——HMaster 主要负责元数据管理和表结构变更，实际的数据读写全部由 RegionServer 处理。这种设计使得 HBase 能够水平扩展，写入和查询的吞吐量随 RegionServer 数量的增加而线性增长。
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                      ZooKeeper                          │
+│          (协调服务，选举主 Master，记录 Meta 表位置)        │
+└─────────────────────────────────────────────────────────┘
+                              │
+          ┌───────────────────┼───────────────────┐
+          ▼                   ▼                   ▼
+┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐
+│     HMaster     │ │   HMaster       │ │   HMaster       │
+│  (主节点，管理   │ │  (从节点，待机)   │ │  (从节点，待机)   │
+│   Region 分片)   │ │                 │ │                 │
+└────────┬────────┘ └─────────────────┘ └─────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────┐
+│                   RegionServer 集群                      │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  │
+│  │ Region1  │  │ Region2  │  │ Region3  │  │ Region4  │  │
+│  │ Table:A  │  │ Table:A  │  │ Table:B  │  │ Table:B  │  │
+│  │ RS-1     │  │ RS-1     │  │ RS-2     │  │ RS-2     │  │
+│  └──────────┘  └──────────┘  └──────────┘  └──────────┘  │
+│  ┌──────────┐  ┌──────────┐                                │
+│  │ Region5  │  │ Region6  │                                │
+│  │ Table:C  │  │ Table:C  │                                │
+│  │ RS-3     │  │ RS-3     │                                │
+│  └──────────┘  └──────────┘                                │
+└─────────────────────────────────────────────────────────┘
+```
+
+### 核心组件职责
+
+| 组件 | 类型 | 主要职责 |
+|---|---|---|
+| ZooKeeper | 协调服务 | Master 选举、RegionServer 心跳、Meta 表位置存储 |
+| HMaster | 主节点 | 表结构变更、Region 负载均衡、RegionServer 故障恢复 |
+| RegionServer | 从节点 | 数据读写、MemStore 缓存、Compaction 合并、Minor/Major Compaction |
+| Region | 数据分片 | 表的数据子集，按 RowKey 范围划分 |
+| WAL | 预写日志 | 写入会先写入 WAL，确保宕机后可恢复 |
+
+## 二、ZooKeeper 的核心作用
+
+很多初学者会忽视 ZooKeeper 的重要性，觉得它只是一个"配置管理工具"。实际上，在 HBase 的高可用架构中，ZooKeeper 是整个系统的神经中枢。
+
+### 2.1 Master 选举
+
+HMaster 通过 ZooKeeper 的临时节点机制实现主备切换：
+
+```java
+// 伪代码：Master 选举逻辑
+zookeeper.create("/hbase/master", hostname, 
+    ZOO_ID_TYPE, EPHEMERAL); // 临时节点，宕机自动消失
+```
+
+当主 HMaster 宕机后，ZooKeeper 检测到临时节点消失，其他备选 HMaster 立即抢注 `/hbase/master` 节点，抢注成功者成为新的主节点。整个过程通常在秒级完成，对外服务几乎无感知。
+
+### 2.2 RegionServer 心跳
+
+每个 RegionServer 启动时会在 ZooKeeper 中注册一个临时节点：
+
+```
+/hbase/rs/RS-1:16020:123456
+/hbase/rs/RS-2:16020:789012
+/hbase/rs/RS-3:16020:456789
+```
+
+HMaster 定期检测这些节点的存活状态。如果某个 RegionServer 的心跳超时（默认 3 分钟），HMaster 判定其宕机，将其上的所有 Region 标记为待分配，触发故障恢复流程。
+
+### 2.3 Meta 表位置
+
+`hbase:meta` 表存储了所有用户表的 Region 位置信息，格式如下：
+
+| RowKey | Column Family:qualifier | Value |
+|---|---|---|
+| `TableName,startKey,timestamp` | `info:regioninfo` | Region 的元数据 |
+| `TableName,startKey,timestamp` | `info:server` | Region 所在的 RegionServer |
+| `TableName,startKey,timestamp` | `info:server_startcode` | RegionServer 启动时间戳 |
+
+HBase 客户端首先从 ZooKeeper 中读取 `hbase:meta` 表的位置，然后查询 `hbase:meta` 获取目标 RowKey 所在的 RegionServer，最后直接请求该 RegionServer 完成数据读写。整个过程只需要一次网络跳转，因此 HBase 的元数据查询路径极短。
+
+## 三、HMaster 的管理职责
+
+### 3.1 表结构变更
+
+HMaster 负责处理 CreateTable、DeleteTable、AlterTable 等元数据变更操作。这些操作不会直接影响数据文件，而是修改 ZooKeeper 和 `hbase:meta` 中的元数据：
+
+```java
+// 创建表的简化流程
+public void createTable(TableName tableName, ColumnFamilyDescriptor[] columns) {
+    // 1. 将表描述写入 ZooKeeper
+    zk.create("/hbase/table/TableName", tableDescriptor);
+    
+    // 2. 更新 hbase:meta 表（如果需要预分配 Region）
+    if (splitKeys != null) {
+        for (String splitKey : splitKeys) {
+            createRegionMeta(tableName, splitKey);
+        }
+    }
+    
+    // 3. 将 Region 分配给 RegionServer
+    assignRegionsToServers(tableName);
+}
+```
+
+### 3.2 Region 负载均衡
+
+HMaster 定期检查各 RegionServer 上的 Region 数量，当发现不均衡时会触发负载均衡。默认每 5 分钟检查一次（`hbase.balancer.period`）。
+
+负载均衡遵循以下原则：
+
+- Region 数量在集群节点间大致均衡
+- 单个 RegionServer 上的 Region 数量差不超过阈值（默认 4）
+- 正在处理大量请求的 Region 不会被迁移
+
+```java
+// 负载均衡策略示意
+public Map<ServerName, List<RegionPlan>> balanceCluser(
+    Map<ServerName, List<RegionInfo>> clusterState) {
+    
+    // 计算每个 Server 应承担的 Region 数量
+    int totalRegions = clusterState.values().stream()
+        .mapToInt(List::size).sum();
+    int avgRegions = totalRegions / clusterState.size();
+    
+    // 将超额 Server 上的 Region 迁移到不足的 Server
+    // ...
+}
+```
+
+### 3.3 故障恢复
+
+当 RegionServer 宕机后，HMaster 触发以下恢复流程：
+
+1. **检测故障**：ZooKeeper 心跳超时（默认 30s），触发 `RS_ZK_REGIONSERVER_CLOSE` 事件
+2. **重新分配 Region**：将宕机 Server 上的 Region 标记为 `OFFLINE`，重新分配给其他存活的 RegionServer
+3. **数据恢复**：如果宕机 Server 上的 Region 有未刷写的 MemStore 数据，通过 WAL 重放恢复
+
+```
+宕机前：
+RS-1: [Region-A, Region-B, Region-C]   MemStore 未刷写: 50MB
+RS-2: [Region-D, Region-E]
+
+宕机后：
+RS-1: [已下线]
+RS-2: [Region-D, Region-E, Region-A, Region-B]  ← Region-A/B 被迁移
+     WAL 重放恢复 Region-C 的 50MB 未刷写数据
+```
+
+## 四、RegionServer 的读写引擎
+
+RegionServer 是 HBase 数据操作的核心引擎，它管理着一组 Region，每个 Region 对应表中的一部分数据。RegionServer 内部包含多个关键组件：
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    RegionServer                          │
+│                                                          │
+│  ┌────────────┐  ┌────────────┐  ┌────────────┐          │
+│  │   Region   │  │   Region   │  │   Region   │          │
+│  │   Table-A  │  │   Table-B  │  │   Table-A  │          │
+│  │  (0-100]   │  │  (50-150]  │  │ (100-200]  │          │
+│  │            │  │            │  │            │          │
+│  │ ┌────────┐ │  │ ┌────────┐ │  │ ┌────────┐ │          │
+│  │ │MemStore│ │  │ │MemStore│ │  │ │MemStore│ │          │
+│  │ └────────┘ │  │ └────────┘ │  │ └────────┘ │          │
+│  │ ┌────────┐ │  │ ┌────────┐ │  │ ┌────────┐ │          │
+│  │ │  WAL   │ │  │ │  WAL   │ │  │ │  WAL   │ │          │
+│  │ └────────┘ │  │ └────────┘ │  │ └────────┘ │          │
+│  └────────────┘  └────────────┘  └────────────┘          │
+│                                                          │
+│  ┌─────────────────────────────────────────────────────┐│
+│  │              BlockCache (LruBlockCache)             ││
+│  │  L1: 堆内缓存 (默认 25% 堆内存)                        ││
+│  │  L2: 堆外缓存 (BucketCache，IO 模式)                   ││
+│  └─────────────────────────────────────────────────────┘│
+│                                                          │
+│  ┌─────────────────────────────────────────────────────┐│
+│  │           HFile (HDFS 上的数据文件)                  ││
+│  │  Region-A: [HFile-1, HFile-2, HFile-3]               ││
+│  │  Region-B: [HFile-4, HFile-5]                       ││
+│  └─────────────────────────────────────────────────────┘│
+└─────────────────────────────────────────────────────────┘
+```
+
+### 4.1 MemStore：写缓存
+
+每个 Region 都有一个 MemStore，用于缓存最近的写操作。写入流程：
+
+1. 数据先写入 WAL（保证持久性）
+2. 数据写入 MemStore（内存中的有序结构）
+3. 当 MemStore 大小达到阈值（默认 128MB，`hbase.hregion.memstore.flush.size`）时，触发 flush，生成 HFile
+
+MemStore 的数据结构是一个 **KeyValue 有序数组**，按 RowKey + Column Family + Qualifier + Timestamp 排序。这种有序结构使得后续生成 HFile 时可以直接顺序写入，非常高效。
+
+### 4.2 WAL：预写日志
+
+WAL（Write-Ahead Log）是 HBase 实现高可用的关键机制。每次写入操作必须先写入 WAL，只有 WAL 成功刷写到磁盘后，操作才算完成。这样，即使 RegionServer 宕机，也可以通过重放 WAL 恢复未持久化的数据。
+
+```java
+// WAL 写入流程
+public void append(WALKey key, WALEdit edit) {
+    // 1. 获取序列号（用于幂等性保证）
+    long sequenceId = wal.getSequenceNumber();
+    
+    // 2. 写入 WAL 缓冲区
+    FSWALEntry entry = new FSWALEntry(sequenceId, key, edit);
+    wal.bufferAppend(entry);
+    
+    // 3. 同步到磁盘（可选：asyncSync 或 sync）
+    if (!isSyncEnabled()) {
+        return; // 异步模式
+    }
+    wal.syncer.sync(); // 同步刷盘
+}
+```
+
+WAL 的持久化策略可以通过 `hbase.wal.provider` 配置：
+
+| 策略 | 说明 | 适用场景 |
+|---|---|---|
+| `defaultProvider` | 同步写 WAL，性能较差 | 数据安全性要求极高 |
+| `asyncfs` | 异步批量刷盘（默认） | 大多数生产场景 |
+| `multiwal` | 每个 Region 使用独立的 WAL | 写入密集型场景，减少 WAL 竞争 |
+
+### 4.3 BlockCache：读缓存
+
+HBase 的读操作会优先查询 BlockCache（LRU 缓存），命中则直接返回。如果未命中，则从 HFile 中读取数据并放入 BlockCache。
+
+BlockCache 默认使用堆内内存（`hfile.block.cache.size`，默认堆内存的 25%），也可以配置 BucketCache 使用堆外内存，减少 GC 压力：
+
+```xml
+<property>
+  <name>hbase.bucketcache.ioengine</name>
+  <value>offheap</value>  <!-- 或 file:path/to/cachefile -->
+</property>
+<property>
+  <name>hbase.bucketcache.size</name>
+  <value>2048</value>  <!-- 2GB -->
+</property>
+```
+
+## 五、Region 的生命周期
+
+### 5.1 Region 的结构
+
+每个 Region 包含以下信息：
+
+```java
+public class HRegionInfo {
+    private final TableName tableName;       // 表名
+    private final byte[] startKey;           // 起始 RowKey（包含）
+    private final byte[] endKey;             // 结束 RowKey（不包含）
+    private final long regionId;             // Region 唯一 ID
+    private final int replicaId;             // 副本 ID（用于 Region 复制）
+    private final boolean split;             // 是否正在分裂
+    private final boolean merged;            // 是否由合并产生
+}
+```
+
+一张表的数据按 RowKey 范围被划分为多个 Region，每个 Region 默认大小 10GB（`hbase.hregion.max.filesize`）。当 Region 过大时，会触发分裂。
+
+### 5.2 Region 寻址流程
+
+客户端读取数据的完整寻址流程：
+
+```
+客户端                        ZooKeeper                    Meta 表
+   │                              │                            │
+   │── get /hbase/meta-region-server ──→                      │
+   │←─ meta:RS-1:16000 ───────────│                            │
+   │                              │                            │
+   │──────────────────查询 meta 表 (RowKey: usertable,,) ─────→│
+   │←─ RegionInfo: usertable,,12345, RS-1:16000 ──────────────│
+   │                              │                            │
+   │──────────────────直接请求 RS-1 读取数据 ──────────────────→│
+   │←─ 返回数据 ────────────────────────────────────────────────│
+```
+
+这个流程确保了客户端能够准确定位数据，同时元数据查询路径极短。
+
+### 5.3 Region 分裂
+
+当 Region 的大小超过阈值（默认 10GB）时，RegionServer 会将其分裂为两个子 Region：
+
+```
+分裂前（Region-AB）:
+┌─────────────────────────────────────┐
+│  Region-AB [RowKey: A - Z]          │
+│  大小: 12GB                         │
+└─────────────────────────────────────┘
+
+分裂后:
+┌───────────────────┬─────────────────┐
+│  Region-A [A-M]   │ Region-N [N-Z]  │
+│  大小: 6GB        │ 大小: 6GB       │
+│  Parent Region    │ (新创建的子     │
+│  (标记为 split)   │  Region)        │
+└───────────────────┴─────────────────┘
+```
+
+分裂过程：
+
+1. **准备分裂**：RegionServer 在 ZooKeeper 创建 `/hbase/region-in-transition/table/region` 节点
+2. **更新 Meta**：修改 `hbase:meta` 表，记录两个子 Region 的信息
+3. **关闭父 Region**：停止对外服务，将 MemStore flush 到磁盘
+4. **创建子 Region**：在 HDFS 上创建两个子 Region 的目录结构
+5. **上线子 Region**：通知 HMaster，更新集群状态
+
+分裂过程对业务透明，但如果是热点 Region 分裂，新分裂出的子 Region 可能仍然在同一台 RegionServer 上，导致热点问题转移而非消除。
+
+## 六、高可用机制
+
+### 6.1 Region 复制
+
+HBase 2.x 引入了 Region 复制（Region Replication）特性，每个 Region 可以有多个副本分布在不同的 RegionServer 上：
+
+- **主副本（Primary Replica）**：处理所有写操作和强一致读
+- **从副本（Secondary Replica）**：处理最终一致性读请求，可以配置为只读或异步复制
+
+```xml
+<property>
+  <name>hbase.region.replication</name>
+  <value>true</value>
+</property>
+<property>
+  <name>hbase.regionserver.replication.sink.enabled</name>
+  <value>true</value>
+</property>
+```
+
+### 6.2 WAL 复制
+
+如果配置了 Region 复制，从副本通过异步重放 WAL 来追赶主副本的数据。HBase 使用 Ring Buffered Channel 实现低延迟的异步复制。
+
+### 6.3 故障恢复时间线
+
+```
+T+0s:    RegionServer 宕机，ZooKeeper 检测到心跳超时
+T+30s:   ZooKeeper 通知 HMaster
+T+45s:   HMaster 确认 RegionServer 不可用，开始重新分配 Region
+T+60s:   Region 在其他 RegionServer 上线，短暂不可用
+T+90s:   WAL 重放完成，数据完全恢复
+```
+
+默认的故障恢复时间约 30-90 秒，可以通过以下参数调优：
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `zookeeper.session.timeout` | 90s | ZooKeeper 心跳超时 |
+| `hbase.master.wait.for.regions.timeout` | 300s | 等待 Region 上线的超时时间 |
+
+## 七、架构设计的权衡
+
+### 7.1 CAP 定理的权衡
+
+分布式系统 CAP 定理告诉我们：一致性（Consistency）、可用性（Availability）、分区容错性（Partition Tolerance）三者不可兼得。HBase 的选择是：**强一致性 + 分区容错性，放弃部分可用性**。
+
+当网络分区发生时：
+
+- 如果无法连接到 ZooKeeper，HBase 集群将不可用（CP 系统）
+- 但在正常情况下，HBase 保证数据的强一致性
+
+与 HBase 不同，Cassandra 是典型的 AP 系统：允许读取到过期数据，但保证写入永远成功。
+
+### 7.2 LSM-Tree 的代价
+
+LSM-Tree（Log-Structured Merge-Tree）是 HBase 存储引擎的核心。相比 B+Tree，它在写入性能上有巨大优势，但也带来了以下代价：
+
+- **读放大（Read Amplification）**：查询可能需要扫描多个 HFile
+- **写放大（Write Amplification）**：数据被多次写入（MemStore → HFile → Compaction）
+- **空间放大（Space Amplification）**：Compaction 期间需要额外的磁盘空间
+
+```
+LSM-Tree 写入路径：
+写入 MemStore (内存) → flush 到 HFile (磁盘) → Compaction 合并 (后台)
+         ↓                    ↓                       ↓
+    极快，顺序写           刷满 128MB 时触发          多文件合并
+```
+
+## 总结
+
+HBase 的架构设计围绕一个核心目标：**在普通硬件上支持海量数据的随机读写**。
+
+- **ZooKeeper** 是系统的协调中心，负责 Master 选举、心跳检测、Meta 表定位
+- **HMaster** 是管理者，负责元数据变更和 Region 负载均衡，不参与实际数据读写
+- **RegionServer** 是数据节点，包含 MemStore、WAL、BlockCache 三大核心组件
+- **Region** 是数据分片单元，按 RowKey 范围划分，支持动态分裂和迁移
+- **WAL** 是高可用的保障，确保宕机后数据不丢失
+
+理解这些组件的职责和交互，是进行 HBase 性能调优和故障排查的基础。下一篇文章我们将深入探讨 HBase 的数据模型，理解 RowKey、列族、时间戳如何组织数据。

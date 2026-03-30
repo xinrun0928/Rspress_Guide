@@ -1,0 +1,488 @@
+import { Badge } from '@rspress/core/theme';
+
+# Redis 对象系统
+
+Redis 的对象系统是理解 Redis 高性能和内存优化的关键。我们已经了解了 Redis 支持的五种数据类型，但数据类型只是对外的接口。真正决定 Redis 性能和内存占用的，是底层的**数据结构**。
+
+这一章，我们深入 Redis 源码，看看每种数据类型背后的实现细节。
+
+## 对象系统的设计哲学
+
+Redis 的对象系统有几条核心原则：
+
+1. **编码与类型分离**：同一类型可以有多种编码实现
+2. **自动类型转换**：根据数据量自动选择最优编码
+3. **对象引用计数**：支持对象共享和延迟回收
+4. **LRU 机制**：内存淘汰策略的基础
+
+```c
+// Redis 对象结构
+typedef struct redisObject {
+    unsigned type:4;        // 类型：STRING/LIST/HASH/SET/ZSET
+    unsigned encoding:4;   // 编码：int/embstr/raw/ziplist/quicklist...
+    unsigned lru:LRU_BITS; // LRU 时间或引用计数
+    int refcount;           // 引用计数
+    void *ptr;             // 指向底层数据结构的指针
+} robj;
+```
+
+这条设计让 Redis 能够在小数据量时节省内存，大数据量时保证性能。
+
+## SDS：简单动态字符串
+
+### 为什么不用 C 字符串
+
+Redis 没有直接使用 C 语言的 char* 字符串，而是实现了自己的字符串类型 SDS（Simple Dynamic String）。
+
+C 字符串的问题：
+
+```c
+// C 字符串的问题
+char buf[10];
+strcpy(buf, "Hello");      // 没有边界检查，可能溢出
+strlen(buf);               // O(n) 时间复杂度
+sprintf(buf + strlen(buf), " World");  // 追加需要重新计算长度
+```
+
+### SDS 的结构
+
+```c
+// SDS 结构
+struct sdshdr {
+    int len;    // 已使用的字节数
+    int free;   // 剩余可用字节数
+    char buf[]; // 字节数组
+};
+```
+
+相比 C 字符串，SDS 的优势：
+
+| 特性 | C 字符串 | SDS |
+| --- | --- | --- |
+| 获取长度 | O(n) | O(1)，直接从 len 字段读取 |
+| 缓冲区溢出 | 可能发生 | 不会，追加前检查容量 |
+| 内存重分配 | 每次追加都可能 | 空间预分配 + 惰性释放 |
+| 二进制安全 | 不能含 \0 | 可以，依赖 len 而非 \0 |
+
+### SDS 的空间预分配
+
+SDS 追加操作会预分配额外空间：
+
+```c
+// 预分配策略
+if (newlen <= 1024 * 1024) {
+    // 小于 1MB，预分配 1 倍空间
+    alloc = newlen * 2;
+} else {
+    // 大于 1MB，预分配 1MB 额外空间
+    alloc = newlen + 1024 * 1024;
+}
+```
+
+这减少了内存重分配的次数。
+
+### SDS 的惰性空间释放
+
+SDS 缩短字符串时，不立即释放多余空间：
+
+```bash
+# Redis 示例
+> SET mykey "Hello World"
+OK
+> STRLEN mykey
+(integer) 11
+
+> APPEND mykey "!"
+(integer) 12  # free 字段保留了空间
+
+> SET mykey "Hi"
+(integer) 2  # 只改变 len，buf 中仍有剩余空间
+```
+
+这样后续追加操作可能不需要内存重分配。
+
+## ziplist：压缩列表
+
+### 结构设计
+
+ziplist 是 Redis 为了节省内存设计的一种紧凑结构：
+
+```
++------------------+----------+---------+
+| zlbytes (4字节)  | zltail(4)| zllen(2)| entries... | zlend (1字节) |
++------------------+----------+---------+
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| zlbytes | 整个 ziplist 的字节数 |
+| zltail | 最后一个元素的偏移量 |
+| zllen | 元素个数 |
+| entries | 压缩列表节点 |
+| zlend | 固定值 0xFF，表示结束 |
+
+### entry 的内部结构
+
+```
++-------------+-----------+---------------+
+| prevlen     | encoding  | content       |
++-------------+-----------+---------------+
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| prevlen | 前一个 entry 的长度（可变长 1/5 字节） |
+| encoding | 当前 entry 的编码和长度 |
+| content | 实际数据 |
+
+prevlen 的可变长设计：当长度 `` `<=` 253` 时，用 1 字节存储；超过则用 5 字节存储。
+
+### ziplist 的优缺点
+
+**优点**：
+
+- 内存连续，节省指针开销
+- 小数据量时非常紧凑
+
+**缺点**：
+
+- 插入/删除操作需要移动后续所有元素
+- 极端情况下可能引发连锁更新
+
+### 连锁更新问题
+
+当 ziplist 中前一个 entry 的 prevlen 从 253 变为 254 时，会导致下一个 entry 的 prevlen 从 1 字节扩展到 5 字节，这个 entry 又可能触发再下一个...
+
+```c
+// 极端场景：连续多个 entry 的 prevlen 边界值
+// prevlen = 253 -> 254 -> 253 -> 254 -> ...
+
+// 删除中间某个 entry 后：
+// 可能触发连锁扩展或收缩
+ziplistDelete(&zl, index);
+
+// 时间复杂度可能退化为 O(n^2)
+```
+
+这是 ziplist 的设计权衡，也是为什么 Redis 会在数据量增大时转换为其他结构。
+
+## quicklist：快速列表
+
+### 为什么需要 quicklist
+
+List 类型如果只用 ziplist，插入/删除效率太低；如果只用 linkedlist，指针开销太大。
+
+quicklist 是两者的折中：**多个 ziplist 组成的双向链表**。
+
+```
+quicklist
++---+     +---+---+---+     +---+---+---+
+| A | <-> |   | 1 |   | <-> |   | 2 |   | <-> | B |
++---+     +---+---+---+     +---+---+---+
+          ziplist           ziplist
+```
+
+每个 ziplist 被称为一个**节点**（quicklistNode），可以包含多个元素。
+
+### quicklist 的配置
+
+```bash
+# redis.conf
+list-max-ziplist-size -2      # 每个 ziplist 的最大元素数
+list-compress-depth 0         # 两端不压缩的节点数
+```
+
+`list-max-ziplist-size` 的取值：
+
+| 值 | 含义 |
+| --- | --- |
+| -5 | 最大 64 KB |
+| -4 | 最大 32 KB |
+| -3 | 最大 16 KB |
+| -2 | 最大 8 KB（默认） |
+| -1 | 每个 ziplist 最大 4 KB |
+| 正数 | 元素个数上限 |
+
+### LZF 压缩
+
+quicklist 支持 LZF 压缩，减少内存占用：
+
+```bash
+list-compress-depth 1  # 两端各 1 个节点不压缩，方便操作
+```
+
+```
+压缩后：
++---+     +-----------+     +-----------+     +---+---+---+
+| A | <-> | compressed | <-> | compressed | <-> | B | 1 | 2 |
++---+     +-----------+     +-----------+     +---+---+---+
+          压缩节点           压缩节点           不压缩
+```
+
+## intset：整数集合
+
+### 结构设计
+
+intset 是 Set 类型在小数据量时的底层实现：
+
+```c
+typedef struct intset {
+    uint32_t encoding;  // 编码：16/32/64 位整数
+    uint32_t length;    // 元素个数
+    int8_t contents[];  // 整数数组
+} intset;
+```
+
+### 整数自动升级
+
+当添加的整数超出当前编码范围时，会触发**升级**：
+
+```
+场景：当前 intset 编码为 int16_t，范围 [-32768, 32767]
+添加：40000
+
+触发升级：
+1. 扩展 encoding 为 int32_t
+2. 重新编码所有元素
+3. 添加新元素
+```
+
+升级过程：
+
+```c
+// 升级过程
+intset *is = intsetNew();      // encoding = int16_t
+is = intsetAdd(is, 100, NULL); // 添加 int16_t 范围内的数
+is = intsetAdd(is, 40000, NULL); // 触发升级到 int32_t
+// 所有元素重新编码，空间扩大
+```
+
+**不支持降级**：一旦升级到更大的编码，就不会再降回来。
+
+:::tip 升级的好处
+- 节省内存：大部分元素是小整数时使用 int16_t
+- 避免碎片：只在必要时才扩展空间
+:::
+
+## dict：字典
+
+### 结构设计
+
+Redis 的 dict 实现了标准的哈希表：
+
+```c
+typedef struct dict {
+    dictType *type;     // 类型特定函数
+    void *privdata;     // 私有数据
+    dictht ht[2];       // 两个哈希表（渐进式 rehash）
+    long rehashidx;     // rehash 进度，-1 表示未进行
+    long active;        // 正在迭代的迭代器数量
+} dict;
+```
+
+### 哈希表结构
+
+```c
+typedef struct dictht {
+    dictEntry **table;  // 哈希表数组
+    unsigned long size; // 哈希表大小
+    unsigned long sizemask;  // 掩码 = size - 1
+    unsigned long used;      // 已使用的节点数
+} dictht;
+```
+
+```
+哈希表结构：
+table
++------+------+------+------+
+| nil  |  *   | nil  |  *   |
++------+------+------+------+
+        |           |
+     entry      entry
+     key->v     key->v
+```
+
+### 哈希算法
+
+Redis 使用 MurmurHash2 算法：
+
+```c
+// 哈希计算
+unsigned long dictHashKey(dict *d, void *key) {
+    return dict->type->hashFunction(key);
+}
+
+// 桶计算
+index = hash & d->ht[table].sizemask;  // 相当于 hash % size
+```
+
+### 渐进式 rehash
+
+当哈希表需要扩展或收缩时，Redis 使用渐进式 rehash：
+
+```c
+// 渐进式 rehash
+// 将 ht[0] 的数据逐步迁移到 ht[1]
+
+// 第一步：扩展
+if (d->ht[0].used >= d->ht[0].size) {
+    d->ht[1] = dictNewHashTable(d->ht[0].size * 2);
+    d->rehashidx = 0;  // 开始 rehash
+}
+
+// 每次操作迁移一个桶
+while (d->rehashidx < d->ht[0].size) {
+    // 迁移一个桶
+    dictRehashStep(d);
+}
+```
+
+**渐进式的好处**：分摊了 rehash 的成本，避免大哈希表迁移时的阻塞。
+
+### 触发 rehash 的条件
+
+```c
+// 扩展条件
+if (d->ht[0].used >= d->ht[0].size) {
+    // 负载因子 >= 1，触发扩展
+}
+
+// 收缩条件
+if (d->ht[0].used < d->ht[0].size * 0.1) {
+    // 负载因子 < 0.1，触发收缩
+}
+```
+
+## 编码转换规则
+
+Redis 根据数据量自动转换编码：
+
+### Hash
+
+| 条件 | 编码 |
+| --- | --- |
+| 元素数 `` `<=` 512`，每元素 `` `<=` 64 字节 | ziplist |
+| 超过上述任一条件 | hashtable（dict） |
+
+```bash
+# 配置项
+hash-max-ziplist-entries 512
+hash-max-ziplist-value 64
+```
+
+### List
+
+| 条件 | 编码 |
+| --- | --- |
+| 满足 quicklist 条件 | quicklist（默认） |
+| 旧版本中元素数 `` `<=` 512` | ziplist |
+
+### Set
+
+| 条件 | 编码 |
+| --- | --- |
+| 所有元素都是整数，元素数 `` `<=` 512` | intset |
+| 超过上述条件 | hashtable（dict） |
+
+### ZSet
+
+| 条件 | 编码 |
+| --- | --- |
+| 元素数 `` `<=` 128`，每元素 `` `<=` 64 字节 | ziplist |
+| 超过上述条件 | skiplist + dict |
+
+:::warning 配置项
+可以在 redis.conf 中调整这些阈值，但通常不建议修改。Redis 的默认值是经过实践检验的平衡点。
+:::
+
+## 内存优化技巧
+
+### 利用编码特性节省内存
+
+```bash
+# 小整数使用 int 编码
+> SET small:num 100
+> DEBUG OBJECT ENCODING small:num
+"int"
+
+# 大整数使用 raw 编码
+> SET big:num 9999999999999
+> DEBUG OBJECT ENCODING big:num
+"raw"
+```
+
+### 利用 intset 节省 Set 内存
+
+```bash
+# 存储用户 ID（都是整数）
+> SADD user:ids 1001 1002 1003 1004 1005
+> DEBUG OBJECT ENCODING user:ids
+"intset"
+
+# 存储字符串
+> SADD user:tags "vip" "active" "premium"
+> DEBUG OBJECT ENCODING user:tags
+"hashtable"
+```
+
+### 利用 Hash 字段过期
+
+Redis 6.2 之前，Hash 字段不能独立设置过期时间。可以用以下方式模拟：
+
+```bash
+# 使用两级 key
+HSET user:session:1001 expire 1712000000 data "..."
+EXPIREAT user:session:1001 1712000000
+```
+
+## 对象共享
+
+### 引用计数机制
+
+Redis 使用引用计数管理对象生命周期：
+
+```c
+// 增加引用
+robj *dbFind(redisDb *db, robj *key) {
+    key->refcount++;  // 共享对象，引用计数 +1
+    return key;
+}
+
+// 释放对象
+void decrRefCount(robj *o) {
+    if (--o->refcount == 0) {
+        freeObject(o);
+    }
+}
+```
+
+### 共享对象池
+
+Redis 启动时创建共享对象池：
+
+```c
+// 共享对象
+shared.integers[0] = createObject(OBJ_STRING, sdsnew("0"));
+shared.integers[1] = createObject(OBJ_STRING, sdsnew("1"));
+// ... 预创建 0-9999 的整数对象
+
+// 当执行 INCR 时，直接返回共享对象
+if (value >= -1000 && value <= 1000) {
+    return shared.integers[value];
+}
+```
+
+:::tip 为什么从 0 开始
+小整数使用频率最高，共享它们可以节省大量内存。如果每次 SET/GET 都创建新对象，内存占用会显著增加。
+:::
+
+## 面试追问方向
+
+- SDS 相比 C 字符串有什么优势？
+- ziplist 的连锁更新问题是如何产生的？
+- quicklist 如何平衡空间和时间？
+- intset 升级后能降级吗？为什么？
+- dict 的渐进式 rehash 是如何工作的？
+- Redis 如何利用 LRU 淘汰数据？
+
+这些追问将帮助你深入理解 Redis 的内部实现。

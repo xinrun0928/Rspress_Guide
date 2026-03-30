@@ -1,0 +1,190 @@
+import { Badge } from '@rspress/core/theme';
+
+# TiDB 数据库总览
+
+凌晨 2 点，你正盯着监控大屏，MySQL 主库的 CPU 已经飙到 95%，数据量眼看就要突破单机的天花板。团队讨论要不要分库分表，但一想到跨库 JOIN、分布式事务、跨节点排序这些头疼的问题，又陷入了沉默。
+
+如果这时候有人说：「为什么不试试 TiDB？」你会不会好奇——它到底解决了什么问题？
+
+---
+
+## 一、TiDB 是什么？
+
+TiDB 是 PingCAP 公司开源的分布式 SQL 数据库，核心设计目标是**同时支持 OLTP（在线事务处理）和 OLAP（在线分析处理）**，也就是所谓的 HTAP 混合负载。
+
+<Badge text="HTAP" type="tip" /> 这三个字母背后意味着什么？传统架构下，你可能需要维护两套系统——MySQL 扛业务，Hive/Spark 做分析，中间用 Canal 或 Debezium 同步数据。HTAP 的野心是让你只需要维护一套数据库，既能秒级响应下单请求，也能几分钟内跑完上亿数据的聚合分析。
+
+但问题来了：OLTP 要求低延迟、强一致性，OLAP 要求高吞吐、并行计算，这两个需求在工程上天然对立。TiDB 是怎么做到的？
+
+答案藏在它的架构里。
+
+---
+
+## 二、核心架构：存储与计算分离
+
+TiDB 采用经典的 **Google Spanner/F1** 架构灵感，由四个核心组件构成：
+
+### TiDB Server：无状态的 SQL 层
+
+TiDB Server 负责解析 SQL、生成执行计划、结果汇总。它本身不存储数据，完全是无状态设计。这意味着你可以水平扩展任意多个 TiDB Server，用负载均衡器分发请求。
+
+```sql
+-- 客户端连接任意 TiDB Server
+-- TiDB Server 负责 SQL 解析和执行
+SELECT * FROM orders WHERE user_id = 12345;
+```
+
+### TiKV：行式存储引擎
+
+<Badge text="TiKV" type="tip" /> 是 TiDB 的行式存储引擎，基于 RocksDB 构建，采用 **Range 分片**（而不是 Hash 分片）。每个 Key-Value 对存储在一个 96MB 的 Region 中，Region 是数据调度的基本单元。
+
+```rust
+// TiKV 中数据的组织形式
+Key: "t{table}_r{region_id}_k{row_key}"
+Value: {row_data}
+```
+
+### PD：调度大脑
+
+<Badge text="PD" type="tip" />（Placement Driver）是整个集群的元数据管理和调度中心。它负责：
+
+- 存储整个集群的 Region 分布信息
+- 动态调度 Region 在 TiKV 节点间的均衡
+- 分配全局唯一的事务 ID（TSO）
+- 管理 TiKV 副本的拓扑（Label 亲和性）
+
+### TiFlash：列式存储引擎
+
+<Badge text="TiFlash" type="tip" /> 是 TiDB 的列式存储引擎，通过 Raft Learner 机制实时同步 TiKV 的数据。与 ClickHouse、Hive 不同，TiFlash 的同步是强一致的，不会出现 OLAP 查询读到旧数据的问题。
+
+---
+
+## 三、为什么 TiDB 能同时支持 OLTP 和 OLAP？
+
+这是面试官最爱问的问题。答案需要从三个维度来分析：
+
+### 维度一：架构层面的解耦
+
+| 特性 | 传统分库分表 | TiDB |
+|---|---|---|
+| SQL 支持 | 有限（跨库 JOIN 困难） | 完整（分布式 SQL） |
+| 扩展方式 | 业务代码改造 | 透明扩容 |
+| 事务范围 | 单库内原子性 | 跨节点分布式事务 |
+| 查询优化 | 依赖业务层 | CBO 优化器 |
+
+传统 MySQL 分库分表后，跨库查询基本靠业务层拼装，这是一场噩梦。而 TiDB 的 SQL 层完整保留了对 JOIN、子查询、窗口函数的支持。
+
+### 维度二：存储层面的分离
+
+TiKV 用行式存储服务 OLTP 场景，TiFlash 用列式存储服务 OLAP 场景。两者通过 Raft 协议保证数据一致性，OLAP 查询可以放心读到最新数据。
+
+```sql
+-- OLTP：行式查询，单行访问，延迟 < 10ms
+SELECT id, name, balance FROM users WHERE id = 1;
+
+-- OLAP：列式扫描，聚合分析
+SELECT region, SUM(amount), COUNT(*)
+FROM orders
+WHERE create_time >= '2024-01-01'
+GROUP BY region;
+```
+
+### 维度三：执行层面的优化
+
+TiDB 的 MPP（Massively Parallel Processing）模式让复杂分析查询可以在多个 TiFlash 节点间并行执行，充分利用硬件资源。
+
+---
+
+## 四、水平扩展能力
+
+TiDB 的扩展性是它的核心竞争力之一。
+
+### 在线扩容
+
+添加新的 TiKV 节点后，PD 会自动将数据从高负载节点迁移到新节点。整个过程对应用完全透明，无需停机。
+
+```bash
+# 扩容 TiKV（Kubernetes 环境）
+kubectl scale tidbcluster sample --namespace=tidb-cluster --replicas=4
+```
+
+### 热点打散
+
+对于写入热点（比如大促期间的订单表），TiDB 支持**自动热点调度**：PD 检测到某个 Region 访问频繁时，会自动将其分裂或调度到不同节点。
+
+### Label 亲和性
+
+通过 PD 的 Label 配置，可以控制数据副本的物理位置：
+
+```json
+{
+  "location-labels": ["zone", "rack"],
+  "region-schedule-limit": 2048
+}
+```
+
+---
+
+## 五、与 MySQL 的兼容性
+
+<Badge text="MySQL 5.7" type="tip" /> <Badge text="MySQL 8.0" type="tip" /> TiDB 高度兼容 MySQL 协议，现有 MySQL 客户端/ORM 框架可以无缝迁移。
+
+支持的特性：
+
+- DDL（CREATE、ALTER、DROP）
+- DML（SELECT、INSERT、UPDATE、DELETE）
+- 事务（ACID，支持 snapshot isolation）
+- 索引（主键索引、唯一索引、普通索引）
+- 字符集和排序规则
+
+不兼容的部分（如自增 ID 语义、外键、存储过程）官方有详细文档说明。
+
+---
+
+## 六、生态工具
+
+TiDB 生态中有几个常用的工具：
+
+| 工具 | 用途 |
+|---|---|
+| TiDB Data Migration (DM) | MySQL 到 TiDB 的数据同步 |
+| TiDB Lightning | 快速导入大量数据 |
+| Dumpling | 导出数据为 SQL 或 CSV |
+| sync-diff-inspector | 数据一致性校验 |
+| PingCAP Clinic | 远程诊断和巡检 |
+
+---
+
+## 七、适用场景
+
+TiDB 不是银弹，但它在以下场景表现出色：
+
+- **数据库瓶颈**：MySQL 单机已经优化到极限，但业务还在增长
+- **分库分表恐惧**：不想改造业务代码，不想处理跨库 JOIN
+- **HTAP 需求**：同时有实时分析和事务处理的需求
+- **云原生**：Kubernetes 部署，享受弹性扩缩容
+- **数据归档**：历史数据太多，想低成本归档又不丢失查询能力
+
+相反，如果你的数据量很小（< 1TB），MySQL 完全够用，没必要引入 TiDB 的复杂度。
+
+---
+
+## 八、学习路径
+
+本专题将从以下几个维度深入 TiDB：
+
+- **基础入门**：架构、MySQL 兼容性、应用场景
+- **TiKV 存储层**：Region 管理、Raft 协议、MVCC、Leader 调度
+- **SQL 执行层**：执行引擎、MPP、DDL、查询优化器、Percolator 事务
+- **运维管理**：PD 调度、扩容缩容、Binlog/DM、备份恢复、监控、故障排查
+- **HTAP 分析**：TiFlash 列式存储、HTAP 实战、TiSpark
+
+---
+
+## 总结
+
+TiDB 的本质是一个**分布式 SQL 引擎 + 存储层**。它用 Raft 协议保证副本一致性，用 PD 实现元数据调度，用 TiFlash 扩展 OLAP 能力。这套架构让它在保持 MySQL 兼容性的同时，获得了水平扩展的能力。
+
+但技术选型永远要考虑场景。TiDB 不是万能药，要不要用它，取决于你的业务特征和团队能力。
+
+下一节，我们深入看看 TiDB 的整体架构原理。

@@ -1,0 +1,482 @@
+# 缓存雪崩：过期时间随机化 + 多级缓存
+
+凌晨 12 点，你的系统准时「挂」了。不是被攻击，不是因为流量突增——只是因为你的 Redis 缓存在零点全部过期了。
+
+这就是缓存雪崩。
+
+## 什么是缓存雪崩
+
+缓存雪崩是指：**大量缓存 key 在同一时间失效，导致大量请求同时击穿到数据库**。
+
+```
+时间 T: 大量 key 同时过期
+         |
+         v
+缓存集群 -> 大量 key 失效
+         |
+         v
+大量请求 -> 数据库
+         |
+         v
+数据库过载 -> 系统崩溃
+```
+
+### 雪崩的两种类型
+
+**类型一：大量 key 同时过期**
+
+```bash
+# 场景：系统在零点重启，所有缓存同时过期
+
+# 用户请求 -> 缓存未命中 -> 数据库
+# 大量请求 -> 数据库崩溃
+
+# 常见原因：
+# - 系统初始化时批量写入缓存，设置相同过期时间
+# - 运维在低峰期刷新了所有缓存
+# - 缓存服务 Redis 突然重启
+```
+
+**类型二：Redis 宕机**
+
+```bash
+# 场景：Redis 集群突然宕机
+
+# 所有请求 -> 直接打到数据库
+# 数据库无法承受 -> 系统崩溃
+
+# 常见原因：
+# - Redis 内存耗尽
+# - Redis 主从全部宕机
+# - 网络分区
+```
+
+## 雪崩 vs 击穿 vs 穿透
+
+```
+缓存穿透：查询不存在的数据
+         ↓
+      数据不存在，绕过缓存
+      ↓
+      每次都查数据库
+
+缓存击穿：单个热点 key 过期
+         ↓
+      大量请求同时查一个 key
+      ↓
+      数据库压力集中在一点
+
+缓存雪崩：大量 key 同时过期
+         ↓
+      大量请求分散到多个 key
+      ↓
+      数据库压力分散但总量很大
+```
+
+## 解决方案一：过期时间随机化
+
+### 原理
+
+给缓存过期时间加一个随机值，避免大量 key 同时过期：
+
+```python
+import random
+
+def set_cache(key, value, base_ttl=3600):
+    """
+    设置缓存，过期时间 = 基础时间 + 随机时间
+    """
+    # 基础过期时间：1 小时
+    # 随机偏移：0 ~ 30 分钟
+    ttl = base_ttl + random.randint(0, 1800)
+    
+    redis.setex(key, ttl, json.dumps(value))
+
+
+def set_cache_with_jitter(key, value, base_ttl=3600):
+    """
+    使用「过期时间 jitter」策略
+    过期时间 = base_ttl + random(0, base_ttl * 0.2)
+    """
+    jitter = random.uniform(0, base_ttl * 0.2)
+    ttl = int(base_ttl + jitter)
+    
+    redis.setex(key, ttl, json.dumps(value))
+```
+
+### 过期时间分布
+
+```
+不使用随机化：
+缓存 key 过期时间
+key1: 3600 秒
+key2: 3600 秒
+key3: 3600 秒
+...
+所有 key 在同一秒过期！
+
+使用随机化：
+缓存 key 过期时间
+key1: 3600 秒
+key2: 3875 秒
+key3: 3421 秒
+key4: 3956 秒
+...
+过期时间分散开来
+```
+
+### 实现代码
+
+```python
+import random
+import json
+from typing import Any, Optional
+
+class CacheWithRandomExpire:
+    """带随机过期时间的缓存"""
+    
+    def __init__(self, redis_client, base_ttl: int = 3600):
+        self.redis = redis_client
+        self.base_ttl = base_ttl
+        self.jitter_ratio = 0.2  # 20% 的随机偏移
+    
+    def set(self, key: str, value: Any, ttl: Optional[int] = None):
+        """设置缓存"""
+        if ttl is None:
+            # 计算带随机偏移的过期时间
+            jitter = random.uniform(0, self.base_ttl * self.jitter_ratio)
+            ttl = int(self.base_ttl + jitter)
+        
+        self.redis.setex(key, ttl, json.dumps(value))
+    
+    def get(self, key: str) -> Optional[Any]:
+        """获取缓存"""
+        value = self.redis.get(key)
+        if value:
+            return json.loads(value)
+        return None
+
+
+# 使用示例
+cache = CacheWithRandomExpire(redis, base_ttl=3600)
+
+# 批量设置缓存（过期时间自动随机化）
+for item in items:
+    cache.set(f"item:{item['id']}", item)
+```
+
+## 解决方案二：多级缓存
+
+### 原理
+
+构建多级缓存架构，一级缓存失效时还有二级缓存：
+
+```
+请求 -> L1 缓存（本地缓存）
+            |
+            v
+      L1 未命中 -> L2 缓存（Redis）
+                        |
+                        v
+                  L2 未命中 -> 数据库
+```
+
+### 多级缓存实现
+
+```python
+import json
+from typing import Any, Optional
+from threading import Lock
+
+class LocalCache:
+    """本地缓存（LRU）"""
+    
+    def __init__(self, capacity=1000):
+        self.capacity = capacity
+        self.cache = {}
+        self.access_order = []
+        self.lock = Lock()
+    
+    def get(self, key: str) -> Optional[Any]:
+        """获取数据"""
+        with self.lock:
+            if key in self.cache:
+                # 更新访问顺序
+                self.access_order.remove(key)
+                self.access_order.append(key)
+                return self.cache[key]
+            return None
+    
+    def set(self, key: str, value: Any):
+        """设置数据"""
+        with self.lock:
+            if key in self.cache:
+                self.access_order.remove(key)
+            elif len(self.cache) >= self.capacity:
+                # LRU 淘汰
+                oldest = self.access_order.pop(0)
+                del self.cache[oldest]
+            
+            self.cache[key] = value
+            self.access_order.append(key)
+
+
+class MultiLevelCache:
+    """多级缓存"""
+    
+    def __init__(self, redis_client, local_cache: LocalCache):
+        self.redis = redis_client
+        self.l1_cache = local_cache
+    
+    def get(self, key: str) -> Optional[Any]:
+        """从多级缓存获取数据"""
+        # 1. 查询 L1（本地缓存）
+        value = self.l1_cache.get(key)
+        if value:
+            return value
+        
+        # 2. 查询 L2（Redis）
+        value = self.redis.get(key)
+        if value:
+            # 回填 L1
+            self.l1_cache.set(key, value)
+            return json.loads(value)
+        
+        return None
+    
+    def set(self, key: str, value: Any, ttl: int = 3600):
+        """设置多级缓存"""
+        # 1. 设置 L1
+        self.l1_cache.set(key, value)
+        
+        # 2. 设置 L2
+        self.redis.setex(key, ttl, json.dumps(value))
+    
+    def invalidate(self, key: str):
+        """失效缓存"""
+        self.l1_cache.cache.pop(key, None)
+        self.redis.delete(key)
+```
+
+### 缓存更新策略
+
+```python
+# 方案一：主动更新所有层级
+def update_all_levels(key, new_value):
+    # 更新 L1
+    l1_cache.set(key, new_value)
+    
+    # 更新 L2
+    redis.setex(key, ttl, json.dumps(new_value))
+    
+    # 更新 L3（如有）
+    if use_l3:
+        l3_cache.set(key, new_value)
+
+
+# 方案二：只更新 L2，L1 自动过期
+def update_l2_only(key, new_value):
+    redis.setex(key, ttl, json.dumps(new_value))
+    # L1 会在下次访问时更新
+```
+
+## 解决方案三：服务熔断限流
+
+### 熔断机制
+
+```python
+import time
+from functools import wraps
+
+class CircuitBreaker:
+    """熔断器"""
+    
+    def __init__(self, failure_threshold=5, timeout=60):
+        self.failure_count = 0
+        self.failure_threshold = failure_threshold
+        self.timeout = timeout
+        self.last_failure_time = None
+        self.state = 'CLOSED'  # CLOSED, OPEN, HALF_OPEN
+    
+    def call(self, func, *args, **kwargs):
+        """执行函数"""
+        if self.state == 'OPEN':
+            # 熔断开启，直接返回降级结果
+            if time.time() - self.last_failure_time > self.timeout:
+                self.state = 'HALF_OPEN'
+            else:
+                return self._fallback(*args, **kwargs)
+        
+        try:
+            result = func(*args, **kwargs)
+            self._on_success()
+            return result
+        except Exception as e:
+            self._on_failure()
+            raise e
+    
+    def _on_success(self):
+        """成功回调"""
+        self.failure_count = 0
+        self.state = 'CLOSED'
+    
+    def _on_failure(self):
+        """失败回调"""
+        self.failure_count += 1
+        self.last_failure_time = time.time()
+        
+        if self.failure_count >= self.failure_threshold:
+            self.state = 'OPEN'
+    
+    def _fallback(self, *args, **kwargs):
+        """降级方法"""
+        return {'status': 'degraded', 'data': None}
+```
+
+### 限流策略
+
+```python
+import time
+import redis
+
+class RateLimiter:
+    """限流器"""
+    
+    def __init__(self, redis_client):
+        self.redis = redis_client
+    
+    def is_allowed(self, key: str, max_requests: int, window: int) -> bool:
+        """
+        滑动窗口限流
+        key: 限流 key
+        max_requests: 窗口内最大请求数
+        window: 时间窗口（秒）
+        """
+        now = time.time()
+        window_key = f"rate_limit:{key}"
+        
+        # 移除窗口外的请求
+        self.redis.zremrangebyscore(window_key, 0, now - window)
+        
+        # 获取当前请求数
+        current = self.redis.zcard(window_key)
+        
+        if current >= max_requests:
+            return False
+        
+        # 添加当前请求
+        self.redis.zadd(window_key, {str(now): now})
+        self.redis.expire(window_key, window)
+        
+        return True
+
+
+# 使用限流器
+def get_data_with_limit(key):
+    limiter = RateLimiter(redis)
+    
+    if not limiter.is_allowed(f'db:{key}', max_requests=100, window=60):
+        # 限流触发，返回降级数据或错误
+        return {'error': 'Too many requests', 'status': 429}
+    
+    return get_data(key)
+```
+
+## 解决方案四：预热缓存
+
+### 原理
+
+在缓存过期前，主动重建缓存：
+
+```python
+import asyncio
+from datetime import datetime, timedelta
+
+class CacheWarmer:
+    """缓存预热"""
+    
+    def __init__(self, redis_client, cache_service):
+        self.redis = redis_client
+        self.cache_service = cache_service
+    
+    def warm_cache(self, keys: list):
+        """预热缓存"""
+        for key in keys:
+            # 查询数据库
+            data = self.cache_service._query_db(key)
+            
+            if data:
+                # 设置缓存（带随机过期时间）
+                ttl = 3600 + random.randint(0, 1800)
+                self.redis.setex(f"cache:{key}", ttl, json.dumps(data))
+    
+    async def schedule_warm(self, keys: list, interval: int = 3600):
+        """定时预热"""
+        while True:
+            self.warm_cache(keys)
+            await asyncio.sleep(interval)
+```
+
+## 组合方案
+
+实际生产环境中，通常组合使用多种方案：
+
+```python
+class AntiAvalancheCache:
+    """防雪崩缓存"""
+    
+    def __init__(self):
+        self.l1_cache = LocalCache(capacity=1000)
+        self.l2_cache = redis
+        self.breaker = CircuitBreaker()
+        self.limiter = RateLimiter(redis)
+    
+    def get(self, key):
+        """获取数据"""
+        # 1. L1 查询
+        value = self.l1_cache.get(key)
+        if value:
+            return value
+        
+        # 2. 限流检查
+        if not self.limiter.is_allowed(f'db:{key}', 100, 60):
+            return self._fallback(key)
+        
+        # 3. 熔断检查
+        try:
+            return self.breaker.call(self._get_from_db, key)
+        except Exception:
+            return self._fallback(key)
+    
+    def _get_from_db(self, key):
+        """从数据库获取"""
+        # L2 查询
+        value = self.l2_cache.get(f"cache:{key}")
+        if value:
+            self.l1_cache.set(key, value)
+            return json.loads(value)
+        
+        # 查数据库（带互斥锁）
+        data = self.cache_service.get_with_lock(key)
+        
+        if data:
+            # 回填缓存
+            ttl = 3600 + random.randint(0, 1800)
+            self.l2_cache.setex(f"cache:{key}", ttl, json.dumps(data))
+        
+        return data
+    
+    def _fallback(self, key):
+        """降级方法"""
+        return {'status': 'degraded', 'message': 'Service temporarily unavailable'}
+```
+
+## 面试追问方向
+
+- 什么是缓存雪崩？和击穿、穿透有什么区别？
+- 如何避免大量 key 同时过期？
+- 多级缓存架构有什么优缺点？
+- 熔断和限流的区别是什么？
+- 如何设计一个防雪崩的缓存系统？
+
+理解缓存雪崩问题，展示了你对系统高可用性的理解。

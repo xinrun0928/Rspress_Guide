@@ -1,0 +1,675 @@
+import { Badge } from '@rspress/core/theme';
+
+# SQLite 事务模型与 WAL 模式
+
+凌晨两点，你的手机只剩 10% 的电量。你正在编辑一条重要的备忘录，突然系统崩溃了。
+
+当你重启手机后，你发现那条备忘录完好无损——最后修改的时间就在崩溃前的几秒钟。
+
+这背后是 SQLite 的事务机制在起作用。SQLite 的事务不是 MySQL 那样的 Redo Log，也不是 PostgreSQL 那样的 WAL 体系，而是基于文件系统的原子操作。这种设计简单到不可思议，但恰恰是这份简单，让它在极端环境下依然可靠。
+
+你能回答这个问题吗——**「为什么 SQLite 的事务原子性比大多数数据库更可靠，即使它没有复杂的 Redo Log？」**
+
+## 事务的基石：ACID 在 SQLite 中的实现
+
+### SQLite 的 ACID 保障
+
+ACID 是事务的四大特性：原子性（Atomicity）、一致性（Consistency）、隔离性（Isolation）、持久性（Durability）。SQLite 对 ACID 的实现有其独特之处：
+
+| 特性 | SQLite 实现 | 与 MySQL InnoDB 对比 |
+|---|---|---|
+| 原子性 | 基于文件系统的事务（fsync） | 基于 Redo Log + 崩溃恢复 |
+| 一致性 | 文件级别的完整性约束 | 事务回滚 + 约束检查 |
+| 隔离性 | SERIALIZABLE / READ UNCOMMITTED | 4 种隔离级别 |
+| 持久性 | 提交时强制刷盘（fsync） | Redo Log 保证 |
+
+:::tip SQLite 原子性的秘密
+
+SQLite 的原子性依赖于操作系统和文件系统提供的基础能力。具体来说：
+- macOS: `fcntl()` 加锁 + `fsync()` 刷盘
+- Linux: `flock()` 或 `fcntl()` 加锁 + `fsync()` 刷盘
+- Windows: `WriteFile()` + `FlushFileBuffers()`
+
+SQLite 本身不做任何「恢复」操作——要么写入成功，要么什么都没发生。
+:::
+
+### 事务类型
+
+SQLite 支持三种事务类型，通过 SQL 语句指定：
+
+```sql
+-- 立即模式：立即获取写锁
+BEGIN IMMEDIATE;
+
+-- 独占模式：立即获取排他锁
+BEGIN EXCLUSIVE;
+
+-- 默认模式：延迟到第一条写操作才获取锁
+BEGIN;
+-- 或者
+BEGIN TRANSACTION;
+```
+
+选择正确的事务类型对性能至关重要：
+
+| 类型 | 何时获取锁 | 适用场景 |
+|---|---|---|
+| `BEGIN`（默认） | 第一条写语句时 | 读多写少，单事务 |
+| `BEGIN IMMEDIATE` | 立即 | 明确知道会写 |
+| `BEGIN EXCLUSIVE` | 立即，并排斥其他连接 | 需要最高保证 |
+
+```sql
+-- 场景：电商下单
+-- 正确做法：使用 IMMEDIATE 避免长时间持有读锁
+BEGIN IMMEDIATE;
+UPDATE inventory SET stock = stock - 1 WHERE product_id = 123;
+UPDATE orders SET status = 'paid' WHERE order_id = 456;
+COMMIT;
+
+-- 错误做法：先读后写，使用默认 BEGIN
+BEGIN;  -- 此时还是读锁
+SELECT stock FROM inventory WHERE product_id = 123;  -- 读
+-- ... 业务逻辑 ...
+UPDATE inventory SET stock = stock - 1 ...  -- 升级为写锁，可能阻塞其他读者
+COMMIT;
+```
+
+## 三种回滚模式：DELETE、TRUNCATE、WAL
+
+### 模式概览
+
+SQLite 支持三种事务回滚模式，通过 `PRAGMA journal_mode` 设置：
+
+```sql
+-- 查看当前模式
+PRAGMA journal_mode;
+
+-- 设置模式
+PRAGMA journal_mode = DELETE;      -- 默认模式
+PRAGMA journal_mode = TRUNCATE;    -- 日志截断
+PRAGMA journal_mode = WAL;         -- Write-Ahead Logging
+PRAGMA journal_mode = MEMORY;      -- 仅内存（测试用）
+PRAGMA journal_mode = OFF;         -- 无日志，禁止并发（危险）
+```
+
+| 模式 | 优点 | 缺点 | 适用场景 |
+|---|---|---|---|
+| DELETE | 兼容性好，崩溃安全 | 写入慢，需要读写两次 | 默认，生产环境 |
+| TRUNCATE | 比 DELETE 稍快 | 崩溃恢复可能不完整 | 追求性能 |
+| WAL | 高并发读写 | 多文件占用空间 | 高并发应用 |
+| MEMORY | 最快 | 断电即丢失 | 测试、缓存 |
+| OFF | 最快 | 任意断电会损坏数据库 | 禁止使用 |
+
+### DELETE 模式：经典的回滚日志
+
+DELETE 模式是 SQLite 的默认模式，也是最经典的回滚日志实现。
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     DELETE 模式工作流程                       │
+├─────────────────────────────────────────────────────────────┤
+│ 1. BEGIN (获取 SHARED 锁)                                    │
+│                                                             │
+│ 2. BEGIN IMMEDIATE (获取 RESERVED 锁)                       │
+│    ├─ 创建 .db-journal 文件                                 │
+│    └─ 备份即将修改的页面到 journal 文件                      │
+│                                                             │
+│ 3. 执行修改                                                  │
+│    ├─ 修改内存中的页面                                        │
+│    └─ 标记页面为「已修改」                                    │
+│                                                             │
+│ 4. COMMIT                                                   │
+│    ├─ 将 journal 文件重命名为特殊名称                         │
+│    ├─ 原子性地更新文件头                                      │
+│    └─ 删除 journal 文件                                     │
+│                                                             │
+│ 5. 释放锁                                                    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+关键步骤的细节：
+
+```sql
+-- 实际发生的事件序列
+BEGIN IMMEDIATE;
+
+-- SQLite 内部操作（用户不可见）：
+-- 1. 打开 myapp.db-journal 文件
+-- 2. 读取需要修改的页面（Page 5, Page 12）
+-- 3. 将原始 Page 5, Page 12 写入 journal 文件
+-- 4. 在内存中修改 Page 5, Page 12
+-- 5. 将修改后的 Page 5, Page 12 写入数据库文件
+-- 6. fsync() 确保数据落盘
+-- 7. 删除 journal 文件
+-- 8. 提交完成
+
+COMMIT;
+```
+
+:::warning DELETE 模式的性能瓶颈
+
+每次写入都需要：
+1. 读取原始页面
+2. 写入 journal 文件
+3. 写入新页面
+4. fsync() 两次（journal + 数据文件）
+
+对于频繁写入的场景，这是巨大的开销。
+:::
+
+### TRUNCATE 模式：DELETE 的优化变体
+
+TRUNCATE 模式与 DELETE 模式工作原理相同，但有一个关键优化：
+
+```sql
+PRAGMA journal_mode = TRUNCATE;
+
+-- TRUNCATE vs DELETE 的区别：
+-- DELETE:   rm myapp.db-journal     (删除文件)
+-- TRUNCATE: truncate myapp.db-journal to 0 bytes  (截断文件)
+```
+
+文件截断比删除更快，因为：
+- 不需要释放文件系统的目录项
+- 不需要更新文件系统的元数据
+
+```bash
+# DELETE 模式：删除 journal 文件
+$ rm myapp.db-journal
+# 需要：删除目录项 + 更新 inode + 释放磁盘块
+
+# TRUNCATE 模式：截断 journal 文件
+$ truncate -s 0 myapp.db-journal
+# 只需：更新文件大小为 0，保留磁盘块供下次复用
+```
+
+对于频繁写入的场景，TRUNCATE 模式可以节省 10-20% 的 I/O 时间。
+
+## WAL 模式：Write-Ahead Logging 详解
+
+### WAL 的核心思想
+
+WAL（Write-Ahead Logging）是 SQLite 3.11.0 引入的持久化模式，它的核心思想是：**写操作先记日志，读操作照常进行**。
+
+```
+传统模式（DELETE/TRUNCATE）：
+┌─────────────────────────────────────────────────────────┐
+│ 写事务执行期间：                                          │
+│ - 持有 RESERVED 锁                                        │
+│ - 其他读操作被阻塞（等待 SHARED 锁）                      │
+│ - 其他写操作被阻塞（等待 EXCLUSIVE 锁）                    │
+└─────────────────────────────────────────────────────────┘
+
+WAL 模式：
+┌─────────────────────────────────────────────────────────┐
+│ 写事务执行期间：                                          │
+│ - 持有 WAL 写入权限                                       │
+│ - 读操作无需等待，可以并发进行                              │
+│ - 写操作追加到 WAL 文件                                    │
+└─────────────────────────────────────────────────────────┘
+```
+
+### WAL 文件结构
+
+启用 WAL 模式后，SQLite 会创建三个文件：
+
+```bash
+$ ls -lh myapp.db*
+-rw-r--r--  1 user  staff  10M Mar 30 10:00 myapp.db       # 主数据库文件
+-rw-r--r--  1 user  staff  1M Mar 30 10:00 myapp.db-wal    # WAL 日志文件
+-rw-r--r--  1 user  staff  4K Mar 30 10:00 myapp.db-shm   # 共享内存文件
+```
+
+每个文件的作用：
+
+| 文件 | 作用 | 大小 | 可否删除 |
+|---|---|---|---|
+| `.db` | 主数据库文件，包含已提交的修改 | 固定 | 否 |
+| `.db-wal` | WAL 日志，包含未 checkpoint 的修改 | 动态增长 | 可（会丢失未提交事务） |
+| `.db-shm` | 共享内存，用于多进程协调 | 固定（约 64KB） | 可（下次自动创建） |
+
+### WAL 页面结构
+
+WAL 文件由一系列 WAL 页面组成，每个页面包含：
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    WAL 文件结构                            │
+├─────────────────────────────────────────────────────────┤
+│ Header (32 字节)                                         │
+│ ├─ WAL 格式版本                                          │
+│ ├─ 页面大小                                              │
+│ ├─ 序列号                                                │
+│ └─ 校验和                                                │
+├─────────────────────────────────────────────────────────┤
+│ Frame 1 (每个 Frame = 24 字节 header + 页面大小)           │
+│ ├─ 页码 (4 字节)                                         │
+│ ├─ 提交序列号 (4 字节)                                   │
+│ ├─ 页面内容校验和 (8 字节)                               │
+│ └─ 页面数据 (通常 4096 字节)                             │
+├─────────────────────────────────────────────────────────┤
+│ Frame 2                                                  │
+│ ...                                                      │
+├─────────────────────────────────────────────────────────┤
+│ Frame N                                                  │
+└─────────────────────────────────────────────────────────┘
+```
+
+### WAL 的写入流程
+
+```sql
+PRAGMA journal_mode = WAL;
+PRAGMA synchronous = NORMAL;  -- 推荐设置
+
+-- 开启事务
+BEGIN IMMEDIATE;  -- 在 WAL 模式下会获取写锁
+
+-- 执行写入
+UPDATE users SET email = 'new@example.com' WHERE id = 1;
+
+-- 提交
+COMMIT;
+```
+
+实际发生的内部操作：
+
+```
+1. 获取 WAL 写入锁（在 myapp.db-shm 中记录）
+
+2. 读取原始页面（从 myapp.db）
+   Page 7 的内容被读取到内存
+
+3. 修改页面
+   Page 7 的 email 字段改为 'new@example.com'
+
+4. 追加到 WAL 文件（myapp.db-wal）
+   Frame 1: [Page 7 Header] + [修改后的 Page 7 数据]
+   写入位置：WAL 文件末尾
+
+5. 释放 WAL 写入锁
+
+6. COMMIT 完成
+   此时修改已经在 WAL 文件中，但主数据库文件尚未更新
+```
+
+### Checkpoint：WAL 到数据库的同步
+
+WAL 文件中的修改最终需要写回主数据库文件，这个过程叫做 **Checkpoint**。
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                      Checkpoint 流程                      │
+├─────────────────────────────────────────────────────────┤
+│ 1. 获取 CHECKPOINT 锁                                    │
+│                                                             │
+│ 2. 读取 WAL 文件中的所有 Frame                            │
+│    Frame 1: Page 7                                        │
+│    Frame 2: Page 15                                       │
+│    ...                                                    │
+│                                                             │
+│ 3. 将修改写入主数据库文件                                   │
+│    myapp.db Page 7 ← 修改后的 Page 7                      │
+│    myapp.db Page 15 ← 修改后的 Page 15                    │
+│                                                             │
+│ 4. 更新数据库文件头                                        │
+│    - WAL 计数器                                            │
+│    - 文件修改时间                                          │
+│                                                             │
+│ 5. fsync() 主数据库文件                                    │
+│                                                             │
+│ 6. 截断或删除 WAL 文件                                     │
+│    myapp.db-wal → 已清空                                   │
+└─────────────────────────────────────────────────────────┘
+```
+
+SQLite 支持三种 Checkpoint 策略：
+
+```sql
+-- 同步级别
+PRAGMA synchronous = 0;   -- 不调用 fsync()，最快但不安全
+PRAGMA synchronous = 1;   -- 只同步 WAL 文件（NORMAL，推荐）
+PRAGMA synchronous = 2;   -- 同步 WAL 和数据库文件（FULL，最安全）
+
+-- WAL 自动 checkpoint 阈值
+PRAGMA wal_autocheckpoint = 1000;  -- 默认：WAL 超过 1000 页时自动 checkpoint
+```
+
+### WAL 的并发特性
+
+WAL 模式的核心优势是**读写并发**：
+
+```
+时间轴 →
+───────────────────────────────────────────────────────────────────
+事务 A (写)  │ BEGIN │ [写WAL]  │ COMMIT │
+             │       │          │        │
+事务 B (读)  │       │ [读取]   │        │ [读取]
+事务 C (读)  │       │ [读取]   │        │ [读取]
+───────────────────────────────────────────────────────────────────
+             ↑       ↑          ↑
+          读锁无阻塞  写锁互斥    写完读可继续
+
+DELETE 模式：
+时间轴 →
+───────────────────────────────────────────────────────────────────
+事务 A (写)  │ BEGIN │ [升级写锁] │ [阻塞读] │ [完成] │
+             │       │           │          │        │
+事务 B (读)  │       │           │ [等待锁] │        │
+事务 C (读)  │       │           │ [等待锁] │        │
+───────────────────────────────────────────────────────────────────
+                      ↑           ↑
+                   升级写锁      其他事务等待
+```
+
+| 场景 | DELETE/TRUNCATE 模式 | WAL 模式 |
+|---|---|---|
+| 1 写 1 读 | 写阻塞读 | 并发执行 |
+| 1 写 N 读 | 写阻塞所有读 | 写并发 N 读 |
+| N 写 1 读 | 写串行 | 写串行（同一时刻只能一个写） |
+
+:::tip WAL 的最佳实践
+
+1. **批量写入**：将多个操作放在一个事务中，减少 WAL 文件增长
+2. **定期 checkpoint**：监控 WAL 文件大小，避免无限增长
+3. **合理设置 synchronous**：生产环境用 NORMAL，极端场景用 FULL
+4. **关闭前 checkpoint**：确保所有修改都已持久化
+
+:::
+
+## 事务的锁机制
+
+### 锁的状态转换
+
+SQLite 使用五种锁状态：
+
+| 状态 | 说明 | 谁持有 | 其他事务能否读 | 其他事务能否写 |
+|---|---|---|---|---|
+| UNLOCKED | 无锁 | 无 | 能 | 能 |
+| SHARED | 共享锁 | 读事务 | 能（共享） | 不能 |
+| RESERVED | 预留锁 | 即将写入 | 能（共享） | 不能 |
+| PENDING | 待定锁 | 等待升级 | 不能 | 不能 |
+| EXCLUSIVE | 排他锁 | 写事务 | 不能 | 不能 |
+
+锁状态转换图：
+
+```
+                    UNLOCKED
+                       │
+                       │ BEGIN
+                       ▼
+                   SHARED ◄─────────────┐
+                   │     │                │
+                   │     │  BEGIN EXCLUSIVE
+                   │     ▼                │
+                   │  EXCLUSIVE           │
+                   │     │                │
+                   │     │  COMMIT/ROLLBACK
+                   │     └────────────────┘
+                   │
+                   │ BEGIN IMMEDIATE 或写操作
+                   ▼
+                RESERVED
+                   │
+                   │ 等待所有 SHARED 释放
+                   ▼
+                PENDING
+                   │
+                   │ 所有 SHARED 释放
+                   ▼
+               EXCLUSIVE
+                   │
+                   │ COMMIT/ROLLBACK
+                   ▼
+                  ...
+```
+
+### WAL 模式的锁机制
+
+WAL 模式不使用传统的数据库锁，而是使用 WAL 槽位（frame）：
+
+```sql
+-- WAL 模式的锁实际上是在 .db-shm 文件中管理的
+PRAGMA journal_mode = WAL;
+
+BEGIN;
+-- 此时：
+-- - 获取数据库文件的 SHARED 锁
+-- - 在 WAL 中分配写槽位
+-- 读操作只需要 SHARED 锁，可以并发
+UPDATE ...;
+-- 将修改写入 WAL 文件，不阻塞读
+COMMIT;
+```
+
+WAL 的锁机制更加精细：
+
+- **读事务**：只需要 SHARED 锁，可以在任意时刻获取
+- **写事务**：在 WAL 中获取写权限，追加 Frame
+- **Checkpoint**：获取 EXCLUSIVE 锁，合并 WAL 到数据库
+
+:::warning WAL 的潜在问题
+
+WAL 文件可能无限增长，如果：
+- Checkpoint 被禁用
+- 有长时间运行的读事务（阻止 checkpoint）
+- 写入频繁但 checkpoint 不及时
+
+解决方法是定期执行 `PRAGMA wal_checkpoint(TRUNCATE);`
+:::
+
+## 事务的隔离级别
+
+### SQLite 支持的隔离级别
+
+SQLite 只支持两种隔离级别：
+
+```sql
+-- 默认：SERIALIZABLE
+BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+
+-- 可选：READ UNCOMMITTED
+BEGIN TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+```
+
+| 隔离级别 | 说明 | 脏读 | 不可重复读 | 幻读 |
+|---|---|---|---|---|
+| SERIALIZABLE | 串行化，最严格 | 不可能 | 不可能 | 不可能 |
+| READ UNCOMMITTED | 未提交读，最宽松 | 可能 | 可能 | 可能 |
+
+### SERIALIZABLE 的实现
+
+SQLite 的 SERIALIZABLE 不是通过 MVCC（多版本并发控制）实现的，而是通过**真正的串行执行**：
+
+```sql
+-- 事务 A
+BEGIN IMMEDIATE;
+SELECT * FROM users WHERE id = 1;  -- 返回: {id: 1, name: 'Alice'}
+UPDATE users SET name = 'Bob' WHERE id = 1;
+-- 此时事务 B 尝试 SELECT:
+BEGIN IMMEDIATE;  -- 阻塞，等待事务 A 完成
+SELECT * FROM users WHERE id = 1;  -- 事务 A 提交后执行
+-- 结果: {id: 1, name: 'Bob'}
+
+-- 事务 A 的修改对事务 B 可见，但 B 没有读取到中间状态
+```
+
+这意味着 SQLite 的 SERIALIZABLE 级别比 MySQL InnoDB 的 REPEATABLE READ 更强——它不会出现「同一事务中两次读取结果不同」的情况。
+
+### WAL 模式下的读一致性
+
+在 WAL 模式下，SQLite 提供了一个特殊的机制来保证读一致性：
+
+```sql
+PRAGMA journal_mode = WAL;
+
+-- 读取器可以指定一个「读取桩」（Read Mark）
+PRAGMA read_uncommitted = 1;  -- 允许读取未提交的 WAL 数据
+
+-- 或者使用默认行为：
+-- 读取器总是看到数据库在 BEGIN 时刻的一致性快照
+BEGIN;
+SELECT * FROM users;  -- 快照：事务开始时的状态
+-- 此时其他事务修改并提交了新数据
+SELECT * FROM users;  -- 仍然是快照中的数据
+COMMIT;
+```
+
+## 崩溃恢复
+
+### SQLite 的崩溃恢复机制
+
+SQLite 的崩溃恢复是自动的，不需要任何人工干预：
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    崩溃恢复流程                           │
+├─────────────────────────────────────────────────────────┤
+│ 1. 数据库重新打开                                         │
+│                                                             │
+│ 2. 读取文件头，检查：                                      │
+│    ├─ change counter 是否匹配                             │
+│    ├─ 是否有未完成的 journal/wal 文件                      │
+│    └─ 文件是否损坏                                         │
+│                                                             │
+│ 3. 如果发现异常，进入恢复模式：                             │
+│    ├─ DELETE 模式：回放 journal 文件                       │
+│    └─ WAL 模式：执行 checkpoint                            │
+│                                                             │
+│ 4. 恢复正常状态                                             │
+└─────────────────────────────────────────────────────────┘
+```
+
+### DELETE 模式的恢复
+
+```sql
+-- 假设崩溃发生在写入过程中
+BEGIN IMMEDIATE;
+UPDATE users SET name = 'NewName' WHERE id = 1;
+-- 崩溃！此时 journal 文件存在且未删除
+
+-- 恢复过程：
+-- 1. SQLite 发现 .db-journal 文件
+-- 2. 读取 journal 中的原始页面
+-- 3. 将原始页面写回数据库（撤销未完成的修改）
+-- 4. 删除 journal 文件
+-- 5. 数据库恢复到 BEGIN 之前的状态
+```
+
+### WAL 模式的恢复
+
+```sql
+-- WAL 模式下的崩溃
+BEGIN IMMEDIATE;
+UPDATE users SET name = 'NewName' WHERE id = 1;
+COMMIT;  -- 假设此时崩溃
+-- WAL 文件中已有已提交的修改，但未 checkpoint
+
+-- 恢复过程：
+-- 1. SQLite 读取 WAL 文件头
+-- 2. 检查并验证所有 Frame 的校验和
+-- 3. 执行 checkpoint：将 WAL 内容合并到主数据库
+-- 4. 数据库恢复到最近的一致状态
+```
+
+:::tip 崩溃安全的保障
+
+SQLite 的崩溃安全基于两个关键点：
+1. **原子性的文件写入**：操作系统保证 512 字节块的原子写入
+2. **完整的恢复日志**：journal 或 WAL 文件包含完整的恢复信息
+
+这意味着 SQLite 可以在任何时刻（即使正在写入）崩溃，恢复后要么看到完整的修改，要么什么修改都没有——永远不会看到「半写」状态。
+:::
+
+## 事务的使用实践
+
+### 正确的事务写法
+
+```sql
+-- ✅ 正确：使用 try-finally 确保提交或回滚
+BEGIN IMMEDIATE;
+try:
+    UPDATE users SET balance = balance - 100 WHERE id = 1;
+    UPDATE users SET balance = balance + 100 WHERE id = 2;
+    COMMIT;
+except:
+    ROLLBACK;
+finally:
+    -- 释放锁
+
+-- ❌ 错误：忘记提交或回滚
+BEGIN IMMEDIATE;
+UPDATE ...;
+-- 忘记写 COMMIT 或 ROLLBACK
+-- 锁会一直持有，直到连接关闭
+```
+
+### 批量操作优化
+
+```sql
+-- ❌ 低效：每行一个事务
+BEGIN IMMEDIATE;
+INSERT INTO logs VALUES (1, 'msg1'); COMMIT;
+BEGIN IMMEDIATE;
+INSERT INTO logs VALUES (2, 'msg2'); COMMIT;
+BEGIN IMMEDIATE;
+INSERT INTO logs VALUES (3, 'msg3'); COMMIT;
+-- 每个操作都有独立的 fsync() 开销
+
+-- ✅ 高效：批量事务
+BEGIN IMMEDIATE;
+INSERT INTO logs VALUES (1, 'msg1');
+INSERT INTO logs VALUES (2, 'msg2');
+INSERT INTO logs VALUES (3, 'msg3');
+COMMIT;
+-- 整个批量操作只需一次 fsync()
+```
+
+### WAL 模式的配置建议
+
+```sql
+-- 推荐的生产配置
+PRAGMA journal_mode = WAL;
+PRAGMA synchronous = NORMAL;        -- WAL 文件同步
+PRAGMA wal_autocheckpoint = 1000;  -- 自动 checkpoint
+PRAGMA cache_size = -64000;        -- 64MB 缓存
+
+-- 应用启动时执行一次
+-- 确保 WAL 模式已启用
+PRAGMA journal_mode;  -- 应该返回 'wal'
+```
+
+## 面试要点总结
+
+### 面试官可能会问的问题
+
+**Q1：SQLite 的 WAL 模式和 DELETE 模式有什么区别？**
+
+回答要点：
+- DELETE 模式使用回滚日志，写操作阻塞读
+- WAL 模式使用预写日志，写操作追加到 WAL 文件
+- WAL 模式支持读写并发（多个读可以和一个写同时执行）
+- WAL 模式会产生三个文件（.db, .db-wal, .db-shm）
+
+**Q2：SQLite 事务的原子性是如何保证的？**
+
+回答要点：
+- SQLite 的原子性依赖文件系统的原子写入能力
+- 事务开始时获取锁，所有修改缓存在内存
+- 提交时一次性写入文件（或 WAL），最后更新文件头
+- 如果写入中断，文件头不更新，恢复时根据 journal/WAL 判断
+
+**Q3：SQLite 的 Checkpoint 是什么？什么时候发生？**
+
+回答要点：
+- Checkpoint 是将 WAL 内容合并回主数据库的过程
+- 自动 checkpoint：当 WAL 文件达到 `wal_autocheckpoint` 阈值（默认 1000 页）
+- 手动 checkpoint：`PRAGMA wal_checkpoint`
+- Checkpoint 需要获取 EXCLUSIVE 锁，会阻塞读写
+
+**Q4：SQLite 的 SERIALIZABLE 和 MySQL InnoDB 的 REPEATABLE READ 有什么区别？**
+
+回答要点：
+- SQLite 使用真正的串行执行，通过锁实现 SERIALIZABLE
+- MySQL InnoDB 使用 MVCC 实现 REPEATABLE READ
+- SQLite 不会出现同一事务内两次读取结果不同（不会有幻读）
+- MySQL InnoDB 的 REPEATABLE READ 可能出现幻读，但通过 Next-Key Lock 缓解

@@ -1,0 +1,262 @@
+import { Badge } from '@rspress/core/theme';
+
+# Redis Cluster：槽分片与集群通信
+
+哨兵解决了高可用问题，但没有解决**数据容量**问题。当单台 Redis 内存不够用时，哨兵束手无策。
+
+Redis Cluster 就是为了解决这个问题的——**将数据分散到多个节点，实现水平扩展**。
+
+## Cluster 的核心设计
+
+Redis Cluster 采用**去中心化**架构，每个节点都是对等的，通过 Gossip 协议进行通信。
+
+### 槽分片机制
+
+Redis Cluster 将整个 key space 划分为 **16384 个槽**（slot），每个槽属于一个主节点。
+
+```
+16384 个槽，分布到 3 个主节点：
+
+节点 A：槽 0 - 5460     （5461 个槽）
+节点 B：槽 5461 - 10922 （5462 个槽）
+节点 C：槽 10923 - 16383（5461 个槽）
+```
+
+当客户端存取一个 key 时，通过**CRC16 算法**计算槽号，然后路由到对应节点：
+
+```bash
+# key 的槽号计算
+> CLUSTER KEYSLOT mykey
+:5798
+
+# CRC16 算法
+slot = CRC16(key) % 16384
+```
+
+**为什么是 16384 个槽？**
+
+1. **槽数量适中**：太少无法均匀分布，太多管理开销大
+2. **位图传输优化**：节点间交换槽信息时，用 16384 位的位图表示，约 2KB
+3. **不超过 Redis 节点上限**：16384 个槽可以分配给不超过 1000 个节点
+
+:::tip 槽数量的权衡
+16384 不是 magic number，是经验和工程权衡的结果。Redis 作者antirez 在博客中解释过这个选择。
+:::
+
+### 客户端路由策略
+
+#### MOVE 重定向
+
+客户端连接任意节点，计算槽号后发现不在当前节点，返回 MOVE 错误：
+
+```bash
+> GET mykey
+-MOVED 5798 127.0.0.1:6380
+
+# 客户端收到 MOVE 后，自动向目标节点重试
+> GET mykey
+"value"
+```
+
+#### ASK 重定向
+
+槽迁移过程中，旧节点返回 ASK 重定向，提示客户端去新节点尝试：
+
+```bash
+> GET mykey
+-ASK 5798 127.0.0.1:6381
+
+# ASK 是礼貌询问，客户端仍可从旧节点读取
+> GET mykey
+"value"
+```
+
+MOVE vs ASK 的区别：
+
+| 类型 | 含义 | 后续请求 |
+| --- | --- | --- |
+| MOVED | 槽已永久迁移 | 直接访问新节点 |
+| ASK | 槽正在迁移 | 先访问旧节点，再访问新节点 |
+
+### 槽迁移
+
+当需要添加/移除节点时，需要迁移槽：
+
+```bash
+# 将槽 5798 从当前节点迁移到目标节点
+> CLUSTER SETSLOT 5798 MIGRATING 127.0.0.1:6381
+
+# 目标节点设置接收状态
+> CLUSTER SETSLOT 5798 IMPORTING 127.0.0.1:6379
+
+# 迁移具体 key
+> MIGRATE 127.0.0.1 6381 "" 0 5000 KEYS key1 key2 key3
+```
+
+迁移过程中：
+- 旧节点对迁移中的 key 会返回 ASK 重定向
+- 新节点收到 ASK 请求，会先尝试本地查找，再去旧节点获取
+- 迁移完成后，旧节点上的 key 被删除
+
+## Gossip 协议：节点间通信
+
+Redis Cluster 没有中心节点，节点间通过 **Gossip 协议** 传播集群状态。
+
+### Gossip 的工作原理
+
+每个节点定期随机选择几个节点交换信息：
+
+```bash
+# Gossip 消息包含
+{
+  "node_id": "xxx",
+  "ip": "127.0.0.1",
+  "port": 6379,
+  "flags": "master",
+  "cluster_addr": "127.0.0.1:6379",
+  "link_status": "connected",
+  ...
+}
+```
+
+**传播过程**：
+
+```
+节点 A 知道节点 B 宕机了
+节点 A 随机选择 3 个节点，发送 Gossip 消息
+节点 C、D、E 收到消息后，可能：
+  1. 继续传播给其他节点
+  2. 更新本地的节点状态
+```
+
+### Gossip 的优点
+
+- **去中心化**：没有单点故障
+- **自动故障检测**：节点宕机无需集中报告
+- **扩展性好**：节点只和少数节点通信
+
+### Gossip 的缺点
+
+- **收敛时间**：故障信息传播有延迟
+- **消息冗余**：可能发送重复消息
+- **无法保证强一致性**：可能短暂出现不一致视图
+
+### Gossip 配置
+
+```bash
+# 节点间 ping/pong 频率
+cluster-node-timeout 15000  # 默认 15 秒
+
+# 每次选择发送 gossip 消息的节点数量
+cluster-replica-validity-factor 10
+```
+
+## 故障检测与转移
+
+### 故障检测
+
+集群中的每个节点都会定期 ping 其他节点：
+
+```bash
+# 如果节点 B 没有在 cluster-node-timeout 时间内响应 ping
+# 节点 A 认为 B 疑似宕机（pfail）
+
+# 如果超过 half(cluster-node-timeout) 时间没响应
+# 节点 A 认为 B 确认宕机（fail）
+```
+
+### 故障转移
+
+当一个主节点宕机后，它的从节点自动升级为主节点：
+
+```
+主节点 A 宕机
+   |
+   v
+从节点 B 检测到主节点下线
+   |
+   v
+从节点 B 向其他节点申请成为主节点
+   |
+   v
+获得多数从节点投票后，成为新主节点
+```
+
+**投票机制**：
+
+- 集群需要 **N/2 + 1** 票才能认定故障（可配置）
+- 每个从节点只能投票一次
+- 只有持有槽的主节点有投票权
+
+```bash
+# 查看集群节点状态
+> CLUSTER NODES
+a1b2c3d4 127.0.0.1:6379 master - 0 1234567890 connected 0-5460
+e5f6g7h8 127.0.0.1:6380 master - 0 1234567891 connected 5461-10922
+i9j0k1l2 127.0.0.1:6381 master - 0 1234567892 connected 10923-16383
+```
+
+## 集群搭建
+
+### 方式一：手动创建
+
+```bash
+# 1. 启动 6 个 Redis 实例（3 主 3 从）
+redis-server --port 6379 --cluster-enabled yes --cluster-config-file nodes-6379.conf
+redis-server --port 6380 --cluster-enabled yes --cluster-config-file nodes-6380.conf
+...
+
+# 2. 创建集群
+redis-cli --cluster create 127.0.0.1:6379 127.0.0.1:6380 127.0.0.1:6381 \
+  127.0.0.1:6382 127.0.0.1:6383 127.0.0.1:6384 \
+  --cluster-replicas 1
+
+# --cluster-replicas 1 表示每个主节点 1 个从节点
+```
+
+### 方式二：使用 redis-cli --cluster 命令
+
+```bash
+# 添加主节点
+redis-cli --cluster add-node 127.0.0.1:6390 127.0.0.1:6379
+
+# 添加从节点
+redis-cli --cluster add-node 127.0.0.1:6391 127.0.0.1:6379 --cluster-slave
+
+# 删除节点
+redis-cli --cluster del-node 127.0.0.1:6390 <node_id>
+
+# 重新分配槽
+redis-cli --cluster reshard 127.0.0.1:6379
+```
+
+## 集群限制
+
+Redis Cluster 有一些固有限制：
+
+| 限制 | 说明 |
+| --- | --- |
+| 多 key 操作 | 同一个槽的多 key 操作支持，跨槽不支持 |
+| 事务 | 只支持同一节点上的 key |
+| 数据库 | 只支持 DB 0 |
+| 复制 | 每个主节点至少 1 个从节点 |
+
+```bash
+# 同一槽的多个 key，可以批量操作
+> MSET key1 value1 key2 value2 key3 value3
+
+# 跨槽的 key，无法批量操作
+> MSET key1 value1 key100 value100  # key1 和 key100 可能在不同槽
+(error) CROSSSLOT Keys in request don't hash to the same slot
+```
+
+## 面试追问方向
+
+- Redis Cluster 如何实现数据分片？
+- 16384 个槽是怎么计算出来的？
+- MOVE 和 ASK 重定向有什么区别？
+- Gossip 协议是如何工作的？
+- 故障转移需要多少票？
+- 为什么跨槽的 key 无法批量操作？
+
+这些问题考察你对 Redis Cluster 原理的理解深度。

@@ -1,0 +1,461 @@
+import { Badge } from '@rspress/core/theme';
+
+# DMV 与扩展事件
+
+「数据库响应慢，怎么定位问题？」
+
+SQL Server 提供了一套强大的诊断工具：**动态管理视图（DMV）** 和 **扩展事件（Extended Events）**。
+
+它们是 DBA 的瑞士军刀，几乎能回答所有性能相关的问题。
+
+## 动态管理视图（DMV）
+
+### DMV 分类
+
+| 类别 | 前缀 | 说明 |
+|---|---|---|
+| 数据库相关 | `sys.dm_db_*` | 数据库级别统计 |
+| 执行相关 | `sys.dm_exec_*` | 查询和会话统计 |
+| 事务相关 | `sys.dm_tran_*` | 事务和锁信息 |
+| SQL 操作系统 | `sys.dm_os_*` | 内存、调度器、I/O |
+| 全文相关 | `sys.dm_fts_*` | 全文搜索 |
+
+### 常用 DMV 查询
+
+#### 1. 查找最耗时查询
+
+```sql
+SELECT TOP 20 
+    qs.execution_count,
+    SUBSTRING(qt.text, qs.statement_start_offset / 2 + 1,
+        (CASE qs.statement_end_offset 
+            WHEN -1 THEN DATALENGTH(qt.text)
+            ELSE qs.statement_end_offset 
+        END - qs.statement_start_offset) / 2 + 1) AS QueryText,
+    qs.total_worker_time / 1000 AS total_cpu_ms,
+    qs.total_elapsed_time / 1000 AS total_elapsed_ms,
+    qs.total_logical_reads,
+    qs.total_physical_reads,
+    qs.total_logical_writes,
+    qs.max_elapsed_time / 1000 AS max_elapsed_ms,
+    qs.last_elapsed_time / 1000 AS last_elapsed_ms,
+    qs.last_logical_reads,
+    qs.last_physical_reads,
+    qs.last_execution_time,
+    cp.usecounts AS plan_use_count,
+    cp.size_in_bytes / 1024.0 AS plan_size_kb,
+    qp.query_plan
+FROM sys.dm_exec_query_stats qs
+CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) qt
+CROSS APPLY sys.dm_exec_query_plan(qs.plan_handle) qp
+JOIN sys.dm_exec_cached_plans cp ON qs.plan_handle = cp.plan_handle
+WHERE qt.dbid = DB_ID()
+ORDER BY qs.total_worker_time DESC;
+```
+
+#### 2. 查找逻辑读最多的查询
+
+```sql
+SELECT TOP 20
+    qs.total_logical_reads,
+    qs.execution_count,
+    qs.total_logical_reads / NULLIF(qs.execution_count, 0) AS avg_logical_reads,
+    qs.total_worker_time / 1000 AS total_cpu_ms,
+    qs.total_elapsed_time / 1000 AS total_elapsed_ms,
+    SUBSTRING(qt.text, qs.statement_start_offset / 2 + 1,
+        (CASE qs.statement_end_offset 
+            WHEN -1 THEN DATALENGTH(qt.text)
+            ELSE qs.statement_end_offset 
+        END - qs.statement_start_offset) / 2 + 1) AS QueryText
+FROM sys.dm_exec_query_stats qs
+CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) qt
+WHERE qt.dbid = DB_ID()
+ORDER BY qs.total_logical_reads DESC;
+```
+
+#### 3. 查找缺失索引
+
+```sql
+SELECT 
+    d.eq_highest_object_id,
+    OBJECT_NAME(d.eq_highest_object_id) AS TableName,
+    d.equality_columns,
+    d.inequality_columns,
+    d.included_columns,
+    d.statement AS IndexColumns,
+    d.avg_total_user_cost * d.user_seeks * d.avg_impact AS Score,
+    d.user_seeks,
+    d.user_scans,
+    d.avg_total_user_cost,
+    d.avg_impact,
+    d.unique_compiles
+FROM sys.dm_db_missing_index_groups g
+JOIN sys.dm_db_missing_index_group_stats d 
+    ON g.index_group_handle = d.group_handle
+JOIN sys.dm_db_missing_index_details d2 
+    ON g.index_handle = d2.index_handle
+WHERE d.database_id = DB_ID()
+ORDER BY Score DESC;
+```
+
+#### 4. 查看索引使用情况
+
+```sql
+SELECT 
+    OBJECT_NAME(s.object_id) AS TableName,
+    i.name AS IndexName,
+    i.type_desc AS IndexType,
+    s.user_seeks,
+    s.user_scans,
+    s.user_lookups,
+    s.user_updates,
+    s.last_user_seek,
+    s.last_user_scan,
+    s.last_user_lookup,
+    s.last_user_update,
+    s.system_seeks,
+    s.system_scans,
+    s.system_updates
+FROM sys.dm_db_index_usage_stats s
+JOIN sys.indexes i ON s.object_id = i.object_id AND s.index_id = i.index_id
+WHERE OBJECTPROPERTY(s.object_id, 'IsUserTable') = 1
+ORDER BY s.user_seeks + s.user_scans ASC;
+```
+
+#### 5. 查看当前等待
+
+```sql
+SELECT 
+    wait_type,
+    waiting_tasks_count,
+    wait_time_ms,
+    signal_wait_time_ms,
+    wait_time_ms - signal_wait_time_ms AS resource_wait_ms,
+    CAST(100.0 * wait_time_ms / NULLIF(SUM(wait_time_ms) OVER(), 0) AS DECIMAL(5,2)) AS wait_percent
+FROM sys.dm_os_wait_stats
+WHERE wait_time_ms > 0
+    AND wait_type NOT IN (
+        -- 排除系统等待
+        'SLEEP_TASK', 'LAZYWRITER_SLEEP', 'SQLTRACE_BUFFER_FLUSH',
+        'XE_DISPATCHER_WAIT', 'LOGMGR_QUEUE', 'REQUEST_FOR_DEADLOCK_SEARCH'
+    )
+ORDER BY wait_time_ms DESC;
+```
+
+#### 6. 查看阻塞
+
+```sql
+SELECT 
+    blocked.session_id AS BlockedSPID,
+    blocker.session_id AS BlockerSPID,
+    blocker.status AS BlockerStatus,
+    blocker.login_name AS BlockerLogin,
+    blocker.host_name AS BlockerHost,
+    blocker.program_name AS BlockerProgram,
+    blocked.wait_time / 1000.0 AS WaitSeconds,
+    blocked.wait_type AS WaitType,
+    blocked.resource_description,
+    blocked_percent AS BlockedPercent,
+    blocker_cpu AS BlockerCPU,
+    blocker.total_elapsed_time / 1000.0 AS BlockerElapsedMs,
+    qt_blocked.text AS BlockedQuery,
+    qt_blocker.text AS BlockerQuery,
+    qp_blocker.query_plan AS BlockerPlan
+FROM sys.dm_exec_requests blocked
+JOIN sys.dm_exec_requests blocker 
+    ON blocked.blocking_session_id = blocker.session_id
+CROSS APPLY sys.dm_exec_sql_text(blocked.sql_handle) qt_blocked
+CROSS APPLY sys.dm_exec_sql_text(blocker.sql_handle) qt_blocker
+CROSS APPLY sys.dm_exec_query_plan(blocker.sql_handle) qp_blocker
+WHERE blocked.session_id > 50;
+```
+
+#### 7. 查看调度器状态
+
+```sql
+SELECT 
+    scheduler_id,
+    cpu_id,
+    status,
+    is_online,
+    is_idle,
+    current_tasks_count,
+    runnable_tasks_count,
+    current_workers_count,
+    active_workers_count,
+    work_queue_count,
+    pending_disk_io_count,
+    load_factor
+FROM sys.dm_os_schedulers
+WHERE status = 'VISIBLE ONLINE'
+ORDER BY scheduler_id;
+```
+
+#### 8. 查看内存使用
+
+```sql
+-- 按类型查看内存使用
+SELECT 
+    type,
+    name,
+    pages_kb / 1024.0 AS pages_mb,
+    virtual_memory_reserved_kb / 1024.0 AS virtual_reserved_mb,
+    virtual_memory_committed_kb / 1024.0 AS virtual_committed_mb,
+    shared_memory_reserved_kb / 1024.0 AS shared_reserved_mb,
+    shared_memory_committed_kb / 1024.0 AS shared_committed_mb,
+    page_size_in_bytes / 1024.0 AS page_size_kb
+FROM sys.dm_os_memory_clerks
+ORDER BY pages_kb DESC;
+
+-- 查看 Buffer Pool
+SELECT 
+    COUNT(*) * 8 / 1024.0 AS BufferPoolGB,
+    SUM(CASE WHEN database_id = DB_ID() THEN 1 ELSE 0 END) * 8 / 1024.0 AS CurrentDB_MB,
+    SUM(CASE WHEN is_modified = 1 THEN 1 ELSE 0 END) * 8 / 1024.0 AS DirtyPages_MB
+FROM sys.dm_os_buffer_descriptors;
+```
+
+## 扩展事件（Extended Events）
+
+### 扩展事件 vs SQL Trace
+
+| 特性 | 扩展事件 | SQL Trace |
+|---|---|---|
+| 性能开销 | 低 | 高 |
+| 可扩展性 | 高 | 低 |
+| 目标类型 | 多种 | 仅文件/表 |
+| 过滤能力 | 强大 | 有限 |
+| 最小化收集 | 支持 | 不支持 |
+| 生产环境 | 推荐 | 不推荐 |
+
+### 创建扩展事件会话
+
+#### 1. 捕获慢查询
+
+```sql
+CREATE EVENT SESSION [SlowQueries] ON SERVER
+ADD EVENT sqlserver.sql_statement_completed (
+    ACTION (
+        sqlserver.session_id,
+        sqlserver.sql_text,
+        sqlserver.query_hash,
+        sqlserver.plan_handle,
+        sqlserver.database_name
+    )
+    WHERE (
+        duration > 100000  -- 超过 100ms
+        AND sqlserver.is_system = 0
+    )
+)
+ADD TARGET package0.event_file (
+    SET filename = 'D:\XEL\SlowQueries.xel',
+        max_file_size = 100,
+        max_rollover_files = 5,
+        metadatafile = 'D:\XEL\SlowQueries.xem'
+)
+WITH (
+    MAX_MEMORY = 4096 KB,
+    EVENT_RETENTION_MODE = ALLOW_SINGLE_EVENT_LOSS,
+    MAX_DISPATCH_LATENCY = 30 SECONDS,
+    TRACK_CAUSALITY = ON,
+    STARTUP_STATE = OFF
+);
+
+-- 启动会话
+ALTER EVENT SESSION [SlowQueries] ON SERVER STATE = START;
+
+-- 停止会话
+ALTER EVENT SESSION [SlowQueries] ON SERVER STATE = STOP;
+
+-- 删除会话
+DROP EVENT SESSION [SlowQueries] ON SERVER;
+```
+
+#### 2. 捕获死锁
+
+```sql
+CREATE EVENT SESSION [DeadlockMonitor] ON SERVER
+ADD EVENT sqlserver.xml_deadlock_report (
+    ACTION (
+        sqlserver.session_id,
+        sqlserver.sql_text,
+        sqlserver.database_name
+    )
+)
+ADD EVENT sqlserver.lock_deadlock_chain (
+    ACTION (
+        sqlserver.session_id,
+        sqlserver.sql_text
+    )
+)
+ADD TARGET package0.event_file (
+    SET filename = 'D:\XEL\Deadlock.xel',
+        max_file_size = 100,
+        max_rollover_files = 5
+)
+WITH (
+    MAX_MEMORY = 4096 KB,
+    STARTUP_STATE = ON
+);
+
+ALTER EVENT SESSION [DeadlockMonitor] ON SERVER STATE = START;
+```
+
+#### 3. 捕获阻塞
+
+```sql
+CREATE EVENT SESSION [BlockingMonitor] ON SERVER
+ADD EVENT sqlserver.wait_info (
+    ACTION (
+        sqlserver.session_id,
+        sqlserver.sql_text
+    )
+    WHERE (
+        duration > 5000  -- 等待超过 5 秒
+        AND wait_type IN (152, 153, 154, 155, 156, 157, 158, 159, 160, 161)
+        -- LCK 锁等待类型
+    )
+)
+ADD TARGET package0.event_file (
+    SET filename = 'D:\XEL\Blocking.xel',
+        max_file_size = 100
+)
+WITH (
+    MAX_MEMORY = 4096 KB,
+    STARTUP_STATE = ON
+);
+
+ALTER EVENT SESSION [BlockingMonitor] ON SERVER STATE = START;
+```
+
+### 读取扩展事件数据
+
+```sql
+-- 读取慢查询
+SELECT 
+    event_data.value('(event/@timestamp)[1]', 'DATETIME2') AS EventTime,
+    event_data.value('(event/action[@name="session_id"])[1]', 'INT') AS SPID,
+    event_data.value('(event/action[@name="sql_text"])[1]', 'NVARCHAR(MAX)') AS SQLText,
+    event_data.value('(event/data[@name="duration"])[1]', 'BIGINT') / 1000.0 AS DurationMS,
+    event_data.value('(event/data[@name="cpu_time"])[1]', 'BIGINT') / 1000.0 AS CPUTimeMS,
+    event_data.value('(event/data[@name="logical_reads"])[1]', 'BIGINT') AS LogicalReads,
+    event_data.value('(event/data[@name="physical_reads"])[1]', 'BIGINT') AS PhysicalReads,
+    event_data.value('(event/action[@name="query_hash"])[1]', 'NVARCHAR(100)') AS QueryHash
+FROM (
+    SELECT CAST(event_data AS XML) AS event_data
+    FROM sys.fn_xe_file_target_read_file(
+        'D:\XEL\SlowQueries*.xel', 
+        'D:\XEL\SlowQueries*.xem', 
+        NULL, 
+        NULL
+    )
+) AS events
+ORDER BY EventTime DESC;
+```
+
+### 系统健康会话
+
+SQL Server 自带系统健康会话，持续收集关键信息：
+
+```sql
+-- 查看系统健康会话数据
+SELECT 
+    event_data.value('(event/@timestamp)[1]', 'DATETIME2') AS EventTime,
+    event_data.value('(event/@name)[1]', 'VARCHAR(100)') AS EventName,
+    event_data.value('(event/data[@name="error"])[1]', 'INT') AS ErrorNumber,
+    event_data.value('(event/data[@name="message"])[1]', 'NVARCHAR(MAX)') AS ErrorMessage
+FROM (
+    SELECT CAST(event_data AS XML) AS event_data
+    FROM sys.fn_xe_file_target_read_file(
+        'D:\XEL\system_health*.xel',
+        NULL,
+        NULL,
+        NULL
+    )
+) AS events
+WHERE event_data.value('(event/@name)[1]', 'VARCHAR(100)') LIKE '%error%'
+ORDER BY EventTime DESC;
+```
+
+## 诊断脚本合集
+
+### 综合诊断脚本
+
+```sql
+-- SQL Server 综合诊断脚本
+CREATE PROCEDURE usp_ServerHealthCheck
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    PRINT '=== SQL Server 健康检查 ===';
+    PRINT '检查时间：' + CONVERT(VARCHAR, GETDATE(), 120);
+    PRINT '';
+
+    -- 1. 当前等待统计
+    PRINT '--- Top 10 等待类型 ---';
+    SELECT TOP 10
+        wait_type,
+        waiting_tasks_count,
+        wait_time_ms,
+        wait_time_ms / 1000.0 AS WaitSeconds,
+        signal_wait_time_ms,
+        wait_time_ms - signal_wait_time_ms AS ResourceWaitMS
+    FROM sys.dm_os_wait_stats
+    WHERE wait_time_ms > 0
+    ORDER BY wait_time_ms DESC;
+
+    -- 2. 当前阻塞
+    PRINT '';
+    PRINT '--- 当前阻塞 ---';
+    SELECT 
+        blocked.session_id AS BlockedSPID,
+        blocker.session_id AS BlockerSPID,
+        blocked.wait_type,
+        blocked.wait_time / 1000.0 AS WaitSeconds
+    FROM sys.dm_exec_requests blocked
+    JOIN sys.dm_exec_requests blocker 
+        ON blocked.blocking_session_id = blocker.session_id;
+
+    -- 3. 调度器状态
+    PRINT '';
+    PRINT '--- 调度器状态 ---';
+    SELECT 
+        scheduler_id,
+        cpu_id,
+        status,
+        is_online,
+        current_tasks_count,
+        runnable_tasks_count
+    FROM sys.dm_os_schedulers
+    WHERE status = 'VISIBLE ONLINE';
+
+    -- 4. 内存使用
+    PRINT '';
+    PRINT '--- 内存使用 ---';
+    SELECT 
+        type,
+        name,
+        pages_kb / 1024.0 AS MemoryMB
+    FROM sys.dm_os_memory_clerks
+    ORDER BY pages_kb DESC;
+
+    -- 5. 最耗时查询
+    PRINT '';
+    PRINT '--- Top 10 最耗时查询 ---';
+    SELECT TOP 10
+        qs.total_worker_time / 1000.0 AS CPUMillisecs,
+        qs.total_elapsed_time / 1000.0 AS DurationMillisecs,
+        qs.total_logical_reads,
+        qs.execution_count,
+        SUBSTRING(qt.text, 1, 200) AS QueryText
+    FROM sys.dm_exec_query_stats qs
+    CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) qt
+    ORDER BY qs.total_worker_time DESC;
+END;
+GO
+
+EXEC usp_ServerHealthCheck;
+```
+
+DMV 和扩展事件是 SQL Server 诊断的基石。熟练使用它们，能快速定位各类性能问题。

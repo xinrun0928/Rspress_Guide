@@ -1,0 +1,473 @@
+# HFile 物理存储原理
+
+如果说 MemStore 是 HBase 的"工作台"，那 HFile 就是 HBase 的"档案柜"。数据在内存中处理完毕后，最终会以 HFile 的形式持久化到 HDFS 上。
+
+理解 HFile 的内部结构，是理解 HBase 读取性能、Compaction 机制、布隆过滤器工作的基础。这也是面试中经常被追问的深度话题。
+
+本篇文章预计 3500 字，深入剖析 HFile 的物理存储原理。
+
+## HFile 的前世今生
+
+HBase 的 HFile 格式经历了多次演进：
+
+```
+HFile 版本演进：
+v1 (0.20+)    ──▶ 基本格式，支持 KeyValue 存储
+v2 (0.92+)    ──▶ 添加布隆过滤器、支持多层级索引
+v3 (0.98+)    ──▶ 支持 Tags、嵌入式安全
+v4 (2.0+)     ──▶ 重新设计 Trailer，性能优化
+```
+
+我们主要关注当前主流的 HFile v2/v3 格式，它在性能和功能上达到了很好的平衡。
+
+## HFile 整体结构
+
+一个 HFile 由以下部分组成：
+
+```
+┌────────────────────────────────────────────────────────────┐
+│                       HFile                                 │
+│                                                            │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │                    Data Blocks                        │  │
+│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐          │  │
+│  │  │ Block 1  │  │ Block 2  │  │ Block N  │          │  │
+│  │  │ 64KB     │  │ 64KB     │  │ 64KB     │          │  │
+│  │  └──────────┘  └──────────┘  └──────────┘          │  │
+│  │  所有 KeyValue 数据存储在这里                         │  │
+│  └──────────────────────────────────────────────────────┘  │
+│                                                            │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │                   Meta Index                          │  │
+│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐          │  │
+│  │  │ Meta A   │  │ Meta B   │  │ Meta N   │          │  │
+│  │  │ offset   │  │ offset   │  │ offset   │          │  │
+│  │  └──────────┘  └──────────┘  └──────────┘          │  │
+│  │  Column Family 级别的索引                            │  │
+│  └──────────────────────────────────────────────────────┘  │
+│                                                            │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │                  Block Index                          │  │
+│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐          │  │
+│  │  │ Index A  │  │ Index B  │  │ Index N   │          │  │
+│  │  │ BlockKey │  │ BlockKey │  │ BlockKey  │          │  │
+│  │  │ offset   │  │ offset   │  │ offset   │          │  │
+│  │  └──────────┘  └──────────┘  └──────────┘          │  │
+│  │  Data Block 级别的索引（用于快速定位）                │  │
+│  └──────────────────────────────────────────────────────┘  │
+│                                                            │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │                  Meta Index                           │  │
+│  │  文件级元信息（布隆过滤器、统计信息等）               │  │
+│  └──────────────────────────────────────────────────────┘  │
+│                                                            │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │                    File Info                          │  │
+│  │  ├─ LastKey                                          │  │
+│  │  ├─ KeyValueStats                                    │  │
+│  │  ├─ BloomFilter Metadata                             │  │
+│  │  └─ ...                                              │  │
+│  └──────────────────────────────────────────────────────┘  │
+│                                                            │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │                    Trailer                            │  │
+│  │  ├─ version                                          │  │
+│  │  ├─ fileinfo_offset                                  │  │
+│  │  ├─ data_index_offset                                │  │
+│  │  ├─ meta_index_offset                                │  │
+│  │  ├─ total_data_block_count                           │  │
+│  │  └─ uncompressed_data_index_size                     │  │
+│  └──────────────────────────────────────────────────────┘  │
+│                                                            │
+└────────────────────────────────────────────────────────────┘
+```
+
+### Trailer：文件的"目录"
+
+Trailer 是 HFile 的最后一部分，存储了其他所有部分的偏移量。读取 HFile 时，先读 Trailer，再根据偏移量定位其他部分。
+
+```java
+// Trailer 核心字段
+public class HFileTrailer {
+    private final int version;              // 版本号
+    private final long fileinfoOffset;       // FileInfo 偏移量
+    private final long dataIndexOffset;      // Data Block Index 偏移量
+    private final long metaIndexOffset;      // Meta Index 偏移量
+    private final long dataIndexCount;       // Data Block 数量
+    private final long uncompressedDataIndexSize;  // 索引未压缩大小
+}
+```
+
+这种设计让 HFile 的读取只需要一次磁盘寻址：先读 Trailer，再根据偏移量随机访问。
+
+## Data Block：数据存储单元
+
+### Block 的基本概念
+
+Data Block 是 HFile 中存储 KeyValue 的基本单元，默认大小 64KB（可通过 `blocksize` 配置）。
+
+```
+Block 大小对比：
+┌──────────────┬─────────────────────────────────────────────┐
+│ Block 大小   │ 特点                                       │
+├──────────────┼─────────────────────────────────────────────┤
+│ 16KB        │ 随机读取友好，但索引变大，扫描效率降低      │
+│ 32KB        │ 平衡选择，适合大多数场景                    │
+│ 64KB        │ 顺序扫描友好，索引小，缓存更多 Block         │
+│ 128KB       │ 大块传输友好，但读取放大严重                 │
+└──────────────┴─────────────────────────────────────────────┘
+```
+
+### Block 内存储结构
+
+每个 Data Block 内部存储连续的 KeyValue：
+
+```
+Data Block 1 (64KB):
+┌────────────────────────────────────────────────────────────┐
+│ KeyValue 1                                                 │
+│ ├─ KeyLength (4B)                                          │
+│ ├─ ValueLength (4B)                                        │
+│ ├─ RowKeyLength (2B)                                      │
+│ ├─ RowKey ...                                             │
+│ ├─ ColumnFamilyLength (1B)                                │
+│ ├─ ColumnFamily ...                                       │
+│ ├─ Qualifier ...                                          │
+│ ├─ Timestamp (8B)                                         │
+│ ├─ KeyType (1B)                                           │
+│ └─ Value ...                                              │
+├────────────────────────────────────────────────────────────┤
+│ KeyValue 2                                                 │
+│ ...                                                        │
+├────────────────────────────────────────────────────────────┤
+│ KeyValue N                                                 │
+└────────────────────────────────────────────────────────────┘
+```
+
+### KeyValue 的存储格式
+
+KeyValue 是 HBase 最基本的存储单元，它的格式设计非常精妙：
+
+```java
+// KeyValue 内存结构
+public class KeyValue {
+    // |---------- 4 bytes ----------|
+    // |         Key Length          |
+    // |---------- 4 bytes ----------|
+    // |         Value Length        |
+    // |---------- 2 bytes ----------|
+    // |        RowKey Length        |
+    // |---------- n bytes ----------|
+    // |           RowKey            |
+    // |---------- 1 byte  ----------|
+    // |     ColumnFamily Length     |
+    // |---------- m bytes ----------|
+    // |        ColumnFamily         |
+    // |---------- k bytes ----------|
+    // |          Qualifier          |
+    // |---------- 8 bytes ----------|
+    // |         Timestamp           |
+    // |---------- 1 byte  ----------|
+    // |          Key Type           |
+    // |---------- v bytes ----------|
+    // |           Value             |
+}
+```
+
+**KeyType 字段**
+
+KeyType 标识这个 KeyValue 的类型：
+
+| KeyType | 值 | 说明 |
+| --- | --- | --- |
+| `Maximum` | 0 | 最大标识 |
+| `Put` | 1 | 写入操作 |
+| `Delete` | 2 | 删除（列级别） |
+| `DeleteColumn` | 3 | 删除（列族级别） |
+| `DeleteFamily` | 4 | 删除（行级别） |
+| `Latest` | 5 | 最新版本标识 |
+
+**为什么 KeyLength 和 ValueLength 分开存储？**
+
+这是一个精妙的设计：
+- 只需要 KeyLength 就能定位下一个 KeyValue（向后扫描）
+- 只需要 ValueLength 就能跳过 Value（不需要解析 Value）
+
+```java
+// 跳过当前 KeyValue
+int keyLength = Bytes.toInt(buffer, offset);
+int valueLength = Bytes.toInt(buffer, offset + 4);
+int nextOffset = offset + 8 + keyLength + valueLength;  // 直接跳到下一个
+```
+
+## Block Index：索引结构
+
+### 为什么需要索引？
+
+如果没有索引，读取一个 KeyValue 需要：
+1. 从文件开头扫描
+2. 依次读取每个 KeyValue
+3. 比较 RowKey
+
+这叫"全表扫描"，时间复杂度 O(n)。
+
+有了索引：
+1. 根据 RowKey 在索引中找到目标 Block
+2. 只读取一个 Block
+3. 在 Block 内部顺序查找
+
+时间复杂度 O(log n) + O(Block 大小)。
+
+### Data Block Index
+
+Data Block Index 存储每个 Data Block 的起始 Key 和偏移量：
+
+```
+Block Index 结构：
+┌─────────────────────────────────────────────────────────────┐
+│ Index Entry 1                                                │
+│ ├─ BlockKey:    "user_001"                                  │
+│ ├─ BlockOffset: 0 (HFile 起始位置)                           │
+│ └─ BlockDataSize: 65536 (Block 大小)                        │
+├─────────────────────────────────────────────────────────────┤
+│ Index Entry 2                                                │
+│ ├─ BlockKey:    "user_050"                                   │
+│ ├─ BlockOffset: 65536                                       │
+│ └─ BlockDataSize: 65536                                     │
+├─────────────────────────────────────────────────────────────┤
+│ Index Entry N                                                │
+│ ...                                                          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 二分查找定位 Block
+
+给定一个 RowKey，如何找到它所在的 Block？
+
+```java
+// 简化版的 Block 定位逻辑
+public HFileBlock getBlockByKey(byte[] rowKey) {
+    // 1. 在 BlockIndex 中二分查找
+    int lo = 0, hi = indexEntries.size() - 1;
+    
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        int cmp = Bytes.compareTo(
+            rowKey,
+            indexEntries.get(mid).getBlockKey()
+        );
+        
+        if (cmp < 0) {
+            hi = mid - 1;  // RowKey 小于当前 BlockKey，搜索左半部分
+        } else if (cmp > 0) {
+            lo = mid + 1;  // RowKey 大于当前 BlockKey，搜索右半部分
+        } else {
+            return readBlock(mid);  // 精确命中
+        }
+    }
+    
+    // 2. lo 就是目标 Block（BlockKey <= RowKey 的最大索引）
+    return readBlock(lo);
+}
+```
+
+:::tip 索引与布隆过滤器的关系
+Block Index 只能告诉你"数据在哪个 Block"，但无法告诉你"这个 Key 是否存在"。布隆过滤器解决的就是这个问题——快速判断某个 Key 是否存在于这个 HFile 中。
+:::
+
+## 布隆过滤器：快速判断存在性
+
+### 布隆过滤器原理
+
+布隆过滤器（Bloom Filter）是一种空间效率极高的概率数据结构，用于判断一个元素是否"可能存在"于集合中。
+
+```
+布隆过滤器原理：
+┌─────────────────────────────────────────────────────────────┐
+│  位数组（m bits，全部初始化为 0）                            │
+│  ┌───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┐ │
+│  │ 0 │ 0 │ 0 │ 0 │ 0 │ 0 │ 0 │ 0 │ 0 │ 0 │ 0 │ 0 │ 0 │ 0 │ │
+│  └───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┘ │
+│                                                              │
+│  添加 "user_001" 时：                                        │
+│  ┌────────────────────────────────────────────────────────┐ │
+│  │ h1("user_001") = 2  ──▶  设置 bit 2 = 1                 │ │
+│  │ h2("user_001") = 5  ──▶  设置 bit 5 = 1                 │ │
+│  │ h3("user_001") = 7  ──▶  设置 bit 7 = 1                 │ │
+│  └────────────────────────────────────────────────────────┘ │
+│                                                              │
+│  ┌───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┐ │
+│  │ 0 │ 0 │ 1 │ 0 │ 0 │ 1 │ 0 │ 1 │ 0 │ 0 │ 0 │ 0 │ 0 │ 0 │ │
+│  └───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┘ │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 布隆过滤器的查询
+
+查询 "user_002" 是否存在时：
+
+```java
+// 查询逻辑
+public boolean mightContain(String key) {
+    // 计算 key 的所有哈希值
+    int h1 = hash1(key);
+    int h2 = hash2(key);
+    int h3 = hash3(key);
+    
+    // 检查对应的 bit 位
+    return bitArray[h1] == 1 &&
+           bitArray[h2] == 1 &&
+           bitArray[h3] == 1;
+}
+```
+
+### 布隆过滤器的特点
+
+| 特点 | 说明 |
+| --- | --- |
+| **假阳性** | 不存在的数据可能被误判为"存在" |
+| **假阴性** | 不可能！存在的数据一定会被找到 |
+| **空间效率** | 每个 key 只占几个 bit |
+| **查询效率** | O(k)，k 是哈希函数个数（通常 3 个） |
+
+### 布隆过滤器在 HBase 中的应用
+
+HBase 在 HFile 的 Meta Index 中存储每个 Column Family 的布隆过滤器：
+
+```
+Meta Index：
+┌─────────────────────────────────────────────────────────────┐
+│ Meta Entry for CF: info                                     │
+│ ├─ BloomFilterType: ROWCOL                                 │
+│ ├─ BloomFilterData: (位数组)                                │
+│ └─ NumberOfKeys: 1000000                                    │
+├─────────────────────────────────────────────────────────────┤
+│ Meta Entry for CF: order                                    │
+│ ├─ BloomFilterType: ROWCOL                                  │
+│ ├─ BloomFilterData: (位数组)                                │
+│ └─ NumberOfKeys: 5000000                                    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**布隆过滤器的类型**：
+
+| 类型 | 说明 | 适用场景 |
+| --- | --- | --- |
+| `ROW` | 基于 RowKey 的布隆过滤器 | 只按 RowKey 查询 |
+| `ROWCOL` | 基于 RowKey + Column 的布隆过滤器 | 按 RowKey + Qualifier 查询 |
+
+```java
+// 配置列族的布隆过滤器类型
+ColumnFamilyDescriptor cf = ColumnFamilyDescriptorBuilder
+    .newBuilder(Bytes.toBytes("info"))
+    .setBloomFilterType(BloomType.ROWCOL)  // 推荐使用 ROWCOL
+    .build();
+```
+
+### 布隆过滤器的代价
+
+布隆过滤器不是免费的，它有存储开销：
+
+```
+布隆过滤器空间计算：
+┌─────────────────────────────────────────────────────────────┐
+│  公式：m = - (n * ln(p)) / (ln(2)^2)                        │
+│                                                              │
+│  其中：                                                       │
+│  - m: bit 数组大小                                            │
+│  - n: key 数量                                               │
+│  - p: 期望的假阳性率                                          │
+│                                                              │
+│  示例：                                                       │
+│  - n = 10,000,000 keys                                       │
+│  - p = 1% 假阳性率                                           │
+│  - m ≈ 95 MB                                                 │
+│                                                              │
+│  vs 不使用布隆过滤器：                                        │
+│  - 需要扫描所有 HFile                                        │
+│  - 每个 HFile 64KB，假设 100 个 HFile = 6.4MB               │
+│  - 节省大量 I/O                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## HFile 的读取流程
+
+综合以上知识，HFile 的读取流程如下：
+
+```java
+public KeyValue getKeyValue(byte[] rowKey, byte[] cf, byte[] qualifier) {
+    // 1. 读取 Trailer，获取索引偏移量
+    HFileTrailer trailer = readTrailer();
+    
+    // 2. 读取 Block Index（可能很大，放入缓存）
+    BlockIndexReader indexReader = readBlockIndex(trailer.getDataIndexOffset());
+    
+    // 3. 查询布隆过滤器
+    BloomFilter bloomFilter = readBloomFilter();
+    if (!bloomFilter.mightContain(rowKey, cf, qualifier)) {
+        return null;  // 一定不存在，跳过这个 HFile
+    }
+    
+    // 4. 在 Block Index 中二分查找目标 Block
+    int blockIndex = indexReader.binarySearch(rowKey);
+    HFileBlock block = readBlock(blockIndex);
+    
+    // 5. 在 Block 内部顺序查找
+    return block.scanForRowKey(rowKey, cf, qualifier);
+}
+```
+
+## HFile 的写入流程
+
+MemStore flush 时，数据以 HFile 的形式写入：
+
+```
+MemStore Flush 到 HFile 的流程：
+
+1. 创建 HFile Writer
+   └─ 写入空的 Trailer（占位）
+
+2. 遍历 MemStore 中的 KeyValue
+   └─ 写入 Data Block
+       └─ Block 满了？先写入 Block Index Entry，再开新 Block
+
+3. 写入 Meta Index（布隆过滤器信息）
+
+4. 写入 File Info
+   ├─ LastKey
+   ├─ MaxSequenceID
+   └─ BloomFilter Metadata
+
+5. 写入 Trailer（真实偏移量）
+
+6. 关闭 HFile
+```
+
+## 存储格式演进：从 v2 到 v3
+
+### HFile v2 的改进
+
+v2 相比 v1 的主要改进：
+- 支持多层次的 Block Index（Tree Index）
+- 支持布隆过滤器
+- 优化了顺序扫描性能
+
+### HFile v3 的改进
+
+v3 在 v2 基础上增加：
+- 支持 Tags（用于存储单元级别的元数据）
+- 更好的压缩算法支持
+- 嵌入式安全特性
+
+## 面试追问方向
+
+- HFile 的内部结构是怎样的？有哪些组成部分？
+- Data Block 的默认大小是多少？如何选择合适的 Block 大小？
+- Block Index 的作用是什么？如何通过索引定位数据？
+- 布隆过滤器的原理是什么？有什么特点？
+- HFile v2 和 v3 有什么区别？
+- 布隆过滤器的假阳性率和哪些因素有关？
+- 为什么 KeyLength 和 ValueLength 要分开存储？
+- 如果一个 HFile 有 1000 个 Block，读取一个 Key 需要几次磁盘 I/O？
+
+理解 HFile 的物理存储原理，你就能理解 HBase 读取性能的根源。这也是为什么 RowKey 设计如此重要——好的 RowKey 设计配合布隆过滤器，可以让查询只扫描少量 Block。

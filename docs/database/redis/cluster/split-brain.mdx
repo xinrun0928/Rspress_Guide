@@ -1,0 +1,262 @@
+# Redis 脑裂问题与解决方案
+
+想象一下这个场景：你的 Redis 主节点还活着，但哨兵和主节点之间网络不通了。哨兵以为主节点挂了，选了另一个从节点当新主节点。结果网络恢复后，有两个「主节点」——这就是脑裂。
+
+## 什么是脑裂
+
+脑裂（Split Brain）是指**集群中同时存在两个或多个主节点，它们互相认为对方不可用**。
+
+```
+正常状态：
++------+       +------+       +------+
+|Master|----->|Slave1|----->|Slave2|
++------+       +------+       +------+
+
+脑裂状态（网络分区）：
++------+                    +------+
+|Master|     网络断开       |Slave1|
+| 旧主 |                    | 新主 |
++------+                    +------+
+
+两台主节点同时存在，数据可能不一致
+```
+
+## 脑裂发生的原因
+
+### 1. 网络抖动
+
+网络短暂中断，但持续时间超过 `down-after-milliseconds`：
+
+```bash
+# 哨兵配置
+sentinel down-after-milliseconds mymaster 30000
+
+# 如果网络中断 30 秒以上
+# 哨兵会认为主节点宕机
+# 从节点升级为新主节点
+```
+
+### 2. 主节点负载过高
+
+主节点无法及时响应哨兵的 ping，导致误判：
+
+```bash
+# 主节点 CPU 100%，响应超时
+# 哨兵认为主节点不可达
+# 触发故障转移
+```
+
+### 3. 哨兵配置不当
+
+`quorum` 设置过小，容易误判：
+
+```bash
+# 2 个哨兵，quorum=1
+# 任意一个哨兵认为主节点下线，就触发故障转移
+sentinel monitor mymaster 127.0.0.1 6379 1
+```
+
+## 脑裂的危害
+
+### 1. 数据丢失
+
+旧主节点写入的数据，在故障转移后丢失：
+
+```
+时间线：
+
+T1: 客户端向旧主节点写入 key1
+T2: 网络断开
+T3: 哨兵选出新主节点
+T4: 客户端向新主节点写入 key2
+T5: 网络恢复
+T6: 旧主节点变为从节点，同步新主节点数据
+    key1 丢失！
+```
+
+### 2. 数据不一致
+
+两个主节点同时存在，可能写入不同数据：
+
+```
+旧主节点：key1 = "A"
+新主节点：key1 = "B"
+
+读 key1 可能返回不同结果
+```
+
+### 3. 应用逻辑混乱
+
+应用可能同时连接两个主节点，导致业务逻辑错误：
+
+```python
+# 应用同时连接两个"主节点"
+# 可能导致重复扣款、库存超卖等问题
+```
+
+## 解决方案
+
+### 方案一：合理配置哨兵
+
+```bash
+# 哨兵配置
+# 1. 至少 3 个哨兵（奇数）
+# 2. quorum 设置为 (哨兵数量 / 2) + 1
+
+sentinel monitor mymaster 127.0.0.1 6379 2
+# 3 个哨兵，quorum=2
+# 至少 2 个哨兵认为下线，才触发故障转移
+```
+
+### 方案二：增大故障转移门槛
+
+```bash
+# 延长主观下线时间，减少误判
+sentinel down-after-milliseconds mymaster 60000  # 60 秒
+
+# 延长故障转移超时
+sentinel failover-timeout mymaster 300000  # 5 分钟
+```
+
+### 方案三：使用 Redis Cluster
+
+Redis Cluster 的故障转移需要**多数派投票**，避免了脑裂：
+
+```bash
+# Redis Cluster 中
+# 假设 3 个主节点
+# 至少 2 个主节点认为某个主节点下线，才触发故障转移
+
+# 如果发生网络分区
+# - 多数分区（有 2 个或以上主节点）：可以继续工作
+# - 少数分区（有 1 个主节点）：停止服务
+```
+
+### 方案四：数据保护（Redis 7.0+）
+
+Redis 7.0 引入了 `cluster-preferred-endpoint-type` 配置：
+
+```bash
+# 优先使用客户端连接时使用的地址
+cluster-preferred-endpoint-type ip
+```
+
+### 方案五：应用层保护
+
+```python
+import redis
+from redis.exceptions import ConnectionError, TimeoutError
+
+def write_with_protection(key, value, master):
+    """
+    写入保护：写入前检查主节点状态
+    """
+    try:
+        # 检查主节点是否真的可用
+        if not master.ping():
+            raise Exception("Master not available")
+        
+        # 写入前获取节点信息
+        info = master.info('replication')
+        if info.get('role') != 'master':
+            raise Exception("Not a master node")
+        
+        return master.set(key, value)
+    except (ConnectionError, TimeoutError) as e:
+        raise Exception(f"Write failed: {e}")
+```
+
+## 脑裂检测与处理
+
+### 检测脑裂
+
+```bash
+# 查看集群节点状态
+> CLUSTER NODES
+
+# 正常情况：只有一个主节点持有某个槽
+# 异常情况：两个节点都声称持有同一槽
+
+# 查看复制状态
+> INFO replication
+# 检查 connected_slaves 是否正常
+```
+
+### 处理脑裂
+
+```bash
+# 如果发现脑裂
+
+# 1. 确定谁是"真正的"主节点
+#    - 数据完整性高的为主
+#    - 服务时间长的为主
+
+# 2. 关闭"伪主节点"
+redis-cli -p 6380 SHUTDOWN NOSAVE
+
+# 3. 以从节点方式重启
+redis-server --port 6380 --replicaof 真正的master_ip 6379
+
+# 4. 等待数据同步完成
+> INFO replication
+role:slave
+master_link_status:up
+```
+
+## 预防措施
+
+### 1. 网络层面
+
+```bash
+# 使用专线，减少网络抖动
+# 配置网络监控，及时发现网络问题
+# 使用双网卡双线路
+```
+
+### 2. 哨兵层面
+
+```bash
+# 哨兵数量：3 个或 5 个（奇数）
+# quorum：(哨兵数量 / 2) + 1
+# down-after-milliseconds：适当增大（建议 30-60 秒）
+```
+
+### 3. 应用层面
+
+```python
+# 应用层实现写入确认
+def safe_write(client, key, value):
+    """
+    安全写入：
+    1. 写入主节点
+    2. 确认复制到从节点
+    """
+    pipe = client.pipeline()
+    pipe.set(key, value)
+    pipe.wait_for_pending()
+    pipe.execute()
+```
+
+### 4. 监控层面
+
+```bash
+# 监控关键指标
+# - 主从复制延迟
+# - 哨兵状态
+# - 网络延迟
+
+# 告警配置
+# - 复制延迟超过阈值
+# - 哨兵状态变化
+# - 节点不可达
+```
+
+## 面试追问方向
+
+- 什么是脑裂？什么情况下会发生？
+- 如何避免脑裂？
+- 哨兵的 quorum 如何配置才合理？
+- Redis Cluster 如何避免脑裂？
+- 发现脑裂后如何处理？
+
+理解脑裂问题，展示了你对分布式系统一致性和高可用性的深刻理解。

@@ -1,0 +1,313 @@
+# Oracle SGA 与 PGA 内存结构
+
+内存管理是 Oracle 数据库最核心的技术之一。如果说物理结构是数据的"仓库"，那么内存结构就是数据的"缓存"——决定了哪些数据可以常驻内存，哪些需要淘汰，哪些需要持久化。
+
+想象一个高频交易系统，每秒处理上万笔订单。每笔订单需要查询用户信息、扣减库存、更新账户余额——这些操作如果全部从磁盘读取，性能将惨不忍睹。SGA 和 PGA 的设计，就是为了让尽可能多的操作在内存中完成，减少磁盘 I/O。
+
+## Oracle 内存架构概述
+
+Oracle 的内存分为两大区域：**SGA（System Global Area）** 和 **PGA（Program Global Area）**。两者的核心区别在于：SGA 是共享的，所有进程共享访问；PGA 是私有的，每个进程独有。
+
+```text
+┌─────────────────────────────────────────────────────────────────┐
+│                        Oracle 实例内存                           │
+├─────────────────────────────────────────────────────────────────┤
+│  SGA (System Global Area) ─────────────── 共享区域               │
+│  ┌───────────────┐ ┌───────────────┐ ┌───────────────┐          │
+│  │  Buffer Cache │ │  Shared Pool  │ │  Redo Log     │          │
+│  │  (最大组件)   │ │  (库缓存+字典) │ │   Buffer      │          │
+│  └───────────────┘ └───────────────┘ └───────────────┘          │
+│  ┌───────────────┐ ┌───────────────┐                            │
+│  │  Large Pool   │ │  Java Pool    │                            │
+│  │  (可选)       │ │  (可选)        │                            │
+│  └───────────────┘ └───────────────┘                            │
+├─────────────────────────────────────────────────────────────────┤
+│  PGA (Program Global Area) ──────────── 私有区域                 │
+│  ┌───────────────┐ ┌───────────────┐ ┌───────────────┐          │
+│  │ Sort Area    │ │ Hash Area     │ │ Bitmap Merge  │          │
+│  │ (排序区)     │ │ (哈希区)      │ │   Area        │          │
+│  └───────────────┘ └───────────────┘ └───────────────┘          │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## SGA：系统全局区详解
+
+SGA 是 Oracle 实例启动时分配的核心内存区域，所有后台进程和服务器进程共享 SGA 中的数据。
+
+### 内存管理的演进
+
+Oracle 的内存管理经历了三个阶段：
+
+**手动管理（Oracle 9i 之前）**：DBA 手动设置 `shared_pool_size`、`db_cache_size`、`java_pool_size` 等参数，工作量大且容易出错。
+
+**自动共享内存管理（Automatic Shared Memory Management, ASMM，Oracle 9i~10g）**：设置 `sga_target`，Oracle 自动在各个组件之间分配内存。但部分组件（如 log buffer、large pool）仍需手动设置。
+
+**自动内存管理（Automatic Memory Management, AMM，Oracle 11g 之后）**：设置 `memory_target`，Oracle 自动管理 SGA 和 PGA 的分配。只需关注 `memory_target` 和 `memory_max_target` 两个参数。
+
+```sql
+-- 查看当前内存配置
+SHOW PARAMETER memory_target;
+SHOW PARAMETER sga_target;
+SHOW PARAMETER pga_aggregate_target;
+
+-- 查看 SGA 组件大小
+SELECT * FROM V$SGAINFO;
+SELECT name, bytes/1024/1024 AS size_mb FROM V$SGA ORDER BY name;
+```
+
+### Buffer Cache：数据库缓冲区缓存
+
+Buffer Cache 是 SGA 中最大的组件，用于缓存从数据文件读取的数据块。Buffer Cache 的设计目标是将磁盘 I/O 降到最低。
+
+**工作原理**：当服务器进程需要读取数据时，首先在 Buffer Cache 中查找——如果找到（缓存命中），直接使用内存中的数据；如果未找到（缓存未命中），从磁盘读取数据块，放入 Buffer Cache，然后返回结果。写操作同样先修改 Buffer Cache 中的数据块（标记为脏），再由 DBWn 批量写入磁盘。
+
+**缓存命中率**是衡量 Buffer Cache 效率的关键指标：
+
+```sql
+-- 查看 Buffer Cache 命中率
+SELECT name, value, 
+       ROUND(value * 100 / (SUM(value) OVER()), 2) AS pct
+FROM V$SYSSTAT
+WHERE name IN ('db block gets', 'consistent gets', 'physical reads');
+
+-- 更详细的缓存统计
+SELECT * FROM V$BUFFER_POOL;
+```
+
+理想情况下，Buffer Cache 命中率应保持在 95% 以上。如果命中率过低，可能需要增加 `db_cache_size` 或优化 SQL（减少全表扫描）。
+
+**多缓冲池配置**：Buffer Cache 可以划分为多个子池，每个子池可以设置不同块大小或管理策略：
+
+```sql
+-- 创建不同块大小的表空间
+CREATE TABLESPACE app_16k
+DATAFILE '/u01/oradata/orcl/app16k01.dbf' SIZE 1G
+BLOCKSIZE 16384;
+
+-- 配置 16K 缓冲池
+ALTER SYSTEM SET db_16k_cache_size = 256M;
+
+-- 将表分配到 KEEP 池（常访问）或 RECYCLE 池（一次性使用）
+ALTER TABLE big_table STORAGE (BUFFER_POOL KEEP);
+```
+
+**DEFAULT 池**：默认池，所有未指定池的段使用此池。
+
+**KEEP 池**：用于频繁访问但容量较小的表，尽量让这些表常驻内存，避免缓存淘汰。
+
+**RECYCLE 池**：用于一次性使用的大表扫描数据，扫描完成后立即从内存清除，不占用过多缓存空间。
+
+### Shared Pool：共享池
+
+Shared Pool 是 Oracle 最复杂的内存组件之一，存储了库缓存（Library Cache）和数据字典缓存（Dictionary Cache）。
+
+**库缓存**：缓存解析过的 SQL 和 PL/SQL 代码，包括：
+
+- SQL 语句文本
+- 解析树（Parse Tree）
+- 执行计划（Execution Plan）
+- PL/SQL 存储过程、函数、包
+
+**数据字典缓存**：缓存数据字典信息，包括：
+
+- 表和视图的定义
+- 列的数据类型
+- 用户和权限信息
+- 约束定义
+
+```sql
+-- 查看 Shared Pool 大小分布
+SELECT component, granule_size/1024/1024 AS granule_mb,
+       current_size/1024/1024 AS size_mb
+FROM V$SGAINFO
+WHERE component LIKE '%Shared Pool%';
+
+-- 查看库缓存统计
+SELECT namespace, pins, pinhits, 
+       ROUND(pinhits/pins*100, 2) AS hit_ratio
+FROM V$LIBRARYCACHE;
+
+-- 清除 Shared Pool（执行计划失效）
+ALTER SYSTEM FLUSH SHARED_POOL;
+```
+
+**软解析和硬解析**：当一条 SQL 进入 Oracle 时，解析器首先在库缓存中查找是否有相同的 SQL。如果找到，执行软解析（Soft Parse），重用已有的解析结果和执行计划；如果未找到，执行硬解析（Hard Parse），生成新的执行计划并缓存。
+
+软解析只需要"查找"操作，代价极低；硬解析需要"语法解析"、"语义分析"、"权限检查"、"优化器优化"等步骤，代价很高。绑定变量是减少硬解析的关键技术。
+
+```sql
+-- 硬解析（每次语义不同）
+SELECT * FROM employees WHERE employee_id = 100;
+SELECT * FROM employees WHERE employee_id = 200;
+
+-- 软解析（使用绑定变量）
+SELECT * FROM employees WHERE employee_id = :1;
+```
+
+### Redo Log Buffer：重做日志缓冲区
+
+Redo Log Buffer 是 SGA 中相对较小的组件（通常几 MB），用于暂存即将写入联机重做日志文件的变更记录。
+
+**工作原理**：任何数据修改操作（DML、DDL）都会生成重做记录，首先写入 Redo Log Buffer。LGWR 进程负责将 Redo Log Buffer 的内容写入磁盘。
+
+**LGWR 写入时机**：
+
+- 事务提交（COMMIT）时
+- Redo Log Buffer 达到 1/3 满
+- 超过 3 秒未写入
+- DBWn 准备写脏数据之前
+- 其他触发条件
+
+```sql
+-- 查看 Redo Log Buffer 大小
+SHOW PARAMETER log_buffer;
+
+-- 查看 LGWR 写入统计
+SELECT name, value FROM V$SYSSTAT 
+WHERE name LIKE '%redo%';
+```
+
+### Large Pool：大池
+
+Large Pool 是可选的 SGA 组件，用于减轻 Shared Pool 的压力。主要用途包括：
+
+- RMAN 备份和恢复操作
+- 并行查询（Parallel Query）服务器进程
+- I/O 服务器进程
+- 共享服务器（Shared Server）模式的会话内存
+
+```sql
+-- 配置 Large Pool
+ALTER SYSTEM SET large_pool_size = 128M;
+
+-- Large Pool 不使用 LRU 链表，使用独立的保留链表
+```
+
+### Java Pool：Java 池
+
+Java Pool 用于存储 Java 代码的内部表示，仅在使用 Oracle JVM（aurora）时需要。如果不使用 Java 存储过程，可以将 Java Pool 设为最小值。
+
+```sql
+ALTER SYSTEM SET java_pool_size = 64M;
+```
+
+## PGA：程序全局区详解
+
+PGA 是服务器进程或后台进程私有的内存区域，每个连接都有一个独立的 PGA。PGA 不被多个进程共享，与 SGA 的共享性质形成对比。
+
+### PGA 的组成
+
+**Sort Area（排序区）**：用于 SQL 查询的排序操作（ORDER BY、GROUP BY、DISTINCT 等）和索引创建。排序结果超过排序区大小时，使用临时段（磁盘排序），性能急剧下降。
+
+**Hash Area（哈希区）**：用于哈希连接（Hash Join）操作，将较小表加载到内存构建哈希表。
+
+**Bitmap Merge Area**：用于位图索引操作中的位图合并。
+
+**Session Memory（会话内存）**：存储会话信息、绑定变量值等。
+
+```sql
+-- 配置 PGA 目标大小
+ALTER SYSTEM SET pga_aggregate_target = 512M;
+
+-- 查看 PGA 使用情况
+SELECT name, value/1024/1024 AS size_mb FROM V$PGASTAT
+WHERE name = 'total PGA allocated';
+
+-- 查看各进程 PGA 使用
+SELECT pid, name, pga_alloc_mem/1024/1024 AS pga_mb
+FROM V$PROCESS
+ORDER BY pga_alloc_mem DESC;
+```
+
+### PGA 的演进：从 UGA 到 SESSION PGA
+
+在 Oracle 12c 之前：
+
+- **专用服务器模式**：UGA 位于 PGA 中（进程私有）
+- **共享服务器模式**：UGA 位于 Large Pool 中（共享）
+
+在 Oracle 12c 之后，统一称为 **SESSION PGA**，不再区分这两种模式，简化了内存管理。
+
+### 私有 SQL 区域
+
+每条 SQL 语句在 PGA 中都有对应的私有 SQL 区域，存储：
+
+- 绑定变量值
+- 会话级别的优化统计
+- 游标信息
+
+```sql
+-- 查看打开的游标数
+SELECT user_process, COUNT(*) AS cursor_count
+FROM V$OPEN_CURSOR
+GROUP BY user_process;
+
+-- 设置单个会话最大游标数
+ALTER SESSION SET open_cursors = 500;
+```
+
+## 内存管理参数
+
+```sql
+-- 查看所有内存相关参数
+SHOW PARAMETER memory;
+SHOW PARAMETER sga;
+SHOW PARAMETER pga;
+
+-- 自动内存管理（Oracle 11g+ 推荐方式）
+ALTER SYSTEM SET memory_target = 4G SCOPE = SPFILE;
+ALTER SYSTEM SET memory_max_target = 4G SCOPE = SPFILE;
+
+-- 自动共享内存管理
+ALTER SYSTEM SET sga_target = 3G;
+ALTER SYSTEM SET sga_max_size = 3G;
+
+-- 禁用 AMM（使用 HugePages 时必须禁用）
+ALTER SYSTEM SET memory_target = 0;
+ALTER SYSTEM SET memory_max_target = 4G;
+```
+
+| 参数 | 说明 | 适用场景 |
+|---|---|---|
+| memory_target | SGA + PGA 目标大小 | AMM 模式 |
+| sga_target | SGA 目标大小 | ASMM 模式 |
+| pga_aggregate_target | PGA 目标大小 | 手动管理 PGA |
+| sga_max_size | SGA 最大大小 | 所有模式 |
+
+## 内存调优建议
+
+**Buffer Cache 命中率低于 90%**：
+
+- 增加 `db_cache_size`
+- 检查是否有大表全表扫描
+- 考虑将热点表放入 KEEP 池
+
+**Shared Pool 命中率低**：
+
+- 使用绑定变量减少硬解析
+- 避免动态 SQL
+- 增加 `shared_pool_size`
+
+**PGA 不足（磁盘排序多）**：
+
+- 增加 `pga_aggregate_target`
+- 优化 SQL，减少排序数据量
+- 创建合适的索引
+
+## 常见面试问题
+
+**问：SGA 和 PGA 的主要区别是什么？**
+
+SGA 是共享内存区域，所有进程共享访问，包含 Buffer Cache、Shared Pool、Redo Log Buffer 等组件；PGA 是进程私有内存区域，每个服务器进程独有，包含排序区、哈希区、会话信息等。
+
+**问：什么是软解析和硬解析？为什么绑定变量能提高性能？**
+
+软解析指 SQL 在库缓存中找到匹配项，直接重用已有的执行计划，代价很低。硬解析指 SQL 未在库缓存中找到，需要执行完整的语法分析、语义分析、优化等步骤，代价很高。绑定变量将 SQL 中的字面值替换为占位符（`:1`），使相同结构的 SQL 共享一个执行计划，大幅减少硬解析次数。
+
+**问：Buffer Cache 命中率如何计算？什么情况下需要调优？**
+
+命中率 `= 1 - (physical reads / (db block gets + consistent gets))`。命中率低于 90% 时应考虑调优，可能需要增加 Buffer Cache 大小或优化 SQL。
+
+## 总结
+
+SGA 和 PGA 构成了 Oracle 内存管理的两大支柱。SGA 的自动内存管理简化了 DBA 的工作，但理解各组件的原理有助于进行精细调优。Buffer Cache 的命中率、Shared Pool 的解析效率、PGA 的排序和哈希操作，都是日常监控和优化的重点方向。

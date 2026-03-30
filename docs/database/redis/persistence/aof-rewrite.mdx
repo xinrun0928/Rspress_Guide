@@ -1,0 +1,347 @@
+import { Badge } from '@rspress/core/theme';
+
+# AOF 重写机制
+
+AOF（Append Only File）通过记录所有写命令来持久化数据。但随着时间推移，AOF 文件会越来越大，而且文件中可能包含大量冗余命令（如同一个 key 被修改了 100 次）。AOF 重写机制解决了这个问题。
+
+## AOF 文件膨胀问题
+
+```bash
+# AOF 文件示例
+SET user:1:name "Alice"        # 1 KB
+SET user:1:name "Bob"          # 1 KB
+SET user:1:name "Charlie"      # 1 KB
+INCR page:views:1001           # 1 KB
+INCR page:views:1001           # 1 KB
+INCR page:views:1001           # 1 KB
+HSET product:100 price 99      # 1 KB
+HSET product:100 stock 100     # 1 KB
+HSET product:100 sold 50       # 1 KB
+# ... 重复 10000 次
+
+# 最终文件大小：100 MB
+# 但实际有效数据只有 10 KB
+```
+
+## AOF 重写原理
+
+AOF 重写会**压缩** AOF 文件，只保留最终的数据状态：
+
+```
+重写前（100MB）：
+SET user:1:name "Alice"      # 1KB
+SET user:1:name "Bob"         # 1KB
+SET user:1:name "Charlie"     # 1KB
+... 重复 100000 次
+---
+最终状态：user:1:name = "Charlie"
+
+重写后（1KB）：
+SET user:1:name "Charlie"
+```
+
+## 重写方式
+
+### 方式一：bgrewriteaof 命令
+
+```bash
+# 手动触发 AOF 重写
+redis-cli BGREWRITEAOF
+
+# 返回：Background append only file rewriting started
+```
+
+### 方式二：自动触发
+
+```bash
+# 配置自动重写
+appendonly yes                    # 开启 AOF
+auto-aof-rewrite-percentage 100   # 文件比上次重写后增长 100% 时触发
+auto-aof-rewrite-min-size 64mb    # 文件至少 64MB 时才触发
+```
+
+## 重写原理
+
+### 子进程重写
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      主进程                                  │
+│                                                              │
+│  接收命令：SET user:1:name "David"                          │
+│                          │                                  │
+│                          │ 继续处理命令                      │
+│                          ▼                                  │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │                    主进程                            │    │
+│  │  1. fork() 创建子进程                                │    │
+│  │  2. 继续处理新命令                                    │    │
+│  │  3. 将新命令追加到 AOF 缓冲区和 AOF 重写缓冲区          │    │
+│  └─────────────────────────────────────────────────────┘    │
+│                          │                                  │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │                    子进程                            │    │
+│  │  1. 读取当前数据库数据                                │    │
+│  │  2. 生成新的 AOF 文件                                │    │
+│  │  3. 完成后通知主进程                                  │    │
+│  └─────────────────────────────────────────────────────┘    │
+│                          │                                  │
+│                          ▼                                  │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │                    完成                              │    │
+│  │  1. 原子替换旧 AOF 文件                              │    │
+│  │  2. 将重写缓冲区追加到新文件                           │    │
+│  └─────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 重写缓冲区
+
+重写过程中，主进程仍在处理命令。这些命令会被写入**重写缓冲区**：
+
+```bash
+# 重写过程中：
+# 子进程正在生成新的 AOF 文件
+
+# 主进程收到新命令
+SET user:1:name "Eve"
+HSET product:200 price 199
+
+# 新命令被写入：
+# 1. AOF 缓冲区（原有逻辑）
+# 2. AOF 重写缓冲区（新增）
+```
+
+重写完成后，重写缓冲区的内容会被追加到新的 AOF 文件：
+
+```bash
+# 新的 AOF 文件
+SET user:1:name "Charlie"    # 子进程生成
+SET user:1:name "Eve"        # 重写缓冲区追加
+HSET product:200 price 199   # 重写缓冲区追加
+```
+
+## AOF 持久化配置
+
+### 配置参数
+
+```bash
+# 开启 AOF
+appendonly yes
+
+# AOF 文件名
+appendfilename "appendonly.aof"
+
+# AOF 写入策略
+appendfsync everysec   # 每秒同步（推荐）
+# appendfsync always   # 每次写入同步（最安全，性能差）
+# appendfsync no       # 交给操作系统同步（性能最好，可能丢失数据）
+
+# 重写配置
+auto-aof-rewrite-percentage 100   # 增长 100% 时重写
+auto-aof-rewrite-min-size 64mb    # 最小 64MB
+```
+
+### 重写触发条件
+
+```bash
+# 条件 1：文件大小增长达到阈值
+# 当前文件大小 > 上次重写后文件大小 * (100 + 100) / 100
+# 即：当前 > 上次 * 2
+
+# 条件 2：文件大小达到最小值
+# 当前文件大小 >= 64MB
+```
+
+## Java 实现 AOF 重写
+
+```java
+@Service
+public class AOFService {
+    
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+    
+    /**
+     * 触发手动重写
+     */
+    public void triggerRewrite() {
+        // 发送 BGREWRITEAOF 命令
+        String result = redisTemplate.execute(new RedisCallback<String>() {
+            @Override
+            public String doInRedis(RedisConnection connection) throws DataAccessException {
+                return connection.commands().bgrewriteaof();
+            }
+        });
+        
+        System.out.println("AOF 重写已触发: " + result);
+    }
+    
+    /**
+     * 获取 AOF 重写状态
+     */
+    public Map<String, Object> getRewriteStatus() {
+        Map<String, Object> status = new HashMap<>();
+        
+        // 获取 AOF 持久化状态
+        Properties info = redisTemplate.getConnectionFactory()
+            .getConnection().serverCommands().info("persistence");
+        
+        if (info != null) {
+            status.put("aofEnabled", info.getProperty("aof_enabled"));
+            status.put("aofCurrentSize", info.getProperty("aof_current_size"));
+            status.put("aofBaseSize", info.getProperty("aof_base_size"));
+            status.put("aofPendingRewrite", info.getProperty("aof_pending_rewrite"));
+            status.put("aofRewriteScheduled", info.getProperty("aof_rewrite_scheduled"));
+        }
+        
+        return status;
+    }
+}
+```
+
+## AOF 恢复
+
+### 从 AOF 恢复数据
+
+```bash
+# Redis 启动时自动检测 AOF 文件
+# 如果 AOF 文件存在，自动加载
+
+# 如果 AOF 文件损坏，可以使用修复工具
+redis-check-aof --fix appendonly.aof
+
+# 查看修复后的变化
+redis-check-aof --fix appendonly.aof --diff
+```
+
+### 修复示例
+
+```bash
+# 备份损坏的 AOF
+cp appendonly.aof appendonly.aof.bak
+
+# 修复 AOF
+redis-check-aof --fix appendonly.aof
+
+# 检查修复结果
+# 如果丢失了部分数据，需要评估影响
+```
+
+## AOF 重写与 RDB 混合持久化
+
+Redis 4.0 引入了混合持久化，AOF 重写时生成 RDB 格式的数据：
+
+```bash
+# 开启混合持久化
+aof-use-rdb-preamble yes
+```
+
+```
+混合持久化的 AOF 文件结构：
+
+┌─────────────────────────────────────────────────────────────┐
+│                      混合 AOF 文件                           │
+│                                                              │
+│  ┌─────────────────┐    ┌─────────────────────────────────┐│
+│  │   RDB 格式      │ +  │   AOF 增量                      ││
+│  │   (重写前的状态) │    │   (重写期间的增量命令)            ││
+│  │   REDIS.........│    │   SET user:1:name "Eve"         ││
+│  │   ...           │    │   HSET product:200 price 199    ││
+│  └─────────────────┘    └─────────────────────────────────┘│
+└─────────────────────────────────────────────────────────────┘
+```
+
+优点：
+- 加载速度更快（RDB 部分快速加载）
+- 体积更小（RDB 压缩）
+- 数据完整性（AOF 增量保证）
+
+## 性能影响
+
+### 重写的性能影响
+
+```bash
+# fork() 的影响
+# - 复制页表
+# - COW（Copy On Write）机制
+# - 阻塞时间取决于内存大小
+
+# 重写过程的性能影响
+# - fork() 时短暂阻塞（约几十毫秒）
+# - COW 期间内存翻倍的风险
+# - AOF 缓冲区写入
+```
+
+### 优化建议
+
+```bash
+# 1. 使用 everysec 策略，减少同步开销
+appendfsync everysec
+
+# 2. 设置合理的重写阈值
+auto-aof-rewrite-percentage 100   # 100% 增长时重写
+auto-aof-rewrite-min-size 1gb    # 1GB 以上才重写
+
+# 3. 使用混合持久化，加快恢复速度
+aof-use-rdb-preamble yes
+
+# 4. 监控重写状态
+redis-cli INFO persistence | grep aof
+```
+
+## 监控 AOF 重写
+
+```bash
+# 查看 AOF 状态
+redis-cli INFO persistence
+
+# 输出示例
+aof_enabled:1
+aof_current_size:104857600
+aof_base_size:52428800
+aof_pending_rewrite:0
+aof_rewrite_buffer_length:0
+aof_rewrite_scheduled:0
+aof_last_write_status:ok
+aof_last_cow_size:52428800
+```
+
+```python
+# Python 监控
+import redis
+
+def monitor_aof():
+    r = redis.Redis()
+    info = r.info('persistence')
+    
+    print(f"AOF 开启: {info['aof_enabled']}")
+    print(f"当前大小: {info['aof_current_size'] / 1024 / 1024:.2f} MB")
+    print(f"上次重写大小: {info['aof_base_size'] / 1024 / 1024:.2f} MB")
+    print(f"重写缓冲区: {info['aof_rewrite_buffer_length']}")
+    
+    # 计算增长比例
+    if info['aof_base_size'] > 0:
+        growth = (info['aof_current_size'] / info['aof_base_size'] - 1) * 100
+        print(f"增长比例: {growth:.2f}%")
+```
+
+## 面试追问方向
+
+- AOF 重写的原理是什么？
+- 为什么使用子进程而不是线程？
+- 重写缓冲区的作用是什么？
+- AOF 和 RDB 混合持久化有什么优势？
+- 如何优化 AOF 重写的性能？
+
+## 总结
+
+AOF 重写是保持 AOF 文件精简的关键机制：
+
+1. **压缩文件**：去除冗余命令，只保留最终状态
+2. **子进程重写**：避免阻塞主进程
+3. **重写缓冲区**：记录重写期间的新命令
+4. **混合持久化**：结合 RDB 和 AOF 的优势
+5. **自动触发**：根据配置自动执行
+
+合理配置 AOF 重写，可以兼顾数据安全和性能。

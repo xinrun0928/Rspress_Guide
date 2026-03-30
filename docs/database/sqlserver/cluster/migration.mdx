@@ -1,0 +1,425 @@
+import { Badge } from '@rspress/core/theme';
+
+# 登台与迁移
+
+数据库迁移是一项复杂工程，需要精心规划和执行。本文介绍从准备到上线的完整迁移流程。
+
+## 迁移策略概述
+
+### 迁移类型
+
+| 类型 | 说明 | 停机时间 |
+|---|---|---|
+| 备份/恢复 | 最简单，停机最长 | 数小时 |
+| 分离/附加 | 较快，有连接断开 | 中等 |
+| 复制/同步 | 最小停机 | 最短 |
+| Always On AG | 最小停机，复杂 | 最短 |
+
+### 迁移决策
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    迁移策略选择                                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  数据量 < 100GB？ ──▶ 备份/恢复                                 │
+│       │                                                         │
+│       │ 否                                                      │
+│       ▼                                                         │
+│  能否接受较长停机？ ──▶ 备份/恢复 或 分离附加                     │
+│       │                                                         │
+│       │ 否                                                      │
+│       ▼                                                         │
+│  目标版本 >= SQL 2012？ ──▶ Always On AG 迁移                    │
+│       │                                                         │
+│       │ 否                                                      │
+│       ▼                                                         │
+│  事务复制迁移                                                  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 迁移前准备
+
+### 环境评估
+
+```sql
+-- 1. 收集源数据库信息
+SELECT 
+    DB_NAME(database_id) AS DatabaseName,
+    CAST(SUM(size) * 8.0 / 1024 / 1024 AS DECIMAL(10,2)) AS SizeGB,
+    compatibility_level,
+    collation_name,
+    recovery_model_desc
+FROM sys.dm_db_file_space_usage
+CROSS JOIN sys.databases
+WHERE DB_NAME(database_id) = 'YourDB'
+GROUP BY database_id, compatibility_level, collation_name, recovery_model_desc;
+
+-- 2. 收集连接信息
+SELECT 
+    session_id,
+    login_name,
+    host_name,
+    program_name,
+    status,
+    cpu_time,
+    memory_usage,
+    total_elapsed_time
+FROM sys.dm_exec_sessions
+WHERE database_id = DB_ID('YourDB');
+
+-- 3. 收集长时间运行的查询
+SELECT 
+    qs.total_elapsed_time / 1000.0 AS TotalSeconds,
+    SUBSTRING(qt.text, 1, 200) AS QueryText,
+    sp.program_name,
+    sp.loginame
+FROM sys.dm_exec_query_stats qs
+CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) qt
+JOIN sys.dm_exec_sessions sp ON qs.session_id = sp.session_id
+WHERE qt.dbid = DB_ID('YourDB')
+ORDER BY qs.total_elapsed_time DESC;
+
+-- 4. 收集索引信息
+SELECT 
+    OBJECT_NAME(i.object_id) AS TableName,
+    i.name AS IndexName,
+    i.type_desc,
+    ips.page_count * 8 / 1024.0 AS IndexSizeMB
+FROM sys.indexes i
+JOIN sys.dm_db_index_physical_stats(
+    DB_ID(), NULL, NULL, NULL, 'DETAILED') ips ON i.object_id = ips.object_id AND i.index_id = ips.index_id
+WHERE OBJECTPROPERTY(i.object_id, 'IsUserTable') = 1;
+```
+
+### 依赖分析
+
+```sql
+-- 查看数据库对象依赖
+SELECT 
+    referencing_schema_name,
+    referencing_entity_name,
+    referencing_id,
+    is_ambiguous,
+    is_cascading
+FROM sys.sql_expression_dependencies
+WHERE referenced_id = OBJECT_ID('YourObject');
+
+-- 查看链接服务器引用
+SELECT 
+    name AS LinkedServer,
+    provider,
+    data_source,
+    is_remote_login_enabled
+FROM sys.servers
+WHERE is_linked = 1;
+
+-- 查看作业引用
+SELECT 
+    j.name AS JobName,
+    j.enabled,
+    j.description
+FROM msdb.dbo.sysjobs j
+JOIN msdb.dbo.sysjobsteps js ON j.job_id = js.job_id
+WHERE js.database_name = 'YourDB';
+```
+
+## 备份/恢复迁移
+
+### 标准备份恢复
+
+```sql
+-- 1. 源服务器完整备份
+BACKUP DATABASE [YourDB]
+TO DISK = '\\FileShare\YourDB_Full.bak'
+WITH COMPRESSION, CHECKSUM, STATS = 10;
+
+-- 2. 复制备份到目标服务器
+-- PowerShell:
+Copy-Item -Path '\\FileShare\YourDB_Full.bak' -Destination 'E:\Backup\'
+
+-- 3. 目标服务器恢复
+RESTORE DATABASE [YourDB]
+FROM DISK = 'E:\Backup\YourDB_Full.bak'
+WITH MOVE 'YourDB_Data' TO 'F:\Data\YourDB.mdf',
+     MOVE 'YourDB_Log' TO 'G:\Logs\YourDB.ldf',
+     STATS = 10;
+
+-- 4. 验证恢复
+SELECT 
+    name,
+    state_desc,
+    compatibility_level,
+    collation_name
+FROM sys.databases
+WHERE name = 'YourDB';
+
+-- 5. 更新统计信息
+EXEC sp_updatestats 'YourDB';
+```
+
+### 分离/附加迁移
+
+```sql
+-- 源服务器
+-- 1. 确保没有连接
+ALTER DATABASE [YourDB] SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
+
+-- 2. 分离数据库
+EXEC sp_detach_db @dbname = 'YourDB', @skipchecks = 'true';
+
+-- 3. 复制文件到目标服务器
+-- PowerShell:
+Copy-Item -Path '\\SourceServer\F$\Data\YourDB.mdf' -Destination '\\TargetServer\F$\Data\'
+Copy-Item -Path '\\SourceServer\F$\Logs\YourDB_log.ldf' -Destination '\\TargetServer\F$\Logs\'
+
+-- 目标服务器
+-- 4. 附加数据库
+CREATE DATABASE [YourDB]
+ON (FILENAME = 'F:\Data\YourDB.mdf'),
+    (FILENAME = 'F:\Logs\YourDB_log.ldf')
+FOR ATTACH;
+
+-- 5. 设置多用户模式
+ALTER DATABASE [YourDB] SET MULTI_USER;
+```
+
+## Always On AG 迁移
+
+### 最小停机迁移
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Always On AG 迁移流程                          │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  阶段 1：准备                                                  │
+│  - 在目标服务器恢复数据库（NORECOVERY）                         │
+│  - 创建 Always On AG                                           │
+│  - 将数据库加入 AG                                              │
+│                                                                 │
+│  阶段 2：同步                                                  │
+│  - 等待所有副本同步                                             │
+│  - 监控同步状态                                                  │
+│                                                                 │
+│  阶段 3：切换                                                  │
+│  - 停止应用程序                                                 │
+│  - 等待最后一个日志备份                                          │
+│  - 执行故障转移                                                  │
+│  - 更新连接字符串                                                │
+│                                                                 │
+│  阶段 4：清理                                                  │
+│  - 删除源 AG                                                    │
+│  - 清理源服务器                                                 │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 迁移步骤
+
+```sql
+-- 阶段 1：准备目标服务器
+-- 1. 在目标副本恢复数据库（NORECOVERY）
+RESTORE DATABASE [YourDB]
+FROM DISK = '\\FileShare\YourDB_Full.bak'
+WITH NORECOVERY,
+MOVE 'YourDB_Data' TO 'F:\Data\YourDB.mdf',
+MOVE 'YourDB_Log' TO 'G:\Logs\YourDB.ldf';
+
+RESTORE LOG [YourDB]
+FROM DISK = '\\FileShare\YourDB_Log.trn'
+WITH NORECOVERY;
+
+-- 2. 创建 AG（使用 PowerShell 或 SSMS）
+New-AgAvailabilityGroup -Name "AG1" `
+    -ClusterType Wsfc `
+    -DtcSupportEnabled `
+    -DatabaseHealthTrigger `
+    -EncryptionMode Preferred `
+    -ServerInstance "TargetServer1"
+
+-- 3. 添加副本
+Add-AgAvailabilityGroupReplica `
+    -Name "AG1" `
+    -ServerInstance "TargetServer2" `
+    -EndpointUrl "TCP://TargetServer2:5022" `
+    -AvailabilityMode AsynchronousCommit `
+    -FailoverMode Manual `
+    -SeedingMode Automatic
+
+-- 4. 将数据库加入 AG
+Add-DbaAgDatabase `
+    -SqlInstance "TargetServer1" `
+    -AvailabilityGroup "AG1" `
+    -Database "YourDB"
+
+-- 阶段 2：监控同步
+-- 在所有副本上验证
+SELECT 
+    ag.name AS AGName,
+    ar.replica_server_name,
+    ar.availability_mode_desc,
+    drs.synchronization_state_desc,
+    drs.last_redone_lsn
+FROM sys.dm_hadr_database_replica_states drs
+JOIN sys.availability_replicas ar ON drs.replica_id = ar.replica_id
+JOIN sys.availability_groups ag ON ar.group_id = ag.group_id;
+
+-- 阶段 3：切换
+-- 1. 停止应用
+-- 2. 在主副本执行最后一次日志备份
+BACKUP LOG [YourDB]
+TO DISK = '\\FileShare\YourDB_Final.trn'
+WITH COMPRESSION;
+
+-- 3. 在目标副本应用最后日志
+RESTORE LOG [YourDB]
+FROM DISK = '\\FileShare\YourDB_Final.trn'
+WITH NORECOVERY;
+
+-- 4. 执行故障转移
+ALTER AVAILABILITY GROUP [AG1] FAILOVER;
+
+-- 5. 验证新主副本
+SELECT 
+    ar.replica_server_name,
+    drs.is_primary_replica,
+    drs.synchronization_state_desc
+FROM sys.dm_hadr_database_replica_states drs
+JOIN sys.availability_replicas ar ON drs.replica_id = ar.replica_id
+WHERE drs.is_local = 1;
+
+-- 6. 更新应用连接字符串
+"Server=AGListenerName;Database=YourDB;ApplicationIntent=ReadWrite"
+```
+
+## 迁移后验证
+
+### 功能验证
+
+```sql
+-- 1. 验证数据库完整性
+DBCC CHECKDB ('YourDB') WITH NO_INFOMSGS;
+
+-- 2. 验证对象
+SELECT 
+    OBJECT_NAME(object_id) AS MissingObject
+FROM sys.objects
+WHERE is_ms_shipped = 0
+    AND type IN ('P', 'FN', 'IF', 'TF', 'V')
+    AND OBJECT_DEFINITION(object_id) LIKE '%NonExistent%';
+
+-- 3. 验证索引
+EXEC sp_helpindex 'YourTable';
+
+-- 4. 验证约束
+SELECT 
+    OBJECT_NAME(parent_object_id) AS TableName,
+    name AS ConstraintName,
+    type_desc
+FROM sys.key_constraints
+WHERE parent_object_id = OBJECT_ID('YourTable');
+
+-- 5. 验证权限
+SELECT 
+    dp.name AS Principal,
+    dp.type_desc,
+    o.name AS ObjectName,
+    dp.permission_name
+FROM sys.database_permissions dp
+JOIN sys.objects o ON dp.major_id = o.object_id
+WHERE o.object_id = OBJECT_ID('YourTable');
+```
+
+### 性能验证
+
+```sql
+-- 1. 检查查询性能
+SET STATISTICS IO ON;
+SET STATISTICS TIME ON;
+
+-- 2. 重建索引
+EXEC sp_MSforeachtable 'ALTER INDEX ALL ON ? REBUILD';
+
+-- 3. 更新统计信息
+EXEC sp_updatestats 'YourDB';
+
+-- 4. 检查等待统计
+SELECT 
+    wait_type,
+    wait_time_ms,
+    waiting_tasks_count
+FROM sys.dm_os_wait_stats
+WHERE wait_time_ms > 1000
+ORDER BY wait_time_ms DESC;
+```
+
+## 回滚计划
+
+### 回滚触发条件
+
+| 条件 | 说明 |
+|---|---|
+| 性能回归 > 20% | 响应时间明显变慢 |
+| 功能错误 | 关键功能不可用 |
+| 连接失败 | 无法连接数据库 |
+| 数据不一致 | 数据校验失败 |
+
+### 回滚步骤
+
+```sql
+-- 方案 1：从备份恢复
+-- 1. 备份当前数据库
+BACKUP DATABASE [YourDB]
+TO DISK = '\\FileShare\YourDB_PreRollback.bak'
+WITH COMPRESSION;
+
+-- 2. 恢复到原服务器
+RESTORE DATABASE [YourDB]
+FROM DISK = '\\FileShare\YourDB_Original.bak'
+WITH MOVE 'YourDB_Data' TO 'F:\Data\YourDB.mdf',
+     MOVE 'YourDB_Log' TO 'G:\Logs\YourDB.ldf',
+     REPLACE;
+
+-- 方案 2：Always On AG 回切
+-- 1. 确保原服务器可用
+-- 2. 从备份恢复原服务器
+-- 3. 重建 AG
+-- 4. 故障转移回原服务器
+ALTER AVAILABILITY GROUP [AG1] FAILOVER;
+```
+
+## 迁移检查清单
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    迁移检查清单                                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  迁移前                                                          │
+│  □ 完整备份已验证                                                │
+│  □ 恢复测试已完成                                                │
+│  □ 所有依赖已记录                                                │
+│  □ 回滚计划已准备                                                │
+│  □ 沟通计划已通知                                                │
+│  □ 维护窗口已确认                                                │
+│                                                                 │
+│  迁移中                                                          │
+│  □ 按计划执行步骤                                                │
+│  □ 记录执行时间                                                  │
+│  □ 监控进度                                                      │
+│  □ 记录问题                                                      │
+│                                                                 │
+│  迁移后                                                          │
+│  □ 功能验证通过                                                  │
+│  □ 性能验证通过                                                  │
+│  □ 安全设置正确                                                  │
+│  □ 监控已配置                                                    │
+│  □ 备份已配置                                                    │
+│  □ 文档已更新                                                    │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+数据库迁移是高风险操作，遵循系统化的流程和充分的测试是成功的关键。

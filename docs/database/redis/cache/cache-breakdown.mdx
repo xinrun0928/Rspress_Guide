@@ -1,0 +1,445 @@
+# 缓存击穿：互斥锁 + 逻辑过期双检
+
+热点数据过期了，大批请求同时涌入数据库——这不是雪崩，而是击穿。
+
+## 什么是缓存击穿
+
+缓存击穿是指：**某个热点 key 过期瞬间，大量请求同时击穿到数据库**。
+
+```
+热点 key 在缓存中
+     |
+     v
+   过期
+     |
+     v
+请求 A -> 缓存（未命中）-> 数据库查询
+请求 B -> 缓存（未命中）-> 数据库查询
+请求 C -> 缓存（未命中）-> 数据库查询
+...
+     |
+     v
+  数据库被打垮
+```
+
+**击穿 vs 穿透 vs 雪崩**：
+
+| 类型 | 描述 | 特点 |
+| --- | --- | --- |
+| 穿透 | 查询不存在的数据 | 绕过缓存，直击数据库 |
+| 击穿 | 热点 key 过期瞬间 | 大量请求同时击穿 |
+| 雪崩 | 大量 key 同时过期 | 大规模失效 |
+
+```
+穿透：数据根本不存在
+     key 不存在 -> 每次都查数据库
+
+击穿：热点数据过期
+     热点 key -> 过期 -> 大量请求同时查数据库
+
+雪崩：大量数据过期
+     大量 key -> 同时过期 -> 数据库压力剧增
+```
+
+## 击穿的危害
+
+```python
+# 场景：商品详情页缓存过期
+
+# 正常情况（缓存有效）
+10000 QPS -> Redis 缓存 -> 全部命中 -> 数据库 0 QPS
+
+# 击穿情况（缓存失效）
+10000 QPS -> Redis 缓存 -> 全部未命中
+                  |
+                  v
+            10000 个请求同时查数据库
+                  |
+                  v
+            数据库连接池耗尽 -> 数据库宕机
+```
+
+## 解决方案一：互斥锁
+
+### 原理
+
+只允许一个请求去查询数据库，其他请求等待：
+
+```
+请求 A -> 获取互斥锁 -> 查询数据库 -> 写入缓存 -> 释放锁
+请求 B -> 获取互斥锁（失败）-> 等待或重试 -> 获取锁（成功）-> 从缓存读取
+请求 C -> 获取互斥锁（失败）-> 等待或重试 -> 从缓存读取
+```
+
+### Redis 实现互斥锁
+
+```python
+import redis
+import time
+import uuid
+
+class MutexLock:
+    def __init__(self):
+        self.redis = redis.Redis(host='localhost', port=6379)
+        self.lock_key = "lock:{key}"
+        self.lock_timeout = 10  # 锁过期时间
+    
+    def acquire(self, key, timeout=5):
+        """尝试获取锁"""
+        lock_key = self.lock_key.format(key=key)
+        lock_value = str(uuid.uuid4())  # 唯一标识
+        
+        # SETNX + EXPIRE 原子操作
+        if self.redis.set(lock_key, lock_value, nx=True, ex=timeout):
+            return lock_value
+        return None
+    
+    def release(self, key, lock_value):
+        """释放锁"""
+        lock_key = self.lock_key.format(key=key)
+        
+        # Lua 脚本保证原子性
+        lua = """
+        if redis.call("get", KEYS[1]) == ARGV[1] then
+            return redis.call("del", KEYS[1])
+        else
+            return 0
+        end
+        """
+        self.redis.eval(lua, 1, lock_key, lock_value)
+
+
+# 互斥锁查询实现
+def get_data_with_lock(key):
+    cache_key = f"cache:{key}"
+    mutex = MutexLock()
+    
+    # 1. 查询缓存
+    value = redis.get(cache_key)
+    if value:
+        return json.loads(value)
+    
+    # 2. 尝试获取互斥锁
+    lock_value = mutex.acquire(key)
+    
+    if lock_value is None:
+        # 获取锁失败，等待后重试
+        time.sleep(0.1)
+        value = redis.get(cache_key)
+        if value:
+            return json.loads(value)
+        # 再次尝试获取锁
+        lock_value = mutex.acquire(key, timeout=1)
+        if lock_value is None:
+            # 仍然获取不到，直接查数据库（兜底）
+            return query_db(key)
+    
+    # 3. 获取锁成功，查询数据库
+    try:
+        value = query_db(key)
+        if value:
+            redis.setex(cache_key, 3600, json.dumps(value))
+        return value
+    finally:
+        # 4. 释放锁
+        mutex.release(key, lock_value)
+```
+
+### 优缺点
+
+**优点**：
+- 保证数据库不会被压垮
+- 实现简单
+
+**缺点**：
+- 大量请求会等待，增加响应时间
+- 可能产生死锁（需要设置合理的过期时间）
+
+## 解决方案二：逻辑过期
+
+### 原理
+
+不给缓存设置真正的过期时间，而是在数据中保存一个「逻辑过期时间」：
+
+```
+缓存结构：
+{
+    "data": {...},
+    "logical_expire": "2024-01-01 12:00:00"  # 逻辑过期时间
+}
+
+线程 A 发现逻辑过期：
+     |
+     v
+获取互斥锁
+     |
+     v
+开启新线程重建缓存
+     |
+     v
+返回旧数据给用户（不过期）
+```
+
+### 逻辑过期实现
+
+```python
+import time
+import json
+from datetime import datetime
+
+class LogicalExpireCache:
+    def __init__(self):
+        self.redis = redis.Redis(host='localhost', port=6379)
+        self.lock_key = "lock:{key}"
+        self.mutex_timeout = 10
+    
+    def get_data(self, key):
+        """获取数据"""
+        cache_key = f"cache:{key}"
+        
+        # 1. 查询缓存
+        value = self.redis.get(cache_key)
+        if not value:
+            # 缓存未命中，直接查数据库
+            return self._query_db_and_cache(key)
+        
+        # 2. 解析缓存数据
+        cache_data = json.loads(value)
+        logical_expire = datetime.fromisoformat(cache_data['logical_expire'])
+        
+        # 3. 判断是否逻辑过期
+        if logical_expire < datetime.now():
+            # 已逻辑过期，尝试获取锁
+            lock_key = self.lock_key.format(key=key)
+            lock_value = str(uuid.uuid4())
+            
+            if self.redis.set(lock_key, lock_value, nx=True, ex=self.mutex_timeout):
+                # 获取锁成功，开启后台线程重建缓存
+                Thread(target=self._rebuild_cache, args=(key,)).start()
+        
+        # 4. 返回数据（即使过期也返回旧数据）
+        return cache_data['data']
+    
+    def _rebuild_cache(self, key):
+        """重建缓存"""
+        cache_key = f"cache:{key}"
+        
+        try:
+            # 1. 查询数据库
+            data = self._query_db(key)
+            
+            # 2. 设置新的逻辑过期时间
+            new_expire = datetime.now() + timedelta(hours=1)
+            cache_data = {
+                "data": data,
+                "logical_expire": new_expire.isoformat()
+            }
+            
+            # 3. 写入缓存
+            self.redis.setex(cache_key, self.mutex_timeout + 60, json.dumps(cache_data))
+        finally:
+            # 4. 释放锁
+            self._release_lock(key)
+    
+    def _query_db_and_cache(self, key):
+        """查数据库并缓存"""
+        data = self._query_db(key)
+        
+        if data:
+            cache_key = f"cache:{key}"
+            new_expire = datetime.now() + timedelta(hours=1)
+            cache_data = {
+                "data": data,
+                "logical_expire": new_expire.isoformat()
+            }
+            self.redis.setex(cache_key, 3600, json.dumps(cache_data))
+        
+        return data
+```
+
+### 优缺点
+
+**优点**：
+- 所有请求都能立即获取数据
+- 只有一个线程重建缓存，开销小
+
+**缺点**：
+- 实现复杂
+- 返回的可能是过期数据（逻辑过期）
+- 如果锁失效，可能有多个线程同时重建缓存
+
+## 方案对比
+
+| 方案 | 优点 | 缺点 | 适用场景 |
+| --- | --- | --- | --- |
+| 互斥锁 | 实现简单，保证一致性 | 并发能力差，有等待 | 数据一致性要求高 |
+| 逻辑过期 | 并发能力强 | 可能返回过期数据 | 可以容忍短暂不一致 |
+
+## 实际代码示例
+
+### 互斥锁完整实现
+
+```python
+import redis
+import uuid
+import time
+import json
+
+class DistributedLock:
+    """分布式锁实现"""
+    
+    def __init__(self, redis_client):
+        self.redis = redis_client
+    
+    def lock(self, key, timeout=10):
+        """获取锁"""
+        lock_key = f"lock:{key}"
+        lock_value = str(uuid.uuid4())
+        
+        # SET NX EX 原子操作
+        if self.redis.set(lock_key, lock_value, nx=True, ex=timeout):
+            return lock_value
+        return None
+    
+    def unlock(self, key, lock_value):
+        """释放锁"""
+        lock_key = f"lock:{key}"
+        lua = """
+        if redis.call("get", KEYS[1]) == ARGV[1] then
+            return redis.call("del", KEYS[1])
+        else
+            return 0
+        end
+        """
+        return self.redis.eval(lua, 1, lock_key, lock_value)
+
+
+class CacheService:
+    """缓存服务（互斥锁方案）"""
+    
+    def __init__(self):
+        self.redis = redis.Redis(host='localhost', port=6379)
+        self.lock = DistributedLock(self.redis)
+        self.cache_ttl = 3600
+    
+    def get(self, key):
+        """获取数据"""
+        cache_key = f"cache:{key}"
+        
+        # 1. 查询缓存
+        value = self.redis.get(cache_key)
+        if value:
+            return json.loads(value)
+        
+        # 2. 尝试获取锁
+        lock_value = self.lock.lock(key)
+        
+        if lock_value is None:
+            # 获取锁失败，短暂等待后重试
+            time.sleep(0.1)
+            value = self.redis.get(cache_key)
+            if value:
+                return json.loads(value)
+        
+        try:
+            # 3. 获取锁成功，查数据库
+            data = self._query_db(key)
+            
+            if data:
+                self.redis.setex(cache_key, self.cache_ttl, json.dumps(data))
+            
+            return data
+        finally:
+            if lock_value:
+                self.lock.unlock(key, lock_value)
+```
+
+### 逻辑过期完整实现
+
+```python
+import json
+import time
+from datetime import datetime, timedelta
+from threading import Thread
+
+class LogicalExpireCache:
+    """逻辑过期缓存"""
+    
+    def __init__(self):
+        self.redis = redis.Redis(host='localhost', port=6379)
+        self.lock_key = "lock:{key}"
+        self.cache_ttl = 7200  # 2 小时
+        self.logical_ttl = 3600  # 1 小时逻辑过期
+        self.lock_timeout = 10
+    
+    def get(self, key):
+        """获取数据"""
+        cache_key = f"cache:{key}"
+        
+        # 1. 查询缓存
+        value = self.redis.get(cache_key)
+        if not value:
+            return self._load_from_db(key)
+        
+        # 2. 解析数据
+        cache_data = json.loads(value)
+        expire_time = datetime.fromisoformat(cache_data['expire_time'])
+        
+        # 3. 检查是否逻辑过期
+        if expire_time < datetime.now():
+            # 已过期，尝试获取锁
+            lock_value = str(uuid.uuid4())
+            acquired = self.redis.set(
+                self.lock_key.format(key=key),
+                lock_value,
+                nx=True,
+                ex=self.lock_timeout
+            )
+            
+            if acquired:
+                # 获取锁成功，开启线程重建
+                Thread(target=self._rebuild, args=(key,)).start()
+        
+        # 4. 返回数据
+        return cache_data['data']
+    
+    def _load_from_db(self, key):
+        """从数据库加载"""
+        cache_key = f"cache:{key}"
+        data = self._query_db(key)
+        
+        if data:
+            expire_time = datetime.now() + timedelta(seconds=self.logical_ttl)
+            cache_data = {
+                'data': data,
+                'expire_time': expire_time.isoformat()
+            }
+            self.redis.setex(cache_key, self.cache_ttl, json.dumps(cache_data))
+        
+        return data
+    
+    def _rebuild(self, key):
+        """重建缓存"""
+        try:
+            data = self._query_db(key)
+            if data:
+                cache_key = f"cache:{key}"
+                expire_time = datetime.now() + timedelta(seconds=self.logical_ttl)
+                cache_data = {
+                    'data': data,
+                    'expire_time': expire_time.isoformat()
+                }
+                self.redis.setex(cache_key, self.cache_ttl, json.dumps(cache_data))
+        finally:
+            self.redis.delete(self.lock_key.format(key=key))
+```
+
+## 面试追问方向
+
+- 什么是缓存击穿？和穿透、雪崩有什么区别？
+- 互斥锁的实现有什么注意点？
+- 逻辑过期方案有什么优缺点？
+- 为什么释放锁要用 Lua 脚本？
+- 如果锁获取失败了怎么办？
+
+理解缓存击穿问题，展示了你对高并发场景下缓存一致性的理解。

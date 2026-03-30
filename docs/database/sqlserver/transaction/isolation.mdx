@@ -1,0 +1,358 @@
+import { Badge } from '@rspress/core/theme';
+
+# 隔离级别
+
+「脏读、不可重复读、幻读——这三个概念有什么区别？」
+
+这三个「读」问题是事务并发控制的经典问题。SQL Server 通过隔离级别控制这些问题在什么程度上被允许或禁止。
+
+理解隔离级别，是掌握 SQL Server 并发控制的钥匙。
+
+## 四种经典并发问题
+
+在讨论隔离级别之前，先理解三种经典的并发问题：
+
+### 脏读（Dirty Read）
+
+读取了其他未提交事务的数据：
+
+```
+时间     事务 A                    事务 B
+T1      UPDATE Orders
+        SET Amount = 0
+        WHERE OrderID = 1
+T2                                 SELECT Amount
+                                  FROM Orders
+                                  WHERE OrderID = 1
+                                  -- 读到 0（脏数据）
+T3      ROLLBACK
+                                 -- B 读到了不存在的数据
+```
+
+### 不可重复读（Non-repeatable Read）
+
+同一事务中，两次读取同一行数据，结果不同：
+
+```
+时间     事务 A                    事务 B
+T1      SELECT Amount = 100
+        FROM Orders
+        WHERE OrderID = 1
+T2                                 UPDATE Orders
+                                  SET Amount = 200
+                                  WHERE OrderID = 1
+T3      SELECT Amount = 200  -- 与 T1 不同
+        FROM Orders
+        WHERE OrderID = 1
+```
+
+### 幻读（Phantom Read）
+
+同一事务中，两次查询返回的行数不同（新增或删除了行）：
+
+```
+时间     事务 A                    事务 B
+T1      SELECT COUNT(*) = 10
+        FROM Orders
+        WHERE CustomerID = 1
+T2                                 INSERT INTO Orders
+                                  VALUES (11, 1, ...)
+T3      SELECT COUNT(*) = 11  -- 与 T1 不同
+        FROM Orders
+        WHERE CustomerID = 1
+```
+
+## SQL Server 隔离级别
+
+SQL Server 支持五种隔离级别：
+
+| 隔离级别 | 脏读 | 不可重复读 | 幻读 |
+|---|---|---|---|
+| READ UNCOMMITTED | 可能 | 可能 | 可能 |
+| READ COMMITTED（默认） | 不可能 | 可能 | 可能 |
+| READ COMMITTED SNAPSHOT | 不可能 | 可能 | 可能 |
+| REPEATABLE READ | 不可能 | 不可能 | 可能 |
+| SERIALIZABLE | 不可能 | 不可能 | 不可能 |
+
+```sql
+-- 设置会话隔离级别
+SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
+
+-- 或在事务中设置
+BEGIN TRANSACTION
+SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+-- ...
+COMMIT;
+```
+
+## READ UNCOMMITTED
+
+最低隔离级别，允许读取未提交的数据（脏读）。
+
+```sql
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+
+-- 脏读示例
+BEGIN TRANSACTION;
+    -- 事务 B 正在更新但未提交
+    SELECT * FROM Orders WHERE Amount > 1000;
+    -- 可能读到事务 B 未提交的脏数据
+COMMIT;
+```
+
+### 使用场景
+
+- 允许脏数据的查询（如监控、报表）
+- 需要避免锁争用的只读查询
+- 数据一致性要求不高的场景
+
+### NOLOCK 提示
+
+```sql
+-- 等同于 READ UNCOMMITTED
+SELECT * FROM Orders WITH (NOLOCK);
+
+-- 警告：NOLOCK 可能导致：
+-- - 脏读
+-- - 页面错误（读取正在被分裂/合并的页）
+-- - 读取不存在的行（行被删除）
+```
+
+## READ COMMITTED
+
+SQL Server 默认隔离级别，不允许脏读。
+
+```sql
+SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
+
+-- 基本行为
+BEGIN TRANSACTION;
+    SELECT * FROM Orders WHERE OrderID = 1;
+    -- 如果其他事务正在修改此行，会等待
+COMMIT;
+```
+
+### 问题
+
+仍然允许不可重复读和幻读。
+
+## READ COMMITTED SNAPSHOT (RCSI)
+
+READ COMMITTED 的快照版本，使用行版本控制。
+
+### 启用 RCSI
+
+```sql
+-- 启用 RCSI
+ALTER DATABASE [YourDB] SET READ_COMMITTED_SNAPSHOT ON;
+
+-- 需要独占锁
+-- 执行期间数据库不可用
+```
+
+### 工作原理
+
+```
+不使用 RCSI：
+┌─────────────────────────────────────────────────────────────────┐
+│  事务 A 读取 OrderID=1                                        │
+│  事务 B 修改 OrderID=1，未提交                                  │
+│  事务 A 被阻塞，等待事务 B 提交或回滚                           │
+└─────────────────────────────────────────────────────────────────┘
+
+使用 RCSI：
+┌─────────────────────────────────────────────────────────────────┐
+│  事务 A 读取 OrderID=1                                         │
+│  事务 B 修改 OrderID=1，未提交                                  │
+│  事务 A 读取行版本（修改前的快照）                              │
+│  事务 A 不被阻塞                                                │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 与快照隔离的区别
+
+| 特性 | RCSI | SNAPSHOT |
+|---|---|---|
+| 版本读取时机 | 语句开始时 | 事务开始时 |
+| 更新冲突检测 | 否 | 是 |
+| UPDATE 失败可能 | 否 | 是 |
+| 开启方式 | 数据库级别 | 会话级别 |
+
+## REPEATABLE READ
+
+确保同一事务中多次读取同一行，返回相同结果。
+
+```sql
+SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+
+BEGIN TRANSACTION;
+    SELECT * FROM Orders WHERE OrderID = 1;
+    -- 在事务结束前，OrderID=1 行的锁不会被释放
+    -- 其他事务无法修改此行
+COMMIT;
+```
+
+### 锁的影响
+
+REPEATABLE READ 会持有共享锁直到事务结束，可能导致：
+- 长时间阻塞其他事务
+- 增加死锁风险
+- 高并发场景下性能下降
+
+## SERIALIZABLE
+
+最高隔离级别，完全串行化执行。
+
+```sql
+SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+
+BEGIN TRANSACTION;
+    SELECT COUNT(*) FROM Orders WHERE CustomerID = 1;
+    -- 锁定 CustomerID=1 的所有行
+    -- 其他事务无法插入、更新、删除 CustomerID=1 的行
+COMMIT;
+```
+
+### 范围锁
+
+SERIALIZABLE 会对查询范围加锁，包括：
+- 满足条件的行
+- 满足条件行之间的间隙（Gap Lock）
+
+### 性能影响
+
+SERIALIZABLE 是最严格的隔离级别，会显著降低并发性能：
+- 锁定范围大
+- 长时间持有锁
+- 高并发场景下严重阻塞
+
+## 快照隔离（SNAPSHOT）
+
+事务开始时读取数据快照，读取的是事务开始时的 Committed 数据。
+
+```sql
+-- 开启快照隔离（数据库级别）
+ALTER DATABASE [YourDB] SET ALLOW_SNAPSHOT_ISOLATION ON;
+
+-- 使用快照隔离
+SET TRANSACTION ISOLATION LEVEL SNAPSHOT;
+
+BEGIN TRANSACTION;
+    SELECT * FROM Orders WHERE OrderID = 1;
+    -- 读取事务开始时的数据版本
+COMMIT;
+```
+
+### 与 RCSI 的区别
+
+| 特性 | RCSI | SNAPSHOT |
+|---|---|---|
+| 版本读取时机 | 语句开始时 | 事务开始时 |
+| 第一次读取后数据不变 | 否 | 是 |
+| UPDATE 冲突检测 | 否 | 是 |
+| 并发更新同一行 | 第二个被阻塞 | 第二个失败 |
+
+### 更新冲突
+
+SNAPSHOT 隔离会检测更新冲突：
+
+```sql
+-- 事务 A
+SET TRANSACTION ISOLATION LEVEL SNAPSHOT;
+BEGIN TRANSACTION;
+    SELECT Amount INTO @OldAmount FROM Orders WHERE OrderID = 1;  -- Amount = 100
+    -- 事务 B 同时修改 Amount = 200 并提交
+    UPDATE Orders SET Amount = @OldAmount + 50 WHERE OrderID = 1;
+    -- 失败：数据已被其他事务修改
+COMMIT;
+
+-- 错误：Update conflicts occurred...
+```
+
+## 隔离级别与锁
+
+### 锁持有时间
+
+| 隔离级别 | 行锁持有时间 | 页/表锁持有时间 |
+|---|---|---|
+| READ UNCOMMITTED | 无 | 无 |
+| READ COMMITTED | 语句结束 | 语句结束 |
+| READ COMMITTED SNAPSHOT | 无（使用版本） | 无 |
+| REPEATABLE READ | 事务结束 | 事务结束 |
+| SERIALIZABLE | 事务结束 | 事务结束 |
+
+### 锁粒度升级
+
+```sql
+-- 当锁数量超过阈值时，SQL Server 会升级锁
+-- 默认阈值：5000 个锁
+
+-- 查看锁升级
+SELECT * FROM sys.dm_db_index_operational_stats(NULL, NULL, NULL, NULL)
+WHERE lock Escalation_desc = 'TABLE';
+
+-- 禁用锁升级
+ALTER TABLE Orders SET (LOCK_ESCALATION = DISABLE);
+
+-- 表级别锁升级
+ALTER TABLE Orders SET (LOCK_ESCALATION = AUTO);
+-- 在分区表上，分区级别锁升级
+```
+
+## 选择隔离级别
+
+### 选择指南
+
+| 场景 | 推荐隔离级别 |
+|---|---|
+| 报表/数据分析 | READ UNCOMMITTED / NOLOCK |
+| 常规 OLTP | READ COMMITTED 或 RCSI |
+| 金融交易 | SERIALIZABLE 或 SNAPSHOT |
+| 长时间查询 | RCSI（避免长时间锁定） |
+| 并发写入为主 | RCSI（减少阻塞） |
+
+### 性能与一致性权衡
+
+```
+一致性要求高
+    │
+    │  SERIALIZABLE
+    │    ↓
+    │  REPEATABLE READ
+    │    ↓
+    │  RCSI / SNAPSHOT
+    │    ↓
+    │  READ COMMITTED
+    │    ↓
+    │  READ UNCOMMITTED
+    │
+性能要求高
+```
+
+## 监控隔离级别
+
+```sql
+-- 查看当前会话隔离级别
+SELECT 
+    session_id,
+    transaction_isolation_level,
+    CASE transaction_isolation_level
+        WHEN 0 THEN 'UNSPECIFIED'
+        WHEN 1 THEN 'READ UNCOMMITTED'
+        WHEN 2 THEN 'READ COMMITTED'
+        WHEN 3 THEN 'REPEATABLE READ'
+        WHEN 4 THEN 'SNAPSHOT'
+        WHEN 5 THEN 'SERIALIZABLE'
+    END AS isolation_level
+FROM sys.dm_exec_sessions
+WHERE session_id = @@SPID;
+
+-- 查看数据库隔离级别设置
+SELECT 
+    name,
+    is_read_committed_snapshot_on,
+    snapshot_isolation_state_desc
+FROM sys.databases;
+```
+
+理解隔离级别，是在性能和一致性之间找到平衡的关键。

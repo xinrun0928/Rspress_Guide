@@ -1,0 +1,457 @@
+import { Badge } from '@rspress/core/theme';
+
+# SQL 执行引擎
+
+你写了一条 SQL，TiDB 怎么把它变成结果返回给你？
+
+这个过程涉及 SQL 解析、优化、执行三个阶段。TiDB 的执行引擎经历了从火山模型到向量化执行的演进，理解这个演进过程，能帮助你看懂 TiDB 的性能优化方向。
+
+---
+
+## 一、SQL 执行流程
+
+### 1.1 整体架构
+
+```
+SQL -> Lexer -> Parser -> AST -> Logical Plan -> Physical Plan -> Execution
+                                                                         ↓
+TiDB Server                                                             ↓
+                                          TiKV Coprocessor: 执行下推算子
+```
+
+### 1.2 解析阶段
+
+```sql
+-- 输入
+SELECT id, name FROM users WHERE age > 25 ORDER BY name;
+```
+
+```rust
+// Lexer 词法分析
+SELECT -> K_SELECT
+id -> IDENT
+, -> COMMA
+name -> IDENT
+FROM -> K_FROM
+users -> IDENT
+WHERE -> K_WHERE
+age -> IDENT
+> -> GT
+25 -> INT
+ORDER -> K_ORDER
+BY -> K_BY
+name -> IDENT
+; -> SEMICOLON
+
+// Parser 语法分析（生成 AST）
+SelectStmt {
+    fields: [Column(id), Column(name)],
+    table: Table(users),
+    where: BinOp(Gt, Column(age), 25),
+    order_by: [Column(name)]
+}
+```
+
+### 1.3 优化阶段
+
+```sql
+-- 逻辑优化：谓词下推、列裁剪、常量折叠
+SELECT id, name FROM users WHERE age > 25 ORDER BY name
+  ↓
+SELECT id, name FROM (SELECT * FROM users WHERE age > 25) WHERE age > 25
+  ↓
+TableScan(users) -> Selection(age > 25) -> Sort(name) -> Projection(id, name)
+```
+
+```rust
+// 物理优化：选择算子实现、代价估算
+TableScan(users)           -> TableReader
+Selection(age > 25)        -> Selection
+Sort(name)                -> TopN(SortKey: name, Limit: ALL)
+Projection(id, name)       -> Projection
+
+// 最终物理计划
+TopN -> Projection -> Selection -> TableReader
+```
+
+---
+
+## 二、火山模型（Volcano Model）
+
+### 2.1 什么是火山模型？
+
+火山模型是最经典的迭代器执行模型：每个算子提供 `Open()`、`Next()`、`Close()` 三个接口。
+
+```rust
+// 火山模型接口
+trait Executor {
+    fn open(&mut self);
+    fn next(&mut self) -> Option<Row>;
+    fn close(&mut self);
+}
+```
+
+```rust
+// TableScan 算子
+struct TableScan {
+    table: TableRef,
+    range: KeyRange,
+}
+
+impl Executor for TableScan {
+    fn next(&mut self) -> Option<Row> {
+        // 从 TiKV 读取下一行
+        self.kv_get()
+    }
+}
+
+// Selection 算子
+struct Selection {
+    child: Box<Executor>,
+    cond: Expression,
+}
+
+impl Executor for Selection {
+    fn next(&mut self) -> Option<Row> {
+        loop {
+            let row = self.child.next()?;
+            if self.cond.eval(&row) {
+                return Some(row);
+            }
+        }
+    }
+}
+```
+
+### 2.2 执行流程
+
+```bash
+# 查询：SELECT * FROM users WHERE age > 25
+TopN
+  └─ Projection
+       └─ Selection (age > 25)
+            └─ TableScan
+
+# 执行过程（按需拉取）
+TopN.next()
+  └─ Projection.next()
+       └─ Selection.next()
+            └─ TableScan.next()  # 返回 Row 1: (1, "张三", 26)
+       ← Selection 返回 Row 1
+  ← Projection 返回 Row 1
+  ← TopN 收集...
+
+  └─ TableScan.next()  # 返回 Row 2: (2, "李四", 30)
+...
+```
+
+<Badge text="Push vs Pull" type="tip" /> 火山模型是「拉取」（Pull）模型——数据从叶子节点向上「拉」。与之对应的是「推送」（Push）模型，每个算子计算完直接往下发。
+
+### 2.3 火山模型的优缺点
+
+| 优点 | 缺点 |
+|---|---|
+| 实现简单 | 函数调用开销大 |
+| 内存占用低（按需拉取） | CPU 缓存不友好 |
+| 支持多种查询类型 | 无法利用 SIMD |
+
+---
+
+## 三、向量化执行
+
+### 3.1 什么是向量化？
+
+向量化执行的核心是一次处理**一批数据**，而不是一行。
+
+```rust
+// 火山模型：一次处理一行
+fn next(&mut self) -> Option<Row> {
+    row := self.kv_get_one_row()
+    return Some(row)
+}
+
+// 向量化：一次处理一批
+fn next(&mut self) -> Chunk {
+    rows := self.kv_get_batch(1024)  // 每次 1024 行
+    return rows
+}
+```
+
+### 3.2 向量化优势
+
+```rust
+// 场景：计算 SUM(amount)
+struct AggregationSum {
+    col: ColumnRef,
+}
+
+// 火山模型：逐行累加
+fn next(&mut self) -> Option<i64> {
+    while let Some(row) = self.child.next() {
+        sum += row.get(&self.col);  // 1024 次函数调用
+    }
+}
+
+// 向量化：一批数据一起算
+fn next(&mut self) -> Chunk {
+    let batch = self.child.next();  // 获取 1024 行
+    let values = batch.get_column(&self.col);
+    sum = simd_sum(values);  // SIMD 指令，一次计算 1024 个值
+    return Chunk { sum }
+}
+```
+
+向量化执行的优势：
+
+- **减少函数调用**：一次调用处理 1024 行
+- **SIMD 加速**：CPU 一次计算多个值
+- **缓存友好**：批量数据连续访问
+
+### 3.3 TiDB 的向量化实现
+
+```rust
+// TiDB 的 Chunk 结构
+struct Chunk {
+    columns: Vec<Column>,
+    num_rows: usize,  // 通常是 1024
+}
+
+struct Column {
+    data: ColumnData,  // 列式存储
+    null_count: u64,
+}
+
+// Vectorized Expression
+fn vec_eval(&self, input: &Chunk) -> Result<Column> {
+    let a = input.get_column("a");
+    let b = input.get_column("b");
+    
+    // SIMD 加法
+    Column::binary_op(a, b, |x, y| x + y)
+}
+```
+
+---
+
+## 四、CBO 优化器
+
+### 4.1 代价模型
+
+TiDB 使用 **CBO（Cost-Based Optimizer）**基于代价选择执行计划：
+
+```rust
+// 代价模型
+struct CostModel {
+    scan_cost_per_row: f64,     // 扫描每行代价
+    network_cost_per_byte: f64, // 网络传输每字节代价
+    seek_cost: f64,            // 随机访问代价
+    cpu_cost_per_row: f64,     // CPU 处理每行代价
+}
+
+// 扫描代价估算
+fn estimate_scan_cost(&self, table: &Table) -> f64 {
+    let row_count = table.stats.row_count;
+    let avg_row_size = table.stats.avg_row_size;
+    
+    self.scan_cost_per_row * row_count 
+    + self.network_cost_per_byte * row_count * avg_row_size
+}
+
+// 索引扫描代价估算
+fn estimate_index_scan_cost(&self, index: &Index) -> f64 {
+    let index_rows = index.stats.row_count;
+    let range_count = index.ranges.len();
+    
+    self.seek_cost * range_count
+    + self.scan_cost_per_row * index_rows
+}
+```
+
+### 4.2 统计信息
+
+代价估算依赖统计信息：
+
+```sql
+-- 查看表统计信息
+ANALYZE TABLE users;
+
+-- 查看统计信息
+SHOW STATS_HISTOGRAMS WHERE table_name = 'users';
+```
+
+```rust
+// 统计信息结构
+struct TableStats {
+    row_count: u64,        // 行数
+    columns: HashMap<String, ColumnStats>,
+}
+
+struct ColumnStats {
+    null_count: u64,       // NULL 数量
+    distinct_count: u64,   // 不同值数量
+    histogram: Histogram,  // 直方图
+    topn: Vec<Value>,      // TopN 值
+}
+
+// 直方图用于估算 selectivity
+fn estimate_selectivity(&self, cond: &Condition) -> f64 {
+    // 假设 age > 25 的 selectivity
+    let age_stats = self.column_stats.get("age");
+    let histogram = age_stats.histogram;
+    
+    // 根据直方图估算有多少行满足条件
+    histogram.less_than(25)
+}
+```
+
+### 4.3 执行计划选择
+
+```sql
+EXPLAIN SELECT * FROM users WHERE age > 25;
+```
+
+```bash
+# 输出
+id                     | estRows | task        | access object | operator info
+Projection_4           | 8000    | root        |              | users.id, users.name
+└─TableReader_7        | 8000    | root        |              | data:Selection_6
+   └─Selection_6       | 8000    | cop[tikv]   |              | gt(users.age, 25)
+      └─TableScan_5    | 100000  | cop[tikv]   | table:users  | range:[0,+inf], keep order:false
+```
+
+- `root`：在 TiDB Server 执行
+- `cop[tikv]`：下推到 TiKV 执行
+
+---
+
+## 五、执行引擎详解
+
+### 5.1 主要算子
+
+| 算子 | 功能 | 下推支持 |
+|---|---|---|
+| TableScan | 全表扫描 | ✅ |
+| IndexScan | 索引扫描 | ✅ |
+| Selection | WHERE 过滤 | ✅ |
+| Projection | 列选择 | ✅ |
+| HashJoin | Hash JOIN | 部分 |
+| Sort | 排序 | 部分 |
+| Limit | 限制行数 | ✅ |
+| Aggregation | 聚合 | ✅ |
+
+### 5.2 Join 实现
+
+```rust
+// TiDB 支持多种 Join 算法
+
+// Hash Join（常用）
+struct HashJoin {
+    build_side: Vec<Row>,  // 小表
+    probe_side: Box<Executor>,
+}
+
+impl Executor for HashJoin {
+    fn next(&mut self) -> Option<Row> {
+        // 构建 Hash 表
+        for row in self.build_side {
+            self.hash_table.insert(row.hash(), row);
+        }
+        
+        // 探测
+        while let Some(row) = self.probe_side.next() {
+            if let Some(match_row) = self.hash_table.get(row.hash()) {
+                return Some(concat(row, match_row));
+            }
+        }
+        None
+    }
+}
+```
+
+### 5.3 TiKV Coprocessor
+
+```rust
+// TiKV 的 Coprocessor 框架
+struct CoprocessorHost {
+    handlers: Vec<Box<CoprocessorHandler>>,
+}
+
+impl CoprocessorHost {
+    // 处理下推请求
+    fn handle_request(&self, req: &CopRequest) -> CopResponse {
+        let plan = self.decode_plan(req);
+        let result = self.execute(plan);
+        self.encode_response(result)
+    }
+}
+
+// 下推的算子在 TiKV 端执行
+struct TableScanExecutor {
+    dag: DAG,
+    range: KeyRange,
+}
+
+impl Executor for TableScanExecutor {
+    fn next_batch(&mut self, batch_size: usize) -> Chunk {
+        // 从 RocksDB 批量读取
+        let mut chunk = Chunk::new(batch_size);
+        for key in self.range.scan_keys() {
+            let row = self.decode_row(key);
+            chunk.append(row);
+        }
+        chunk
+    }
+}
+```
+
+---
+
+## 六、性能优化
+
+### 6.1 常见性能问题
+
+| 问题 | 原因 | 解决方案 |
+|---|---|---|
+| 全表扫描 | 缺少索引 | 添加索引 |
+| 慢 Join | 大表 JOIN | 考虑 Hint |
+| 统计信息过期 | ANALYZE 不及时 | 定期 ANALYZE |
+| Coprocessor 过载 | 下推算子太重 | 优化下推逻辑 |
+
+### 6.2 优化建议
+
+```sql
+-- 强制使用索引
+SELECT * FROM users USE INDEX (idx_age) WHERE age > 25;
+
+-- 禁止下推
+SELECT /*+ READ_FROM_STORAGE(TIFLASH[users]) */ * FROM users;
+
+-- 控制并发度
+SET tidb_executor_concurrency = 5;
+
+-- 调整 chunk 大小
+SET tidb_chunk_size = 1024;
+```
+
+---
+
+## 七、面试追问
+
+- 火山模型和向量化执行的区别？
+- TiDB 的 CBO 优化器是怎么选执行计划的？
+- Hash Join 和 Nested Loop Join 的适用场景？
+- Coprocessor 下推了什么？下推的条件是什么？
+- 统计信息过期会导致什么问题？
+
+---
+
+## 总结
+
+TiDB 的 SQL 执行引擎经历了从火山模型到向量化的演进：
+
+- **火山模型**：拉取式执行，代码简单但性能受限
+- **向量化执行**：批量处理，利用 SIMD 加速
+- **CBO 优化器**：基于代价选择最优执行计划
+- **Coprocessor**：将计算下推到 TiKV，减少网络传输
+
+理解执行引擎的工作原理，是优化 TiDB 查询性能的基础。

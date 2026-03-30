@@ -1,0 +1,459 @@
+import { Badge } from '@rspress/core/theme';
+
+# Using filesort 与 Using temporary 优化
+
+「这个查询为什么这么慢？Using filesort 是怎么回事？」
+
+Using filesort 和 Using temporary 是常见的性能问题。本文深入剖析这两个问题的原因和解决方法。
+
+## Using filesort：文件排序
+
+### 什么是 filesort？
+
+filesort 不是「使用文件排序」，而是 MySQL 对无法利用索引的排序操作的总称。
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    filesort 示意                                 │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  MySQL 8.0 之前：                                              │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │  如果排序数据无法放入内存排序区（sort_buffer_size）      │   │
+│  │  MySQL 会使用磁盘文件进行外部排序                        │   │
+│  │  - 排序结果写入临时文件                                 │   │
+│  │  - 多路合并排序                                         │   │
+│  │  - 性能很差！                                          │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                 │
+│  MySQL 8.0 之后：                                              │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │  - 优化了排序算法                                        │   │
+│  │  - 优先使用内存排序                                      │   │
+│  │  - 但仍可能出现 filesort                               │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 什么情况下会出现 filesort？
+
+#### 情况一：ORDER BY 列没有索引
+
+```sql
+-- 无索引的 ORDER BY
+EXPLAIN SELECT * FROM orders ORDER BY create_time;
+```
+
+```
++----+-------------+--------+------+------+--------+------+----------+-------+
+| id | select_type| table  | type | key  | key_len| ref  | rows     | Extra |
++----+-------------+--------+------+------+--------+------+----------+-------+
+|  1 | SIMPLE     | orders | ALL  | NULL |  NULL | NULL | 100000   |Using filesort|
++----+-------------+--------+------+------+--------+------+----------+-------+
+```
+
+#### 情况二：ORDER BY 与索引顺序不一致
+
+```sql
+-- 表有索引 idx(a, b)，但 ORDER BY b
+CREATE INDEX idx_a_b ON orders(a, b);
+
+EXPLAIN SELECT * FROM orders WHERE a = 1 ORDER BY b;
+-- 正常使用索引排序（Using index）
+
+EXPLAIN SELECT * FROM orders WHERE a = 1 ORDER BY create_time;
+-- Using filesort（ORDER BY 列不在索引中）
+```
+
+#### 情况三：多字段排序但顺序不匹配
+
+```sql
+-- 索引是 (a ASC, b ASC)，但排序是 (a DESC, b ASC)
+CREATE INDEX idx_a_b ON orders(a, b);
+
+EXPLAIN SELECT * FROM orders ORDER BY a DESC, b ASC;
+-- Using filesort
+```
+
+#### 情况四：排序方向不同
+
+```sql
+-- 索引是 ASC，但排序是 DESC
+CREATE INDEX idx_status ON orders(status);
+
+EXPLAIN SELECT * FROM orders ORDER BY status DESC;
+-- Using filesort
+```
+
+### filesort 优化方法
+
+#### 方法一：添加合适的索引
+
+```sql
+-- 为 ORDER BY 添加索引
+CREATE INDEX idx_create_time ON orders(create_time);
+
+-- 测试
+EXPLAIN SELECT * FROM orders ORDER BY create_time;
+```
+
+```
++----+-------------+--------+-------+------+--------+------+----------+-------+
+| id | select_type| table  | type  | key  |key_len | ref  | rows     | Extra |
++----+-------------+--------+-------+------+--------+------+----------+-------+
+|  1 | SIMPLE     | orders | index | idx_create_time |  6 | NULL | 100000   |       |
++----+-------------+--------+-------+------+--------+------+----------+-------+
+-- Using filesort 消失！
+```
+
+#### 方法二：覆盖索引避免回表
+
+```sql
+-- 索引包含所有需要查询的列
+CREATE INDEX idx_create_time_covering ON orders(create_time, id, status, amount);
+
+-- 查询只需访问索引，无需回表
+EXPLAIN SELECT id, status, amount FROM orders ORDER BY create_time;
+```
+
+```
++----+-------------+--------+-------+------+--------+------+----------+-------+
+| id | select_type| table  | type  | key  |key_len | ref  | rows     | Extra |
++----+-------------+--------+-------+------+--------+------+----------+-------+
+|  1 | SIMPLE     | orders | index | idx_create_time_covering | 6 | NULL | 100000 |Using index|
++----+-------------+--------+-------+------+--------+------+----------+-------+
+-- Using index，使用索引完成排序！
+```
+
+#### 方法三：调整排序缓冲区大小
+
+```sql
+-- 查看排序缓冲区大小
+SHOW VARIABLES LIKE 'sort_buffer_size';
+-- 默认：262144 字节（256KB）
+
+-- 增大排序缓冲区
+SET GLOBAL sort_buffer_size = 4194304;  -- 4MB
+```
+
+## Using temporary：临时表
+
+### 什么是 temporary？
+
+Using temporary 表示查询需要创建临时表来存储结果。
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    temporary 示意                                 │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │  MySQL 执行查询时：                                      │   │
+│  │                                                         │   │
+│  │  1. 将满足条件的数据放入临时表                          │   │
+│  │  2. 对临时表进行排序/分组等操作                        │   │
+│  │  3. 返回结果                                            │   │
+│  │                                                         │   │
+│  │  如果临时表太大，无法放入内存                           │   │
+│  │  → 写入磁盘，性能很差！                                │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 什么情况下会出现 temporary？
+
+#### 情况一：GROUP BY 列没有索引
+
+```sql
+EXPLAIN SELECT status, COUNT(*) FROM orders GROUP BY status;
+```
+
+```
++----+-------------+--------+------+------+--------+------+----------+--------------------------------+
+| id | select_type| table  | type | key  |key_len | ref  | rows     | Extra                        |
++----+-------------+--------+------+------+--------+------+----------+--------------------------------+
+|  1 | SIMPLE     | orders | ALL  | NULL |  NULL | NULL | 100000   |Using temporary; Using filesort|
++----+-------------+--------+------+------+--------+------+----------+--------------------------------+
+```
+
+#### 情况二：DISTINCT
+
+```sql
+EXPLAIN SELECT DISTINCT user_id FROM orders;
+```
+
+```
++----+-------------+--------+------+------+--------+------+----------+-----------------------------+
+| id | select_type| table  | type | key  |key_len | ref  | rows     | Extra                       |
++----+-------------+--------+------+------+--------+------+----------+-----------------------------+
+|  1 | SIMPLE     | orders | ALL  | NULL |  NULL | NULL | 100000   |Using temporary; Using filesort|
++----+-------------+--------+------+------+--------+------+----------+-----------------------------+
+```
+
+#### 情况三：UNION
+
+```sql
+EXPLAIN
+SELECT id, name FROM users WHERE id = 1
+UNION
+SELECT id, name FROM users WHERE id = 2;
+```
+
+```
++----+--------------+------------+------+------+--------+------+----------+-----------------------------+
+| id | select_type | table      | type | key  |key_len | ref  | rows     | Extra                      |
++----+--------------+------------+------+------+--------+------+----------+-----------------------------+
+|  1 | PRIMARY     | users      | const| PRIMARY |  8   | const|       1 | Using temporary             |
+|  2 | UNION       | users      | const| PRIMARY |  8   | const|       1 | Using temporary             |
+| NULL | UNION RESULT | <union1,2> | ALL  | NULL |  NULL | NULL |     NULL | Using temporary             |
++----+--------------+------------+------+------+--------+------+----------+-----------------------------+
+```
+
+#### 情况四：ORDER BY 和 GROUP BY 同时存在
+
+```sql
+EXPLAIN SELECT status, COUNT(*) FROM orders GROUP BY status ORDER BY create_time;
+```
+
+```
++----+-------------+--------+------+------+--------+------+----------+------------------------------------------------+
+| id | select_type| table  | type | key  |key_len | ref  | rows     | Extra                                        |
++----+-------------+--------+------+------+--------+------+----------+------------------------------------------------+
+|  1 | SIMPLE     | orders | ALL  | NULL |  NULL | NULL | 100000   |Using temporary; Using filesort                |
++----+-------------+--------+------+------+--------+------+----------+------------------------------------------------+
+```
+
+### temporary 优化方法
+
+#### 方法一：添加 GROUP BY 列的索引
+
+```sql
+-- 添加索引
+CREATE INDEX idx_status ON orders(status);
+
+-- 测试
+EXPLAIN SELECT status, COUNT(*) FROM orders GROUP BY status;
+```
+
+```
++----+-------------+--------+-------+------+--------+------+----------+-------+
+| id | select_type| table  | type  | key  |key_len | ref  | rows     | Extra |
++----+-------------+--------+-------+------+--------+------+----------+-------+
+|  1 | SIMPLE     | orders | index | idx_status |  6 | NULL |      10 |Using index|
++----+-------------+--------+-------+------+--------+------+----------+-------+
+-- Using temporary 消失！
+```
+
+#### 方法二：使用索引覆盖 GROUP BY
+
+```sql
+-- 创建覆盖索引
+CREATE INDEX idx_status_covering ON orders(status, id);
+
+-- 测试
+EXPLAIN SELECT status, COUNT(*) FROM orders GROUP BY status;
+```
+
+```
++----+-------------+--------+-------+------+--------+------+----------+-------+
+| id | select_type| table  | type  | key  |key_len | ref  | rows     | Extra |
++----+-------------+--------+-------+------+--------+------+----------+-------+
+|  1 | SIMPLE     | orders | index | idx_status_covering |  6 | NULL |      10 |Using index|
++----+-------------+--------+-------+------+--------+------+----------+-------+
+-- Using index，无需临时表！
+```
+
+#### 方法三：用 EXPLAIN 分析
+
+```sql
+-- 查看查询执行计划
+EXPLAIN SELECT status, COUNT(*) FROM orders GROUP BY status;
+
+-- 查看执行计划（JSON 格式）
+EXPLAIN FORMAT=JSON SELECT status, COUNT(*) FROM orders GROUP BY status;
+```
+
+## filesort 与 temporary 的联合优化
+
+### 同时优化
+
+```sql
+-- 不好的查询
+SELECT status, COUNT(*), SUM(amount)
+FROM orders
+WHERE create_time > '2024-01-01'
+GROUP BY status
+ORDER BY COUNT(*) DESC
+LIMIT 10;
+
+-- EXPLAIN 分析
+EXPLAIN SELECT status, COUNT(*), SUM(amount)
+FROM orders
+WHERE create_time > '2024-01-01'
+GROUP BY status
+ORDER BY COUNT(*) DESC
+LIMIT 10;
+```
+
+```
++----+-------------+--------+------+------+--------+------+----------+--------------------------------+
+| id | select_type| table  | type | key  |key_len | ref  | rows     | Extra                        |
++----+-------------+--------+------+------+--------+------+----------+--------------------------------+
+|  1 | SIMPLE     | orders | ALL  | NULL |  NULL | NULL | 100000   |Using temporary; Using filesort|
++----+-------------+--------+------+------+--------+------+----------+--------------------------------+
+```
+
+### 优化方案
+
+```sql
+-- 方案一：添加复合索引
+CREATE INDEX idx_time_status_amount ON orders(create_time, status, amount);
+
+-- 测试
+EXPLAIN SELECT status, COUNT(*), SUM(amount)
+FROM orders
+WHERE create_time > '2024-01-01'
+GROUP BY status
+ORDER BY COUNT(*) DESC
+LIMIT 10;
+```
+
+```
++----+-------------+--------+-------+------+--------+------+----------+-------+
+| id | select_type| table  | type  | key  |key_len | ref  | rows     | Extra |
++----+-------------+--------+-------+------+--------+------+----------+-------+
+|  1 | SIMPLE     | orders | range | idx_time_status_amount |  6 | NULL |    100 |Using index|
++----+-------------+--------+-------+------+--------+------+----------+-------+
+-- Using temporary 和 Using filesort 都消失了！
+```
+
+### 优化后的索引设计
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    索引设计原则                                  │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  根据查询设计索引：                                              │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │  SELECT col1, col2, col3                                │   │
+│  │  FROM table                                             │   │
+│  │  WHERE condition1                                       │   │
+│  │  GROUP BY group_col                                     │   │
+│  │  ORDER BY order_col                                     │   │
+│  │                                                         │   │
+│  │  索引设计：                                              │   │
+│  │  CREATE INDEX idx ON table(condition1, group_col,       │   │
+│  │                               order_col, col1, col2, col3)|   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                 │
+│  索引顺序：WHERE > GROUP BY > ORDER BY > SELECT                 │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 性能监控
+
+### 查看排序相关变量
+
+```sql
+SHOW VARIABLES LIKE 'sort%';
+```
+
+```
++----------------------------------+----------------+
+| Variable_name                    | Value          |
++----------------------------------+----------------+
+| sort_buffer_size                 | 262144         |
+| max_length_for_sort_data         | 1024           |
+| max_sort_length                  | 1024           |
++----------------------------------+----------------+
+```
+
+### 查看临时表使用情况
+
+```sql
+SHOW GLOBAL STATUS LIKE 'Created_tmp%';
+```
+
+```
++-------------------------+-------+
+| Variable_name           | Value |
++-------------------------+-------+
+| Created_tmp_disk_tables | 1000  |
+| Created_tmp_tables      | 5000  |
++-------------------------+-------+
+```
+
+## 面试实战
+
+### 问题一：Using filesort 是怎么回事？
+
+**面试官问**：「Using filesort 是什么意思？如何避免？」
+
+**深入回答**：
+
+> **Using filesort** 是 MySQL 对无法利用索引排序的操作的总称，不是「使用文件排序」。
+>
+> **出现原因**：
+> - ORDER BY 列没有索引
+> - ORDER BY 与索引顺序不一致
+> - 多字段排序但顺序不匹配
+>
+> **优化方法**：
+> 1. 添加 ORDER BY 列的索引
+> 2. 确保索引顺序与 ORDER BY 一致
+> 3. 使用覆盖索引避免回表
+
+### 问题二：Using temporary 怎么优化？
+
+**面试官问**：「Using temporary 是怎么产生的？如何优化？」
+
+**深入回答**：
+
+> **Using temporary** 表示需要创建临时表存储结果。
+>
+> **出现原因**：
+> - GROUP BY 列没有索引
+> - DISTINCT 操作
+> - UNION 操作
+>
+> **优化方法**：
+> 1. 添加 GROUP BY 列的索引
+> 2. 使用覆盖索引
+> 3. 调整 tmp_table_size 和 max_heap_table_size
+
+### 问题三：filesort 和 temporary 同时出现怎么办？
+
+**面试官问**：「查询同时出现 Using temporary 和 Using filesort，如何优化？」
+
+**深入回答**：
+
+> **同时出现的优化**：
+>
+> 1. **分析查询**：找出 WHERE、GROUP BY、ORDER BY、SELECT 列
+> 2. **设计索引**：创建复合索引，顺序为 WHERE > GROUP BY > ORDER BY > SELECT
+> 3. **覆盖索引**：索引包含所有需要的列，避免回表
+>
+> ```sql
+> -- 根据查询设计索引
+> CREATE INDEX idx ON orders(create_time, status, amount);
+>
+> -- 验证优化效果
+> EXPLAIN SELECT status, COUNT(*), SUM(amount)
+> FROM orders
+> WHERE create_time > '2024-01-01'
+> GROUP BY status;
+> ```
+
+## 总结
+
+filesort 和 temporary 是常见的性能问题：
+
+- **Using filesort**：无法利用索引排序，需要额外排序操作
+- **Using temporary**：需要临时表存储结果
+- **优化方法**：添加合适的索引，使用覆盖索引
+
+掌握这两个问题的分析方法，是 SQL 优化的必备技能。

@@ -1,0 +1,301 @@
+# PostgreSQL 复合索引
+
+面试官问："如果你要创建一个复合索引 `(a, b, c)`，查询 `WHERE a = 1 AND c = 2` 能用到索引吗？"
+
+很多人会回答"可以"，因为他们记得"最左前缀原则"。但这个回答不够完整——PostgreSQL 的复合索引与 MySQL 有显著差异。
+
+---
+
+## 复合索引基础
+
+### 创建复合索引
+
+```sql
+-- 创建复合索引
+CREATE INDEX idx_orders_customer_status ON orders(customer_id, status, created_at);
+
+-- 语法糖：多个列用逗号分隔
+CREATE INDEX idx_users_name_email ON users(name, email);
+```
+
+### 复合索引的查询
+
+```sql
+-- 能使用索引：使用了索引的前缀列
+SELECT * FROM orders WHERE customer_id = 1;
+SELECT * FROM orders WHERE customer_id = 1 AND status = 'pending';
+SELECT * FROM orders WHERE customer_id = 1 AND status = 'pending' AND created_at > '2024-01-01';
+
+-- 可能使用索引：跳过了中间列
+SELECT * FROM orders WHERE customer_id = 1 AND created_at > '2024-01-01';
+
+-- 不能使用索引：没有使用前缀列
+SELECT * FROM orders WHERE status = 'pending';
+SELECT * FROM orders WHERE created_at > '2024-01-01';
+```
+
+---
+
+## PostgreSQL vs MySQL：索引设计的差异
+
+### MySQL 的最左前缀原则
+
+MySQL 的复合索引严格遵循最左前缀原则。如果索引是 `(a, b, c)`：
+
+- `WHERE a = 1` → 使用索引
+- `WHERE a = 1 AND b = 2` → 使用索引
+- `WHERE a = 1 AND b = 2 AND c = 3` → 使用索引
+- `WHERE b = 2` → **不能使用索引**
+- `WHERE c = 3` → **不能使用索引**
+
+### PostgreSQL 的灵活性
+
+PostgreSQL 的复合索引更加灵活。对于索引 `(a, b, c)`：
+
+- `WHERE a = 1` → 使用索引
+- `WHERE a = 1 AND b = 2` → 使用索引
+- `WHERE a = 1 AND b = 2 AND c = 3` → 使用索引
+- `WHERE b = 2` → **可以绕过 a 使用索引**（PostgreSQL 12+）
+- `WHERE c = 3` → **可以绕过 a、b 使用索引**（PostgreSQL 12+）
+
+```sql
+-- PostgreSQL 12+ 支持"索引跳跃扫描"
+CREATE INDEX idx_test ON test(a, b, c);
+
+-- 这个查询在 PostgreSQL 12+ 可能使用索引
+EXPLAIN SELECT * FROM test WHERE b = 2;
+
+-- 查看执行计划
+EXPLAIN SELECT * FROM orders WHERE status = 'pending';
+```
+
+:::warning
+虽然 PostgreSQL 支持跳跃扫描，但这不代表你应该跳过前缀列。跳跃扫描的效率通常不如从第一列开始的查询。如果某个列经常被单独查询，应该单独建立索引。
+:::
+
+---
+
+## 复合索引列顺序
+
+复合索引的列顺序至关重要。错误的列顺序可能导致索引无效。
+
+### 原则一：高选择列放前面
+
+选择性强（不同值多）的列放在前面：
+
+```sql
+-- 好：user_id 选择性高，放前面
+CREATE INDEX idx_orders_user_id_status ON orders(user_id, status);
+
+-- 不好：status 选择性低，放前面
+CREATE INDEX idx_orders_status_user_id ON orders(status, user_id);
+```
+
+### 原则二：等值条件列放范围条件列前面
+
+等值查询（`=`）放在范围查询（`>`、`<`、`LIKE`）前面：
+
+```sql
+-- 好：等值列在前面
+CREATE INDEX idx_orders_user_status_created ON orders(user_id, status, created_at);
+
+-- 不好：范围列在前面会阻止后续列的使用
+CREATE INDEX idx_orders_created_user ON orders(created_at, user_id);
+```
+
+### 原则三：考虑查询频率
+
+经常一起查询的列放在一起：
+
+```sql
+-- 查询模式：几乎总是同时查 a 和 b
+-- 很少单独查 a
+-- 很少单独查 b
+-- 经常查 a + b + c
+
+-- 选择：(a, b, c) 是合理的
+CREATE INDEX idx_abc ON tbl(a, b, c);
+```
+
+---
+
+## 复合索引与覆盖索引
+
+### 什么是覆盖索引
+
+如果一个索引包含了查询需要的所有列，这个索引称为"覆盖索引"。
+
+```sql
+-- 创建覆盖索引
+CREATE INDEX idx_orders_covering ON orders(customer_id, status, id, total_amount);
+
+-- 查询
+SELECT id, customer_id, status, total_amount
+FROM orders
+WHERE customer_id = 1;
+
+-- 执行计划
+EXPLAIN SELECT id, customer_id, status, total_amount
+FROM orders
+WHERE customer_id = 1;
+
+-- 结果：Index Only Scan，使用索引而不回表
+```
+
+### 覆盖索引的优势
+
+覆盖索引可以避免回表查询，直接从索引中返回结果：
+
+| 类型 | 回表 | 性能 |
+|---|---|---|
+| 普通索引查询 | 需要回表 | 较慢 |
+| 覆盖索引 | 不需要 | 更快 |
+
+### PostgreSQL 的 Include 语法
+
+PostgreSQL 12+ 支持 `INCLUDE` 语法，将非索引列包含到索引叶子节点：
+
+```sql
+-- 将 total_amount 包含到索引中
+CREATE INDEX idx_orders_covering ON orders(customer_id, status)
+INCLUDE (total_amount, id);
+
+-- 这个查询完全不需要回表
+SELECT id, total_amount
+FROM orders
+WHERE customer_id = 1 AND status = 'pending';
+```
+
+---
+
+## 复合索引实战
+
+### 场景一：用户订单查询
+
+```sql
+-- 常见查询模式
+-- 1. SELECT * FROM orders WHERE user_id = ? AND status = ?
+-- 2. SELECT * FROM orders WHERE user_id = ? AND created_at > ?
+-- 3. SELECT * FROM orders WHERE user_id = ?
+
+-- 索引设计
+CREATE INDEX idx_orders_user_status ON orders(user_id, status);
+CREATE INDEX idx_orders_user_created ON orders(user_id, created_at DESC);
+
+-- 为什么不建一个 (user_id, status, created_at)？
+-- 因为查询 1 和 2 会同时使用两列，但查询 3 只需要第一列
+-- 分开建索引可以更好地满足不同查询
+```
+
+### 场景二：多条件搜索
+
+```sql
+-- 查询模式
+-- 1. SELECT * FROM products WHERE category_id = ? AND brand = ? AND price > ?
+-- 2. SELECT * FROM products WHERE category_id = ? AND price > ?
+-- 3. SELECT * FROM products WHERE brand = ? AND price > ?
+
+-- 索引设计
+CREATE INDEX idx_products_cat_brand_price ON products(category_id, brand, price);
+
+-- 分析：
+-- 查询 1：完美匹配
+-- 查询 2：跳过 brand，但 category_id 是等值，可以继续使用
+-- 查询 3：没有 category_id，无法使用索引跳跃
+```
+
+### 场景三：分页查询
+
+```sql
+-- 分页查询
+SELECT * FROM orders
+WHERE customer_id = 1 AND status = 'pending'
+ORDER BY created_at DESC
+LIMIT 20 OFFSET 100;
+
+-- 索引设计
+CREATE INDEX idx_orders_customer_status_created
+    ON orders(customer_id, status, created_at DESC);
+
+-- 分析：
+-- 索引覆盖了 WHERE 和 ORDER BY
+-- 可以直接返回排序后的结果，不需要额外的排序步骤
+```
+
+---
+
+## 索引与排序
+
+### 复合索引的排序支持
+
+复合索引可以支持排序，但有限制：
+
+```sql
+CREATE INDEX idx_test ON test(a, b, c);
+
+-- 可以利用索引排序
+SELECT * FROM test WHERE a = 1 ORDER BY b, c;  -- 升序
+SELECT * FROM test WHERE a = 1 ORDER BY b DESC, c DESC;  -- 降序
+SELECT * FROM test WHERE a = 1 ORDER BY b ASC, c DESC;  -- 混合（不能完全利用索引）
+
+-- 不能利用索引排序
+SELECT * FROM test WHERE a = 1 ORDER BY c;  -- 跳过了 b
+SELECT * FROM test WHERE b = 1 ORDER BY c;  -- 跳过了 a
+```
+
+### 降序索引
+
+PostgreSQL 9.x+ 支持索引列的降序：
+
+```sql
+-- 创建支持混合排序的索引
+CREATE INDEX idx_test_mixed ON test(a ASC, b DESC);
+
+-- 这个查询可以利用索引
+SELECT * FROM test WHERE a = 1 ORDER BY a, b DESC;
+```
+
+---
+
+## 索引维护
+
+### 查看复合索引
+
+```sql
+-- 查看表的索引
+\d+ orders
+
+-- 查看索引定义
+SELECT indexdef FROM pg_indexes
+WHERE tablename = 'orders'
+  AND indexname = 'idx_orders_customer_status';
+```
+
+### 复合索引的分析
+
+```sql
+-- 查看列的选择性
+SELECT
+    attname,
+    n_distinct,  -- 不同值数量
+    correlation   -- 物理存储与逻辑顺序的相关性
+FROM pg_stats
+WHERE tablename = 'orders'
+  AND attname IN ('customer_id', 'status', 'created_at');
+
+-- 相关性高（接近 1）的列适合 BRIN 索引
+-- 相关性低（接近 0）的列适合 B-Tree 索引
+```
+
+---
+
+## 总结
+
+复合索引的设计需要考虑多个因素：
+
+1. **列顺序**：高选择列放前，等值列放范围列前
+2. **覆盖查询**：将常用列包含到索引中，避免回表
+3. **PostgreSQL 特性**：支持跳跃扫描和 INCLUDE 语法
+4. **查询频率**：根据实际查询模式设计
+
+复合索引不是万能的。对于复杂的查询，可能需要多个索引配合使用。监控索引使用情况，及时调整索引策略，是数据库性能维护的重要工作。

@@ -1,0 +1,452 @@
+# PostgreSQL 面试汇总
+
+本章节汇总了 PostgreSQL 面试中的高频问题，涵盖核心概念、原理理解、性能优化和架构设计等方面。
+
+---
+
+## 一、MVCC 与事务隔离
+
+### 1. PostgreSQL 的 MVCC 是如何实现的？
+
+**参考答案**：
+
+PostgreSQL 通过元组头部的两个隐藏字段实现 MVCC：
+
+- **t_xmin**：创建元组的事务 ID
+- **t_xmax**：删除/更新元组的事务 ID
+
+判断元组是否可见时，PostgreSQL 会：
+1. 获取当前事务的快照（包含 xmin、xmax、活跃事务列表）
+2. 检查 t_xmin：如果 t_xmin 对当前事务不可见（如在活跃列表中），则整条元组不可见
+3. 检查 t_xmax：如果 t_xmax 对当前事务可见，则元组已被删除，不可访问
+
+**追问**：与 MySQL InnoDB 的 MVCC 有什么区别？
+
+| 特性 | PostgreSQL | MySQL InnoDB |
+|---|---|---|
+| 可见性判断 | 快照 + xmin/xmax | ReadView + undo log |
+| 历史版本存储 | 元组本身原地标记 | 独立的 undo log 链表 |
+| 清理机制 | VACUUM | purge 线程 |
+
+---
+
+### 2. PostgreSQL 的默认隔离级别是什么？与 MySQL 有什么区别？
+
+**参考答案**：
+
+PostgreSQL 的默认隔离级别是 **Read Committed**，但其实现比其他数据库的 Read Committed 更强。
+
+PostgreSQL 的 Read Committed 在每个语句开始时获取新快照，这意味着同一事务内的不同 SELECT 可能看到不同的数据（如果期间有其他事务提交）。但它仍然能避免脏读。
+
+**与 MySQL 的区别**：
+
+- MySQL InnoDB 的默认隔离级别是 **Repeatable Read**
+- PostgreSQL 通过 MVCC 实现"快照隔离"，在大多数场景下的行为更接近其他数据库的 Repeatable Read
+- PostgreSQL 11+ 的 Serializable 隔离级别使用 SSI 算法，可以检测并防止序列化异常
+
+---
+
+### 3. 什么是 VACUUM？为什么 PostgreSQL 需要 VACUUM？
+
+**参考答案**：
+
+VACUUM 是 PostgreSQL 的垃圾回收机制，用于清理 MVCC 机制产生的过期元组。
+
+**为什么需要 VACUUM**：
+
+1. MVCC 机制下，UPDATE/DELETE 不会立即删除旧版本元组
+2. 这些过期元组会占用磁盘空间，导致表膨胀
+3. 过期元组占用共享缓冲区，影响查询性能
+4. VACUUM 清理过期元组，释放空间
+
+**VACUUM vs VACUUM FULL**：
+
+| 特性 | VACUUM | VACUUM FULL |
+|---|---|---|
+| 锁类型 | 不阻塞读写 | 阻塞所有操作 |
+| 空间释放 | 立即释放部分 | 真正缩小表 |
+| 执行时间 | 较短 | 可能很长 |
+
+---
+
+## 二、索引
+
+### 4. PostgreSQL 有哪些索引类型？各自适用场景是什么？
+
+**参考答案**：
+
+| 索引类型 | 适用场景 |
+|---|---|
+| **B-Tree** | 默认，等值查询、范围查询、排序 |
+| **Hash** | 纯等值查询，不支持范围查询 |
+| **GIN** | 数组、全文搜索、JSONB |
+| **GiST** | 几何类型、空间查询、全文搜索 |
+| **BRIN** | 时序数据、物理顺序相关的大表 |
+| **Partial** | 只索引部分行，如 WHERE deleted_at IS NULL |
+
+---
+
+### 5. 复合索引 (a, b, c)，查询 WHERE a = 1 AND c = 2 能用到索引吗？
+
+**参考答案**：
+
+在 PostgreSQL 12 之前，这条查询**不能有效使用索引**，因为跳过了中间列 b。
+
+在 PostgreSQL 12+，支持**索引跳跃扫描**（Index Skip Scan），这条查询**可能**能用到索引。
+
+但更推荐的做法是：
+1. 如果 c 列经常被单独查询，考虑单独建索引
+2. 或者将列顺序调整为 (a, c)，但这会失去对 a 的范围查询优化
+
+**追问**：复合索引的列顺序应该怎么设计？
+
+原则：
+1. **高选择列放前面**
+2. **等值条件列放范围条件列前面**
+3. **考虑查询频率**
+
+---
+
+### 6. 什么情况下索引会失效？
+
+**参考答案**：
+
+常见导致索引失效的场景：
+
+1. **索引列参与计算**：`WHERE amount * 1.1 > 100` → 改为 `WHERE amount > 100 / 1.1`
+2. **使用函数或类型转换**：`WHERE LOWER(name) = 'john'` → 创建表达式索引 `CREATE INDEX ON users(LOWER(name))`
+3. **非前缀匹配**：`WHERE name LIKE '%John%'` → 使用 pg_trgm 扩展
+4. **数据类型不匹配**：`WHERE id = '123'`（字符串 vs 整数）
+5. **低选择性列**：性别列只有两个值，索引可能不会被使用
+6. **OR 连接多个条件**：`WHERE a = 1 OR b = 2` → 考虑 UNION
+
+---
+
+## 三、执行计划
+
+### 7. 如何分析一条 SQL 的性能问题？
+
+**参考答案**：
+
+1. **使用 EXPLAIN 查看执行计划**：
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM orders WHERE customer_id = 1;
+```
+
+2. **关键指标**：
+   - `Seq Scan`：全表扫描，可能需要加索引
+   - `Index Scan`：使用索引
+   - `Index Only Scan`：使用覆盖索引，无需回表
+   - `Bitmap Heap Scan`：位图扫描，适合多行查询
+   - `Hash Join`：哈希连接
+   - `Nested Loop`：嵌套循环
+
+3. **关注信息**：
+   - 预估行数 vs 实际行数（差距大说明统计信息过时）
+   - 缓存命中率（Buffers: shared hit=...）
+   - 执行时间
+
+4. **常见优化方法**：
+   - 添加合适的索引
+   - 使用覆盖索引避免回表
+   - 优化 JOIN 顺序
+   - 调整查询条件
+
+---
+
+### 8. 什么是分区裁剪？分区表适合什么场景？
+
+**参考答案**：
+
+分区裁剪是分区表的优化机制——查询时只扫描相关分区，忽略其他分区。
+
+```sql
+EXPLAIN SELECT * FROM orders WHERE created_at BETWEEN '2024-01-01' AND '2024-01-31';
+-- 应该只扫描 orders_2024_01 分区，而不是扫描整个表
+```
+
+**分区表适合的场景**：
+
+- 表数据量超过 100GB
+- 查询通常只涉及部分数据
+- 数据有天然的分区维度（时间、地区）
+- 需要高效删除过期数据
+
+**分区类型**：
+- **Range**：按范围，如按时间
+- **List**：按列表，如按状态
+- **Hash**：按哈希，均衡分布
+
+---
+
+## 四、性能优化
+
+### 9. 如何优化慢查询？
+
+**参考答案**：
+
+优化慢查询的步骤：
+
+1. **发现慢查询**
+   - 开启慢查询日志：`log_min_duration_statement = '100ms'`
+   - 使用 pg_stat_statements：`SELECT * FROM pg_stat_statements ORDER BY total_exec_time DESC LIMIT 10;`
+
+2. **分析执行计划**
+   - 使用 EXPLAIN ANALYZE
+   - 识别全表扫描、错误的 JOIN 顺序等问题
+
+3. **针对性优化**
+   - 添加/优化索引
+   - 重写查询（如用 JOIN 替代子查询）
+   - 使用覆盖索引
+   - 调整查询条件
+
+4. **验证优化效果**
+   - 再次执行 EXPLAIN ANALYZE
+   - 对比执行时间
+
+---
+
+### 10. PostgreSQL 的连接池应该怎么配置？
+
+**参考答案**：
+
+PostgreSQL 使用进程模型，每个连接一个进程，连接开销较大。高并发场景必须使用连接池。
+
+**推荐使用 PgBouncer**：
+
+```ini
+pool_mode = transaction  # 推荐，事务级连接复用
+max_client_conn = 1000    # 最大客户端连接
+default_pool_size = 20    # 每个数据库/用户的连接池大小
+```
+
+**连接池模式**：
+
+| 模式 | 说明 | 适用场景 |
+|---|---|---|
+| `session` | 会话级，连接保持 | 需要 SET、PREPARED STATEMENTS |
+| `transaction` | 事务级，用完释放 | 大多数场景 |
+| `statement` | 语句级 | 极高并发 |
+
+---
+
+## 五、集群与高可用
+
+### 11. PostgreSQL 的主从复制原理是什么？
+
+**参考答案**：
+
+PostgreSQL 使用**流复制（Streaming Replication）**实现主从同步：
+
+1. 主节点不断产生 WAL（预写日志）记录
+2. 从节点通过 WAL Sender 进程从主节点拉取 WAL
+3. 从节点通过 WAL Receiver 进程接收并应用 WAL
+
+```
+主节点：WAL → WAL Sender ──────────────► WAL Receiver → 应用 WAL → 从节点
+```
+
+**关键配置**：
+- `wal_level = replica`：启用 WAL
+- `max_wal_senders`：允许的复制连接数
+- `hot_standby = on`：从节点可读
+
+**复制槽**：确保主节点保留从节点尚未接收的 WAL，防止被清理。
+
+---
+
+### 12. 逻辑复制和物理复制的区别是什么？
+
+**参考答案**：
+
+| 特性 | 逻辑复制 | 物理复制 |
+|---|---|---|
+| 复制粒度 | 表级别 | 数据库级别 |
+| 数据格式 | 逻辑数据 | 物理 WAL |
+| 异构支持 | 支持（不同版本） | 不支持 |
+| 冲突处理 | 需要处理 | 自动处理 |
+| 索引/触发器 | 不复制 | 复制 |
+
+**逻辑复制适用场景**：
+- 异构数据库间同步
+- 只复制部分表
+- CDC（Change Data Capture）
+- 多主复制
+
+**物理复制适用场景**：
+- 读写分离
+- 异地灾备
+- 需要完整复制
+
+---
+
+### 13. 数据备份策略有哪些？
+
+**参考答案**：
+
+**物理备份 + WAL**：
+```bash
+# 基础备份
+pg_basebackup -h master -U replicator -D /backup/base -Ft -z -P
+
+# WAL 归档
+archive_command = 'cp %p /archive/wal/%f'
+```
+
+**逻辑备份**：
+```bash
+# 导出
+pg_dump -h localhost -U postgres -d mydb -F c -f mydb.dump
+
+# 恢复
+pg_restore -h localhost -U postgres -d mydb -v mydb.dump
+```
+
+**推荐策略**：
+- **每日全量备份 + WAL 归档**
+- **3-2-1 原则**：3 份副本、2 种介质、1 份异地
+- **定期演练恢复**
+
+---
+
+## 六、架构与设计
+
+### 14. PostgreSQL 和 MySQL 选型建议？
+
+**参考答案**：
+
+**选择 PostgreSQL 的场景**：
+- 对数据一致性要求极高（金融、订单）
+- 需要复杂查询分析（窗口函数、CTE）
+- 需要空间数据处理（PostGIS）
+- 需要 JSONB、数组等高级类型
+- 需要强大的扩展能力（Citus、TimescaleDB）
+
+**选择 MySQL 的场景**：
+- 团队更熟悉 MySQL
+- Web 应用，读多写少
+- 快速原型开发
+- 需要 MariaDB Galera Cluster 同步多主
+
+**迁移注意**：
+- `AUTO_INCREMENT` → `SERIAL`
+- `ENGINE=InnoDB` → 不需要
+- VARCHAR(255) → 可用 TEXT
+
+---
+
+### 15. Citus 是什么？什么时候需要用 Citus？
+
+**参考答案**：
+
+Citus 是 PostgreSQL 的分布式扩展，通过分片将数据分布在多个节点上，实现水平扩展。
+
+**什么时候需要 Citus**：
+- 单节点 PostgreSQL 已经无法满足性能需求
+- 需要水平扩展写入和存储
+- 多租户 SaaS 应用（按 tenant_id 分片）
+- 实时分析需要分布式计算
+
+**Citus 的特点**：
+- 分片键选择很重要（影响 JOIN 和分布）
+- 支持引用表（跨分片 JOIN）
+- 兼容 PostgreSQL 语法
+- 支持在线扩容
+
+---
+
+## 七、高级特性
+
+### 16. 窗口函数有哪些？如何使用？
+
+**参考答案**：
+
+**排名函数**：
+- `ROW_NUMBER()`：行号，无并列
+- `RANK()`：排名，有并列，跳过后续
+- `DENSE_RANK()`：密集排名，有并列，不跳过
+
+**偏移函数**：
+- `LAG(col)`：获取前一行
+- `LEAD(col)`：获取后一行
+- `FIRST_VALUE(col)`：窗口第一个值
+- `LAST_VALUE(col)`：窗口最后一个值
+
+**聚合函数**：SUM、AVG、COUNT 等也可以作为窗口函数
+
+**基本语法**：
+```sql
+SELECT
+    name,
+    department,
+    salary,
+    RANK() OVER (PARTITION BY department ORDER BY salary DESC) AS dept_rank
+FROM employees;
+```
+
+---
+
+### 17. 什么情况下应该使用 JSONB 而不是普通表？
+
+**参考答案**：
+
+**适合使用 JSONB 的场景**：
+1. **动态属性**：属性不固定或经常变化
+2. **半结构化数据**：如产品属性、日志数据
+3. **快速迭代**：属性经常增减，不需要 DDL
+4. **JSON 为主**：数据本身就是 JSON 格式
+
+**不适合的场景**：
+1. 有大量关联查询
+2. 需要强类型约束
+3. 查询条件复杂（多层嵌套）
+
+**PostgreSQL JSONB 优势**：
+- 支持 GIN 索引加速查询
+- 二进制存储，查询性能好
+- 支持丰富的操作符和函数
+
+---
+
+## 面试技巧
+
+### 回答问题的方法论
+
+1. **先说结论**：让面试官立即知道你的观点
+2. **再解释原理**：说明为什么是这样
+3. **举例说明**：用实际例子帮助理解
+4. **对比差异**：与其他方案的优劣对比
+5. **实战经验**：如果有相关经验，分享实际案例
+
+### 常见失分点
+
+1. **只背概念**：不理解原理，无法回答追问
+2. **不区分场景**：所有问题都是"加索引"
+3. **忽略代价**：没有说明方案的优缺点和限制
+4. **缺乏实战**：没有实际调优或故障排查经验
+
+### 必备技能
+
+1. 能看懂 EXPLAIN 输出
+2. 能使用 pg_stat_statements 分析慢查询
+3. 理解 MVCC 原理
+4. 掌握常见的性能优化方法
+5. 了解备份恢复和 HA 方案
+
+---
+
+## 总结
+
+PostgreSQL 面试的核心知识点：
+
+1. **MVCC 机制**：事务隔离的基础
+2. **VACUUM**：垃圾回收和膨胀控制
+3. **索引类型**：选择正确的索引
+4. **执行计划**：优化 SQL 的关键
+5. **性能优化**：慢查询分析和调优
+6. **集群方案**：复制和 HA
+7. **高级特性**：窗口函数、JSONB 等
+
+掌握这些核心知识点，加上实际项目经验，足以应对大多数 PostgreSQL 相关的面试。

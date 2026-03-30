@@ -1,0 +1,399 @@
+import { Badge } from '@rspress/core/theme';
+
+# 死锁
+
+「两个事务互相等待对方释放锁，这就是死锁。」
+
+死锁是并发系统中最棘手的问题之一。SQL Server 能自动检测和解决死锁，但了解死锁成因才能从根本上避免。
+
+## 死锁的原理
+
+### 死锁条件
+
+发生死锁必须同时满足以下条件（Coffman 条件）：
+
+1. **互斥条件**：资源只能被一个事务持有
+2. **持有并等待**：持有资源的同时请求其他资源
+3. **不可抢占**：资源不能被强制释放
+4. **循环等待**：形成事务之间的循环等待
+
+### 死锁 vs 阻塞
+
+| 特性 | 死锁 | 阻塞 |
+|---|---|---|
+| 检测 | SQL Server 自动检测 | 无自动检测 |
+| 解决 | 回滚一个事务 | 等待或杀进程 |
+| 影响范围 | 涉及多个事务 | 通常两方 |
+| 严重性 | 局部问题 | 可能扩散 |
+
+## 死锁图（Deadlock Graph）
+
+SQL Server 提供死锁图帮助分析死锁原因。
+
+### 启用扩展事件捕获
+
+```sql
+-- 创建死锁扩展事件会话
+CREATE EVENT SESSION [DeadlockMonitor] ON SERVER
+ADD EVENT sqlserver.xml_deadlock_report (
+    ACTION (sqlserver.session_id, sqlserver.sql_text)
+)
+ADD TARGET package0.event_file (
+    SET filename = 'D:\XEL\Deadlock.xel',
+        max_file_size = 100,
+        max_rollover_files = 5
+)
+WITH (STARTUP_STATE = ON);
+
+ALTER EVENT SESSION [DeadlockMonitor] ON SERVER STATE = START;
+```
+
+### 读取死锁图
+
+```sql
+-- 查看最近的死锁
+SELECT 
+    XEvent.query('.') AS DeadlockGraph
+FROM (
+    SELECT CAST(target_data AS XML) AS TargetData
+    FROM sys.dm_xe_session_targets
+    JOIN sys.dm_xe_sessions ON address = event_session_address
+    WHERE name = 'system_health'
+) AS Data
+CROSS APPLY TargetData.nodes('//event[@name="xml_deadlock_report"]') AS XEventData(XEvent);
+```
+
+### 死锁图解析
+
+死锁图包含：
+- **victim-list**：被选为牺牲品的事务
+- **process-list**：涉及死锁的进程
+- **resource-list**：锁定的资源
+- **inputbuf**：导致死锁的 SQL
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        死锁图示例                                │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  <deadlock>                                                     │
+│    <victim-list>                                                │
+│      <victimProcess id="process123" />                         │
+│    </victim-list>                                               │
+│    <process-list>                                               │
+│      <process id="process123" ...>                             │
+│        <executionStack>...</executionStack>                    │
+│        <inputbuf>UPDATE Orders SET Amount=100                  │
+│               WHERE OrderID=1</inputbuf>                        │
+│      </process>                                                 │
+│      <process id="process456" ...>                             │
+│        <executionStack>...</executionStack>                    │
+│        <inputbuf>UPDATE Products SET Price=50                  │
+│               WHERE ProductID=2</inputbuf>                      │
+│      </process>                                                 │
+│    </process-list>                                              │
+│    <resource-list>                                              │
+│      <keylock hobtid="..." ...>OrderID=1</keylock>             │
+│      <keylock hobtid="..." ...>ProductID=2</keylock>          │
+│    </resource-list>                                             │
+│  </deadlock>                                                    │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 常见死锁类型
+
+### 类型一：两个表死锁
+
+```sql
+-- 事务 A
+BEGIN TRANSACTION;
+    UPDATE Orders SET Amount = 100 WHERE OrderID = 1;  -- 锁定 Orders
+    UPDATE Products SET Price = 50 WHERE ProductID = 2; -- 等待 Products
+COMMIT;
+
+-- 事务 B（并发执行）
+BEGIN TRANSACTION;
+    UPDATE Products SET Price = 50 WHERE ProductID = 2; -- 锁定 Products
+    UPDATE Orders SET Amount = 100 WHERE OrderID = 1;  -- 等待 Orders
+COMMIT;
+
+-- 死锁！
+```
+
+**解决方案**：统一访问顺序
+
+```sql
+-- 所有事务都按相同顺序访问表
+-- 先访问 Orders，再访问 Products
+```
+
+### 类型二：索引键死锁
+
+```sql
+-- 非聚集索引更新导致死锁
+BEGIN TRANSACTION;
+    UPDATE Orders SET CustomerID = 100 WHERE OrderID = 1;
+    -- 需要更新：
+    -- 1. 聚集索引（OrderID）
+    -- 2. 非聚集索引 IX_CustomerID（旧值）
+    -- 3. 非聚集索引 IX_CustomerID（新值）
+COMMIT;
+```
+
+### 类型三：键范围锁死锁
+
+```sql
+SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+
+BEGIN TRANSACTION;
+    -- 锁定 OrderID 1-100 的范围
+    SELECT * FROM Orders WHERE OrderID BETWEEN 1 AND 100;
+    
+    -- 事务 B 同时执行（不同范围）
+    -- 锁定 OrderID 50-150 的范围
+    
+    -- 两个范围重叠，死锁！
+COMMIT;
+```
+
+### 类型四：标识列更新死锁
+
+```sql
+-- 主键更新导致死锁
+BEGIN TRANSACTION;
+    UPDATE Orders SET OrderID = 999 WHERE OrderID = 1;
+    -- 锁定 OrderID=1
+    -- 需要更新所有非聚集索引
+COMMIT;
+```
+
+## 避免死锁的策略
+
+### 策略一：统一访问顺序
+
+始终按相同顺序访问资源。
+
+```sql
+-- 正确：所有代码统一顺序
+-- 模块 A
+BEGIN TRANSACTION;
+    UPDATE Accounts SET Balance = Balance - 100 WHERE AccountID = 1;
+    UPDATE Accounts SET Balance = Balance + 100 WHERE AccountID = 2;
+COMMIT;
+
+-- 模块 B
+BEGIN TRANSACTION;
+    UPDATE Accounts SET Balance = Balance - 100 WHERE AccountID = 1;
+    UPDATE Accounts SET Balance = Balance + 100 WHERE AccountID = 2;  -- 相同顺序
+COMMIT;
+```
+
+### 策略二：减少事务持续时间
+
+```sql
+-- 不好：长事务
+BEGIN TRANSACTION;
+    SELECT * FROM LargeTable;  -- 读取大量数据
+    -- 用户思考/操作时间
+    -- 网络延迟
+    UPDATE ...;  -- 锁持有太久
+COMMIT;
+
+-- 好：短事务
+BEGIN TRANSACTION;
+    -- 只做必要的操作
+    UPDATE ...;
+COMMIT;
+```
+
+### 策略三：减少锁粒度
+
+```sql
+-- 不好：锁定太多行
+BEGIN TRANSACTION;
+    UPDATE Orders SET Status = 'Shipped' WHERE CustomerID = 100;
+    -- 可能锁定数万行
+COMMIT;
+
+-- 好：分批处理
+DECLARE @BatchSize INT = 1000;
+DECLARE @MaxID INT, @MinID INT;
+
+SELECT @MaxID = MAX(OrderID), @MinID = MIN(OrderID) FROM Orders;
+
+WHILE @MinID <= @MaxID
+BEGIN
+    UPDATE Orders SET Status = 'Shipped' 
+    WHERE OrderID BETWEEN @MinID AND @MinID + @BatchSize - 1;
+    
+    SET @MinID = @MinID + @BatchSize;
+END
+```
+
+### 策略四：使用低隔离级别
+
+```sql
+-- 不好：SERIALIZABLE 锁定范围大
+SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+
+-- 好：READ COMMITTED + NOWAIT
+BEGIN TRANSACTION;
+    SELECT * FROM Orders WITH (UPDLOCK, NOWAIT)
+    WHERE OrderID = 1;
+    -- 立即返回错误而不是阻塞
+COMMIT;
+```
+
+### 策略五：使用索引
+
+确保查询能使用索引，避免全表扫描导致大量锁。
+
+```sql
+-- 不好：全表扫描
+UPDATE Orders SET Status = 'Shipped' 
+WHERE YEAR(OrderDate) = 2024;  -- 函数导致索引失效
+
+-- 好：使用索引
+CREATE INDEX IX_Orders_OrderDate ON Orders(OrderDate);
+UPDATE Orders SET Status = 'Shipped' 
+WHERE OrderDate >= '2024-01-01' AND OrderDate < '2025-01-01';
+```
+
+## 死锁监控
+
+### 跟踪标志
+
+```sql
+-- 启用死锁跟踪（每次死锁输出到错误日志）
+DBCC TRACEON (1204, -1);
+-- 或
+DBCC TRACEON (1222, -1);
+
+-- 关闭跟踪
+DBCC TRACEOFF (1204, -1);
+```
+
+### 错误日志
+
+```sql
+-- 查看错误日志中的死锁信息
+EXEC sp_readerrorlog 0, 1, 'deadlock';
+
+-- 完整错误日志
+EXEC sp_readerrorlog;
+```
+
+### 监控死锁频率
+
+```sql
+-- 查看死锁历史
+SELECT 
+    creation_time,
+    database_name,
+    event_data AS DeadlockGraph
+FROM sys.dm_server_event_sessions es
+JOIN sys.dm_xe_session_targets est ON es.address = est.event_session_address
+CROSS APPLY (SELECT CAST(est.target_data AS XML)) AS T(TargetData)
+CROSS APPLY T.TargetData.nodes('//event') AS XEvent(event_data)
+WHERE es.name = 'system_health'
+    AND XEvent.event_data.value('(@name)[1]', 'VARCHAR(100)') = 'xml_deadlock_report'
+ORDER BY creation_time DESC;
+```
+
+## 处理死锁
+
+### 捕获死锁错误
+
+```sql
+-- 应用代码处理死锁
+try
+{
+    using (var connection = new SqlConnection(connectionString))
+    {
+        connection.Open();
+        using (var transaction = connection.BeginTransaction())
+        {
+            // 执行 SQL
+            transaction.Commit();
+        }
+    }
+}
+catch (SqlException ex)
+{
+    if (ex.Number == 1205)  // 死锁牺牲品
+    {
+        // 重试逻辑
+        Thread.Sleep(100);
+        // 重新执行
+    }
+    throw;
+}
+```
+
+### 自动重试
+
+```sql
+-- 实现重试逻辑
+DECLARE @RetryCount INT = 3;
+DECLARE @RetryDelay INT = 100;  -- 毫秒
+DECLARE @Attempt INT = 0;
+DECLARE @Error INT;
+
+WHILE @Attempt < @RetryCount
+BEGIN
+    BEGIN TRY
+        BEGIN TRANSACTION;
+            UPDATE Orders SET Amount = 100 WHERE OrderID = 1;
+        COMMIT TRANSACTION;
+        BREAK;  -- 成功，退出循环
+    END TRY
+    BEGIN CATCH
+        SET @Error = ERROR_NUMBER();
+        IF @Error = 1205  -- 死锁
+        BEGIN
+            ROLLBACK;
+            SET @Attempt = @Attempt + 1;
+            WAITFOR DELAY @RetryDelay;  -- 等待后重试
+        END
+        ELSE
+        BEGIN
+            ROLLBACK;
+            THROW;  -- 其他错误
+        END
+    END CATCH
+END
+```
+
+## 死锁分析案例
+
+### 案例分析
+
+```sql
+-- 死锁图显示：
+-- victim: process_a50f8b
+-- resource: KEY: 72057594038779904:Orders.PK_Orders (a000303200000200)
+-- victim-process 请求 X 锁
+-- owner-process 持有 X 锁
+
+-- 分析：
+-- 事务 A 执行 UPDATE，需要排他锁
+-- 事务 B 持有排他锁（可能未提交或长事务）
+
+-- 解决方案：
+-- 1. 检查事务 B 是否超时未提交
+-- 2. 优化事务 B 减少锁持有时间
+-- 3. 添加重试逻辑
+```
+
+### 常见原因总结
+
+| 原因 | 解决方案 |
+|---|---|
+| 不同事务访问顺序不同 | 统一访问顺序 |
+| 长事务 | 拆分事务、减少操作 |
+| 大批量操作 | 分批处理、使用索引 |
+| 高隔离级别 | 降低隔离级别 |
+| 缺少索引 | 添加适当索引 |
+
+理解死锁成因并采取预防措施，比处理死锁更重要。

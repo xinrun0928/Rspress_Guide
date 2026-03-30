@@ -1,0 +1,316 @@
+import { Badge } from '@rspress/core/theme';
+
+# MVCC 机制
+
+**面试官问**：TiDB 如何实现 Snapshot Isolation？
+
+**大多数人答不上来。**
+
+这个问题看似问的是隔离级别，但背后涉及的是 TiKV 的 MVCC（Multi-Version Concurrency Control）机制——分布式数据库如何管理多个版本的数据，如何支持并发读写，如何实现一致性读取？
+
+---
+
+## 一、MVCC 的核心思想
+
+### 1.1 什么是 MVCC？
+
+MVCC 的核心思想是**为每个事务提供数据的某个时间点的快照**。
+
+```sql
+-- 时间线
+T1: BEGIN (start_ts = 100)
+T2: BEGIN (start_ts = 101)
+T1: UPDATE users SET balance = 900 WHERE id = 1
+T1: COMMIT (commit_ts = 102)
+T2: SELECT * FROM users WHERE id = 1  -- 看到的是 start_ts=101 时的数据
+```
+
+如果用传统的锁机制，T1 更新时 T2 必须等待。但用 MVCC，T2 可以读到 T1 更新前的快照，不需要等待。
+
+### 1.2 TiDB 的版本号
+
+TiDB 使用 **TSO（Timestamp Oracle）** 生成全局递增的时间戳：
+
+```go
+// TSO = physical_time << 18 + logical_counter
+// 物理时间 + 逻辑计数器
+type Timestamp struct {
+    physical uint64  // 物理时间（毫秒）
+    logical uint64   // 逻辑递增（最多 2^18 个）
+}
+```
+
+每个事务有两个时间戳：
+
+- **start_ts**：事务开始时获取，用于读取
+- **commit_ts**：事务提交时获取，用于写入
+
+---
+
+## 二、TiKV 的 MVCC 实现
+
+### 2.1 Key 的结构
+
+TiKV 的 MVCC Key 包含 **user_key** 和 **start_ts**：
+
+```bash
+# MVCC Key 编码
+MVCC Key = {user_key}_{start_ts}
+
+# 示例
+user_key = "t1_r1_k1"   # 表 1, Region 1, 行键 1
+start_ts = 100
+
+MVCC Key = "t1_r1_k1"_100
+
+# Value
+Value = {data, commit_ts, deleted_flag, ...}
+```
+
+### 2.2 写入流程
+
+```rust
+// TiKV Prewrite 阶段
+fn prewrite(&mut self, key: &[u8], value: &[u8], start_ts: u64) -> Result<()> {
+    let mvcc_key = encode_mvcc_key(key, start_ts);
+    let mvcc_value = encode_mvcc_value(value, start_ts, WriteType::Put);
+    
+    // 检查是否有冲突（锁）
+    if self.is_locked(key, start_ts) {
+        return Err(WriteConflict);
+    }
+    
+    // 写入数据
+    self.write_to_raft(mvcc_key, mvcc_value)?;
+    
+    // 写入锁
+    self.write_lock(key, start_ts)?;
+    
+    Ok(())
+}
+```
+
+### 2.3 读取流程
+
+```rust
+// TiKV 读取（根据 start_ts 获取快照）
+fn get(&mut self, key: &[u8], start_ts: u64) -> Result<Option<Vec<u8>>> {
+    // 1. 获取该 key 的所有版本
+    let versions = self.scan_versions(key)?;
+    
+    // 2. 找到 start_ts 之前最新的已提交版本
+    for (mvcc_key, mvcc_value) in versions.reverse() {
+        let write_ts = decode_write_ts(&mvcc_key);
+        if write_ts <= start_ts {
+            let write_type = decode_write_type(&mvcc_value);
+            if write_type == WriteType::Put {
+                return Ok(Some(decode_value(&mvcc_value)));
+            } else if write_type == WriteType::Delete {
+                return Ok(None);
+            }
+        }
+    }
+    
+    None
+}
+```
+
+### 2.4 提交流程
+
+```rust
+// TiKV Commit 阶段
+fn commit(&mut self, key: &[u8], start_ts: u64, commit_ts: u64) -> Result<()> {
+    // 1. 删除锁
+    self.delete_lock(key, start_ts)?;
+    
+    // 2. 写入提交记录
+    let mvcc_key = encode_mvcc_key(key, commit_ts);
+    let mvcc_value = encode_mvcc_value((), start_ts, WriteType::Rollback);
+    self.write_to_raft(mvcc_key, mvcc_value)?;
+    
+    Ok(())
+}
+```
+
+---
+
+## 三、Lock 和 Write 的分离
+
+TiKV 使用**两列族（CF）**存储 MVCC 数据：
+
+| CF | 存储内容 | 说明 |
+|---|---|---|
+| Default CF | Lock | 事务锁信息 |
+| Write CF | Write | 提交记录 |
+
+### 3.1 Lock CF
+
+```bash
+# Lock CF 存储正在执行的事务的锁
+Key: "t1_r1_k1"
+Value: {
+    primary_key: "t1_r1_k1",
+    lock_type: Put,
+    start_ts: 100,
+    ttl: 3000,
+    ...
+}
+```
+
+Lock CF 的作用：
+
+- 检测写写冲突
+- 记录事务状态
+- 处理死锁
+
+### 3.2 Write CF
+
+```bash
+# Write CF 存储已提交的写入
+Key: "t1_r1_k1"_100
+Value: {
+    start_ts: 99,
+    commit_ts: 100,
+    write_type: Put,
+    ...
+}
+```
+
+---
+
+## 四、垃圾回收（GC）
+
+MVCC 会产生历史版本数据，需要 GC 清理：
+
+### 4.1 GC 流程
+
+```rust
+// TiKV GC 流程
+fn gc(&mut self, safe_point: u64) {
+    // 1. 扫描所有 key
+    for (key, versions) in self.scan_all_keys() {
+        // 2. 保留 safe_point 之后的版本
+        let versions_to_keep: Vec<_> = versions
+            .into_iter()
+            .filter(|v| v.commit_ts > safe_point)
+            .collect();
+        
+        // 3. 删除旧版本
+        for old_version in versions_to_keep.iter().skip(1) {
+            self.delete(old_version.key);
+        }
+    }
+}
+```
+
+### 4.2 GC Safe Point
+
+```sql
+-- TiDB 自动推进 GC Safe Point
+SELECT * FROM mysql.tidb WHERE variable_name = 'tikv_gc_safe_point';
+-- 输出：2024-01-01 00:00:00
+
+-- 手动设置
+SET GLOBAL tidb_gc_life_time = '7d';
+```
+
+---
+
+## 五、事务隔离级别
+
+### 5.1 TiDB 的隔离级别
+
+TiDB 默认使用 **Snapshot Isolation（SI）**：
+
+```sql
+SET TRANSACTION ISOLATION LEVEL SNAPSHOT;
+BEGIN;
+-- 看到的是事务开始时的快照
+SELECT * FROM users;
+COMMIT;
+```
+
+SI 与 MySQL 的 RR（Repeatable Read）类似，但有一个关键区别：
+
+| 隔离级别 | 脏读 | 不可重复读 | 幻读 |
+|---|---|---|---|
+| Read Committed | 不会 | 可能 | 可能 |
+| Repeatable Read | 不会 | 不会 | 可能 |
+| Snapshot Isolation | 不会 | 不会 | 不会 |
+
+### 5.2 读已提交（Read Committed）
+
+TiDB 也支持 RC 级别：
+
+```sql
+SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
+```
+
+但 RC 在分布式环境下实现复杂，通常推荐使用默认的 SI。
+
+---
+
+## 六、一致性读取
+
+### 6.1 什么是 consistency read？
+
+一致性读取是指读取的数据是某个时间点的快照，不受其他事务影响。
+
+```sql
+-- 事务 T1
+BEGIN;
+UPDATE users SET balance = balance - 100 WHERE id = 1;
+-- 不提交
+
+-- 事务 T2
+BEGIN;
+SELECT balance FROM users WHERE id = 1;  -- 看到的是 1000（旧值）
+COMMIT;
+```
+
+### 6.2 TiDB 的实现
+
+```rust
+// TiDB Server 的读取流程
+fn execute_select(&mut self, stmt: &SelectStmt) -> Result<Vec<Row>> {
+    // 1. 获取 start_ts（事务开始时获取）
+    let start_ts = self.get_start_ts()?;
+    
+    // 2. 将读取请求发往 TiKV
+    let mut results = vec![];
+    for region in self.get_regions_for(stmt.table) {
+        let req =KvGet {
+            key: region.keys,
+            start_ts: start_ts,
+        };
+        let resp = tikv.get(req)?;
+        results.push(resp.rows);
+    }
+    
+    // 3. 聚合结果
+    Ok(aggregate(results))
+}
+```
+
+---
+
+## 七、面试追问
+
+- MVCC 和乐观锁/悲观锁的区别？
+- TiDB 的 Write CF 和 Lock CF 有什么区别？
+- 事务冲突时怎么处理？
+- GC 的 safe_point 怎么确定？
+- Snapshot Isolation 和 Serializable 有什么区别？
+
+---
+
+## 总结
+
+MVCC 是 TiKV 实现高并发和一致性读取的关键：
+
+- **版本化 Key**：每个 Key 带 start_ts，支持历史读取
+- **Lock + Write 分离**：Lock 存锁状态，Write 存数据
+- **GC 清理**：定期清理旧版本，避免存储膨胀
+- **SI 隔离级别**：默认 Snapshot Isolation，避免脏读和幻读
+
+理解 MVCC，是理解 TiDB 事务模型的基础。

@@ -1,0 +1,548 @@
+# 写入流程：WAL + MemStore + Flush
+
+凌晨 2 点，你盯着监控：大数据写入洪峰来袭，HBase 集群的写入延迟突然飙升。你开始排查：是 WAL 同步太慢？还是 MemStore 刷写策略出了问题？
+
+要回答这些问题，你必须对 HBase 的写入流程有深入的理解。HBase 的写入路径上，每一个环节都有其独特的设计和权衡。理解它们，才能在生产环境中进行有效的调优。
+
+本篇文章预计 3500 字，深入剖析 HBase 的写入流程。
+
+## 写入流程全景图
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        HBase 写入流程                                │
+│                                                                      │
+│   客户端                                                               │
+│      │                                                                 │
+│      │  1. getTable()                                                │
+│      ▼                                                                 │
+│   ┌──────────────────────────────────────────────────────────────┐   │
+│   │                     RegionServer                              │   │
+│   │                                                               │   │
+│   │   ┌─────────────┐      ┌─────────────┐                        │   │
+│   │   │  ZooKeeper  │      │   WAL      │                        │   │
+│   │   │ (协调服务)   │◀────│ (预写日志)  │                        │   │
+│   │   └─────────────┘      └──────┬──────┘                        │   │
+│   │                               │                                │   │
+│   │                               ▼                                │   │
+│   │   ┌─────────────────────────────────────────────────────┐     │   │
+│   │   │                    MemStore                         │     │   │
+│   │   │   ┌──────────┐  ┌──────────┐  ┌──────────┐          │     │   │
+│   │   │   │ Segment1 │  │ Segment2 │  │ Segment3 │          │     │   │
+│   │   │   └──────────┘  └──────────┘  └──────────┘          │     │   │
+│   │   │   按 RowKey + CF + Qualifier + Timestamp 排序       │     │   │
+│   │   └─────────────────────────────────────────────────────┘     │   │
+│   │                               │                                │   │
+│   │                        flush (128MB)                            │   │
+│   │                               ▼                                │   │
+│   │   ┌─────────────────────────────────────────────────────┐     │   │
+│   │   │                    HFile                            │     │   │
+│   │   │   ┌──────────┐  ┌──────────┐  ┌──────────┐          │     │   │
+│   │   │   │ HFile-1 │  │ HFile-2 │  │ HFile-3 │          │     │   │
+│   │   │   └──────────┘  └──────────┘  └──────────┘          │     │   │
+│   │   └─────────────────────────────────────────────────────┘     │   │
+│   │                                                               │   │
+│   └───────────────────────────────────────────────────────────────┘   │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+## 第一步：客户端路由
+
+客户端写入时，首先需要定位数据应该写入哪个 Region：
+
+```
+客户端写入流程 - 路由阶段：
+
+① 客户端读取 hbase:meta 表
+   └─ 缓存 meta 信息到本地
+
+② 根据 RowKey 计算目标 Region
+   └─ meta 表中存储了所有 Region 的 RowKey 范围
+
+③ 直接请求目标 RegionServer
+   └─ 无需经过 HMaster
+```
+
+```java
+// 简化版的路由逻辑
+public RegionServer getRegionServer(byte[] rowKey) {
+    // 1. 检查本地缓存
+    MetaCache cache = getMetaCache();
+    CachedRegion region = cache.get(rowKey);
+    if (region != null) {
+        return region.getServer();
+    }
+    
+    // 2. 缓存未命中，查询 meta 表
+    MetaEntry entry = metaTable.get(rowKey);
+    
+    // 3. 缓存到本地
+    cache.put(entry.getRegionName(), entry);
+    
+    return entry.getServer();
+}
+```
+
+:::tip 客户端缓存
+HBase 客户端会缓存 meta 表信息到本地，避免每次写入都查询 meta 表。这意味着：
+- 集群拓扑变化时，可能需要刷新客户端缓存
+- 使用 `htable.flushcommits()` 可以强制刷新
+
+:::
+
+## 第二步：写入 WAL
+
+### WAL 的作用
+
+WAL（Write-Ahead Log）是 HBase 实现高可用的关键机制。每次写入必须先写入 WAL，只有 WAL 成功刷写到磁盘，操作才算完成。
+
+```
+WAL 的核心作用：
+┌─────────────────────────────────────────────────────────────┐
+│  MemStore (内存)      HFile (磁盘)                          │
+│       │                    │                                │
+│       │ 写入                │ flush                          │
+│       ▼                    ▼                                │
+│  ┌─────────────┐    ┌─────────────┐                        │
+│  │  数据在内存  │    │  数据已持久  │                        │
+│  └─────────────┘    └─────────────┘                        │
+│       │                                                      │
+│       │ 如果此时宕机？                                       │
+│       ▼                                                      │
+│  ┌─────────────┐                                            │
+│  │  数据丢失！  │   ❌                                       │
+│  └─────────────┘                                            │
+│                                                              │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │  WAL (预写日志)                                       │    │
+│  │  每次写入必须先写 WAL，WAL 刷盘后才算成功              │    │
+│  │  即使 MemStore 丢失，也可以通过 WAL 重放恢复          │    │
+│  └─────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### WAL 的存储结构
+
+WAL 存储在 HDFS 上，每个 RegionServer 有独立的 WAL 目录：
+
+```
+HDFS 目录结构：
+/hbase/WALs/
+├── rs001,16020,1234567890
+│   ├── WAL.rs001%2C16020%2C1234567890.1234567890
+│   ├── WAL.rs001%2C16020%2C1234567890.1234567900
+│   └── ...
+└── rs002,16020,1234567891
+    └── ...
+```
+
+WAL 文件的命名格式：`WAL.{host},{port},{timestamp}.{sequence}`
+
+### WAL 的写入流程
+
+```java
+// WAL 写入核心逻辑
+public class FSHLog {
+    // WAL 由多个 Pipeline 写入（对应 HDFS 副本数）
+    private final HDFSOutputStream[] outputs;
+    
+    // 写入缓冲区
+    private final byte[] buffer;
+    
+    // 追加写入
+    public void append(RegionInfo region, WALKey key, WALEdit edit) {
+        // 1. 序列化和组织数据
+        ByteString data = serialize(key, edit);
+        
+        // 2. 写入本地缓冲区
+        buffer.put(data);
+        
+        // 3. 如果是 sync，强制刷盘
+        if (isSyncRequested()) {
+            sync();
+        }
+    }
+    
+    // 同步刷盘
+    public void sync() {
+        // 等待所有 Pipeline 确认
+        for (HDFSOutputStream out : outputs) {
+            out.hflush();  // 只是保证数据到磁盘，不保证到内存
+        }
+    }
+}
+```
+
+### WAL 的持久化策略
+
+HBase 支持多种 WAL 持久化策略：
+
+| 策略 | 配置 | 说明 | 性能 |
+| --- | --- | --- | --- |
+| `defaultProvider` | 同步写 | 每次写入都同步刷盘 | 最慢 |
+| `asyncfs` | 异步批量写 | 批量异步刷盘（默认） | 快 |
+| `multiwal` | 多 WAL | 每个 Region 独立 WAL | 写入密集友好 |
+
+```xml
+<!-- hbase-site.xml 配置 -->
+<property>
+  <name>hbase.wal.provider</name>
+  <value>asyncfs</value>  <!-- 推荐使用异步 WAL -->
+</property>
+
+<property>
+  <name>hbase.wal.impl</name>
+  <value>asyncfs</value>
+</property>
+```
+
+### MultiWAL：写入密集型场景的优化
+
+默认情况下，一个 RegionServer 上的所有 Region 共享同一个 WAL。这在高并发写入时可能成为瓶颈——所有写入都要竞争同一个 WAL 锁。
+
+MultiWAL 允许每个 Region 使用独立的 WAL：
+
+```xml
+<property>
+  <name>hbase.wal.regiongrouping.impl</name>
+  <value>MultiGroup WAL</value>
+</property>
+```
+
+```
+默认 WAL（单 WAL）：
+┌─────────────────────────────────────────────────────┐
+│                   WAL                               │
+│  ┌────────┐  ┌────────┐  ┌────────┐                │
+│  │Region A│  │Region B│  │Region C│  ← 竞争同一把锁 │
+│  └────────┘  └────────┘  └────────┘                │
+└─────────────────────────────────────────────────────┘
+
+MultiWAL：
+┌─────────────────────────────────────────────────────┐
+│  WAL-1          WAL-2          WAL-3                 │
+│  ┌────────┐    ┌────────┐    ┌────────┐           │
+│  │Region A│    │Region B│    │Region C│           │
+│  └────────┘    └────────┘    └────────┘           │
+│     │              │              │                │
+│     └──────────────┼──────────────┘                │
+│                    │                                │
+│               HDFS (3副本)                          │
+└─────────────────────────────────────────────────────┘
+```
+
+:::warning MultiWAL 的代价
+MultiWAL 会增加 HDFS 的写入负载，因为每个 WAL 都要写 3 副本。如果 HDFS 写入已经是瓶颈，不要启用 MultiWAL。
+:::
+
+## 第三步：写入 MemStore
+
+### MemStore 的数据结构
+
+MemStore 是写入的内存缓冲区，每个 Region 的每个 Column Family 都有一个独立的 MemStore。
+
+```java
+// MemStore 核心结构
+public class MemStore {
+    // 1.6+ 引入的 MSLAB（MemStore-Local Allocation Buffer）
+    private final MemStoreLAB memStoreLAB;
+    
+    // 实际的 Cell 集合（跳过列表实现的有序集合）
+    private final ConcurrentNavigableMap<Cell, Cell> cellSet;
+    
+    // 快照用于 flush
+    private volatile MemStoreSnapshot snapshot;
+    
+    // 时间戳范围（用于查询优化）
+    private final TimeRangeTracker timeRangeTracker;
+}
+```
+
+### MemStore 的排序
+
+MemStore 内部的 KeyValue 按以下顺序排序：
+
+```
+排序顺序：
+RowKey (字典序) → Column Family → Column Qualifier → Timestamp (降序) → KeyType
+```
+
+这意味着：
+- 同一行的所有版本存储在一起
+- 同一列族的所有列存储在一起
+- 最新的版本排在最前面
+
+### MSLAB 优化：减少 GC 压力
+
+在没有 MSLAB 之前，每次写入 MemStore 都会分配新对象，导致频繁的 GC。
+
+```java
+// 没有 MSLAB
+public void add(KeyValue kv) {
+    // 每次都 new byte[]
+    byte[] key = new byte[kv.getKeyLength()];
+    // ... 复制数据
+    cellSet.add(new KeyValue(key));
+    // 这些对象会变成垃圾
+}
+```
+
+MSLAB 的解决方案是预分配大块内存，从中分配小对象：
+
+```java
+// MSLAB 原理
+public class MemStoreLAB {
+    // 预分配 2MB 的 chunk
+    private static final int CHUNK_SIZE = 2 * 1024 * 1024;
+    
+    // 当前 chunk
+    private byte[] currentChunk;
+    private int offset;
+    
+    // 分配空间
+    public byte[] allocateBytes(int len) {
+        if (offset + len > CHUNK_SIZE) {
+            // 当前 chunk 满了，切换到新 chunk
+            currentChunk = new byte[CHUNK_SIZE];
+            offset = 0;
+        }
+        
+        byte[] result = new byte[len];
+        System.arraycopy(currentChunk, offset, result, 0, len);
+        offset += len;
+        return result;
+    }
+}
+```
+
+这样，写入 MemStore 的所有 KeyValue 共享少量大块内存，减少了对象数量和 GC 压力。
+
+## 第四步：Flush 到 HFile
+
+### Flush 的触发条件
+
+MemStore 不能无限增长，以下任一条件满足时会触发 flush：
+
+| 条件 | 默认值 | 配置参数 |
+| --- | --- | --- |
+| MemStore 大小超过阈值 | 128MB | `hbase.hregion.memstore.flush.size` |
+| Region 中所有 MemStore 大小超过 | `128MB * 列族数 * 0.35` | `hbase.regionserver.global.memstore.size.lower.limit` |
+| WAL 文件数量过多 | 32 | `hbase.regionserver.max.logs` |
+| 手动触发 | - | `flush` 命令 |
+
+```java
+// Flush 检查逻辑
+public class RegionServer {
+    // 全局 MemStore 大小检查
+    public void checkMemStoreSize() {
+        long globalMemStoreSize = getGlobalMemStoreSize();
+        long maxMemStoreSize = getGlobalMemStoreLimit();
+        
+        // 如果超过阈值，触发最大的 Region 的 MemStore flush
+        if (globalMemStoreSize > maxMemStoreSize * 0.35) {
+            flushRegionWithLargestMemStore();
+        }
+    }
+}
+```
+
+### Flush 的执行流程
+
+```
+Flush 执行流程：
+┌─────────────────────────────────────────────────────────────┐
+│  1. 创建 MemStore 快照                                        │
+│     └─ 允许继续写入 MemStore                                  │
+│                                                              │
+│  2. 遍历快照中的 Cell，写入 HFile                             │
+│     └─ 使用 HFile Writer                                      │
+│     └─ 按顺序写入 Data Block                                  │
+│     └─ Block 满了自动创建新 Block                              │
+│                                                              │
+│  3. 写入布隆过滤器                                            │
+│     └─ 每个 Column Family 的 Bloom Filter                    │
+│                                                              │
+│  4. 写入索引和 Trailer                                        │
+│     └─ Block Index                                            │
+│     └─ Meta Index                                             │
+│     └─ File Info                                              │
+│     └─ Trailer                                                │
+│                                                              │
+│  5. 关闭 HFile，通知 HDFS                                     │
+│                                                              │
+│  6. 清理 WAL 中的已持久化数据                                 │
+│     └─ WAL 中的数据已经写入 HFile，可以标记为已持久化         │
+│     └─ 减少 WAL 长度                                          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Flush 的原子性保证
+
+Flush 过程是原子的，由 HDFS 的原子性保证：
+
+```java
+// HFile 写入的关键步骤
+public class StoreFlusher {
+    public void flushCache() {
+        // 1. 创建临时文件
+        String tmpPath = path + ".tmp";
+        
+        // 2. 写入数据到临时文件
+        HFileWriter writer = HFile.getWriter(conf, tmpPath);
+        writer.append(snapshot);
+        
+        // 3. 关闭临时文件
+        writer.close();
+        
+        // 4. 原子性重命名（这是 HDFS 保证的原子操作）
+        fs.rename(tmpPath, finalPath);
+        
+        // 5. 添加到 StoreFile 列表
+        addStoreFile(finalPath);
+    }
+}
+```
+
+## WAL 和 MemStore 的协调
+
+### 数据恢复机制
+
+当 RegionServer 宕机时，未刷写的 MemStore 数据通过 WAL 重放恢复：
+
+```
+宕机恢复流程：
+┌─────────────────────────────────────────────────────────────┐
+│  1. HMaster 检测到 RegionServer 宕机                        │
+│     └─ ZooKeeper 心跳超时                                   │
+│                                                              │
+│  2. 重新分配宕机 Server 上的 Region                         │
+│     └─ Region 标记为 OFFLINE                                │
+│                                                              │
+│  3. 新 RegionServer 接管 Region                            │
+│     └─ 读取 WAL 中未刷写的数据                               │
+│     └─ 重放 WAL 到 MemStore                                  │
+│                                                              │
+│  4. WAL 重放完成，Region 恢复在线                           │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### WAL 的截断时机
+
+WAL 文件不能无限增长，需要定期清理：
+
+```
+WAL 清理时机：
+┌─────────────────────────────────────────────────────────────┐
+│  MemStore flush 完成后：                                     │
+│  - 检查 WAL 中的数据是否已写入 HFile                         │
+│  - 如果是，删除 WAL 中对应的数据                             │
+│                                                              │
+│  WAL 文件过大时：                                            │
+│  - 超过 `hbase.regionserver.max.logs` 指定的数量            │
+│  - 强制 flush 最老的 MemStore                               │
+│  - 清理旧的 WAL 文件                                         │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## 写入性能调优
+
+### 核心参数调优
+
+| 参数 | 默认值 | 调优建议 |
+| --- | --- | --- |
+| `hbase.hregion.memstore.flush.size` | 128MB | 数据写入密集可增大到 256MB |
+| `hbase.hregion.memstore.chunkpool.size` | 0 | 启用 MSLAB：`0.05~0.1` |
+| `hbase.wal.provider` | asyncfs | 生产环境使用 asyncfs |
+| `hbase.regionserver.global.memstore.size` | 0.4 | 增大可提高写入缓存，但影响读取 |
+
+### 常见问题排查
+
+**问题 1：写入延迟高，但 CPU 和内存都正常**
+
+```java
+// 可能原因：WAL 同步是瓶颈
+// 解决方案：切换到异步 WAL
+<property>
+  <name>hbase.wal.provider</name>
+  <value>asyncfs</value>
+</property>
+```
+
+**问题 2：写入延迟忽高忽低**
+
+```java
+// 可能原因：MemStore flush 触发时造成写入抖动
+// 解决方案：使用多个较小的 flush 阈值
+<property>
+  <name>hbase.hregion.memstore.flush.size</name>
+  <value>67108864</value>  <!-- 64MB -->
+</property>
+<property>
+  <name>hbase.regionserver.global.memstore.size</name>
+  <value>0.6</value>
+</property>
+```
+
+**问题 3：GC 频繁导致写入停顿**
+
+```java
+// 可能原因：MemStore 对象太多
+// 解决方案：启用 MSLAB
+<property>
+  <name>hbase.hregion.memstore.chunkpool.size</name>
+  <value>0.05</value>  <!-- 5% 堆内存用于 MSLAB chunks -->
+</property>
+```
+
+## 写入流程总结
+
+```
+HBase 写入路径上的关键组件和它们的作用：
+
+┌─────────────────────────────────────────────────────────────┐
+│                        客户端                                 │
+│   - 路由定位（查询 meta 表）                                  │
+│   - 批量写入优化                                             │
+└────────────────────────────┬────────────────────────────────┘
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────┐
+│                     RegionServer                             │
+│                                                              │
+│   ┌─────────────────┐                                        │
+│   │       WAL       │   保证持久化                           │
+│   │  (预写日志)      │   - 顺序写入 HDFS                     │
+│   │  - 异步/同步     │   - 宕机可恢复                        │
+│   └────────┬────────┘                                        │
+│            │                                                  │
+│            ▼                                                  │
+│   ┌─────────────────┐                                        │
+│   │    MemStore     │   内存缓冲                             │
+│   │  - MSLAB 优化   │   - 按 Key 排序                        │
+│   │  - 128MB 阈值   │   - 减少 GC                            │
+│   └────────┬────────┘                                        │
+│            │                                                  │
+│            ▼ flush                                           │
+│   ┌─────────────────┐                                        │
+│   │     HFile       │   持久化存储                           │
+│   │  - 有序存储     │   - Data Block                         │
+│   │  - 布隆过滤器   │   - 索引结构                           │
+│   └─────────────────┘                                        │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## 面试追问方向
+
+- HBase 的写入流程是怎样的？为什么写入比读取快？
+- WAL 的作用是什么？如果关闭 WAL 会怎样？
+- WAL 有哪些持久化策略？各自的特点是什么？
+- MultiWAL 是什么？什么时候需要启用？
+- MemStore 的数据结构是怎样的？为什么按特定顺序排序？
+- MSLAB 是什么？它解决了什么问题？
+- Flush 的触发条件有哪些？Flush 过程是原子的吗？
+- 如果 RegionServer 宕机，未刷写的 MemStore 数据如何恢复？
+- 写入延迟高可能有哪些原因？如何排查和调优？
+
+理解写入流程的每一个环节，你就能在生产环境中从容应对各种写入问题。下一步，让我们看看数据是如何被读取的。

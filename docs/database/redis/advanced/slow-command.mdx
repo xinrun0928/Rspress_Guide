@@ -1,0 +1,394 @@
+import { Badge } from '@rspress/core/theme';
+
+# 慢命令阻塞
+
+Redis 是单线程执行的，如果某个命令执行时间过长，会阻塞其他命令的执行。这就是「慢命令阻塞」问题。
+
+## 为什么会阻塞
+
+Redis 的命令执行是单线程的：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Redis 单线程                              │
+│                                                              │
+│  命令队列                                                    │
+│  ┌─────┬─────┬─────┬─────┬─────┬─────┬─────┐               │
+│  │ CMD1│ CMD2│ CMD3│ CMD4│ CMD5│ CMD6│ ... │               │
+│  └──┬──┴──┬──┴──┬──┴──┬──┴──┬──┴──┬──┴─────┘               │
+│     │     │     │     │     │     │                          │
+│     ▼     │     │     │     │     │                          │
+│  执行中... │     │     │     │     │                          │
+│           ▼     │     │     │     │                          │
+│          等待   │     │     │     │                          │
+│                ▼     │     │     │                          │
+│               等待   │     │     │                          │
+│                     ▼     │     │                          │
+│                    等待   │     │                          │
+│                          ▼     │                          │
+│                         等待   │                          │
+│                               ▼                          │
+│                              等待                          │
+└─────────────────────────────────────────────────────────────┘
+
+如果某个命令执行时间过长（如 10 秒），
+后面所有命令都要等待 10 秒才能执行
+```
+
+## 哪些命令可能阻塞
+
+### 1. KEYS 命令
+
+```bash
+# KEYS 会遍历所有 key，O(n) 复杂度
+# 在有大量 key 的实例上可能执行很慢
+
+redis-cli KEYS "*"
+# 时间复杂度: O(n)，n = key 总数
+# 可能耗时: 几秒到几十秒
+```
+
+**解决方案**：使用 SCAN
+
+```bash
+# SCAN 是游标迭代，不会阻塞
+redis-cli SCAN 0
+# 返回游标，下次调用带上这个游标
+redis-cli SCAN 140325648
+
+# SCAN + MATCH 过滤
+redis-cli SCAN 0 MATCH "user:*" COUNT 100
+```
+
+### 2. SMEMBERS 命令
+
+```bash
+# SMEMBERS 返回集合的所有成员
+# 如果集合有百万级成员，会很慢
+
+redis-cli SMEMBERS bigset
+# 时间复杂度: O(n)，n = 集合大小
+```
+
+**解决方案**：使用 SSCAN
+
+```bash
+# 分批获取
+redis-cli SSCAN bigset 0 COUNT 100
+# 返回 100 个成员和下一个游标
+
+# 继续获取
+redis-cli SSCAN bigset 140325648 COUNT 100
+```
+
+### 3. FLUSHALL / FLUSHDB
+
+```bash
+# 清空所有数据
+redis-cli FLUSHALL
+redis-cli FLUSHDB
+
+# 时间复杂度: O(n)，n = key 总数
+```
+
+**解决方案**：
+- 异步执行（Redis 4.0+）：`FLUSHALL ASYNC`
+
+```bash
+# Redis 4.0+ 支持异步删除
+redis-cli FLUSHALL ASYNC
+redis-cli FLUSHDB ASYNC
+```
+
+### 4. DEL / UNLINK 删除大 key
+
+```bash
+# DEL 是同步删除，大 key 会阻塞
+redis-cli DEL biglist
+# 时间复杂度: O(n)，n = 数据结构大小
+
+# UNLINK 是异步删除，不阻塞
+redis-cli UNLINK biglist
+```
+
+**区别**：
+- `DEL`：同步删除，阻塞主线程
+- `UNLINK`：标记删除，主线程立即返回，后台线程异步删除
+
+```java
+// Jedis
+jedis.del("bigkey");        // 同步删除
+jedis.unlink("bigkey");     // 异步删除
+```
+
+### 5. SORT 命令
+
+```bash
+# 对列表、集合、有序集合排序
+redis-cli SORT mylist ALPHA
+redis-cli SORT mylist BY weight DESC
+
+# 时间复杂度: O(n log n)，n = 元素数量
+# 如果有外部排序，会更慢
+```
+
+**解决方案**：
+- 数据量小时使用
+- 考虑在应用层排序
+
+### 6. SAVE / BGSAVE
+
+```bash
+# SAVE 阻塞主线程，生成 RDB 文件
+redis-cli SAVE
+
+# BGSAVE 后台执行，不阻塞
+redis-cli BGSAVE
+```
+
+**解决方案**：
+- 使用 BGSAVE 而不是 SAVE
+- 在从节点执行 BGSAVE
+
+### 7. 过期 key 的惰性删除
+
+```bash
+# Redis 两种过期删除策略：
+# 1. 惰性删除：访问 key 时检查是否过期
+# 2. 定期删除：定时扫描过期 key
+
+# 如果大量 key 同时过期，定期删除可能阻塞
+```
+
+### 8. 大 HGETALL / LRANGE
+
+```bash
+# 返回哈希表的所有字段和值
+redis-cli HGETALL bighash
+
+# 返回列表的所有元素
+redis-cli LRANGE mylist 0 -1
+
+# 时间复杂度: O(n)，n = 字段/元素数量
+```
+
+**解决方案**：
+- 使用 HSCAN 分批获取
+- 使用 LTRIM 限制列表长度
+- 考虑拆分数据结构
+
+## BIG 系列命令
+
+Redis 6.2+ 引入了 BIG 系列命令，可以估算命令的复杂度：
+
+```bash
+# 检查命令的潜在问题
+redis-cli BIGKEYS
+
+# 返回示例
+0. sampled 100000 keys in the keyspace
+-- Top 10 big keys
+0) key:counter          type:string   size:1024000 bytes
+1) key:mylist          type:list      len:50000 items
+2) key:myhash          type:hash       len:10000 fields
+```
+
+```bash
+# MEMORY USAGE 查看 key 内存占用
+redis-cli MEMORY USAGE mykey
+# (integer) 1048576  # 1MB
+
+# MEMORY DOCTOR 诊断内存问题
+redis-cli MEMORY DOCTOR
+```
+
+## 阻塞诊断
+
+### 使用 LATENCY 命令
+
+```bash
+# Redis 延迟监控（需要开启）
+redis-cli CONFIG SET latency-monitor-threshold 100
+
+# 查看最近的事件
+redis-cli LATENCY HISTORY
+# 1) 1) (integer) 1700000000
+   2) (integer) 5000
+   3) (integer) "command"
+   4) (integer) 0
+   5) (string) "FLUSHDB"
+
+# 查看事件统计
+redis-cli LATENCY STATS
+
+# 查看最近的延迟事件
+redis-cli LATENCY LATEST
+```
+
+### 使用 INFO 命令
+
+```bash
+# 查看命令统计
+redis-cli INFO commandstats
+
+# 返回示例
+cmdstat_get: calls=1000000,usec=500000,usec_per_call=0.50
+cmdstat_set: calls=500000,usec=300000,usec_per_call=0.60
+cmdstat_hgetall: calls=100,usec=500000,usec_per_call=5000.00
+#                    ↑ 每次调用平均 5ms，可能有问题
+```
+
+### 使用 SLOWLOG
+
+```bash
+# 查看慢查询
+redis-cli SLOWLOG GET 10
+```
+
+## 预防措施
+
+### 1. 避免使用阻塞命令
+
+```java
+// 不好
+String value = jedis.get("bigkey");
+Set<String> members = jedis.smembers("bigset");
+
+// 好：检查 key 大小
+Long size = jedis.scard("bigset");
+if (size > 10000) {
+    // 分批处理或使用 SSCAN
+    ScanResult<String> result = jedis.sscan("bigset", 
+        ScanParams.SCAN_POINTER_START, new ScanOptions.CountOptions(100));
+}
+
+// 好：使用异步删除
+jedis.unlink("bigkey");
+```
+
+### 2. 限制数据结构大小
+
+```java
+// 限制列表长度
+public void lpush(String key, String value) {
+    redis.lpush(key, value);
+    
+    // 限制最大长度
+    redis.ltrim(key, 0, 9999);
+}
+
+// 限制集合大小
+public void sadd(String key, String... members) {
+    Long size = redis.scard(key);
+    if (size >= 100000) {
+        throw new IllegalStateException("Set 已达上限: " + key);
+    }
+    redis.sadd(key, members);
+}
+```
+
+### 3. 监控 key 大小
+
+```java
+// 写入时检查大小
+public void hset(String key, Map<String, String> data) {
+    if (data.size() > 10000) {
+        log.warn("Hash 字段过多: key={}, size={}", key, data.size());
+    }
+    redis.hset(key, data);
+}
+
+// 使用 MEMORY USAGE 监控
+public long getKeyMemoryUsage(String key) {
+    return jedis.memoryUsage(key);
+}
+```
+
+### 4. 使用从节点查询
+
+```java
+// 读操作可以在从节点执行
+// 但要注意主从延迟
+Jedis master = new Jedis("127.0.0.1", 6379);
+Jedis slave = new Jedis("127.0.0.1", 6380);
+
+// 读操作
+String value = slave.get("key");
+
+// 写操作
+master.set("key", "value");
+```
+
+## 阻塞问题处理流程
+
+```bash
+# 1. 发现阻塞
+redis-cli INFO stats | grep total_commands_processed
+# 查看命令处理速度
+
+# 2. 检查慢查询
+redis-cli SLOWLOG GET 10
+
+# 3. 查看命令统计
+redis-cli INFO commandstats
+
+# 4. 检查客户端连接
+redis-cli CLIENT LIST
+
+# 5. 查看阻塞原因
+redis-cli DEBUG SLEEP 5
+# 模拟阻塞测试
+```
+
+## 最佳实践
+
+### 数据结构设计
+
+```java
+// 不好：存储大文本
+redis.set("article:content:1", largeText);
+
+// 好：分块存储
+redis.set("article:chunk:1:0", chunk1);
+redis.set("article:chunk:1:1", chunk2);
+redis.set("article:chunk:1:2", chunk3);
+redis.hset("article:meta:1", "chunks", "3");
+
+// 好：使用 String 的分段特性
+// String 最大 512MB，但建议不要超过 10MB
+```
+
+### 操作习惯
+
+```bash
+# 不好
+KEYS *                    # 全表扫描
+FLUSHALL                  # 清空所有
+DEL bigkey                # 同步删除
+SMEMBERS bigset           # 返回所有成员
+
+# 好
+SCAN 0                    # 游标迭代
+FLUSHALL ASYNC            # 异步清空
+UNLINK bigkey             # 异步删除
+SSCAN bigset 0 COUNT 100  # 分批获取
+```
+
+## 面试追问方向
+
+- Redis 哪些命令可能导致阻塞？
+- KEYS 和 SCAN 的区别是什么？
+- DEL 和 UNLINK 的区别是什么？
+- 如何发现和预防慢命令阻塞？
+- Redis 的惰性删除和定期删除有什么区别？
+
+## 总结
+
+慢命令阻塞是 Redis 性能问题的重要原因：
+
+1. **识别阻塞命令**：O(n) 操作是主要风险
+2. **使用替代方案**：SCAN 替代 KEYS，UNLINK 替代 DEL
+3. **监控和预警**：SLOWLOG、LATENCY 命令
+4. **优化数据结构**：避免存储过大的数据结构
+
+记住：**预防胜于治疗，合理的数据结构设计是根本**。

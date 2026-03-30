@@ -668,6 +668,7 @@ export const databaseSidebar = [
             { text: 'SQLite 的并发限制：写锁与数据库锁', link: '/database/sqlite/concurrency' },
             { text: 'SQLite 与 Android 嵌入式开发', link: '/database/sqlite/android' },
             { text: 'SQLite 适用场景与局限性', link: '/database/sqlite/limitation' },
+            { text: 'SQLite 面试高频问题汇总', link: '/database/sqlite/interview-summary' },
         ],
     },
     {

@@ -1,0 +1,220 @@
+# Oracle 物理结构：数据文件、日志文件、控制文件
+
+物理结构是 Oracle 数据库的"躯体"。如果说逻辑结构（表空间、段、区、块）是数据的组织方式，那么物理结构就是这些数据在磁盘上的实际存在形式。理解物理结构，是理解数据持久化、备份恢复、高可用方案的前提。
+
+想象这样一个场景：服务器断电，Oracle 数据库非正常关闭。重启后，SMON 进程自动执行实例恢复，数据恢复到一致状态。这个过程是如何工作的？——答案就藏在物理结构中。
+
+## 三类核心物理文件
+
+Oracle 数据库的物理文件分为三类：**数据文件（Data File）**、**控制文件（Control File）**、**重做日志文件（Redo Log File）**。这三类文件缺一不可，任何一个丢失或损坏都会导致数据库无法正常打开。
+
+### 数据文件：数据的仓库
+
+数据文件是存储实际数据的物理文件，每个数据文件只属于一个表空间。数据文件大小可以动态扩展（autoextend），也可以设置最大大小。
+
+```sql
+-- 查看数据文件信息
+SELECT tablespace_name, file_name, bytes/1024/1024 AS size_mb, 
+       status, online_status
+FROM dba_data_files
+ORDER BY tablespace_name;
+
+-- 查看临时数据文件
+SELECT tablespace_name, file_name, bytes/1024/1024 AS size_mb
+FROM dba_temp_files;
+
+-- 数据文件状态说明
+-- AVAILABLE: 联机状态，可读写
+-- OFFLINE: 脱机状态，不可访问
+```
+
+数据文件的读写由 DBWn 进程完成。读操作（从磁盘到 Buffer Cache）通常由服务器进程直接完成；写操作（从 Buffer Cache 到磁盘）由 DBWn 批量处理，不是一修改就立即写盘。
+
+:::warning 重要特性
+Oracle 的数据文件在创建后不会立即占用全部空间，只有当数据实际写入时才会占用物理空间。这就是为什么你看到数据文件大小是 10GB，但实际磁盘占用可能只有 500MB——这称为"稀疏文件"特性（部分平台支持）。
+:::
+
+### 控制文件：数据库的"GPS"
+
+控制文件是一个非常小的二进制文件（通常只有几 MB），但它记录了数据库的"元信息"：
+
+- 数据库名称和创建时间
+- 数据文件的位置和名称
+- 重做日志文件的位置和成员信息
+- 当前日志序列号
+- 检查点信息
+- RMAN 备份信息
+
+控制文件在数据库 MOUNT 阶段被读取，在整个数据库运行期间被频繁更新。每次日志切换、数据文件变更、备份操作都会更新控制文件。
+
+```sql
+-- 查看控制文件信息
+SELECT name, status, block_size, file_size_blks
+FROM V$CONTROLFILE;
+
+-- 查看控制文件中记录的信息
+SELECT * FROM V$CONTROLFILE_RECORD_SECTION;
+
+-- 查看数据库基本信息
+SELECT name, created, log_mode, open_mode
+FROM V$DATABASE;
+```
+
+Oracle 建议至少维护两份控制文件，放在不同磁盘上，防止单点故障。配置多个控制文件时，所有控制文件的内容保持完全同步。
+
+```text
+# 在 init.ora 或 spfile 中配置
+control_files = (/u01/oradata/orcl/control01.ctl,
+                 /u02/oradata/orcl/control02.ctl,
+                 /u03/oradata/orcl/control03.ctl)
+```
+
+### 重做日志文件：数据库的"日记本"
+
+重做日志文件记录了数据库的所有变更操作（INSERT、UPDATE、DELETE 等）。这些记录是数据库恢复的核心依据——无论是实例崩溃后的实例恢复，还是介质故障后的介质恢复，都依赖重做日志。
+
+Oracle 至少需要两组重做日志文件，采用循环覆盖的写入方式：
+
+```text
+Group 1 (Member A, Member B) → Group 2 (Member A, Member B) → Group 3 (Member A, Member B) → Group 1 (Member A, Member B) → ...
+```
+
+当 Group 1 写满时，LGWR 触发日志切换（Log Switch），开始向 Group 2 写入。如果启用了归档模式，ARCn 进程会将已写满的日志组复制为归档日志文件。
+
+```sql
+-- 查看重做日志组信息
+SELECT group#, thread#, sequence#, bytes/1024/1024 AS size_mb,
+       status, members
+FROM V$LOG
+ORDER BY group#;
+
+-- 查看重做日志成员
+SELECT group#, member, type, status
+FROM V$LOGFILE
+ORDER BY group#;
+
+-- 查看当前日志序列号
+SELECT sequence#, status, archived
+FROM V$LOG
+WHERE status = 'CURRENT';
+
+-- 手动切换日志
+ALTER SYSTEM SWITCH LOGFILE;
+```
+
+日志组状态含义：
+
+| 状态 | 说明 |
+|---|---|
+| CURRENT | 当前正在使用的日志组 |
+| ACTIVE | 活跃状态，包含未归档且未完成检查点的日志 |
+| INACTIVE | 非活跃，可以被覆盖 |
+| UNUSED | 从未使用过的新日志组 |
+| CLEARING | 正在被清除重建 |
+
+日志成员状态含义：
+
+| 状态 | 说明 |
+|---|---|
+| INVALID | 文件不可访问 |
+| STALE | 文件内容可能不完整 |
+| DELETED | 已被删除 |
+| NULL | 正常状态 |
+
+## 日志文件的多路复用
+
+为了防止重做日志文件本身的丢失（单点故障），Oracle 支持多路复用（Multiplexing）——将同一份日志内容同时写入多个成员（Member）。每个日志组可以有多个成员，这些成员通常放在不同磁盘上。
+
+```sql
+-- 添加日志成员
+ALTER DATABASE ADD LOGFILE MEMBER 
+  '/u02/oradata/orcl/redo01b.log' TO GROUP 1;
+
+-- 删除日志成员（不能删除 CURRENT 状态的组）
+ALTER DATABASE DROP LOGFILE MEMBER '/u02/oradata/orcl/redo01b.log';
+```
+
+多路复用的意义在于：即使某个磁盘损坏，只要同一组中有一个成员完好，就不会丢失重做数据。建议将同一组的成员放在不同磁盘控制器上，以最大化保护。
+
+## 归档日志：数据安全的最后一道防线
+
+在生产环境中，强烈建议启用归档模式（ARCHIVELOG）。归档日志是对已写满的重做日志文件的永久拷贝，与联机重做日志配合实现任意时间点恢复（PITR, Point-In-Time Recovery）。
+
+```sql
+-- 查看当前归档模式
+ARCHIVE LOG LIST;
+
+-- 启用归档模式（需重启 MOUNT 状态）
+SHUTDOWN IMMEDIATE;
+STARTUP MOUNT;
+ALTER DATABASE ARCHIVELOG;
+ALTER DATABASE OPEN;
+
+-- 禁用归档模式
+ALTER DATABASE NOARCHIVELOG;
+```
+
+归档模式的日志传输方式：
+
+| 传输方式 | 说明 |
+|---|---|
+| ARCn 进程 | 默认方式，ARCn 自动传输归档日志 |
+| LGWR 传输 | 由 LGWR 直接传输，适用于 Far Sync 实例 |
+| 远程同步传输 | 通过 Oracle Data Guard 网络配置 |
+
+## 物理结构的备份与恢复
+
+理解物理结构后，才能正确执行备份恢复操作。
+
+**冷备份（Closed Backup）**：数据库正常关闭后，备份所有数据文件、控制文件、重做日志文件。简单但需要停机。
+
+**热备份（Open Backup）**：在数据库 OPEN 状态下，使用 `BEGIN BACKUP` 和 `END BACKUP` 命令配合备份数据文件。热备份要求数据库运行在 ARCHIVELOG 模式下。
+
+```sql
+-- 热备份数据文件
+ALTER TABLESPACE users BEGIN BACKUP;
+!cp /u01/oradata/orcl/users01.dbf /backup/
+ALTER TABLESPACE users END BACKUP;
+```
+
+**RMAN 备份**：Oracle 推荐的备份恢复工具，可以备份数据文件、控制文件、归档日志，支持增量备份、压缩、加密等功能。
+
+## 物理文件位置与管理
+
+```sql
+-- 查看所有数据文件路径
+SELECT file_id, tablespace_name, file_name, 
+       bytes/1024/1024 AS size_mb
+FROM dba_data_files;
+
+-- 查看归档日志路径
+SHOW PARAMETER log_archive_dest_1;
+
+-- 查看联机日志路径
+SELECT group#, member FROM V$LOGFILE;
+
+-- 移动数据文件（需将表空间脱机）
+ALTER TABLESPACE users OFFLINE;
+-- 操作系统层面移动文件
+ALTER TABLESPACE users RENAME DATAFILE 
+  '/u01/oradata/orcl/users01.dbf' TO '/u02/oradata/orcl/users01.dbf';
+ALTER TABLESPACE users ONLINE;
+```
+
+## 常见面试问题
+
+**问：控制文件的作用是什么？**
+
+控制文件记录了数据库的物理结构信息，包括数据文件和重做日志文件的位置、日志序列号、检查点信息等。数据库启动到 MOUNT 阶段时读取控制文件，整个运行期间频繁更新。没有控制文件，数据库无法正常打开。
+
+**问：重做日志文件的作用是什么？为什么需要多组日志？**
+
+重做日志记录了数据库的所有变更，用于实例恢复和介质恢复。LGWR 循环使用日志组，如果日志组数太少或每组太小，会导致日志等待事件。多组日志确保在归档过程中有足够的日志空间可用。
+
+**问：热备份的原理是什么？**
+
+热备份时，数据文件被置为备份状态（BACKUP BITMAP SET），此时 DBWn 仍会写盘，但会在数据块头部记录开始备份的 SCN。恢复时，Oracle 利用这些信息结合归档日志将数据文件恢复到一致状态。热备份必须在 ARCHIVELOG 模式下进行。
+
+## 总结
+
+Oracle 的物理结构由数据文件、控制文件、重做日志文件三类核心文件组成。数据文件存储业务数据，控制文件记录数据库元信息，重做日志文件记录变更历史。这三类文件协同工作，配合 DBWn、LGWR、CKPT 等后台进程，实现数据的持久化和恢复能力。理解它们的协作关系，是掌握备份恢复和高可用方案的基础。

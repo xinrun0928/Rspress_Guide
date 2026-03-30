@@ -1,0 +1,482 @@
+# HBase 大数据场景应用
+
+理论需要联系实践。这篇文章会介绍 HBase 在实际项目中的典型应用场景，以及每个场景的设计思路和最佳实践。
+
+## 场景一：用户行为数据存储
+
+### 业务需求
+
+- 存储用户的行为数据（浏览、点击、购买等）
+- 支持按用户 ID 查询历史行为
+- 支持按时间范围查询
+- 数据量大，预计 10 亿+ 条/天
+
+### 设计方案
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                                                              │
+│  主表：user_behavior                                        │
+│  ├─ RowKey = userId + reverse(timestamp)                   │
+│  │   └─ 示例：user_001_92233706854775807-1704067200000    │
+│  │                                                          │
+│  ├─ Column Family: behavior                                │
+│  │   ├─ action (行为类型: view/click/buy)                │
+│  │   ├─ productId (商品 ID)                                │
+│  │   ├─ duration (停留时长)                               │
+│  │   └─ metadata (扩展数据，JSON)                         │
+│  │                                                          │
+│  └─ Column Family: device                                 │
+│      ├─ deviceId (设备 ID)                                 │
+│      ├─ os (操作系统)                                     │
+│      └─ ip (IP地址)                                       │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 关键设计
+
+```java
+// RowKey 设计
+public String generateRowKey(String userId, long timestamp) {
+    // 反转时间戳，使新数据排在前面
+    long reverseTimestamp = Long.MAX_VALUE - timestamp;
+    return String.format("%s_%015d", userId, reverseTimestamp);
+}
+
+// 查询用户最近 N 条行为
+public List<Behavior> getRecentBehaviors(String userId, int limit) {
+    Scan scan = new Scan();
+    scan.withStartRow(Bytes.toBytes(userId + "_"));
+    // 无需设置 stopRow，因为字典序中该前缀的数据都在一起
+    scan.setCaching(limit);
+    
+    List<Behavior> results = new ArrayList<>();
+    try (ResultScanner scanner = table.getScanner(scan)) {
+        int count = 0;
+        for (Result result : scanner) {
+            if (count++ >= limit) break;
+            results.add(parseBehavior(result));
+        }
+    }
+    return results;
+}
+```
+
+### 性能优化
+
+- 预分区：按用户 ID 哈希预分 100 个 Region
+- 布隆过滤器：启用 ROWCOL 类型
+- 压缩：使用 SNAPPY 压缩
+- TTL：90 天自动过期
+
+## 场景二：物联网时序数据
+
+### 业务需求
+
+- 存储传感器采集的时序数据
+- 支持按设备 ID 查询
+- 支持按时间范围查询
+- 数据量大，预计 100 万+ 设备/天
+
+### 设计方案
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                                                              │
+│  主表：iot_timeseries                                       │
+│  ├─ RowKey = deviceId + timestamp                         │
+│  │   └─ 示例：device_001_1704067200000                    │
+│  │                                                          │
+│  ├─ Column Family: metrics                                │
+│  │   ├─ temperature (温度)                                │
+│  │   ├─ humidity (湿度)                                   │
+│  │   ├─ pressure (气压)                                    │
+│  │   └─ ...                                               │
+│  │                                                          │
+│  └─ Column Family: alert                                  │
+│      ├─ level (告警级别)                                   │
+│      └─ message (告警消息)                                 │
+│                                                              │
+│  聚合表：iot_aggregated                                     │
+│  ├─ RowKey = deviceId + timeBucket + metricName          │
+│  │   └─ 示例：device_001_20240101_avg_cpu                 │
+│  │                                                          │
+│  └─ Column Family: stats                                  │
+│      ├─ min, max, avg, count                              │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 关键设计
+
+```java
+// 预聚合数据写入
+public void writeAggregatedData(String deviceId, String metricName, 
+                                 long timestamp, double value) {
+    // 生成聚合表 RowKey
+    String timeBucket = new SimpleDateFormat("yyyyMMdd").format(new Date(timestamp));
+    String rowKey = String.format("%s_%s_%s", deviceId, timeBucket, metricName);
+    
+    // 读取现有聚合数据
+    Get get = new Get(Bytes.toBytes(rowKey));
+    Result result = table.get(get);
+    
+    // 计算新的聚合值
+    double oldMin = getDoubleValue(result, "stats", "min");
+    double oldMax = getDoubleValue(result, "stats", "max");
+    double oldAvg = getDoubleValue(result, "stats", "avg");
+    long oldCount = getLongValue(result, "stats", "count");
+    
+    double newMin = Math.min(oldMin, value);
+    double newMax = Math.max(oldMax, value);
+    double newAvg = (oldAvg * oldCount + value) / (oldCount + 1);
+    long newCount = oldCount + 1;
+    
+    // 写入更新
+    Put put = new Put(Bytes.toBytes(rowKey));
+    put.addColumn(Bytes.toBytes("stats"), Bytes.toBytes("min"), 
+        Bytes.toBytes(newMin));
+    put.addColumn(Bytes.toBytes("stats"), Bytes.toBytes("max"), 
+        Bytes.toBytes(newMax));
+    put.addColumn(Bytes.toBytes("stats"), Bytes.toBytes("avg"), 
+        Bytes.toBytes(newAvg));
+    put.addColumn(Bytes.toBytes("stats"), Bytes.toBytes("count"), 
+        Bytes.toBytes(newCount));
+    
+    aggregatedTable.put(put);
+}
+```
+
+## 场景三：消息推送记录
+
+### 业务需求
+
+- 存储消息推送记录
+- 支持按用户 ID 查询推送历史
+- 支持按消息类型、时间范围查询
+- 需要记录送达状态
+
+### 设计方案
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                                                              │
+│  主表：push_records                                         │
+│  ├─ RowKey = userId + reverse(pushId)                     │
+│  │                                                          │
+│  └─ Column Family: info                                    │
+│      ├─ pushId (推送 ID)                                    │
+│      ├─ templateId (模板 ID)                               │
+│      ├─ title (标题)                                       │
+│      ├─ content (内容)                                      │
+│      ├─ pushTime (推送时间)                                 │
+│      ├─ status (送达状态: sent/delivered/read)            │
+│      └─ metadata (扩展数据)                                │
+│                                                              │
+│  索引表：push_records_by_status                             │
+│  ├─ RowKey = status + pushTime + pushId                   │
+│  └─ 列：userId (用于回查主表)                              │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 关键设计
+
+```java
+// 协处理器维护索引
+public class PushIndexObserver extends RegionObserver {
+    
+    @Override
+    public void postPut(ObserverContext<RegionCoprocessorEnvironment> e,
+                        Put put, WALEdit edit, Durability durability) {
+        String userId = getRowKey(put);
+        byte[] pushId = getColumnValue(put, "info", "pushId");
+        byte[] status = getColumnValue(put, "info", "status");
+        byte[] pushTime = getColumnValue(put, "info", "pushTime");
+        
+        // 写入索引表
+        String indexRowKey = Bytes.toString(status) + "_" + 
+                            Bytes.toString(pushTime) + "_" + 
+                            Bytes.toString(pushId);
+        Put indexPut = new Put(Bytes.toBytes(indexRowKey));
+        indexPut.addColumn(Bytes.toBytes("info"), Bytes.toBytes("userId"), 
+            Bytes.toBytes(userId));
+        
+        Table indexTable = e.getEnvironment().getTable(
+            TableName.valueOf("push_records_by_status"));
+        indexTable.put(indexPut);
+    }
+}
+```
+
+## 场景四：电商订单存储
+
+### 业务需求
+
+- 存储订单全量信息
+- 支持按订单 ID 查询
+- 支持按用户 ID 查询订单列表
+- 支持按时间范围查询
+- 数据量大，预计 1000 万+ 订单/天
+
+### 设计方案
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                                                              │
+│  订单主表：orders                                           │
+│  ├─ RowKey = orderId                                       │
+│  │                                                          │
+│  └─ Column Family: detail                                 │
+│      ├─ userId, productId, amount                         │
+│      ├─ status, paymentMethod                              │
+│      ├─ shippingAddress, contactInfo                      │
+│      └─ createdAt, updatedAt                              │
+│                                                              │
+│  用户索引表：orders_by_user                                │
+│  ├─ RowKey = userId + reverse(orderId)                   │
+│  └─ 列：orderId, createdAt, amount                         │
+│                                                              │
+│  时间索引表：orders_by_time                                │
+│  ├─ RowKey = date(createdAt) + reverse(orderId)         │
+│  └─ 列：orderId, userId, amount                          │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 多索引查询
+
+```java
+// 按用户 ID 和时间范围查询订单
+public List<Order> queryOrdersByUserAndTimeRange(String userId, 
+                                                  long startTime, 
+                                                  long endTime) {
+    // 1. 查询用户索引表，获取 orderId 列表
+    Table userIndexTable = connection.getTable(
+        TableName.valueOf("orders_by_user"));
+    
+    Scan scan = new Scan();
+    // 构造 startKey：userId + reverse(maxTimestamp)
+    String startKey = userId + "_" + String.format("%015d", Long.MAX_VALUE - startTime);
+    String stopKey = userId + "_" + String.format("%015d", Long.MAX_VALUE - endTime);
+    
+    scan.withStartRow(Bytes.toBytes(startKey));
+    scan.withStopRow(Bytes.toBytes(stopKey + "~"));
+    
+    List<byte[]> orderIds = new ArrayList<>();
+    try (ResultScanner scanner = userIndexTable.getScanner(scan)) {
+        for (Result result : scanner) {
+            // 从索引表获取 orderId
+            orderIds.add(result.getValue(
+                Bytes.toBytes("info"), 
+                Bytes.toBytes("orderId")));
+        }
+    }
+    
+    // 2. 批量查询主表
+    if (orderIds.isEmpty()) {
+        return Collections.emptyList();
+    }
+    
+    Table mainTable = connection.getTable(TableName.valueOf("orders"));
+    List<Get> gets = orderIds.stream()
+        .map(id -> new Get(id))
+        .collect(Collectors.toList());
+    
+    Result[] results = mainTable.get(gets);
+    return convertToOrders(results);
+}
+```
+
+## 场景五：金融交易记录
+
+### 业务需求
+
+- 存储金融交易流水
+- 强一致性要求
+- 支持按交易流水号查询
+- 支持按账户 ID 和时间范围查询
+- 数据需要保留 7 年
+
+### 设计方案
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                                                              │
+│  交易流水表：transactions                                    │
+│  ├─ RowKey = accountId + reverse(transactionId)            │
+│  │   └─ 账户维度组织，便于按账户查询                        │
+│  │                                                          │
+│  └─ Column Family: info                                    │
+│      ├─ transactionId (交易流水号)                          │
+│      ├─ type (交易类型: debit/credit/transfer)           │
+│      ├─ amount (交易金额)                                  │
+│      ├─ balance (交易后余额)                               │
+│      ├─ counterparty (对手方账户)                          │
+│      ├─ status (状态: pending/completed/failed)          │
+│      ├─ createdAt (交易时间)                             │
+│      └─ signature (签名，用于审计)                          │
+│                                                              │
+│  快照表：account_snapshots                                 │
+│  ├─ RowKey = accountId + date                            │
+│  │   └─ 每日账户快照，用于历史余额查询                     │
+│  │                                                          │
+│  └─ Column Family: snapshot                                │
+│      ├─ balance (日终余额)                                 │
+│      ├─ transactionCount (当日交易笔数)                     │
+│      └─ updatedAt (更新时间)                               │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 关键设计
+
+```java
+// 交易写入（强一致性）
+public void processTransaction(Transaction tx) {
+    // 1. 验证账户余额（如果有余额校验需求）
+    Account account = getAccount(tx.getAccountId());
+    if (tx.getType().isDebit() && account.getBalance() < tx.getAmount()) {
+        throw new InsufficientBalanceException();
+    }
+    
+    // 2. 更新账户余额（单行事务）
+    Account newAccount = account.updateBalance(tx);
+    Put accountPut = new Put(Bytes.toBytes(account.getId()));
+    accountPut.addColumn(Bytes.toBytes("info"), Bytes.toBytes("balance"), 
+        Bytes.toBytes(newAccount.getBalance()));
+    accountPut.addColumn(Bytes.toBytes("info"), Bytes.toBytes("updatedAt"), 
+        Bytes.toBytes(System.currentTimeMillis()));
+    accountTable.put(accountPut);
+    
+    // 3. 写入交易记录
+    Put txPut = new Put(Bytes.toBytes(generateRowKey(tx)));
+    txPut.addColumn(Bytes.toBytes("info"), Bytes.toBytes("transactionId"), 
+        Bytes.toBytes(tx.getTransactionId()));
+    txPut.addColumn(Bytes.toBytes("info"), Bytes.toBytes("type"), 
+        Bytes.toBytes(tx.getType().name()));
+    // ... 其他字段
+    
+    transactionTable.put(txPut);
+    
+    // 4. 异步更新日终快照
+    asyncUpdateSnapshot(tx);
+}
+```
+
+## 场景六：实时数据分析
+
+### 业务需求
+
+- 实时处理用户行为事件
+- 支持实时统计和聚合
+- 支持告警规则
+
+### 架构设计
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                                                              │
+│  数据采集层                                                  │
+│  ┌─────────┐      ┌─────────┐      ┌─────────┐              │
+│  │ Web/App │ ───▶ │  Kafka  │ ───▶ │ Flink  │              │
+│  └─────────┘      └─────────┘      └─────────┘              │
+│                                              │                  │
+│                                              ▼                  │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │              实时处理                                │    │
+│  │  ├─ 实时统计 (滑动窗口)                           │    │
+│  │  ├─ 实时聚合 (按维度组合)                         │    │
+│  │  ├─ 实时告警 (规则引擎)                          │    │
+│  │  └─ 实时写入 HBase                              │    │
+│  └─────────────────────────────────────────────────────┘    │
+│                                              │                  │
+│                                              ▼                  │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │                    HBase                             │    │
+│  │  ├─ 原始事件表 (user_events)                      │    │
+│  │  ├─ 实时聚合表 (realtime_stats)                  │    │
+│  │  └─ 告警记录表 (alerts)                           │    │
+│  └─────────────────────────────────────────────────────┘    │
+│                                                              │
+│  查询层                                                      │
+│  ┌─────────┐      ┌─────────┐                              │
+│  │ Phoenix │ ───▶ │ Grafana │                              │
+│  └─────────┘      └─────────┘                              │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Flink 实时写入
+
+```java
+// Flink 实时写入 HBase
+public class HBaseSinkFunction implements SinkFunction<Event> {
+    
+    @Override
+    public void invoke(Event event, Context context) throws Exception {
+        // 写入原始事件表
+        String rowKey = generateRowKey(event);
+        Put put = new Put(Bytes.toBytes(rowKey));
+        put.addColumn(Bytes.toBytes("event"), Bytes.toBytes("type"), 
+            Bytes.toBytes(event.getType()));
+        put.addColumn(Bytes.toBytes("event"), Bytes.toBytes("userId"), 
+            Bytes.toBytes(event.getUserId()));
+        // ... 其他字段
+        
+        hbaseTable.put(put);
+        
+        // 更新实时聚合表
+        updateRealtimeStats(event);
+        
+        // 检查告警规则
+        checkAlertRules(event);
+    }
+}
+```
+
+## 设计模式总结
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                                                              │
+│  HBase 常见设计模式：                                        │
+│                                                              │
+│  1. 宽表模式                                                │
+│     - 同一实体的所有属性放在一行                            │
+│     - 避免 JOIN                                              │
+│                                                              │
+│  2. 索引表模式                                              │
+│     - 维护主表 RowKey 与索引字段的映射                     │
+│     - 解决非主键查询问题                                    │
+│                                                              │
+│  3. 时间序列模式                                            │
+│     - RowKey 包含时间维度                                   │
+│     - 支持时间范围查询                                       │
+│     - 使用时间戳反转实现新数据在前                          │
+│                                                              │
+│  4. 层级汇总模式                                            │
+│     - 原始数据 + 多级聚合数据                               │
+│     - 支持不同粒度的查询                                    │
+│                                                              │
+│  5. 关系图谱模式                                            │
+│     - RowKey = 实体1 + 关系 + 实体2                      │
+│     - 支持关系查询                                          │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## 面试追问方向
+
+- 你在项目中如何使用 HBase？
+- HBase 的 RowKey 设计有哪些经验？
+- HBase 如何处理非主键查询？
+- HBase 的预分区是如何设计的？
+- HBase 与其他存储方案如何配合使用？
+- HBase 在你的项目中遇到过哪些问题？
+- 如何保证 HBase 的数据一致性？
+- HBase 的性能如何调优？
+- 在你的业务场景中，HBase 的优势和劣势是什么？
+
+实际项目经验是最好的学习。希望这些场景能给你一些启发，帮助你在实际项目中更好地使用 HBase。

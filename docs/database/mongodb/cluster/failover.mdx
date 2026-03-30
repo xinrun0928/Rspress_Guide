@@ -1,0 +1,384 @@
+import { Badge } from '@rspress/core/theme';
+
+# MongoDB 高可用与故障转移
+
+「MongoDB 分片集群中，如果一个分片挂了会发生什么？」
+
+理解故障转移机制，是保证 MongoDB 生产环境高可用的基础。MongoDB 的高可用设计让系统能够自动从故障中恢复，最大程度减少停机时间。
+
+## 副本集故障转移
+
+### 主节点故障
+
+```
+副本集故障转移流程：
+
+正常状态：
+┌─────────────────────────────────────────┐
+│ Primary ──同步 oplog──→ Secondary-1    │
+│ Primary ──同步 oplog──→ Secondary-2    │
+└─────────────────────────────────────────┘
+
+Primary 故障：
+┌─────────────────────────────────────────┐
+│ ❌ Primary 宕机                          │
+│ 心跳检测超时（默认 10 秒）                 │
+└─────────────────────────────────────────┘
+
+选举过程：
+┌─────────────────────────────────────────┐
+│ Secondary-1 → "选举" → Secondary-2       │
+│ Secondary-2 → "投票" → Secondary-1       │
+│ Secondary-1 获得多数票，成为 Primary      │
+│ 选举耗时约 10-30 秒                      │
+└─────────────────────────────────────────┘
+
+恢复后：
+┌─────────────────────────────────────────┐
+│ Primary ← 同步 oplog ← Secondary-1 (原) │
+│ Secondary ← 同步 oplog ← Primary        │
+└─────────────────────────────────────────┘
+```
+
+### 故障检测机制
+
+```javascript
+// 心跳机制
+// 副本集成员每 2 秒发送一次心跳
+// 默认 10 秒无响应则判定为失效
+
+// 查看心跳状态
+rs.status().members.forEach(m => {
+  print(m.name + ": " +
+    "health=" + m.health + ", " +
+    "lastHeartbeat=" + m.lastHeartbeat
+  );
+});
+
+// 查看选举超时配置
+cfg = rs.conf();
+print("electionTimeoutMillis: " + cfg.settings.electionTimeoutMillis);
+```
+
+### 故障转移时间
+
+| 阶段 | 默认时间 | 说明 |
+|---|---|---|
+| 心跳超时 | 10 秒 | 检测到主节点失效 |
+| 选举超时 | 15 秒 | 等待选举完成 |
+| 故障转移总时间 | 30-50 秒 | 整个过程 |
+
+```javascript
+// 优化故障转移时间
+cfg = rs.conf();
+cfg.settings = {
+  heartbeatTimeoutSecs: 5,    // 缩短心跳超时（默认 10）
+  electionTimeoutMs: 10000    // 缩短选举超时（默认 15000）
+};
+rs.reconfig(cfg);
+```
+
+## 分片集群故障转移
+
+### 单个 Shard 故障
+
+```javascript
+// 分片副本集故障：
+// 如果 Shard 是副本集，自动进行故障转移
+
+// 场景：Shard1 的 Primary 宕机
+// 影响：Shard1 的数据暂时不可用
+// 恢复：副本集自动选举新 Primary 后恢复
+
+// 查看分片状态
+sh.status()
+
+// 示例输出：
+// shards:
+//   { "_id": "shard0001", "host": "rs1/host1:27017", "state": 1 }
+//   { "_id": "shard0002", "host": "rs2/host2:27017", "state": 1 }  ← 故障
+```
+
+### 多个 Shard 故障
+
+<Badge text="重要" type="warning" /> 多个 Shard 同时故障可能导致数据永久丢失。
+
+```javascript
+// 3 分片集群：
+// - 1 个 Shard 故障：数据部分可用，可降级服务
+// - 2 个 Shard 故障：多数分片不可用，整个集群不可写
+// - 3 个 Shard 故障：整个集群不可用
+
+// 设计原则：确保数据冗余和副本数量足够
+// 建议：每个 Shard 至少 3 节点副本集
+```
+
+### Config Server 故障
+
+```javascript
+// Config Server 故障影响：
+// - 元数据查询暂缓（不影响数据读写）
+// - 集群扩缩容暂停
+// - 均衡器暂停
+
+// Config Server 是副本集，自动故障转移
+
+// 查看 Config Server 状态
+db.adminCommand({ replSetGetStatus: 1 })  // 在 Config Server 上执行
+```
+
+### mongos 故障
+
+```javascript
+// mongos 故障影响：
+// - 客户端连接中断
+// - 请求无法路由
+
+// mongos 无状态，客户端应连接多个 mongos
+
+// 推荐架构：
+// 应用程序 ──→ mongos1 ──┐
+// 应用程序 ──→ mongos2 ──┼──→ Shards
+// 应用程序 ──→ mongos3 ──┘
+
+// 客户端连接字符串
+// mongodb://mongos1:27017,mongos2:27017,mongos3:27017
+```
+
+## 高可用架构设计
+
+### 最小高可用架构
+
+```javascript
+// 最小推荐架构：
+// 副本集：至少 3 节点
+// 分片集群：每个 Shard 至少 3 节点副本集
+// Config Server：3 节点副本集
+// mongos：至少 2 个（无状态，可水平扩展）
+```
+
+### 推荐架构
+
+```
+高可用分片集群架构：
+
+┌──────────────────────────────────────────────┐
+│                Load Balancer                  │
+│                                              │
+└──────────────┬───────────────┬───────────────┘
+               │               │
+        ┌──────┴──────┐ ┌──────┴──────┐
+        │    mongos   │ │    mongos   │
+        │  (无状态)    │ │  (无状态)    │
+        └──────┬──────┘ └──────┬──────┘
+               │               │
+    ┌──────────┴───────────────┴──────────┐
+    │                                      │
+┌───┴────┐ ┌────┴────┐ ┌────┴────┐ ┌────┴───┐
+│Shard1  │ │ Shard2  │ │ Shard3  │ │ Shard4 │
+│ (RS)   │ │  (RS)   │ │  (RS)   │ │  (RS)  │
+│ P/S/S  │ │  P/S/S  │ │  P/S/S  │ │  P/S/S │
+└────────┘ └─────────┘ └─────────┘ └────────┘
+
+┌──────────────────────────────────────────────┐
+│           Config Server Replica Set           │
+│                  (3 节点)                      │
+└──────────────────────────────────────────────┘
+```
+
+### 地理分布式高可用
+
+```javascript
+// 跨数据中心架构：
+// 数据中心 A: Primary
+// 数据中心 B: Secondary
+// 数据中心 C: Secondary (仲裁)
+
+// 配置
+rs.initiate({
+  _id: "geo-replica",
+  members: [
+    { _id: 0, host: "dc-a:27017", priority: 3 },  // 主数据中心优先
+    { _id: 1, host: "dc-b:27017", priority: 2 },
+    { _id: 2, host: "dc-c:27017", priority: 1, arbiterOnly: true }
+  ]
+});
+```
+
+## 读写策略与高可用
+
+### 写入策略
+
+```javascript
+// 推荐：多数节点确认
+db.collection.insertOne(
+  { data: "value" },
+  { writeConcern: { w: "majority" } }
+);
+
+// 最高持久性：journal + majority
+db.collection.insertOne(
+  { data: "value" },
+  { writeConcern: { w: "majority", j: true, wtimeout: 5000 } }
+);
+```
+
+### 读取策略
+
+```javascript
+// 高可用读取：
+// 1. 主优先（有故障自动切换到从）
+db.collection.find({}).readPref("primaryPreferred")
+
+// 2. 从优先（负载均衡）
+db.collection.find({}).readPref("secondaryPreferred")
+
+// 3. 就近读取（低延迟）
+db.collection.find({}).readPref("nearest")
+
+// 分片集群读取
+// mongos 自动路由到可用的分片
+```
+
+## 故障恢复
+
+### 节点恢复
+
+```javascript
+// 节点重新加入副本集：
+// 1. 从节点自动同步缺失的 oplog
+// 2. 同步完成后恢复正常状态
+
+// 手动触发同步
+db.adminCommand({ resync: "hostname:port" });
+
+// 查看同步状态
+rs.status().members.forEach(m => {
+  if (m.stateStr === "SECONDARY") {
+    print(m.name + ": " +
+      "optime=" + m.optimeDate + ", " +
+      "lag=" + m.lagSinceLastHeartbeat + "s"
+    );
+  }
+});
+```
+
+### 数据恢复
+
+```javascript
+// 从备份恢复
+// 1. 全量备份
+mongodump --host hostname --out /backup/full
+
+// 2. oplog 增量
+mongodump --host hostname --out /backup/oplog --query "{ ts: { $gt: lastBackupTs } }"
+
+// 3. 恢复到指定时间点
+mongorestore --host hostname --oplogReplay --oplogLimit lastBackupTs
+```
+
+### 副本集重建
+
+```javascript
+// 严重故障后重建副本集：
+
+// 1. 选择健康节点作为种子
+// 2. 清理所有节点的数据目录
+// 3. 在新节点初始化副本集
+rs.initiate({
+  _id: "rs0",
+  members: [
+    { _id: 0, host: "new-host1:27017" },
+    { _id: 1, host: "new-host2:27017" },
+    { _id: 2, host: "new-host3:27017" }
+  ]
+});
+
+// 4. 从备份恢复数据
+// 5. 验证数据完整性
+```
+
+## 监控与告警
+
+### 关键监控指标
+
+```javascript
+// 1. 副本集状态
+rs.status().members.forEach(m => {
+  if (m.health !== 1) {
+    print("WARNING: " + m.name + " is down!");
+  }
+});
+
+// 2. 复制延迟
+db.adminCommand({ replSetGetStatus: 1 }).members.forEach(m => {
+  if (m.lagSinceLastHeartbeat > 30) {
+    print("WARNING: " + m.name + " replication lag is " + m.lagSinceLastHeartbeat + "s");
+  }
+});
+
+// 3. 主节点状态
+const status = rs.status();
+const primary = status.members.find(m => m.stateStr === "PRIMARY");
+if (!primary) {
+  print("WARNING: No primary in replica set!");
+}
+```
+
+### 告警配置
+
+```javascript
+// 推荐告警阈值：
+// - 副本集成员 down: 立即告警
+// - 复制延迟 > 30 秒: 告警
+// - 副本集无主节点: 立即告警
+// - oplog 使用率 > 80%: 告警
+// - 连接数 > 80% max: 告警
+```
+
+## 面试实战
+
+**面试官问**：「MongoDB 分片集群某个分片宕机会怎样？」
+
+**深入回答**：
+
+> 这取决于分片架构：
+>
+> 1. **单分片是副本集**：副本集会自动选举新主节点，约 30-50 秒恢复
+>
+> 2. **部分数据不可用**：故障分片的数据无法读写，其他分片正常
+>
+> 3. **写入可能失败**：如果写入配置了 `w: majority`，涉及故障分片的写入会失败
+>
+> 4. **查询降级**：不涉及故障分片的查询可以正常执行
+
+**面试官问**：「如何保证 MongoDB 的高可用？」
+
+**深入回答**：
+
+> 架构层面的高可用措施：
+>
+> 1. **副本集**：至少 3 节点，配置合理的优先级
+>
+> 2. **writeConcern**：使用 `w: majority` 确保数据持久性
+>
+> 3. **readConcern**：使用 `majority` 或 `snapshot` 确保读取一致性
+>
+> 4. **多 mongos**：应用程序连接多个 mongos，避免单点故障
+>
+> 5. **跨机房部署**：防止单机房故障导致数据丢失
+>
+> 6. **监控告警**：及时发现故障，快速响应
+
+## 总结
+
+高可用核心要点：
+
+- **副本集故障转移**：自动进行，约 30-50 秒完成
+- **分片集群故障**：单个 Shard 故障不影响其他 Shard
+- **Config Server 故障**：只影响元数据操作，不影响数据读写
+- **mongos 故障**：无状态，多个 mongos 保证高可用
+- **读写策略**：合理配置 writeConcern 和 readConcern
+- **监控告警**：及时发现和处理故障
+
+高可用设计是生产环境 MongoDB 部署的关键，需要从架构、配置、监控等多个层面综合考虑。

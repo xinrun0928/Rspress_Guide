@@ -1,0 +1,290 @@
+import { Badge } from '@rspress/core/theme';
+
+# 分页查询
+
+「查询第 10000 到 10020 条数据，怎么写最有效？」
+
+分页是数据展示的常见需求，但很多开发者习惯性地用 `OFFSET ... FETCH` 或者更老式的 `TOP` 嵌套，却没意识到在大数据量场景下的性能陷阱。
+
+## OFFSET FETCH 分页
+
+### 基本语法
+
+SQL Server 2012+ 支持标准的 `OFFSET ... FETCH` 语法：
+
+```sql
+SELECT 
+    ProductID,
+    ProductName,
+    Price,
+    CreatedDate
+FROM Products
+ORDER BY ProductID
+OFFSET 0 ROWS FETCH NEXT 20 ROWS ONLY;
+```
+
+参数说明：
+- `OFFSET n ROWS`：跳过前 n 行
+- `FETCH NEXT m ROWS ONLY`：返回接下来的 m 行
+
+### 完整示例
+
+```sql
+-- 第 3 页，每页 20 条
+SELECT 
+    ProductID,
+    ProductName,
+    CategoryID,
+    Price
+FROM Products
+WHERE IsActive = 1
+ORDER BY Price DESC, ProductID ASC
+OFFSET 60 ROWS FETCH NEXT 20 ROWS ONLY;
+```
+
+### OFFSET FETCH 的问题
+
+`OFFSET FETCH` 的性能问题在于：**数据库必须扫描并跳过所有前置行**。
+
+假设你要查询第 5000 页（每页 20 条）：
+- 数据库需要扫描 100,000 行
+- 返回 20 行
+- 效率极低
+
+```sql
+-- 低效分页：查询第 5000 页
+SELECT * FROM Products
+ORDER BY ProductID
+OFFSET 100000 ROWS FETCH NEXT 20 ROWS ONLY;
+-- 需要扫描 100,020 行，返回 20 行
+```
+
+## 键值分页（游标方法）
+
+### 使用 WHERE 条件
+
+通过记录上次查询的最后一条 ID，避免扫描：
+
+```sql
+-- 第一页
+SELECT TOP 20 * FROM Products
+ORDER BY ProductID;
+
+-- 假设最后一行的 ProductID 是 100
+-- 第二页
+SELECT TOP 20 * FROM Products
+WHERE ProductID > 100
+ORDER BY ProductID;
+```
+
+### 多列排序的分页
+
+多列排序时，需要记录所有排序列的值：
+
+```sql
+-- 多列排序
+SELECT * FROM Products
+ORDER BY CategoryID ASC, Price DESC, ProductID ASC;
+
+-- 记录最后一行的排序键值
+-- CategoryID = 5, Price = 99.99, ProductID = 100
+
+-- 下一页查询
+SELECT * FROM Products
+WHERE 
+    (CategoryID > 5)
+    OR (CategoryID = 5 AND Price < 99.99)
+    OR (CategoryID = 5 AND Price = 99.99 AND ProductID > 100)
+ORDER BY CategoryID ASC, Price DESC, ProductID ASC
+FETCH NEXT 20 ROWS ONLY;
+```
+
+### CTE 实现键值分页
+
+```sql
+-- 键值分页的 CTE 版本
+WITH ProductList AS (
+    SELECT 
+        ROW_NUMBER() OVER (ORDER BY Price DESC, ProductID ASC) AS RowNum,
+        ProductID, ProductName, CategoryID, Price
+    FROM Products
+    WHERE IsActive = 1
+)
+SELECT * FROM ProductList
+WHERE RowNum BETWEEN 21 AND 40;
+```
+
+:::warning
+CTE 配合 `ROW_NUMBER()` 在大数据量时仍然需要全表扫描。使用键值分页（记录上次最后 ID）在大数据量场景下更优。
+:::
+
+## CTID 分页（物理行号）
+
+SQL Server 使用隐藏列 `ctid`（物理文件号:页号:行号）：
+
+```sql
+-- 不推荐：ctid 不稳定，DELETE/UPDATE 后会变化
+SELECT * FROM Products
+WHERE ctid IN (
+    SELECT TOP(20) ctid FROM Products
+    WHERE ctid NOT IN (
+        SELECT TOP(40) ctid FROM Products ORDER BY ProductID
+    )
+    ORDER BY ProductID
+);
+```
+
+## 分页性能对比
+
+| 方法 | 适用场景 | 性能特点 |
+|---|---|---|
+| OFFSET FETCH | 小数据量、前几页 | 简单直接，大偏移量时性能差 |
+| 键值分页 | 大数据量、无限滚动 | 高效，需要维护状态 |
+| CTE + ROW_NUMBER | 中等数据量、需要总行数 | 需要全表扫描 |
+| 子查询 | 简单需求 | 与 OFFSET FETCH 类似 |
+
+## 获取总行数
+
+### 单独查询
+
+```sql
+-- 分页 + 总数
+DECLARE @PageSize INT = 20;
+DECLARE @PageNum INT = 10;
+
+SELECT 
+    @PageSize AS PageSize,
+    CEILING(CAST(COUNT(*) AS FLOAT) / @PageSize) AS TotalPages,
+    COUNT(*) AS TotalRows
+FROM Products
+WHERE IsActive = 1;
+
+-- 分页数据
+SELECT ProductID, ProductName, Price
+FROM Products
+WHERE IsActive = 1
+ORDER BY ProductID
+OFFSET (@PageNum - 1) * @PageSize ROWS FETCH NEXT @PageSize ROWS ONLY;
+```
+
+### 使用 CTE 一次查询
+
+```sql
+-- 一次查询获取分页和总数
+DECLARE @PageSize INT = 20;
+DECLARE @PageNum INT = 10;
+
+WITH ProductList AS (
+    SELECT 
+        ProductID, ProductName, Price,
+        COUNT(*) OVER () AS TotalRows
+    FROM Products
+    WHERE IsActive = 1
+)
+SELECT 
+    ProductID, ProductName, Price,
+    TotalRows,
+    CEILING(CAST(TotalRows AS FLOAT) / @PageSize) AS TotalPages
+FROM ProductList
+ORDER BY ProductID
+OFFSET (@PageNum - 1) * @PageSize ROWS FETCH NEXT @PageSize ROWS ONLY;
+```
+
+## 分页存储过程
+
+```sql
+CREATE PROCEDURE usp_GetProductsPaged
+    @PageNum INT = 1,
+    @PageSize INT = 20,
+    @CategoryID INT = NULL,
+    @TotalRows INT OUTPUT,
+    @TotalPages INT OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON;
+    
+    DECLARE @StartRow INT = (@PageNum - 1) * @PageSize + 1;
+    DECLARE @EndRow INT = @PageNum * @PageSize;
+    
+    -- 获取总数
+    SELECT @TotalRows = COUNT(*)
+    FROM Products
+    WHERE @CategoryID IS NULL OR CategoryID = @CategoryID;
+    
+    SET @TotalPages = CEILING(CAST(@TotalRows AS FLOAT) / @PageSize);
+    
+    -- 分页查询
+    SELECT 
+        ProductID, ProductName, CategoryID, Price, CreatedDate
+    FROM (
+        SELECT 
+            ProductID, ProductName, CategoryID, Price, CreatedDate,
+            ROW_NUMBER() OVER (ORDER BY ProductID) AS RowNum
+        FROM Products
+        WHERE @CategoryID IS NULL OR CategoryID = @CategoryID
+    ) AS PagedProducts
+    WHERE RowNum BETWEEN @StartRow AND @EndRow;
+END;
+GO
+
+-- 调用
+DECLARE @Total INT, @Pages INT;
+EXEC usp_GetProductsPaged 
+    @PageNum = 5,
+    @PageSize = 20,
+    @CategoryID = 1,
+    @TotalRows = @Total OUTPUT,
+    @TotalPages = @Pages OUTPUT;
+
+PRINT 'Total Rows: ' + CAST(@Total AS VARCHAR);
+PRINT 'Total Pages: ' + CAST(@Pages AS VARCHAR);
+```
+
+## 性能优化建议
+
+### 确保索引支持排序
+
+```sql
+-- 分页查询需要排序列上有索引
+CREATE INDEX IX_Products_Price ON Products(Price DESC, ProductID ASC)
+INCLUDE (ProductName, CategoryID, CreatedDate);
+```
+
+### 预热查询
+
+```sql
+-- 大型分页查询前，先执行以建立缓冲
+DECLARE @LastID INT;
+SELECT TOP 1 @LastID = ProductID 
+FROM Products 
+WHERE ProductID < @TargetFirstID
+ORDER BY ProductID DESC;
+```
+
+### 使用键值分页代替大偏移
+
+```sql
+-- 不推荐
+SELECT * FROM Products ORDER BY ProductID OFFSET 100000 ROWS FETCH NEXT 20 ROWS ONLY;
+
+-- 推荐：键值分页
+DECLARE @LastProductID INT = 100000;
+SELECT TOP 20 * FROM Products 
+WHERE ProductID > @LastProductID
+ORDER BY ProductID;
+```
+
+## 前端分页 vs 后端分页
+
+| 方案 | 优点 | 缺点 |
+|---|---|---|
+| 前端分页 | 减少数据库请求 | 大量数据传输 |
+| 后端分页 | 数据量小 | 数据库压力大 |
+| 混合分页 | 预加载、滚动加载 | 实现复杂 |
+
+对于移动端和 Web 场景，推荐**键值分页 + 预加载**策略：
+- 首次加载前 2-3 页
+- 用户滚动到第 2 页时预加载第 3 页
+- 保持最后一条记录 ID，支持高效下一页查询
+
+分页查询看似简单，但在高并发、大数据量场景下，选择合适的分页策略至关重要。

@@ -1,0 +1,418 @@
+import { Badge } from '@rspress/core/theme';
+
+# 缓存与数据库双写一致性
+
+缓存一致性是分布式系统中永恒的话题。「先更新数据库还是先删除缓存？」「延迟双删是什么？」「如何保证强一致性？」
+
+这些问题没有标准答案，只有权衡。
+
+## 为什么缓存和数据库会不一致
+
+正常情况下，缓存和数据库应该是一致的：
+
+```
+读操作：
+1. 查缓存 -> 有 -> 返回
+2. 查缓存 -> 无 -> 查数据库 -> 写缓存 -> 返回
+
+写操作：
+1. 写数据库 -> 写缓存（或者删除缓存）
+```
+
+但问题出在**并发**和**分布式**上。
+
+### 并发场景
+
+```
+线程 A：读数据（缓存无） -> 查数据库（value=1）
+线程 B：写数据 -> value=2 -> 删除缓存
+线程 A：写缓存（value=1）
+
+结果：缓存是 1，数据库是 2，不一致！
+```
+
+### 分布式场景
+
+```
+主从复制延迟：
+1. 写主库（value=2）
+2. 删除缓存
+3. 从库还没同步完成
+4. 读请求打到从库（value=1）
+5. 写缓存（value=1）
+
+结果：缓存是 1，数据库是 2，不一致！
+```
+
+## 缓存更新策略
+
+### 策略一：Cache Aside（旁路缓存）
+
+这是最常用的策略。
+
+```
+读：
+1. 查缓存 -> 有 -> 返回
+2. 查缓存 -> 无 -> 查数据库 -> 写缓存 -> 返回
+
+写：
+1. 写数据库
+2. 删除缓存
+```
+
+```java
+public String get(String key) {
+    String value = redis.get(key);
+    if (value != null) {
+        return value;
+    }
+    
+    // 缓存未命中，查询数据库
+    value = db.query(key);
+    
+    // 写入缓存
+    redis.setex(key, 3600, value);
+    
+    return value;
+}
+
+public void update(String key, String value) {
+    // 先写数据库
+    db.update(key, value);
+    
+    // 再删缓存（不是更新缓存）
+    redis.delete(key);
+}
+```
+
+**为什么是删除缓存而不是更新缓存？**
+
+更新缓存可能遇到并发问题：
+
+```
+线程 A：更新数据库（value=2）
+线程 B：更新数据库（value=3）
+线程 B：更新缓存（value=3）
+线程 A：更新缓存（value=2）
+
+结果：缓存是 2，数据库是 3
+```
+
+删除缓存则安全得多。
+
+### 策略二：Read/Write Through（读写穿透）
+
+应用只操作缓存，缓存负责同步数据库。
+
+```
+Read Through：
+1. 查缓存 -> 有 -> 返回
+2. 查缓存 -> 无 -> 缓存查数据库 -> 写缓存 -> 返回
+
+Write Through：
+1. 写缓存 -> 缓存同步写数据库 -> 返回
+```
+
+```java
+// 应用只操作缓存
+public String get(String key) {
+    return cache.get(key);  // 缓存自动查数据库
+}
+
+public void update(String key, String value) {
+    cache.set(key, value);  // 缓存自动同步数据库
+}
+```
+
+### 策略三：Write Behind（异步写入）
+
+写操作直接更新缓存，异步同步到数据库。
+
+```
+1. 写缓存
+2. 异步任务同步到数据库
+```
+
+```java
+public void update(String key, String value) {
+    // 直接写缓存
+    cache.set(key, value);
+    
+    // 写入更新队列
+    updateQueue.add(new Update(key, value));
+}
+
+// 后台线程异步同步
+@Scheduled(fixedDelay = 100)
+public void syncToDb() {
+    while (!updateQueue.isEmpty()) {
+        Update update = updateQueue.poll();
+        db.update(update.key, update.value);
+    }
+}
+```
+
+## 三大缓存问题
+
+### 问题一：先删缓存还是先更新数据库
+
+**方案 A：先删缓存，再更新数据库**
+
+```
+1. 删除缓存
+2. 更新数据库
+3. 延迟（可选）再删除缓存
+```
+
+问题：并发时可能出现短暂的缓存不一致。
+
+**方案 B：先更新数据库，再删缓存**
+
+```
+1. 更新数据库
+2. 删除缓存
+```
+
+问题：如果删除缓存失败，数据库是新数据，缓存是旧数据。
+
+**推荐：先删缓存，再更新数据库 + 延迟双删**
+
+```java
+public void update(String key, String value) {
+    // 1. 删除缓存
+    redis.delete(key);
+    
+    // 2. 更新数据库
+    db.update(key, value);
+    
+    // 3. 延迟再删缓存（解决并发问题）
+    CompletableFuture.delayedExecutor(1, TimeUnit.SECONDS)
+        .execute(() -> redis.delete(key));
+}
+```
+
+### 问题二：缓存删除失败
+
+```java
+public void update(String key, String value) {
+    db.update(key, value);
+    
+    try {
+        redis.delete(key);
+    } catch (Exception e) {
+        // 删除失败，记录日志
+        log.error("缓存删除失败，key={}", key);
+        
+        // 补偿机制：
+        // 1. 重试
+        retryDelete(key);
+        // 2. 消息队列异步删除
+        mq.send("cache:delete", key);
+    }
+}
+```
+
+### 问题三：主从复制延迟
+
+```java
+public String get(String key) {
+    String value = redis.get(key);
+    if (value != null) {
+        return value;
+    }
+    
+    // 读从库（可能有延迟）
+    value = db.queryFromReplica(key);
+    
+    // 写缓存
+    redis.setex(key, 60, value);  // 过期时间短一些
+    
+    return value;
+}
+```
+
+## 延迟双删详解
+
+### 什么是延迟双删
+
+```
+1. 删除缓存
+2. 更新数据库
+3. 延迟 N 毫秒，再删除缓存
+```
+
+### 为什么要延迟
+
+```
+时间线：
+T1: 线程 A 查询缓存（无） -> 查询数据库（value=1）
+T2: 线程 B 写数据 -> value=2 -> 删除缓存
+T3: 线程 A 写缓存（value=1）  <- 这是错误的数据
+T4: 延迟后，再次删除缓存      <- 清理掉错误的数据
+```
+
+### 延迟时间设置
+
+延迟时间应该大于主从复制延迟时间。
+
+```java
+// 延迟 500ms - 1 秒
+CompletableFuture.delayedExecutor(500, TimeUnit.MILLISECONDS)
+    .execute(() -> redis.delete(key));
+
+// 或者使用消息队列保证可靠性
+mq.send("cache:delete:delay", key);  // 延迟消息
+```
+
+## 最终一致性 vs 强一致性
+
+### 最终一致性
+
+允许短暂的不一致，最终会达到一致。
+
+```
+适用场景：
+- 新闻 feed
+- 商品详情
+- 评论列表
+```
+
+实现方式：Cache Aside + 过期时间
+
+```java
+// 设置较短的过期时间
+redis.setex(key, 300, value);  // 5 分钟过期
+```
+
+### 强一致性
+
+任何时刻缓存和数据库必须一致。
+
+```
+适用场景：
+- 库存扣减
+- 余额查询
+- 订单状态
+```
+
+实现方式：分布式锁 + 串行化
+
+```java
+public void update(String key, String value) {
+    // 获取分布式锁
+    String lockKey = "lock:update:" + key;
+    String lockValue = UUID.randomUUID().toString();
+    
+    if (redis.setIfAbsent(lockKey, lockValue, 10, TimeUnit.SECONDS)) {
+        try {
+            // 1. 查缓存
+            String cached = redis.get(key);
+            
+            // 2. 写数据库
+            db.update(key, value);
+            
+            // 3. 删缓存
+            redis.delete(key);
+        } finally {
+            // 释放锁
+            redis.delete(lockKey);
+        }
+    } else {
+        // 等待重试
+        retry(key, value);
+    }
+}
+```
+
+## 分布式锁 + 缓存方案
+
+### 完整的缓存更新方案
+
+```java
+public class CacheService {
+    
+    private StringRedisTemplate redisTemplate;
+    private DbService dbService;
+    
+    // 读
+    public String get(String key) {
+        // 1. 查缓存
+        String value = redisTemplate.opsForValue().get(key);
+        if (value != null) {
+            return value;
+        }
+        
+        // 2. 查数据库
+        value = dbService.query(key);
+        if (value != null) {
+            // 3. 写缓存
+            redisTemplate.opsForValue().set(key, value, 5, TimeUnit.MINUTES);
+        }
+        
+        return value;
+    }
+    
+    // 写
+    public void update(String key, String value) {
+        // 1. 获取分布式锁
+        String lockKey = "lock:" + key;
+        String lockValue = UUID.randomUUID().toString();
+        
+        try {
+            // 2. 获取锁
+            if (!Boolean.TRUE.equals(
+                    redisTemplate.opsForValue().setIfAbsent(lockKey, lockValue, 10, TimeUnit.SECONDS))) {
+                // 获取锁失败，延迟重试
+                Thread.sleep(50);
+                update(key, value);
+                return;
+            }
+            
+            // 3. 查缓存
+            String cached = redisTemplate.opsForValue().get(key);
+            
+            // 4. 写数据库
+            dbService.update(key, value);
+            
+            // 5. 删缓存
+            redisTemplate.delete(key);
+            
+            // 6. 延迟双删（可选）
+            CompletableFuture.delayedExecutor(500, TimeUnit.MILLISECONDS)
+                .execute(() -> redisTemplate.delete(key));
+            
+        } catch (Exception e) {
+            log.error("更新失败", e);
+            throw new RuntimeException("更新失败");
+        } finally {
+            // 7. 释放锁
+            if (lockValue.equals(redisTemplate.opsForValue().get(lockKey))) {
+                redisTemplate.delete(lockKey);
+            }
+        }
+    }
+}
+```
+
+## 面试追问方向
+
+- Cache Aside 和 Read/Write Through 的区别？
+- 为什么删除缓存而不是更新缓存？
+- 延迟双删的作用是什么？
+- 如何保证缓存删除的可靠性？
+- 什么场景需要强一致性？如何实现？
+
+## 总结
+
+缓存一致性没有银弹，只有权衡：
+
+1. **Cache Aside**：最常用，适合大多数场景
+2. **延迟双删**：解决并发问题
+3. **分布式锁**：保证强一致性
+4. **过期时间**：兜底方案
+
+选择原则：
+- 大多数场景：**Cache Aside + 过期时间**（最终一致）
+- 需要强一致：**分布式锁 + 串行化**
+
+记住：**没有最好的方案，只有最适合业务的权衡**。

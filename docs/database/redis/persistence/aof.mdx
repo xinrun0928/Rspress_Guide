@@ -1,0 +1,382 @@
+import { Badge } from '@rspress/core/theme';
+
+# AOF 持久化
+
+AOF（Append Only File）是 Redis 的另一种持久化方式。它通过记录所有写命令来保证数据的完整性。相比 RDB 的定时快照，AOF 提供了更实时的数据保护。
+
+如果说 RDB 是「定期拍照」，那 AOF 就是「全程录像」。
+
+## AOF 的工作原理
+
+### 核心思想
+
+AOF 的核心思想是：**记录所有修改数据的命令**。
+
+当执行一个写命令时，这个命令不仅会在内存中执行，还会追加到 AOF 文件的末尾。Redis 重启时，重放这些命令就能恢复数据。
+
+```
+写命令执行流程：
+
+客户端                    Redis                        dump.aof
+   |                        |                            |
+   |---- SET k v ---->      |                            |
+   |                        |---- 执行命令 ---->          |
+   |<--- 响应 ----           |                            |
+   |                        |---- 追加命令 ---->          |
+   |                        |         append             |
+```
+
+### AOF 开启配置
+
+```bash
+# redis.conf
+
+# 开启 AOF
+appendonly yes
+
+# AOF 文件名
+appendfilename "appendonly.aof"
+
+# AOF 目录
+dir /var/lib/redis
+```
+
+## 三种同步策略
+
+AOF 的核心问题是：**何时将数据同步到磁盘？**
+
+同步太频繁会影响性能，同步太稀少可能丢失更多数据。Redis 提供了三种策略：
+
+| 策略 | 说明 | 性能 | 安全性 |
+| --- | --- | --- | --- |
+| always | 每个命令都同步 | 最低 | 最高 |
+| everysec | 每秒同步一次 | 中等 | 中等 |
+| no | 由操作系统决定 | 最高 | 最低 |
+
+### always：每个命令都同步
+
+```bash
+appendfsync always
+```
+
+每个写命令执行后都会调用 `fsync()` 将数据写入磁盘：
+
+```c
+// 命令执行后
+void afterCommand(client *c) {
+    if (server.aof_state == AOF_ON && server.aof_fsync == AOF_FSYNC_ALWAYS) {
+        fsync(server.aof_fd);  // 强制同步
+    }
+}
+```
+
+**特点**：
+
+- 最多丢失一个命令
+- 性能最差，Redis 的 QPS 会被磁盘 I/O 限制
+- 适合对数据安全性要求极高的场景
+
+### everysec：每秒同步一次
+
+```bash
+appendfsync everysec  # 默认策略
+```
+
+后台每秒调用一次 `fsync()`：
+
+```c
+// 后台线程每秒执行
+void *flushThreadMain(void *arg) {
+    while (1) {
+        sleep(1);
+        if (server.aof_pending_fsync) {
+            aof_fsync(server.aof_fd);  // 同步
+        }
+    }
+}
+```
+
+**特点**：
+
+- 最多丢失 1 秒的数据
+- 性能适中，默认推荐配置
+- 适合大多数生产环境
+
+### no：由操作系统决定
+
+```bash
+appendfsync no
+```
+
+Redis 不主动同步，完全由操作系统的 `write()` 决定何时写入磁盘：
+
+```c
+// 每次写入后不调用 fsync
+// 操作系统在缓冲区满或达到阈值时自动写入
+write(server.aof_fd, buf, len);
+```
+
+**特点**：
+
+- 性能最好
+- 可能丢失大量数据（取决于操作系统行为）
+- 适合对性能要求极高、可以容忍数据丢失的场景
+
+## AOF 文件格式
+
+AOF 文件存储的是 Redis 命令协议（RESP 协议）：
+
+```bash
+# AOF 文件内容示例
+*3\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$3\r\nvalue\r\n
+*3\r\n$3\r\nHSET\r\n$5\r\nuser\r\n$4\r\nname\r\n$5\r\nAlice\r\n
+*2\r\n$4\r\nINCR\r\n$5\r\ncounter\r\n
+```
+
+转换为可读格式：
+
+```
+SET mykey value
+HSET user name Alice
+INCR counter
+```
+
+### 命令格式
+
+Redis 使用 RESP（REdis Serialization Protocol）协议：
+
+| 类型 | 格式 | 示例 |
+| --- | --- | --- |
+| 数组 | `*n\r\n` | `*3\r\n` 表示 3 个元素 |
+| 批量字符串 | `$n\r\n` | `$5\r\nhello\r\n` |
+| 整数 | `:n\r\n` | `:12345\r\n` |
+
+### AOF 重写机制
+
+随着时间推移，AOF 文件会不断增长。可以用 BGREWRITEAOF 命令重写：
+
+```bash
+> BGREWRITEAOF
+Background append only file rewriting started
+```
+
+重写会创建一个新的 AOF 文件，只保留最终状态，删除冗余命令：
+
+```
+重写前：
+SET k1 v1
+SET k1 v2
+SET k1 v3
+DEL k1
+
+重写后：
+（k1 已被删除，无需记录）
+```
+
+## AOF 的优缺点
+
+### 优点
+
+**1. 数据安全性更高**
+
+```
+always:   最多丢失 1 个命令
+everysec: 最多丢失 1 秒的数据
+no:       取决于操作系统
+```
+
+**2. 文件可读**
+
+AOF 文件是明文的，可以直接查看和编辑：
+
+```bash
+$ cat appendonly.aof
+SET mykey "hello"
+HSET user name "Alice" age "25"
+ZADD leaderboard 100 "player1"
+```
+
+**3. 后台重写不阻塞**
+
+BGREWRITEAOF 由子进程执行，不影响主进程处理请求。
+
+### 缺点
+
+**1. 文件体积大**
+
+RDB 是二进制格式，AOF 是文本格式。相同的数据，AOF 通常比 RDB 大 10-30%：
+
+```bash
+$ ls -lh dump.rdb appendonly.aof
+-rw-r--r--  1 user  staff  5.2M May 10 12:00 dump.rdb
+-rw-r--r--  1 user  staff   45M May 10 12:00 appendonly.aof
+```
+
+**2. 恢复速度慢**
+
+RDB 直接加载二进制，AOF 需要重放所有命令：
+
+```bash
+# RDB 恢复
+$ redis-server --load dump.rdb
+[OK] DB loaded from RDB: 1.234 seconds
+
+# AOF 恢复
+$ redis-server --load appendonly.aof
+[OK] DB loaded from AOF: 45.678 seconds
+```
+
+**3. 可能有性能开销**
+
+如果 fsync 策略配置不当，可能影响写性能。
+
+## AOF 配置详解
+
+```bash
+# redis.conf
+
+# 开启 AOF
+appendonly yes
+
+# AOF 文件名
+appendfilename "appendonly.aof"
+
+# 同步策略
+appendfsync everysec
+
+# 重写时的同步策略
+no-appendfsync-on-rewrite no
+
+# 自动重写阈值
+auto-aof-rewrite-percentage 100
+auto-aof-rewrite-min-size 64mb
+```
+
+### auto-aof-rewrite-percentage
+
+当 AOF 文件增长超过上次重写后体积的指定百分比时，触发重写：
+
+```bash
+# 当前 AOF: 100MB
+# 上次重写后: 50MB
+# 增长: 100MB / 50MB = 200%
+
+# 配置
+auto-aof-rewrite-percentage 100  # 100% 时触发重写
+# 100MB / 50MB = 200% > 100%，触发重写
+```
+
+### auto-aof-rewrite-min-size
+
+设置触发重写的最小文件大小：
+
+```bash
+auto-aof-rewrite-min-size 64mb  # AOF 至少 64MB 才触发重写
+```
+
+### no-appendfsync-on-rewrite
+
+重写期间是否继续同步：
+
+```bash
+no-appendfsync-on-rewrite yes  # 重写期间暂停 fsync
+no-appendfsync-on-rewrite no   # 重写期间正常同步
+```
+
+:::tip 配置建议
+如果重写导致 fsync 延迟增加，可以设置 `no-appendfsync-on-rewrite yes`，但会略微增加数据丢失风险。
+:::
+
+## AOF 损坏修复
+
+如果 AOF 文件损坏，Redis 可能无法启动。可以使用修复工具：
+
+```bash
+# 检查 AOF 文件
+$ redis-check-aof --fix appendonly.aof
+
+# 查看具体的错误
+0x0000000000000000: Expected opcode 4, got 250
+AOF analyzed: size=123456789, ok_up_to=123456000, diff=789
+This will restore most data and remove trailing entries
+```
+
+修复会删除损坏部分的数据：
+
+```bash
+# 修复前会提示
+[0.12%] Reached 123456000 bytes, 789 bytes remaining
+Please select an action:
+[1] - truncate to 123456000 bytes and remove trailing commands
+[2] - abort
+
+# 选择 1 继续修复
+```
+
+## 最佳实践
+
+### 推荐配置
+
+```bash
+# redis.conf
+
+# 开启 AOF
+appendonly yes
+appendfsync everysec
+
+# 文件路径
+dir /var/lib/redis
+appendfilename "appendonly.aof"
+
+# 重写策略
+auto-aof-rewrite-percentage 100
+auto-aof-rewrite-min-size 64mb
+
+# 修复策略
+aof-load-truncated yes
+aof-use-rdb-preamble yes
+```
+
+### aof-use-rdb-preamble
+
+Redis 4.0 引入的特性，混合使用 RDB 和 AOF：
+
+```bash
+aof-use-rdb-preamble yes  # 开启混合持久化
+```
+
+重写后的 AOF 文件：
+
+```
++------------------+---------------------------+
+|  RDB 格式前缀    |  AOF 命令（增量部分）      |
++------------------+---------------------------+
+|  [二进制数据]     |  *3\r\n$3\r\nSET\r\n...   |
++------------------+---------------------------+
+```
+
+恢复时先加载 RDB 部分快速恢复，再用 AOF 部分增量补全。
+
+### 同时使用 RDB 和 AOF
+
+```bash
+# 推荐配置：同时开启两种持久化
+save 900 1
+save 300 10
+save 60 10000
+
+appendonly yes
+appendfsync everysec
+aof-use-rdb-preamble yes
+```
+
+## 面试追问方向
+
+- AOF 的三种同步策略是什么？各有何优缺点？
+- AOF 文件的格式是怎样的？
+- 为什么 AOF 文件比 RDB 文件大？
+- 什么是 AOF 重写？如何触发？
+- AOF 损坏后如何修复？
+- 什么是混合持久化？有什么优势？
+
+这些追问将帮助你在面试中展示对 AOF 持久化的深入理解。

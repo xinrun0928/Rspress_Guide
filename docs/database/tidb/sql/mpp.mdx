@@ -1,0 +1,290 @@
+import { Badge } from '@rspress/core/theme';
+
+# MPP 架构
+
+当你的数据分析查询需要扫描上亿行数据时，单个节点的计算能力已经不够用了。
+
+MPP（Massively Parallel Processing）架构就是来解决这个问题的——让多个节点协同工作，**并行处理**海量数据分析。
+
+---
+
+## 一、什么是 MPP？
+
+### 1.1 定义
+
+MPP 是一种**大规模并行处理**架构，通过多个节点协同计算来处理大规模数据集。
+
+```sql
+-- TiFlash 上的分析查询走 MPP
+SELECT region, SUM(amount), COUNT(*)
+FROM orders
+WHERE create_time >= '2024-01-01'
+GROUP BY region;
+```
+
+```bash
+# MPP 执行流程
+# 查询被分解为多个 Task，分配到多个 TiFlash 节点
+
+TiDB Server: 查询协调器
+   ↓
+   ├─> TiFlash-1: Task A（处理 region IN ('A', 'B', 'C')）
+   ├─> TiFlash-2: Task B（处理 region IN ('D', 'E', 'F')）
+   ├─> TiFlash-3: Task C（处理 region IN ('G', 'H', 'I')）
+   └─> TiFlash-4: Task D（处理 region IN ('J', 'K', 'L')）
+
+TiDB Server: 聚合各节点结果，返回客户端
+```
+
+### 1.2 MPP vs 单机执行
+
+| 维度 | 单机执行 | MPP |
+|---|---|---|
+| 节点数 | 1 | N |
+| 数据量 | 受单机磁盘限制 | 可处理 PB 级 |
+| 内存需求 | 单机内存 | 分布式内存 |
+| 扩展性 | 差 | 线性扩展 |
+| 适用场景 | 小数据量 | 大数据量分析 |
+
+---
+
+## 二、MPP 执行模型
+
+### 2.1 Exchange 算子
+
+MPP 使用 **Exchange** 算子在节点间传输数据：
+
+```rust
+// Exchange 算子类型
+enum ExchangeType {
+    HashPartition,     // 按 Hash 分区传输
+    Broadcast,         // 广播传输
+    Passthrough,       // 直接透传
+}
+
+// Exchange 操作
+struct ExchangeReceiver {
+    exchange_type: ExchangeType,
+    partition_keys: Vec<Expression>,
+}
+
+struct ExchangeSender {
+    exchange_type: ExchangeType,
+    target_nodes: Vec<NodeID>,
+}
+```
+
+### 2.2 执行计划示例
+
+```sql
+EXPLAIN SELECT region, SUM(amount)
+FROM orders
+WHERE create_time >= '2024-01-01'
+GROUP BY region;
+```
+
+```bash
+# MPP 执行计划
+HashAgg_5                  [root]                           # TiDB Server 聚合
+└─ExchangeReceiver_4        [root]                           # 接收各节点数据
+   └─ExchangeSender_3      [exchange: HashPartition(region)]# 按 region 分区发送
+      └─HashAgg_2          [mpp阿尔法@阿尔法t阿尔法阿尔法t阿尔法3阿尔法阿尔法]  # TiFlash 本地聚合
+         └─TableScan_1     [mpp阿尔法@阿尔法t阿尔法t阿尔法阿尔法阿尔法阿尔法]  # TiFlash 扫描
+            table: orders
+            range: [2024-01-01, +inf]
+```
+
+### 2.3 数据分区
+
+```bash
+# 假设有 4 个 TiFlash 节点，数据按 region Hash 分区
+
+# TiFlash-1: region Hash % 4 = 0
+[A, E, I, M, ...]
+
+# TiFlash-2: region Hash % 4 = 1
+[B, F, J, N, ...]
+
+# TiFlash-3: region Hash % 4 = 2
+[C, G, K, O, ...]
+
+# TiFlash-4: region Hash % 4 = 3
+[D, H, L, P, ...]
+
+# Group By 聚合
+# 每个节点本地执行部分聚合
+TiFlash-1: SUM(A) = 1000, COUNT(A) = 10
+TiFlash-2: SUM(B) = 2000, COUNT(B) = 15
+TiFlash-3: SUM(C) = 1500, COUNT(C) = 12
+TiFlash-4: SUM(D) = 1800, COUNT(D) = 14
+
+# TiDB Server 汇总
+# 最终结果: SUM = 6300, COUNT = 51
+```
+
+---
+
+## 三、MPP 支持的算子
+
+### 3.1 支持的算子
+
+| 算子 | MPP 支持 | 说明 |
+|---|---|---|
+| TableScan | ✅ | 扫描表 |
+| IndexScan | ✅ | 扫描索引 |
+| Selection | ✅ | 过滤 |
+| Projection | ✅ | 列选择 |
+| Aggregation | ✅ | 聚合（HashAgg / StreamAgg） |
+| Sort | ✅ | 排序（部分场景） |
+| Join | ✅ | Hash Join / Broadcast Join |
+| Limit | ✅ | 限制 |
+| TopN | ✅ | 排序取 TopN |
+
+### 3.2 Broadcast Join
+
+当一个小表 join 大表时，使用广播：
+
+```sql
+-- 小表 users（1000 行）
+-- 大表 orders（1 亿行）
+SELECT *
+FROM orders o
+JOIN users u ON o.user_id = u.id;
+```
+
+```bash
+# Broadcast Join 执行
+# 1. 将小表广播到所有节点
+TiDB Server -> TiFlash-1: 广播 users 表
+TiDB Server -> TiFlash-2: 广播 users 表
+TiDB Server -> TiFlash-3: 广播 users 表
+TiDB Server -> TiFlash-4: 广播 users 表
+
+# 2. 各节点执行本地 Join
+TiFlash-1: orders(局部) JOIN users -> 结果 A
+TiFlash-2: orders(局部) JOIN users -> 结果 B
+TiFlash-3: orders(局部) JOIN users -> 结果 C
+TiFlash-4: orders(局部) JOIN users -> 结果 D
+
+# 3. TiDB Server 汇总
+结果 A + B + C + D
+```
+
+<Badge text="Broadcast Join" type="tip" /> 当小表的广播代价小于 Shuffle 大表的代价时，TiDB 自动选择 Broadcast Join。
+
+### 3.3 Shuffle Join
+
+当两个表都很大时，使用 Shuffle：
+
+```sql
+-- 两张大表
+SELECT *
+FROM orders o
+JOIN products p ON o.product_id = p.id;
+```
+
+```bash
+# Shuffle Join 执行
+# 1. 按 join key 重新分区
+orders 按 product_id % 4 分区到 4 个节点
+products 按 id % 4 分区到 4 个节点
+
+# 2. 各节点执行本地 Join
+TiFlash-1: orders(1/4) JOIN products(1/4) -> 结果 A
+TiFlash-2: orders(1/4) JOIN products(1/4) -> 结果 B
+TiFlash-3: orders(1/4) JOIN products(1/4) -> 结果 C
+TiFlash-4: orders(1/4) JOIN products(1/4) -> 结果 D
+
+# 3. TiDB Server 汇总
+结果 A + B + C + D
+```
+
+---
+
+## 四、MPP 配置
+
+### 4.1 启用 MPP
+
+```sql
+-- 启用 MPP（默认已启用）
+SET tidb_enforce_mpp = ON;
+
+-- 查看是否为 MPP 计划
+EXPLAIN SELECT ...
+-- 如果看到 mpp阿尔法阿尔法t阿尔法@阿尔法表示走 MPP
+```
+
+### 4.2 资源控制
+
+```sql
+-- 设置 MPP 查询使用的最大资源
+-- 限制单个查询的 CPU 使用
+SET tidb_mpp_query_cpu_quota = 16;  -- 最多使用 16 核
+
+-- 限制单个查询的内存
+SET tidb_mpp_query_memory_limit = '32GB';
+```
+
+---
+
+## 五、性能调优
+
+### 5.1 常见问题
+
+| 问题 | 原因 | 解决方案 |
+|---|---|---|
+| 数据倾斜 | 分区键选择不当 | 更换分区键 |
+| 网络瓶颈 | Shuffle 数据量太大 | 减少 Shuffle 列 |
+| 内存不足 | 聚合数据量太大 | 增加节点或调整并发 |
+| 节点不均衡 | 节点硬件差异大 | 均匀配置节点 |
+
+### 5.2 数据倾斜问题
+
+```sql
+-- 问题：按日期分区，大多数数据集中在最近几天
+SELECT COUNT(*) FROM logs GROUP BY date;
+-- date = '2024-01-01': 1 亿行（热点）
+-- date = '2024-01-02': 1000 万行（正常）
+
+-- 解决方案：更换分区键或使用随机打散
+SELECT COUNT(*) FROM logs GROUP BY HASH(date) % 10;
+```
+
+### 5.3 调优建议
+
+```sql
+-- 1. 确保统计信息准确
+ANALYZE TABLE orders;
+
+-- 2. 合适的 JOIN 顺序（小表先 JOIN）
+EXPLAIN SELECT * FROM small_table s JOIN big_table b ON s.id = b.s_id;
+
+-- 3. 使用合适的 Hint
+SELECT /*+ MPP_JOIN_BUILD_PROBE(b, s) */ *
+FROM big_table b
+JOIN small_table s ON b.s_id = s.id;
+```
+
+---
+
+## 六、面试追问
+
+- MPP 和 MapReduce 的区别？
+- Broadcast Join 什么条件下触发？
+- 数据倾斜会导致什么问题？
+- TiFlash 和 TiKV 在 MPP 中的角色是什么？
+- MPP 如何保证数据一致性？
+
+---
+
+## 总结
+
+MPP 是 TiDB 处理 OLAP 查询的核心能力：
+
+- **架构**：多个 TiFlash 节点并行计算
+- **Exchange**：节点间数据传输
+- **Broadcast Join**：小表广播到各节点
+- **Shuffle Join**：大表按 Key 分区重分布
+- **资源控制**：可限制单个查询的资源使用
+
+MPP 让 TiDB 能够处理 PB 级数据分析，同时保持与 OLTP 查询的资源隔离。

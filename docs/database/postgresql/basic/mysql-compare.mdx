@@ -1,0 +1,387 @@
+# PostgreSQL 与 MySQL 核心差异对比
+
+面试官问："你用过 PostgreSQL 吗？和 MySQL 相比有什么优缺点？"
+
+这个问题看似简单，但真正能答好的人不多。大部分人只能说出一两个表层差异，比如"PostgreSQL 支持 JSONB"、"PostgreSQL 的 MVCC 更好"。这些答案没有错，但远不够深入。
+
+本文将从架构层面深度剖析 PostgreSQL 和 MySQL 的核心差异，帮助你在面试和实际项目中都能言之有物。
+
+---
+
+## MVCC 实现：两种不同的哲学
+
+MVCC 是面试的高频考点，但很多人只停留在"知道有 MVCC"这个层面，对两种数据库的实现差异一无所知。
+
+### MySQL InnoDB 的 MVCC
+
+MySQL InnoDB 的 MVCC 依赖于：
+
+1. **隐藏列**：每行数据有 `DB_TRX_ID`（最近修改的事务 ID）和 `DB_ROLL_PTR`（指向 undo log 的指针）
+2. **ReadView**：事务开始时创建，包含 `m_ids`（活跃事务列表）、`min_trx_id`、`max_trx_id`
+
+判断一条记录是否可见，需要对比记录的事务 ID 和 ReadView：
+
+- 如果 `DB_TRX_ID` `< min_trx_id`，说明记录在当前事务开始前已提交，可见
+- 如果 `DB_TRX_ID` 在 `m_ids` 中，说明记录被未提交事务修改，不可见
+- 否则，根据 `DB_ROLL_PTR` 从 undo log 中找到历史版本，判断可见性
+
+### PostgreSQL 的 MVCC
+
+PostgreSQL 的 MVCC 实现更加"纯粹"，它不依赖 undo log，而是通过元组头部的两个字段：
+
+1. **xmin**：创建这条元组的事务 ID
+2. **xmax**：删除/更新这条元组的事务 ID（如果为 0 表示未被删除/更新）
+
+判断可见性时，PostgreSQL 会：
+
+1. 获取当前事务的 Snapshot，包含 `xmin`、`xmax`、`xip_list`（活跃事务列表）
+2. 检查 `xmin`：如果 `xmin` 对当前事务不可见（如在活跃列表中），则不可见
+3. 检查 `xmax`：如果 `xmax` 对当前事务可见（如已提交），则这条元组已被删除，不可访问
+
+### 核心差异
+
+| 特性 | MySQL InnoDB | PostgreSQL |
+|---|---|---|
+| 可见性判断依据 | ReadView + undo log | Snapshot + xmin/xmax |
+| 历史版本存储 | undo log（独立存储） | 元组本身（原地标记） |
+| GC 机制 | purge 线程清理 undo | VACUUM 清理过期元组 |
+| 事务回滚开销 | 需要读取 undo log | 可能需要读取历史元组 |
+| 读写并发 | 读不阻塞写，写不阻塞读 | 读不阻塞写，写不阻塞读 |
+
+MySQL 的优势在于历史版本集中管理，清理相对简单。PostgreSQL 的优势在于不需要维护复杂的历史版本链，但容易产生表膨胀。
+
+---
+
+## 索引结构：相似但不相同
+
+两者都使用 B-Tree 作为默认索引，但实现细节有显著差异。
+
+### InnoDB 的索引
+
+InnoDB 使用 B+Tree，有几个关键特点：
+
+- **聚簇索引**：主键索引的叶子节点存储完整行数据，非主键索引的叶子节点存储主键值
+- **自适应哈希**：InnoDB 会自动为热点查询创建哈希索引，但这不是用户可控的
+- **覆盖索引**：如果查询的列都在索引中，InnoDB 可以直接返回结果，不需要回表
+
+```sql
+-- 查询使用覆盖索引（Extra: Using index）
+SELECT id, name FROM users WHERE name = '张三';
+```
+
+### PostgreSQL 的索引
+
+PostgreSQL 的索引系统更加丰富：
+
+**B-Tree 索引**：默认索引，适用于等值和范围查询
+
+```sql
+CREATE INDEX idx_users_name ON users(name);
+```
+
+**表达式索引**：可以在索引中使用表达式
+
+```sql
+-- 索引 email 的小写形式
+CREATE INDEX idx_users_email_lower ON users(LOWER(email));
+
+-- 查询时会自动使用索引
+SELECT * FROM users WHERE LOWER(email) = 'zhang@example.com';
+```
+
+**部分索引**：只索引满足条件的行
+
+```sql
+-- 只索引未删除的用户
+CREATE INDEX idx_users_active ON users(created_at) WHERE deleted_at IS NULL;
+```
+
+**复合索引顺序**：PostgreSQL 的复合索引支持任意列的查询优化，不严格依赖最左前缀原则（但仍建议遵循）。
+
+### 索引回表与覆盖扫描
+
+| 特性 | MySQL InnoDB | PostgreSQL |
+|---|---|---|
+| 主键索引 | 聚簇索引，叶子存储数据 | 逻辑独立，通过 ctid 定位 |
+| 非主键索引 | 叶子存储主键值 | 叶子存储索引列 + ctid |
+| 覆盖扫描 | Index Only Scan | Index Only Scan |
+| 索引统计 | 自动更新 | 需要 ANALYZE 或 autovacuum |
+
+PostgreSQL 的 Index Only Scan 比 MySQL 的覆盖索引更强大——只要索引包含查询的所有列，就可以避免回表，即使查询列不是主键。
+
+```sql
+-- 创建一个完全覆盖查询的索引
+CREATE INDEX idx_users_covering ON users(id, name, email);
+
+-- 这个查询会使用 Index Only Scan
+SELECT id, name, email FROM users WHERE id = 1;
+```
+
+---
+
+## 事务模型：细节决定成败
+
+### 事务 ID 的分配
+
+MySQL InnoDB 的事务 ID 是全局递增的，但会复用。一个事务提交后，其事务 ID 可能会被新事务使用。
+
+PostgreSQL 的事务 ID 也是全局递增的，但永远不会复用。这意味着 PostgreSQL 的事务 ID 会"耗尽"——在 32 位系统中，大约 40 亿个事务后会出现问题。这也是 PostgreSQL 为什么推荐使用 64 位系统。
+
+### 隔离级别的实现
+
+| 隔离级别 | MySQL | PostgreSQL |
+|---|---|---|
+| Read Uncommitted | 等同于 Read Committed | 不支持（行为同 Read Committed） |
+| Read Committed | 默认，支持 READ COMMITTED | 默认，但实现更接近快照隔离 |
+| Repeatable Read | 依赖 MVCC + 间隙锁 | 支持，但 PostgreSQL 11 前有异常 |
+| Serializable | 串行执行，性能差 | 依赖 SSI 算法，检测并解决异常 |
+
+PostgreSQL 的 Serializable Snapshot Isolation（SSI）在大多数场景下性能优于 MySQL 的串行执行，但 SSI 也有自己的开销——在高并发写入场景下，可能会出现大量事务冲突。
+
+### Savepoint 支持
+
+两者都支持 savepoint，但语法和实现略有差异：
+
+```sql
+-- PostgreSQL
+BEGIN;
+UPDATE accounts SET balance = balance - 100;
+SAVEPOINT sp1;
+UPDATE orders SET status = 'cancelled';
+ROLLBACK TO SAVEPOINT sp1;  -- 只回滚到 sp1
+COMMIT;
+
+-- MySQL
+START TRANSACTION;
+UPDATE accounts SET balance = balance - 100;
+SAVEPOINT sp1;
+UPDATE orders SET status = 'cancelled';
+ROLLBACK TO SAVEPOINT sp1;
+COMMIT;
+```
+
+---
+
+## 类型系统：PostgreSQL 的强项
+
+这是两者差距最大的地方之一。
+
+### 数值类型
+
+| 类型 | MySQL | PostgreSQL |
+|---|---|---|
+| 整型 | TINYINT/SMALLINT/MEDIUMINT/INT/BIGINT | SMALLINT/INT/BIGINT（无那么多变种） |
+| 精确小数 | DECIMAL | NUMERIC（推荐使用，性能更好） |
+| 浮点 | FLOAT/DOUBLE | REAL/DOUBLE PRECISION |
+
+PostgreSQL 的 NUMERIC 类型是真正的精确数值，计算结果不会丢失精度。MySQL 的 DECIMAL 在高精度计算时可能有精度损失。
+
+### 字符串类型
+
+| 类型 | MySQL | PostgreSQL |
+|---|---|---|
+| 定长 | CHAR(n) | CHAR(n) |
+| 变长 | VARCHAR(n) | VARCHAR(n) 或 TEXT |
+| 文本 | TEXT/TINYTEXT/MEDIUMTEXT/LONGTEXT | TEXT（统一） |
+| 字节数组 | BINARY/VARBINARY | BYTEA |
+
+MySQL 对 VARCHAR 有长度限制（最大 65535 字节），超过需要用 TEXT。PostgreSQL 的 VARCHAR(n) 和 TEXT 本质上是同一种类型（varlena），VARCHAR(n) 只是多了一个长度检查。
+
+### 日期时间类型
+
+| 类型 | MySQL | PostgreSQL |
+|---|---|---|
+| 日期 | DATE | DATE |
+| 时间 | TIME | TIME |
+| 日期时间 | DATETIME/TIMESTAMP | TIMESTAMP / TIMESTAMPTZ |
+| 时区 | 不原生支持 | 原生支持 TIMESTAMPTZ |
+
+**TIMESTAMPTZ 是 PostgreSQL 的一大优势**。它存储 UTC 时间戳，并在显示时自动转换为客户端时区。MySQL 8.0 也引入了 TIMESTAMP 的时区支持，但实现不如 PostgreSQL 完善。
+
+```sql
+-- PostgreSQL：时区自动转换
+SET TIME ZONE 'Asia/Shanghai';
+
+SELECT NOW();  -- 显示北京时间
+INSERT INTO logs (t) VALUES ('2024-01-01 10:00:00+00');  -- 自动存储 UTC
+
+-- MySQL：需要手动处理
+SET time_zone = '+08:00';
+```
+
+### JSON 类型
+
+| 类型 | MySQL | PostgreSQL |
+|---|---|---|
+| 文本 JSON | JSON | JSON |
+| 二进制 JSON | JSON | JSONB |
+| 索引支持 | 部分支持 | 完全支持 |
+| GIN 索引 | 不支持 | 支持 |
+
+PostgreSQL 的 JSONB 是真正的二进制 JSON，查询时无需重新解析，而且可以创建 GIN 索引加速查询。
+
+```sql
+-- PostgreSQL：JSONB 索引
+CREATE INDEX idx_orders_data ON orders USING GIN (data);
+
+-- 查询
+SELECT * FROM orders WHERE data @> '{"customer": "张三"}';
+```
+
+### 数组类型
+
+MySQL 不支持原生数组类型，需要用 JSON 模拟。PostgreSQL 原生支持数组类型：
+
+```sql
+-- PostgreSQL
+CREATE TABLE users (
+    id SERIAL PRIMARY KEY,
+    tags TEXT[]
+);
+
+INSERT INTO users (tags) VALUES (ARRAY['admin', 'vip']);
+
+-- 数组包含查询
+SELECT * FROM users WHERE 'vip' = ANY(tags);
+```
+
+### 范围类型
+
+PostgreSQL 独有的范围类型，对时序数据和调度系统特别有用：
+
+```sql
+-- 会议室预订
+CREATE TABLE room_bookings (
+    room_id INT,
+    time_range TSRANGE,
+    EXCLUDE USING GIST (room_id WITH =, time_range WITH &&)  -- 排他约束
+);
+
+-- 查询某个时间段可用的会议室
+SELECT * FROM room_bookings WHERE time_range && '[2024-01-01 09:00, 2024-01-01 10:00)';
+```
+
+---
+
+## 扩展性：PostgreSQL 的独门绝技
+
+### MySQL 的插件系统
+
+MySQL 的插件系统相对简单，主要支持：
+
+- 存储引擎插件（InnoDB、MyISAM、MEMORY 等）
+- 认证插件
+- 审计插件
+
+### PostgreSQL 的扩展系统
+
+PostgreSQL 的扩展系统是其最大的优势之一：
+
+| 扩展 | 功能描述 |
+|---|---|
+| PostGIS | 地理信息系统，支持空间数据 |
+| pgvector | 向量数据库，AI 应用 |
+| TimescaleDB | 时序数据处理 |
+| Citus | 分布式数据库 |
+| pg_partman | 分区表管理 |
+| pg_repack | 在线表重构 |
+| pg_stat_statements | 查询性能统计 |
+
+```sql
+-- 安装扩展
+CREATE EXTENSION IF NOT EXISTS postgis;
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+-- 查看已安装扩展
+SELECT * FROM pg_extension;
+```
+
+### FDW（外部数据包装器）
+
+PostgreSQL 可以通过 FDW 连接几乎任何数据源：
+
+```sql
+-- 连接 MySQL
+CREATE EXTENSION mysql_fdw;
+CREATE SERVER mysql_server FOREIGN DATA WRAPPER mysql_fdw
+    OPTIONS (host 'mysql-host', port '3306');
+
+-- 连接 MongoDB
+CREATE EXTENSION mongo_fdw;
+```
+
+---
+
+## 性能特性对比
+
+### 并行查询
+
+| 特性 | MySQL | PostgreSQL |
+|---|---|---|
+| 并行索引扫描 | 支持（8.0+） | 支持 |
+| 并行聚合 | 支持 | 支持 |
+| 并行 JOIN | 支持 | 支持 |
+| 并行 DDL | 部分支持 | 支持 |
+
+PostgreSQL 的并行查询在 9.6 开始引入，到 16 版本已经非常成熟。MySQL 8.0 开始支持并行查询，但并行度控制不如 PostgreSQL 灵活。
+
+### 分区表
+
+| 特性 | MySQL | PostgreSQL |
+|---|---|---|
+| 分区类型 | RANGE, LIST, HASH, KEY | RANGE, LIST, HASH |
+| 分区裁剪 | 支持 | 支持 |
+| 分区索引 | 全局索引/本地索引 | 继承索引 |
+| 分区表达式 | 简单表达式 | 支持函数 |
+
+PostgreSQL 12+ 的分区表支持分区上的全局索引，而 MySQL 8.0 的分区索引都是本地索引（每个分区独立）。
+
+### 连接池
+
+| 特性 | MySQL | PostgreSQL |
+|---|---|---|
+| 连接管理 | MySQL Proxy（已停止） | PgBouncer, Pgpool-II |
+| 连接复用 | 建议使用连接池 | 必须使用连接池 |
+| 连接开销 | 相对较低 | 相对较高 |
+
+PostgreSQL 的进程模型（每个连接一个进程）使得连接开销比 MySQL 的线程模型更高，因此强烈建议在生产环境使用连接池。
+
+---
+
+## 选型建议
+
+### 选择 MySQL 的场景
+
+- 团队更熟悉 MySQL，文档和社区资源更丰富
+- 业务主要是 Web 应用，读多写少
+- 对 JSON 存储需求不高
+- 需要同步多主（如 MariaDB Galera）
+- 快速原型开发
+
+### 选择 PostgreSQL 的场景
+
+- 对数据一致性要求极高（金融、订单、库存）
+- 需要复杂的数据分析和报表
+- 需要空间数据处理（PostGIS）
+- 需要强大的扩展能力（向量搜索、时序数据）
+- 团队有 PostgreSQL 运维经验
+
+### 从 MySQL 迁移到 PostgreSQL
+
+迁移时需要注意：
+
+1. **auto_increment** → `SERIAL` 或 `GENERATED ALWAYS AS IDENTITY`
+2. **ENUM** → PostgreSQL 的 ENUM 支持更好，但语法不同
+3. **LIMIT offset** → 分页方式兼容，但性能需要注意
+4. **VARCHAR(255)** → PostgreSQL 的 VARCHAR 无需指定长度（可用 TEXT）
+5. **ENGINE=InnoDB** → PostgreSQL 不需要指定存储引擎
+
+---
+
+## 总结
+
+PostgreSQL 和 MySQL 都是优秀的开源数据库，但它们的设计哲学和适用场景有显著差异。
+
+MySQL 简洁、高效、普及率高，适合快速迭代的互联网应用。PostgreSQL 功能丰富、标准兼容、扩展性强，适合对数据一致性和功能丰富度有较高要求的场景。
+
+在面试中，能清晰阐述两种数据库的差异和适用场景，是技术实力的体现。背后的原理——MVCC 的实现、事务模型、类型系统——才是真正让面试官眼前一亮的答案。

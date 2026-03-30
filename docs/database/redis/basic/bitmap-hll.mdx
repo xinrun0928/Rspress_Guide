@@ -1,0 +1,431 @@
+import { Badge } from '@rspress/core/theme';
+
+# HyperLogLog 与 Bitmap
+
+Redis 除了五种基本数据类型，还提供了几种高级数据类型。HyperLogLog 和 Bitmap 是其中最常用的两种，它们都用于处理海量数据的统计问题，但应用场景不同。
+
+理解这两种类型的工作原理和使用场景，是 Redis 面试的加分项。
+
+## HyperLogLog：海量数据基数统计
+
+### 什么是基数统计
+
+在数据统计中，「基数」指的是一个集合中**不同元素的数量**。
+
+例如：
+
+```
+集合 {1, 2, 3, 4, 5, 1, 2, 3} 的基数 = 5
+```
+
+常见的基数统计场景：
+
+- 网站 UV（独立访客数）
+- 活跃用户数
+- 点赞的去重用户数
+
+### 朴素方案的痛点
+
+**方案一：使用 Set**
+
+```bash
+SADD uv:2024-03-15 "user1" "user2" "user3"
+SADD uv:2024-03-15 "user1" "user2" "user4"
+SCARD uv:2024-03-15
+> (integer) 4
+```
+
+问题：100 万用户需要约 100 万个 Set 节点，内存占用巨大。
+
+**方案二：使用 Hash 计数**
+
+```bash
+HSET uv:2024-03-15 user1 1
+HSET uv:2024-03-15 user2 1
+HSTRLEN uv:2024-03-15
+```
+
+问题：需要存储所有用户 ID，内存仍然是 O(n)。
+
+**HyperLogLog 的解决方案**
+
+```bash
+PFADD uv:2024-03-15 "user1" "user2" "user3"
+PFADD uv:2024-03-15 "user1" "user2" "user4"
+PFCOUNT uv:2024-03-15
+> (integer) 4
+```
+
+内存占用：固定 12KB，但能统计 2^64 个元素！
+
+### HyperLogLog 的原理
+
+HyperLogLog 的核心思想是：**根据数据的特点估算基数**。
+
+它的理论基础是：对于一个长度为 n 的随机二进制序列，第一个出现的「1」的位置是有规律的。
+
+```
+随机序列中，第一次出现 1 的位置：
+- 50% 的序列，第一个位置就是 1
+- 25% 的序列，第二个位置才是 1
+- 12.5% 的序列，第三个位置才是 1
+```
+
+如果我们用 `max(trailingZeros(x)) + 1` 作为估计器，其中 trailingZeros 是尾部零的个数，那么：
+
+```
+n 个不同的随机数，最大 trailingZeros 的期望 ≈ log2(n)
+```
+
+### Redis 的实现
+
+Redis 使用 16384 个桶（14 位），每个桶存储一个 6 位的计数：
+
+```bash
+# 内存计算
+16384 桶 × 6 位/桶 = 98304 位 = 12KB
+```
+
+PFADD 命令的工作流程：
+
+```c
+void pfaddCommand(client *c) {
+    robj *o = lookupKeyWrite(c->db, c->argv[1]);
+
+    if (o == NULL) {
+        // 创建新的 HyperLogLog 对象
+        o = createHyperLogLogObject();
+    }
+
+    // 更新每个桶的计数
+    for (int j = 2; j < c->argc; j++) {
+        uint64_t hash = MurmurHash64A(c->argv[j]);
+        int idx = hash % 16384;  // 选择桶
+        int zerorun = countTrailingZeros(hash >> 14);  // 计算零游程
+
+        // 更新桶的计数（取较大值）
+        if (zerorun > hll->registers[idx]) {
+            hll->registers[idx] = zerorun;
+        }
+    }
+}
+```
+
+PFCOUNT 的工作流程：
+
+```c
+// 估算基数
+double estimate = 0;
+double sum = 0;
+
+for (int i = 0; i < 16384; i++) {
+    sum += pow(2, -hll->registers[i]);  // 2^(-registers[i])
+}
+
+// 使用调和平均数
+double m = 16384;
+double E = (m * m) / sum;
+
+// 修正偏差（经验系数）
+E = E * 0.72087;
+
+// 小数修正
+if (E < 2 * m) {
+    E = estimateWithBias(E);
+}
+
+return (uint64_t) E;
+```
+
+### 使用示例
+
+```bash
+# 基本使用
+PFADD uv:daily:2024-03-15 "user1" "user2" "user3"
+PFADD uv:daily:2024-03-15 "user1"  # 重复的不计数
+PFCOUNT uv:daily:2024-03-15
+> (integer) 3
+
+# 合并多个 HyperLogLog
+PFADD uv:week:2024-03-11 "user1" "user2"
+PFADD uv:week:2024-03-12 "user3" "user4"
+PFADD uv:week:2024-03-13 "user5" "user6"
+
+PFMERGE uv:week:merged uv:week:2024-03-11 uv:week:2024-03-12 uv:week:2024-03-13
+PFCOUNT uv:week:merged
+> (integer) 6
+
+# 清除过期数据
+DEL uv:week:2024-03-11
+DEL uv:week:2024-03-12
+DEL uv:week:2024-03-13
+```
+
+### 误差分析
+
+HyperLogLog 的标准误差约为 0.81%：
+
+| 真实基数 | 预期误差范围 | 典型估算值 |
+| --- | --- | --- |
+| 1,000 | 992 ~ 1,008 | 997 |
+| 10,000 | 9,920 ~ 10,080 | 10,015 |
+| 1,000,000 | 992,000 ~ 1,008,000 | 999,200 |
+
+这种误差对于 UV 统计、DAU 统计等场景完全可接受。
+
+:::tip 使用建议
+HyperLogLog 适合对精度要求不那么严格、但数据量巨大的场景。精确统计用 Set，追求内存效率用 HyperLogLog。
+:::
+
+## Bitmap：位图操作
+
+### 什么是 Bitmap
+
+Bitmap 是一种用单个位（bit）来表示某个状态的数据结构。它不是独立的数据类型，而是 String 类型的一种扩展。
+
+```bash
+# 1 bit 可以表示两种状态：0 或 1
+SETBIT key 0 1  # 第 0 位设置为 1
+GETBIT key 0   # 获取第 0 位的值 -> 1
+
+# 8 bit = 1 byte
+# 1024 bit = 128 byte
+# 1024 * 1024 bit = 128 KB
+```
+
+### 典型使用场景
+
+#### 场景一：签到系统
+
+```bash
+# 用户签到（假设 2024-03-15 是本月的第 15 天，偏移量为 14）
+SETBIT user:checkin:1001:202403 14 1
+
+# 检查是否签到
+GETBIT user:checkin:1001:202403 14
+> (integer) 1
+
+# 统计本月签到天数
+BITCOUNT user:checkin:1001:202403
+> (integer) 1
+
+# 连续签到计算（需要用 BITCOUNT 范围统计）
+BITCOUNT user:checkin:1001:202403 14 14  # 只统计这一天
+```
+
+#### 场景二：在线状态统计
+
+```bash
+# 用户上线
+SETBIT online:users 1001 1
+
+# 用户下线
+SETBIT online:users 1001 0
+
+# 统计在线人数
+BITCOUNT online:users
+
+# 检查用户是否在线
+GETBIT online:users 1001
+> (integer) 0  # 离线
+
+# 获取某个范围内的在线状态（用户 1000-1010）
+GETRANGE online:users $((1000/8)) $((1010/8))
+```
+
+#### 场景三：用户画像
+
+```bash
+# 标记用户的兴趣标签（假设兴趣 ID 为 1,5,8）
+SETBIT user:interest:1001 1 1
+SETBIT user:interest:1001 5 1
+SETBIT user:interest:1001 8 1
+
+# 检查用户是否有某兴趣
+GETBIT user:interest:1001 5
+> (integer) 1  # 有
+
+# 统计有多少用户对某标签感兴趣
+BITCOUNT user:interest:1001
+> (integer) 3  # 标记了 3 个兴趣
+```
+
+### Bitmap 的内存计算
+
+Bitmap 的内存占用与最大偏移量有关：
+
+```bash
+# 偏移量 0-10000 的用户（需要 10001 位）
+SETBIT user:interest:1001 10000 1
+# 内存占用 = ceil(10001 / 8) bytes = 1251 bytes
+
+# 偏移量 0-1000000 的用户（需要 1,000,001 位）
+SETBIT user:interest:1001 1000000 1
+# 内存占用 = ceil(1000001 / 8) bytes ≈ 125 KB
+```
+
+:::warning 内存注意事项
+Bitmap 的内存占用取决于最大偏移量，而不是实际设置的位数。如果用户 ID 跨度大但实际用户少，可能会浪费内存。
+:::
+
+### 范围统计
+
+```bash
+# BITCOUNT 支持范围统计
+BITCOUNT key start end [BYTE | BIT]
+
+# 统计某个月的所有签到（假设 30 天）
+SETBIT user:checkin:2024-03 0 1   # 第 1 天
+SETBIT user:checkin:2024-03 4 1   # 第 5 天
+SETBIT user:checkin:2024-03 14 1  # 第 15 天
+
+# 统计整个月
+BITCOUNT user:checkin:2024-03
+> (integer) 3
+
+# 统计前 15 天
+BITCOUNT user:checkin:2024-03 0 1  # 前 2 字节（16 天）
+> (integer) 2
+```
+
+### BITOP 批量操作
+
+```bash
+# 计算两个用户共同感兴趣的标签数
+# 假设用户 A 感兴趣的标签：1,3,5
+# 假设用户 B 感兴趣的标签：2,3,6
+
+# 设置
+SETBIT user:A:interest 1 1
+SETBIT user:A:interest 3 1
+SETBIT user:A:interest 5 1
+
+SETBIT user:B:interest 2 1
+SETBIT user:B:interest 3 1
+SETBIT user:B:interest 6 1
+
+# 计算 AND
+BITOP AND user:AB:interest user:A:interest user:B:interest
+BITCOUNT user:AB:interest
+> (integer) 1  # 共同兴趣：标签 3
+
+# 计算 OR
+BITOP OR user:AorB:interest user:A:interest user:B:interest
+BITCOUNT user:AorB:interest
+> (integer) 6  # 总共 6 个不同标签
+```
+
+### 布隆过滤器：Bitmap 的高级应用
+
+Bitmap 是布隆过滤器（Bloom Filter）的基础。布隆过滤器可以快速判断某个元素是否可能存在。
+
+```c
+// 布隆过滤器原理
+bool bloomFilterAdd(bloom_filter *bf, char *item) {
+    uint64_t hash1 = hash1(item);
+    uint64_t hash2 = hash2(item);
+
+    for (int i = 0; i < bf->hash_count; i++) {
+        int idx = (hash1 + i * hash2) % bf->size;
+        setBit(bf->bitmap, idx, 1);
+    }
+
+    return true;
+}
+
+bool bloomFilterCheck(bloom_filter *bf, char *item) {
+    uint64_t hash1 = hash1(item);
+    uint64_t hash2 = hash2(item);
+
+    for (int i = 0; i < bf->hash_count; i++) {
+        int idx = (hash1 + i * hash2) % bf->size;
+        if (getBit(bf->bitmap, idx) == 0) {
+            return false;  // 一定不存在
+        }
+    }
+
+    return true;  # 可能存在
+}
+```
+
+Redis 本身没有原生支持布隆过滤器，但可以通过 RedisBloom 模块或 RedisStack 使用。
+
+## 对比与选择
+
+| 特性 | HyperLogLog | Bitmap |
+| --- | --- | --- |
+| 用途 | 基数统计 | 状态标记 |
+| 内存占用 | 固定 12KB | 与最大偏移量成正比 |
+| 精度 | 约 0.81% 误差 | 精确 |
+| 操作 | PFADD, PFCOUNT | SETBIT, GETBIT, BITCOUNT |
+| 适用场景 | UV 统计、去重计数 | 签到、在线状态、标签 |
+
+### 选择建议
+
+**用 HyperLogLog 的场景**：
+
+- 日活跃用户（DAU）统计
+- 页面 UV 统计
+- 点赞、去重用户数统计
+
+**用 Bitmap 的场景**：
+
+- 用户签到（连续签到分析）
+- 用户在线状态
+- 用户标签、权限标记
+- 布隆过滤器实现
+
+## 实战技巧
+
+### 签到系统完整实现
+
+```bash
+# 用户签到
+SEND_TO: 2024-03-15 用户 1001 签到
+SETBIT user:sign:1001:2024-03 $(($(date +%d) - 1)) 1
+
+# 统计当月签到天数
+BITCOUNT user:sign:1001:2024-03
+
+# 统计连续签到天数（从今天往前数）
+def count_consecutive_sign(user_id, date):
+    offset = date - 1
+    count = 0
+    while GETBIT(user:sign:{user_id}:{month}, offset) == 1:
+        count += 1
+        offset -= 1
+    return count
+
+# 统计月签到次数（用于奖励发放）
+key = "user:sign:{user_id}:{month}"
+sign_days = BITCOUNT(key)
+if sign_days >= 20:
+    give_reward(user_id)
+```
+
+### UV 统计完整实现
+
+```bash
+# 每日 UV 统计
+PFADD uv:2024-03-15 "192.168.1.1"
+PFADD uv:2024-03-15 "192.168.1.2"
+
+# 统计本周累计 UV（需要合并）
+PFMERGE uv:week:2024-11 uv:2024-03-11 uv:2024-03-12 uv:2024-03-13 uv:2024-03-14 uv:2024-03-15
+PFCOUNT uv:week:2024-11
+
+# 精确 UV 统计（需要精确结果时用 Set 作为备选）
+SADD page:uv:exact:2024-03-15 "192.168.1.1"
+SCARD page:uv:exact:2024-03-15
+```
+
+## 面试追问方向
+
+- HyperLogLog 的空间复杂度是多少？误差如何计算？
+- 为什么 HyperLogLog 能用 12KB 统计 2^64 个元素？
+- Bitmap 的内存占用如何计算？有什么注意事项？
+- 如何用 Bitmap 实现布隆过滤器？
+- 签到系统用什么数据结构？有哪些优缺点？
+- HyperLogLog 和 Set 在统计场景下如何选择？
+
+这些追问将帮助你在面试中展示对高级数据类型的深入理解。

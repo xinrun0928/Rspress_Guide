@@ -1,0 +1,415 @@
+import { Badge } from '@rspress/core/theme';
+
+# 乐观并发与行版本控制
+
+「我不想锁等待，有什么替代方案？」
+
+答案是**乐观并发控制（Optimistic Concurrency Control, OCC）**。SQL Server 通过行版本控制实现了这一机制。
+
+## 乐观并发 vs 悲观并发
+
+### 悲观并发（传统锁）
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                       悲观并发                                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  事务 A                    事务 B                              │
+│  获取锁 ──▶ 等待 ──▶ B 释放锁 ──▶ 获取锁                        │
+│      │                       │                                 │
+│      ▼                       ▼                                  │
+│  读取/修改                 读取/修改                            │
+│      │                       │                                  │
+│      ▼                       ▼                                  │
+│  释放锁                    释放锁                               │
+│                                                                 │
+│  特点：先锁后操作，冲突时等待                                     │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 乐观并发（行版本）
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                       乐观并发                                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  事务 A                    事务 B                              │
+│  读取版本 V1 ─────────▶ 读取版本 V1                            │
+│      │                       │                                  │
+│      ▼                       ▼                                  │
+│  修改，版本变为 V2          修改，版本变为 V2                    │
+│      │                       │                                  │
+│      ▼                       ▼                                  │
+│  提交时检查版本             提交时检查版本                       │
+│  版本仍是 V1 ──▶ 成功      版本已变 V2 ──▶ 失败！               │
+│                                                                 │
+│  特点：先操作后验证，冲突时回滚                                   │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 行版本控制（Row Versioning）
+
+### 工作原理
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    行版本控制流程                                │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌─────────────┐                                               │
+│  │  TempDB    │  ← 存储行版本                                    │
+│  └──────┬──────┘                                               │
+│         │                                                       │
+│  ┌──────┴──────┐                                               │
+│  │  版本链     │                                               │
+│  │             │                                               │
+│  │  V1: 数据A  │──▶ V2: 数据B ──▶ V3: 数据C                    │
+│  │  (被替换)   │    (当前旧版本)  (当前版本)                    │
+│  └─────────────┘                                               │
+│                                                                 │
+│  读取时：                                                       │
+│  - 如果当前事务开始时，版本链中存在旧版本                         │
+│  - 读取该旧版本而不是当前版本                                    │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 行版本存储
+
+```sql
+-- 查看 tempdb 中的行版本存储
+SELECT 
+    version_store_page_count / 128.0 AS VersionStoreMB,
+    version_store_active_page_count / 128.0 AS ActiveVersionStoreMB,
+    version_store_virtual_log_file_count AS VLFCount
+FROM sys.dm_db_file_space_usage
+WHERE database_id = 2;  -- tempdb
+```
+
+## READ COMMITTED SNAPSHOT (RCSI)
+
+### 启用 RCSI
+
+```sql
+-- 启用 RCSI（需要独占锁）
+ALTER DATABASE [YourDB] SET READ_COMMITTED_SNAPSHOT ON;
+
+-- 执行期间数据库不可用
+-- 建议在维护窗口执行
+```
+
+### RCSI 行为
+
+```sql
+SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
+
+BEGIN TRANSACTION;
+    SELECT Amount FROM Orders WHERE OrderID = 1;
+    -- 读取事务开始时的 Committed 版本
+    -- 如果其他事务正在修改此行，读取旧版本，不阻塞
+COMMIT;
+```
+
+### 与 READ COMMITTED 的区别
+
+| 特性 | READ COMMITTED | RCSI |
+|---|---|---|
+| 脏读 | 不允许 | 不允许 |
+| 不可重复读 | 可能 | 可能 |
+| 幻读 | 可能 | 可能 |
+| 锁使用 | 使用共享锁 | 使用行版本 |
+| 阻塞 | 读取被 X 锁阻塞 | 不阻塞 |
+
+## 快照隔离（Snapshot Isolation）
+
+### 启用快照隔离
+
+```sql
+-- 单独启用快照隔离
+ALTER DATABASE [YourDB] SET ALLOW_SNAPSHOT_ISOLATION ON;
+
+-- 确认状态
+SELECT 
+    name,
+    snapshot_isolation_state,
+    snapshot_isolation_state_desc,
+    is_read_committed_snapshot_on
+FROM sys.databases;
+```
+
+### 快照隔离行为
+
+```sql
+SET TRANSACTION ISOLATION LEVEL SNAPSHOT;
+
+BEGIN TRANSACTION;
+    SELECT Amount FROM Orders WHERE OrderID = 1;
+    -- 读取事务开始时的版本
+    
+    -- 其他事务修改并提交 OrderID=1
+    -- 再次读取，仍得到事务开始时的版本
+    SELECT Amount FROM Orders WHERE OrderID = 1;
+    -- 结果相同
+    
+    -- 更新时检查冲突
+    UPDATE Orders SET Amount = Amount + 100 WHERE OrderID = 1;
+    -- 如果其他事务已修改，UPDATE 失败
+COMMIT;
+```
+
+### 更新冲突检测
+
+```sql
+-- 事务 A
+SET TRANSACTION ISOLATION LEVEL SNAPSHOT;
+BEGIN TRANSACTION;
+    DECLARE @CurrentAmount DECIMAL(10,2);
+    SELECT @CurrentAmount = Amount FROM Orders WHERE OrderID = 1;  -- 100
+    
+    -- 事务 B 同时执行
+    -- UPDATE Orders SET Amount = 200 WHERE OrderID = 1;
+    -- 提交成功
+    
+    UPDATE Orders SET Amount = @CurrentAmount + 50 WHERE OrderID = 1;
+    -- 失败！Msg 3960: Update conflict
+    
+COMMIT;
+
+-- 错误：
+-- Snapshot isolation transaction aborted due to update conflict.
+-- Cannot use snapshot isolation with table 'Orders'.
+```
+
+## 版本存储管理
+
+### 版本存储池
+
+```sql
+-- 查看版本存储
+SELECT 
+    transaction_id,
+    transaction_sequence_num,
+    elapsed_time_seconds,
+    version_buffer_count,
+    version_buffer_space_used / 128.0 AS VersionBufferMB
+FROM sys.dm_tran_active_snapshot_database_transactions
+ORDER BY elapsed_time_seconds DESC;
+```
+
+### 版本清理
+
+```sql
+-- 查看版本清理状态
+SELECT 
+    DB_NAME(database_id) AS DatabaseName,
+    version_store_page_count / 128.0 AS VersionStoreMB,
+    version_store_virtual_log_file_count AS VLFCount
+FROM sys.dm_db_file_space_usage
+WHERE database_id = 2;  -- tempdb
+
+-- 版本存储增长太快？
+SELECT 
+    RESERVED_PAGE_COUNT / 128.0 AS ReservedMB,
+    SIZE / 128.0 AS TotalSizeMB
+FROM tempdb.sys.database_files
+WHERE type = 2;  -- version store
+```
+
+### 优化版本存储
+
+| 优化项 | 说明 |
+|---|---|
+| 增大 tempdb | 版本存储需要空间 |
+| 多个 tempdb 文件 | 减少 PFS 争用 |
+| 减少长事务 | 减少版本积累 |
+| 调整清理阈值 | `ALTER DATABASE tempdb MODIFY FILE` |
+
+```sql
+-- 监控长时间运行的事务（产生版本）
+SELECT 
+    s.session_id,
+    s.transaction_id,
+    s.transaction_sequence_num,
+    s.elapsed_time_seconds,
+    s.version_buffer_count,
+    s.version_buffer_space_used / 128.0 AS VersionMB,
+    r.text AS SQLText
+FROM sys.dm_tran_active_snapshot_database_transactions s
+CROSS APPLY sys.dm_exec_sql_text(s.sql_handle) r
+WHERE s.elapsed_time_seconds > 60  -- 运行超过 60 秒
+ORDER BY s.elapsed_time_seconds DESC;
+```
+
+## 选择乐观还是悲观
+
+### 乐观并发适用场景
+
+| 场景 | 原因 |
+|---|---|
+| 读多写少 | 减少锁争用 |
+| 冲突概率低 | 冲突时回滚成本可接受 |
+| 长读事务 | 不阻塞写操作 |
+| 分布式系统 | 避免分布式锁 |
+
+### 悲观锁适用场景
+
+| 场景 | 原因 |
+|---|---|
+| 写多读多 | 冲突概率高 |
+| 金融交易 | 不允许失败重试 |
+| 关键业务 | 确定性要求高 |
+| 短事务 | 锁持有时间短 |
+
+### 选择指南
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    并发模式选择                                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  冲突概率高 ──▶ 悲观锁（避免回滚）                              │
+│       │                                                         │
+│       │ 冲突概率低                                              │
+│       ▼                                                         │
+│  对阻塞敏感？ ──▶ 乐观并发                                       │
+│       │                                                         │
+│       │ 不阻塞但有失败可能                                       │
+│       ▼                                                         │
+│  金融/关键业务？ ──▶ 悲观锁                                       │
+│       │                                                         │
+│       │ 一般业务                                                │
+│       ▼                                                         │
+│  快照隔离 + 重试                                                │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 应用实现
+
+### ROWVERSION/TIMESTAMP
+
+```sql
+-- 使用 ROWVERSION 实现乐观锁
+CREATE TABLE Orders (
+    OrderID INT PRIMARY KEY,
+    Amount DECIMAL(10,2),
+    RowVersion ROWVERSION  -- 自动更新，每次修改+1
+);
+
+-- 读取当前版本
+DECLARE @OldVersion ROWVERSION;
+SELECT @OldVersion = RowVersion FROM Orders WHERE OrderID = 1;
+
+-- 更新时检查版本
+UPDATE Orders 
+SET Amount = 200, RowVersion = DEFAULT
+WHERE OrderID = 1 AND RowVersion = @OldVersion;
+
+IF @@ROWCOUNT = 0
+    PRINT '数据已被修改，请重试';
+```
+
+### 应用层重试模式
+
+```sql
+-- 实现重试逻辑
+CREATE PROCEDURE UpdateOrderAmount
+    @OrderID INT,
+    @NewAmount DECIMAL(10,2)
+AS
+BEGIN
+    DECLARE @RetryCount INT = 3;
+    DECLARE @Attempt INT = 0;
+    
+    WHILE @Attempt < @RetryCount
+    BEGIN
+        BEGIN TRY
+            UPDATE Orders SET Amount = @NewAmount WHERE OrderID = @OrderID;
+            
+            IF @@ROWCOUNT = 0
+                THROW 50000, '订单不存在', 16;
+            
+            RETURN 0;
+        END TRY
+        BEGIN CATCH
+            IF ERROR_NUMBER() = 3960  -- 快照隔离更新冲突
+            BEGIN
+                SET @Attempt = @Attempt + 1;
+                WAITFOR DELAY '00:00:00.1';  -- 等待 100ms
+                CONTINUE;
+            END
+            ELSE
+                THROW;
+        END CATCH
+    END
+    
+    THROW 50000, '更新失败，请重试', 16;
+END;
+```
+
+### Entity Framework 实现
+
+```csharp
+// EF Core 乐观并发
+public class Order
+{
+    public int OrderID { get; set; }
+    public decimal Amount { get; set; }
+    
+    [Timestamp]
+    public byte[] RowVersion { get; set; }
+}
+
+// 更新时自动检查版本
+try
+{
+    order.Amount = 200;
+    await context.SaveChangesAsync();
+}
+catch (DbUpdateConcurrencyException)
+{
+    // 处理并发冲突
+    // 重新加载最新数据，合并变更
+}
+```
+
+## 监控与诊断
+
+```sql
+-- 查看快照隔离状态
+SELECT 
+    name,
+    snapshot_isolation_state_desc,
+    is_read_committed_snapshot_on
+FROM sys.databases;
+
+-- 查看版本生成率
+SELECT 
+    version_store_generation_rate / 128.0 AS GenerationRateMB_per_sec,
+    version_store_eviction_rate / 128.0 AS EvictionRateMB_per_sec
+FROM sys.dm_db_resource_stats;
+
+-- 查看快照事务
+SELECT 
+    session_id,
+    transaction_id,
+    elapsed_time_seconds,
+    version_buffer_count
+FROM sys.dm_tran_active_snapshot_database_transactions
+ORDER BY elapsed_time_seconds DESC;
+
+-- 查看 RCSI 使用情况
+SELECT 
+    database_id,
+    DB_NAME(database_id) AS DatabaseName,
+    version_store_size_cache_extension_memory_usageKB / 1024.0 AS CacheExtensionMB,
+    version_store_size_increaser_pages / 128.0 AS SizeIncreaserMB,
+    version_store_size_decreaser_pages / 128.0 AS SizeDecreaserMB
+FROM sys.dm_db_incremental_stats_properties;
+```
+
+理解乐观并发控制，是在高并发场景下提升性能的利器。

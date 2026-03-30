@@ -1,0 +1,373 @@
+import { Badge } from '@rspress/core/theme';
+
+# RDB vs AOF 对比与混合持久化
+
+Redis 提供了两种持久化方式：RDB 和 AOF。它们各有优缺点，实际生产中应该如何选择？
+
+## 两种持久化方式对比
+
+| 特性 | RDB | AOF |
+| --- | --- | --- |
+| 文件格式 | 二进制压缩文件 | 文本命令日志 |
+| 文件大小 | 小（压缩） | 大（原始命令） |
+| 恢复速度 | 快（二进制） | 慢（重放命令） |
+| 数据完整性 | 可能丢失数据 | 可配置（always/everysec） |
+| 资源消耗 | 高（fork + 快照） | 低（持续追加） |
+| 写入方式 | 定时快照 | 持续追加 |
+| 数据恢复 | 全量恢复 | 从指定点恢复 |
+| 兼容性 | 旧版兼容 | 需 AOF 支持 |
+
+## RDB 的优缺点
+
+### 优点
+
+```bash
+# 1. 文件紧凑，适合备份
+# 1GB 数据 -> 200MB RDB 文件
+ls -lh dump.rdb
+# -rw-r--r-- 1 redis redis 200M Jan 15 10:00 dump.rdb
+
+# 2. 恢复速度快
+# 二进制文件直接加载
+redis-server --loadmodule /path/to/module.so
+# 加载 1GB 数据只需 5-10 秒
+
+# 3. 适合灾难恢复
+# 可以备份到云存储
+aws s3 cp dump.rdb s3://my-backup/redis/
+
+# 4. 对 Redis 性能影响小
+# fork 后由子进程执行
+```
+
+### 缺点
+
+```bash
+# 1. 可能丢失数据
+# 假设每 5 分钟生成一次 RDB
+# 如果 Redis 在第 4 分钟宕机，会丢失 4 分钟的数据
+
+# 2. fork() 可能阻塞
+# 数据量大时，fork() 可能阻塞数秒
+# fork() 期间，内存翻倍风险
+
+# 3. 无法实时持久化
+# 只能定时，无法实时
+```
+
+## AOF 的优缺点
+
+### 优点
+
+```bash
+# 1. 数据安全性高
+appendfsync always     # 每次写入都同步
+# 最多丢失一条命令
+
+appendfsync everysec   # 每秒同步（推荐）
+# 最多丢失一秒的数据
+
+# 2. 追加写入，不影响性能
+# 只有追加操作，没有随机读写
+
+# 3. 可恢复性强
+# 可以从任意点恢复
+redis-cli --rdb dump.rdb --pipe < appendonly.aof
+
+# 4. 支持重写压缩
+BGREWRITEAOF
+# 压缩 AOF 文件
+```
+
+### 缺点
+
+```bash
+# 1. 文件通常比 RDB 大
+# 同一数据集，AOF 可能比 RDB 大 30-50%
+
+# 2. 恢复速度慢
+# 需要重放所有命令
+# 1GB AOF 恢复可能需要 30-60 秒
+
+# 3. 可能有写性能问题
+# everysec 策略，平均每秒 fsync
+# always 策略，每次写入都要 fsync
+```
+
+## 性能对比
+
+```bash
+# 测试 RDB 写入性能
+redis-benchmark -t SET -n 100000 -d 1000
+# QPS: 约 100,000
+
+# 测试 AOF 写入性能
+# everysec: QPS: 约 80,000-90,000
+# always:  QPS: 约 10,000-20,000
+```
+
+## 生产环境推荐配置
+
+### 方案一：同时开启 RDB 和 AOF
+
+```bash
+# 推荐配置
+save 900 1        # 1 小时内有 1 次写入 -> 生成 RDB
+save 300 10       # 5 分钟内有 10 次写入 -> 生成 RDB
+save 60 10000     # 1 分钟内有 10000 次写入 -> 生成 RDB
+
+appendonly yes    # 开启 AOF
+appendfsync everysec  # 每秒同步
+
+# AOF 重写配置
+auto-aof-rewrite-percentage 100
+auto-aof-rewrite-min-size 64mb
+
+# 混合持久化（Redis 4.0+）
+aof-use-rdb-preamble yes
+```
+
+优点：
+- RDB 提供快速恢复
+- AOF 保证数据完整性
+- 混合持久化兼顾两者优点
+
+### 方案二：只使用 AOF（推荐给数据安全性高的场景）
+
+```bash
+# 关闭 RDB
+save ""
+
+# 开启 AOF
+appendonly yes
+appendfsync everysec
+
+# AOF 重写配置
+auto-aof-rewrite-percentage 100
+auto-aof-rewrite-min-size 1gb
+```
+
+### 方案三：只使用 RDB（不推荐）
+
+```bash
+# 仅 RDB 快照
+save 900 1
+save 300 10
+save 60 10000
+
+# 关闭 AOF
+appendonly no
+```
+
+## 混合持久化
+
+Redis 4.0 引入了混合持久化，结合 RDB 和 AOF 的优点：
+
+```bash
+# 开启混合持久化
+aof-use-rdb-preamble yes
+appendonly yes
+```
+
+### 工作原理
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      混合持久化流程                          │
+│                                                              │
+│  场景：RDB 持久化触发时                                       │
+│                                                              │
+│  1. fork() 创建子进程                                        │
+│  2. 子进程生成 RDB 格式的数据                                 │
+│  3. 将 RDB 数据写入 AOF 文件                                  │
+│  4. 后续命令仍以 AOF 格式追加                                  │
+│                                                              │
+│  最终 AOF 文件：                                              │
+│  ┌──────────┬────────────────────────────────────┐          │
+│  │ RDB 格式  │ AOF 格式（增量）                    │          │
+│  │ REDIS... │ SET user:1 "Alice"                 │          │
+│  │ ...      │ INCR counter                       │          │
+│  └──────────┴────────────────────────────────────┘          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 恢复过程
+
+```bash
+# Redis 启动时检测到混合 AOF 文件
+# 1. 先加载 RDB 部分（快速）
+# 2. 再应用 AOF 部分（增量）
+
+# 恢复速度比纯 AOF 快 5-10 倍
+```
+
+## Java 配置示例
+
+### Spring Boot 配置
+
+```yaml
+# application.yml
+spring:
+  redis:
+    host: localhost
+    port: 6379
+
+# 自定义 Redis 配置
+redis:
+  persistence:
+    # RDB 配置
+    rdb:
+      enable: true
+      save-points:
+        - seconds: 900
+          writes: 1
+        - seconds: 300
+          writes: 10
+        - seconds: 60
+          writes: 10000
+    
+    # AOF 配置
+    aof:
+      enable: true
+      fsync: everysec
+      rewrite:
+        percentage: 100
+        min-size: 64mb
+      rdb-preamble: true
+```
+
+### Redis 配置类
+
+```java
+@Configuration
+public class RedisPersistenceConfig {
+    
+    @Value("${redis.persistence.rdb.enable:true}")
+    private boolean rdbEnable;
+    
+    @Value("${redis.persistence.aof.enable:true}")
+    private boolean aofEnable;
+    
+    @Bean
+    public LettuceConnectionFactory redisConnectionFactory() {
+        RedisStandaloneConfiguration config = new RedisStandaloneConfiguration();
+        config.setHostName("localhost");
+        config.setPort(6379);
+        
+        LettuceClientConfiguration clientConfig = LettuceClientConfiguration.builder()
+            .commandTimeout(Duration.ofSeconds(10))
+            .build();
+        
+        return new LettuceConnectionFactory(config, clientConfig);
+    }
+}
+```
+
+## 选择建议
+
+### 选 RDB 的场景
+
+- 数据备份和灾难恢复
+- 需要快速恢复大量数据
+- 对数据完整性要求不高
+- 内存数据量不大
+
+### 选 AOF 的场景
+
+- 对数据完整性要求高
+- 写入频繁的场景
+- 需要实时持久化
+
+### 选混合持久化的场景
+
+- 生产环境推荐
+- 需要兼顾性能和安全性
+- 数据量中等
+
+### 不推荐的场景
+
+- 只用 RDB 且数据重要（可能丢失数据）
+- 只用 no appendfsync（性能差）
+
+## 备份策略
+
+```bash
+# 1. 本地备份（定时任务）
+0 2 * * * redis-cli BGSAVE && cp /var/lib/redis/dump.rdb /backup/redis-$(date +\%Y\%m\%d).rdb
+
+# 2. 远程备份
+0 3 * * * aws s3 cp /var/lib/redis/dump.rdb s3://my-bucket/redis/$(date +\%Y\%m\%d).rdb
+
+# 3. 保留策略
+# 保留最近 7 天
+find /backup/redis -name "*.rdb" -mtime +7 -delete
+```
+
+## 监控脚本
+
+```python
+#!/usr/bin/env python3
+import redis
+import time
+
+def check_persistence():
+    r = redis.Redis()
+    info = r.info('persistence')
+    
+    print("=" * 50)
+    print("Redis 持久化状态检查")
+    print("=" * 50)
+    
+    # RDB 状态
+    print("\n【RDB 状态】")
+    rdb_save = r.config_get('save').get('save', '')
+    print(f"保存策略: {rdb_save or '未设置'}")
+    print(f"RDB 最后保存时间: {info.get('rdb_last_save_time', 0)}")
+    print(f"RDB 最后保存耗时: {info.get('rdb_last_cow_size', 0) / 1024:.2f} KB")
+    
+    # AOF 状态
+    print("\n【AOF 状态】")
+    print(f"AOF 开启: {'是' if info.get('aof_enabled') == '1' else '否'}")
+    print(f"当前大小: {int(info.get('aof_current_size', 0)) / 1024 / 1024:.2f} MB")
+    print(f"上次重写大小: {int(info.get('aof_base_size', 0)) / 1024 / 1024:.2f} MB")
+    print(f"上次重写耗时: {int(info.get('aof_last_cow_size', 0)) / 1024 / 1024:.2f} MB")
+    
+    # 计算增长比例
+    base_size = int(info.get('aof_base_size', 0))
+    current_size = int(info.get('aof_current_size', 0))
+    if base_size > 0:
+        growth = (current_size / base_size - 1) * 100
+        print(f"增长比例: {growth:.2f}%")
+        
+        if growth > 100:
+            print("⚠️ AOF 增长超过 100%，建议执行 BGREWRITEAOF")
+    
+    # 检查是否有重写任务
+    if info.get('aof_pending_rewrite') == '1':
+        print("⚠️ 有待执行的重写任务")
+    
+    print()
+
+if __name__ == '__main__':
+    check_persistence()
+```
+
+## 面试追问方向
+
+- RDB 和 AOF 的区别是什么？
+- 同时开启 RDB 和 AOF 时，Redis 优先使用哪个恢复？
+- 混合持久化的原理是什么？
+- AOF 重写和 RDB 快照有什么关系？
+- 如何选择持久化策略？
+
+## 总结
+
+RDB 和 AOF 各有特点：
+
+1. **RDB**：紧凑、快速，适合备份，但可能丢失数据
+2. **AOF**：安全、可恢复，但文件大、恢复慢
+3. **混合持久化**：结合两者优点，推荐生产环境使用
+4. **配置建议**：同时开启，设置合理的重写策略
+5. **备份策略**：定期备份到远程存储
+
+没有最好的方案，只有最适合的方案。根据业务需求选择合适的持久化策略。

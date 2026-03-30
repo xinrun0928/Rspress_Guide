@@ -1,0 +1,468 @@
+# MongoDB 并发控制
+
+「MongoDB 是怎么实现并发控制的？」
+
+理解 MongoDB 的并发控制机制，对于设计高性能应用至关重要。MongoDB 使用乐观并发控制和文档级锁来实现高效的数据访问。
+
+## 并发控制模型
+
+### 乐观锁 vs 悲观锁
+
+| 模型 | 特点 | 适用场景 |
+|---|---|---|
+| 乐观锁 | 先操作后检查，冲突时重试 | 冲突概率低，并发量大 |
+| 悲观锁 | 先加锁再操作，冲突时等待 | 冲突概率高，需要强一致性 |
+
+MongoDB 默认使用**乐观并发控制**，但也支持通过事务实现悲观锁。
+
+### MongoDB 的并发控制
+
+```
+MongoDB 并发控制架构：
+
+┌─────────────────────────────────────────┐
+│           WiredTiger Storage Engine       │
+├─────────────────────────────────────────┤
+│                                           │
+│   ┌─────────────┐      ┌─────────────┐   │
+│   │   乐观锁     │      │   文档级锁   │   │
+│   │ (版本字段)   │      │ (事务场景)   │   │
+│   └─────────────┘      └─────────────┘   │
+│                                           │
+│   ┌─────────────────────────────────┐   │
+│   │         MVCC 多版本并发控制       │   │
+│   │  每个文档有多个版本，读取快照版本  │   │
+│   └─────────────────────────────────┘   │
+│                                           │
+└─────────────────────────────────────────┘
+```
+
+## 乐观锁实现
+
+### 版本字段设计
+
+乐观锁的核心是**版本字段**，每次更新时检查版本是否变化。
+
+```javascript
+// 文档结构：包含版本字段
+{
+  _id: ObjectId("..."),
+  name: "张三",
+  balance: 1000,
+  version: 1,           // 版本号
+  updated_at: ISODate("...")
+}
+
+// 更新时检查版本
+// 初始：version = 1
+// 客户端A读取：balance = 1000, version = 1
+// 客户端B读取：balance = 1000, version = 1
+// 客户端A更新：version = 1 → 2, balance = 1100
+// 客户端B更新：version = 1? 不对了，更新失败！
+```
+
+### 原子更新实现
+
+```javascript
+// 使用 findAndModify 实现乐观锁
+// 原子操作：查询 + 更新一步完成
+
+// 正确的更新方式
+db.accounts.findOneAndUpdate(
+  {
+    _id: accountId,
+    version: currentVersion  // 条件中包含当前版本
+  },
+  {
+    $set: {
+      balance: newBalance,
+      updated_at: new Date()
+    },
+    $inc: { version: 1 }    // 版本 +1
+  },
+  {
+    returnNewDocument: true
+  }
+)
+
+// 返回 null 表示版本不匹配，更新失败
+```
+
+### 重试机制
+
+```javascript
+// 乐观锁重试装饰器
+async function withOptimisticRetry(fn, maxRetries = 3) {
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      return await fn();
+    } catch (error) {
+      if (error.hasErrorLabel("TransientTransactionError")) {
+        console.log(`Retry ${i + 1}/${maxRetries}`);
+        continue;
+      }
+      throw error;
+    }
+  }
+  throw new Error("Max retries exceeded");
+}
+
+// 使用示例
+await withOptimisticRetry(async () => {
+  const account = await db.accounts.findOne({ _id: accountId });
+
+  await db.accounts.updateOne(
+    { _id: accountId, version: account.version },
+    {
+      $set: { balance: account.balance + amount },
+      $inc: { version: 1 }
+    }
+  );
+});
+```
+
+## 业务场景应用
+
+### 库存扣减
+
+```javascript
+// 库存扣减：经典的并发问题
+async function deductInventory(productId, quantity) {
+  // ❌ 错误：先查后改，存在竞态条件
+  const product = await db.products.findOne({ _id: productId });
+  if (product.stock >= quantity) {
+    await db.products.updateOne(
+      { _id: productId },
+      { $inc: { stock: -quantity } }
+    );
+  }
+
+  // ✅ 正确：原子更新，条件检查
+  const result = await db.products.updateOne(
+    {
+      _id: productId,
+      stock: { $gte: quantity }  // 条件中包含库存检查
+    },
+    {
+      $inc: { stock: -quantity }
+    }
+  );
+
+  if (result.modifiedCount === 0) {
+    throw new Error("库存不足");
+  }
+  return result;
+}
+
+// ✅ 正确：乐观锁版本控制
+async function deductInventoryWithVersion(productId, quantity) {
+  while (true) {
+    const product = await db.products.findOne({ _id: productId });
+
+    if (product.stock < quantity) {
+      throw new Error("库存不足");
+    }
+
+    const result = await db.products.updateOne(
+      {
+        _id: productId,
+        version: product.version
+      },
+      {
+        $inc: {
+          stock: -quantity,
+          version: 1
+        }
+      }
+    );
+
+    if (result.modifiedCount === 1) {
+      return result;
+    }
+    // 版本不匹配，重试
+  }
+}
+```
+
+### 账户转账
+
+```javascript
+// 转账：双方账户都要原子操作
+async function transfer(fromId, toId, amount) {
+  const session = startSession();
+
+  try {
+    await session.withTransaction(async () => {
+      const accounts = db.accounts;
+
+      // 扣款
+      const deductResult = await accounts.updateOne(
+        {
+          _id: fromId,
+          balance: { $gte: amount }
+        },
+        {
+          $inc: { balance: -amount }
+        },
+        { session }
+      );
+
+      if (deductResult.modifiedCount === 0) {
+        throw new Error("余额不足");
+      }
+
+      // 存款
+      await accounts.updateOne(
+        { _id: toId },
+        {
+          $inc: { balance: amount }
+        },
+        { session }
+      );
+    });
+  } finally {
+    session.endSession();
+  }
+}
+```
+
+### 点赞计数
+
+```javascript
+// 点赞：使用原子操作
+async function likePost(postId, userId) {
+  const session = startSession();
+
+  try {
+    await session.withTransaction(async () => {
+      const likes = db.likes;
+      const posts = db.posts;
+
+      // 检查是否已点赞
+      const existing = await likes.findOne(
+        { post_id: postId, user_id: userId },
+        { session }
+      );
+
+      if (existing) {
+        throw new Error("已点赞");
+      }
+
+      // 添加点赞记录
+      await likes.insertOne(
+        { post_id: postId, user_id: userId, created_at: new Date() },
+        { session }
+      );
+
+      // 增加点赞数
+      await posts.updateOne(
+        { _id: postId },
+        { $inc: { like_count: 1 } },
+        { session }
+      );
+    });
+  } finally {
+    session.endSession();
+  }
+}
+
+// 或者使用更简单的原子操作
+async function likePostSimple(postId, userId) {
+  // 插入点赞记录，如果重复则报错
+  try {
+    await db.likes.insertOne({
+      post_id: postId,
+      user_id: userId,
+      created_at: new Date()
+    });
+
+    // 原子增加点赞数
+    await db.posts.updateOne(
+      { _id: postId },
+      { $inc: { like_count: 1 } }
+    );
+  } catch (error) {
+    if (error.code === 11000) {
+      throw new Error("已点赞");
+    }
+    throw error;
+  }
+}
+```
+
+## 分布式并发
+
+### 分片环境下的乐观锁
+
+```javascript
+// 分片集合的乐观锁
+// 注意：分片键不能包含在更新条件中
+
+// ✅ 正确：版本字段独立于分片键
+{
+  _id: ObjectId("..."),           // 分片键
+  order_no: "ORDER001",           // 非分片键
+  version: 1,                     // 版本字段
+  status: "pending"
+}
+
+// 版本更新
+db.orders.updateOne(
+  {
+    _id: orderId,
+    version: currentVersion
+  },
+  {
+    $set: { status: "completed" },
+    $inc: { version: 1 }
+  }
+);
+```
+
+### 分布式锁
+
+```javascript
+// 使用 MongoDB 实现分布式锁
+const locks = db.locks;
+
+async function acquireLock(resource, ttlMs = 30000) {
+  const lockId = new ObjectId();
+
+  const result = await locks.updateOne(
+    {
+      resource: resource,
+      $or: [
+        { owner: { $exists: false } },
+        { expire_at: { $lt: new Date() } }  // 过期或无主
+      ]
+    },
+    {
+      $set: {
+        owner: lockId,
+        expire_at: new Date(Date.now() + ttlMs)
+      }
+    },
+    { upsert: true }
+  );
+
+  if (result.upsertedCount === 1 || result.modifiedCount === 1) {
+    return lockId;
+  }
+  return null;  // 锁被占用
+}
+
+async function releaseLock(resource, lockId) {
+  await locks.deleteOne({
+    resource: resource,
+    owner: lockId
+  });
+}
+
+// 使用分布式锁
+const lockId = await acquireLock("order:process:123");
+if (!lockId) {
+  throw new Error("获取锁失败");
+}
+
+try {
+  // 临界区操作
+  await processOrder(123);
+} finally {
+  await releaseLock("order:process:123", lockId);
+}
+```
+
+## 最佳实践
+
+### 避免并发问题
+
+```javascript
+// 1. 优先使用原子操作
+// ❌ 不要
+const doc = await db.collection.findOne({ _id });
+doc.field += 1;
+await db.collection.updateOne({ _id }, { $set: { field: doc.field } });
+
+// ✅ 要
+await db.collection.updateOne(
+  { _id },
+  { $inc: { field: 1 } }
+);
+
+// 2. 条件更新防止超卖
+// ❌ 不要
+const product = await db.products.findOne({ _id });
+if (product.stock > 0) {
+  await db.products.updateOne({ _id }, { $inc: { stock: -1 } });
+}
+
+// ✅ 要
+await db.products.updateOne(
+  { _id, stock: { $gt: 0 } },  // 条件中包含库存检查
+  { $inc: { stock: -1 } }
+);
+
+// 3. 使用事务处理复杂场景
+await session.withTransaction(async () => {
+  // 多个操作的原子性保证
+});
+
+// 4. 乐观锁 + 重试处理高并发
+async function updateWithRetry(collection, filter, update, maxRetries = 3) {
+  for (let i = 0; i < maxRetries; i++) {
+    const doc = await collection.findOne(filter);
+    const result = await collection.updateOne(
+      { ...filter, version: doc.version },
+      { ...update, $inc: { version: 1 } }
+    );
+    if (result.modifiedCount === 1) {
+      return result;
+    }
+  }
+  throw new Error("更新失败，请重试");
+}
+```
+
+## 面试实战
+
+**面试官问**：「MongoDB 的并发控制是怎么实现的？」
+
+**深入回答**：
+
+> MongoDB 的并发控制机制：
+>
+> 1. **文档级锁**：WiredTiger 使用乐观并发控制，文档级别的锁允许同一集合的多个并发写入（只要不修改同一文档）
+>
+> 2. **MVCC**：每个文档有多个版本，读取时根据 readConcern 选择对应版本
+>
+> 3. **索引锁**：索引操作使用意向锁，不会阻塞文档操作
+>
+> 4. **事务锁**：多文档事务使用两阶段锁，事务开始时获取锁，提交时释放
+
+**面试官问**：「如何解决 MongoDB 的并发更新问题？」
+
+**深入回答**：
+
+> 解决并发更新的方法：
+>
+> 1. **原子操作**：使用 `$inc`、`$set` 等原子运算符，避免先读后写
+>
+> 2. **条件更新**：在更新条件中包含检查，如 `stock: { $gt: 0 }`
+>
+> 3. **乐观锁**：使用版本字段，更新时检查版本是否变化
+>
+> 4. **事务**：使用多文档事务处理需要原子性的复杂操作
+>
+> 5. **分布式锁**：使用 Redis 或 MongoDB 的锁集合实现分布式锁
+
+## 总结
+
+MongoDB 并发控制要点：
+
+- **乐观锁**：通过版本字段实现，冲突时重试
+- **原子操作**：使用 `$inc`、`$set` 等避免竞态条件
+- **MVCC**：多版本并发控制，支持不同隔离级别
+- **文档级锁**：WiredTiger 的锁粒度是文档级
+- **事务锁**：多文档事务使用两阶段锁协议
+
+正确理解和应用并发控制机制，是构建高性能 MongoDB 应用的关键。

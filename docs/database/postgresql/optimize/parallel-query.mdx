@@ -1,0 +1,264 @@
+# PostgreSQL 并行查询
+
+现代服务器拥有多核 CPU。如何利用多核加速数据库查询？
+
+PostgreSQL 从 9.6 开始支持并行查询，可以将一个查询分散到多个 worker 进程并行执行。
+
+---
+
+## 并行查询原理
+
+### 工作方式
+
+```
+┌──────────────────────────────────────────────────────┐
+│                    Parallel Query                    │
+│                                                      │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐          │
+│  │ Gather   │◄─│ Gather   │◄─│ Gather   │          │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘          │
+│       │             │             │                 │
+│  ┌────┴─────┐  ┌────┴─────┐  ┌────┴─────┐          │
+│  │ Parallel │  │ Parallel │  │ Parallel │          │
+│  │ Seq Scan │  │ Seq Scan │  │ Seq Scan │          │
+│  └──────────┘  └──────────┘  └──────────┘          │
+└──────────────────────────────────────────────────────┘
+```
+
+### 并行度控制
+
+```sql
+-- 最大并行 worker 数
+SHOW max_parallel_workers_per_gather;
+
+-- 全局最大并行度
+SHOW max_worker_processes;  -- 默认 8
+
+-- 维护操作的并行度（VACUUM、CREATE INDEX 等）
+SHOW max_parallel_maintenance_workers;  -- 默认 2
+```
+
+---
+
+## 启用并行查询
+
+### 配置参数
+
+```sql
+-- postgresql.conf
+
+-- 启用并行查询（默认开启）
+-- parallel_query = on
+
+-- 成本阈值，低于此值的查询不使用并行
+-- parallel_tuple_cost = 0.1
+
+-- 启动并行 Gather 的最小成本
+-- parallel_setup_cost = 1000.0
+
+-- 维护操作的并行度
+-- max_parallel_maintenance_workers = 2
+
+-- 每个 Gather 节点的 worker 数
+-- max_parallel_workers_per_gather = 2
+```
+
+### 调整并行参数
+
+```sql
+-- 提高并行度（适合高并发服务器）
+ALTER SYSTEM SET max_parallel_workers_per_gather = 4;
+ALTER SYSTEM SET max_worker_processes = 16;
+
+-- 降低并行度（适合低并发环境）
+ALTER SYSTEM SET max_parallel_workers_per_gather = 0;  -- 禁用并行查询
+
+SELECT pg_reload_conf();
+```
+
+---
+
+## 并行扫描类型
+
+### Parallel Seq Scan（并行顺序扫描）
+
+```sql
+EXPLAIN SELECT * FROM orders WHERE total > 100;
+
+-- 输出
+Gather  (cost=1000.00..10200.00 rows=10000)
+  ->  Parallel Seq Scan on orders  (cost=...)
+        Filter: (total > 100)
+```
+
+### Parallel Index Scan（并行索引扫描）
+
+```sql
+CREATE INDEX idx_orders_customer ON orders(customer_id);
+
+EXPLAIN SELECT * FROM orders WHERE customer_id = 1;
+
+-- 输出
+Gather  (cost=0.42..100.00 rows=100)
+  ->  Parallel Index Scan using idx_orders_customer on orders  (cost=...)
+        Index Cond: (customer_id = 1)
+```
+
+### Parallel Bitmap Heap Scan（并行位图扫描）
+
+```sql
+EXPLAIN SELECT * FROM orders WHERE customer_id IN (1, 2, 3);
+
+-- 输出
+Gather  (cost=...)
+  ->  Parallel Bitmap Heap Scan on orders  (cost=...)
+        Recheck Cond: (customer_id = ANY (ARRAY[1, 2, 3]))
+```
+
+---
+
+## 并行 JOIN
+
+### Parallel Hash Join
+
+```sql
+EXPLAIN SELECT * FROM orders o
+JOIN customers c ON o.customer_id = c.id;
+
+-- 输出
+Gather  (cost=...)
+  ->  Parallel Hash Join  (cost=...)
+        Hash Cond: (o.customer_id = c.id)
+        ->  Parallel Seq Scan on orders  (cost=...)
+        ->  Parallel Seq Scan on customers  (cost=...)
+```
+
+### Parallel Nested Loop
+
+```sql
+EXPLAIN SELECT * FROM orders o
+WHERE EXISTS (SELECT 1 FROM customers c WHERE c.id = o.customer_id AND c.region = 'North');
+
+-- 输出
+Gather  (cost=...)
+  ->  Parallel Seq Scan on orders o  (cost=...)
+        Filter: EXISTS (SELECT ... FROM customers c ...)
+```
+
+---
+
+## 并行聚合
+
+### Parallel Hash Aggregate
+
+```sql
+EXPLAIN SELECT status, COUNT(*), SUM(total)
+FROM orders
+GROUP BY status;
+
+-- 输出
+Finalize HashAggregate  (cost=...)
+  Group Key: status
+  ->  Gather  (cost=...)
+        ->  Partial HashAggregate  (cost=...)
+              Group Key: status
+              ->  Parallel Seq Scan on orders  (cost=...)
+```
+
+### Parallel Group Aggregate
+
+```sql
+EXPLAIN SELECT status, COUNT(*)
+FROM orders
+GROUP BY status
+ORDER BY status;
+```
+
+---
+
+## 并行查询的限制
+
+### 不支持并行查询的场景
+
+```sql
+-- 1. 修改数据的查询（INSERT、UPDATE、DELETE）
+-- 并行不适用于写操作
+
+-- 2. 递归 CTE
+WITH RECURSIVE ...
+
+-- 3. 触发器
+CREATE TRIGGER ... ON orders
+
+-- 4. 某些窗口函数
+SELECT ..., COUNT(*) OVER (...) FROM orders
+```
+
+### 并行度降低的情况
+
+```sql
+-- 1. 小表不适合并行
+SET max_parallel_workers_per_gather = 4;
+EXPLAIN SELECT * FROM small_table;  -- 可能只有一个 worker
+
+-- 2. 查询成本太低
+SET parallel_tuple_cost = 0.1;
+EXPLAIN SELECT * FROM orders WHERE id = 1;  -- 可能不使用并行
+
+-- 3. 已有其他限制
+SET max_parallel_workers_per_gather = 0;  -- 完全禁用并行
+```
+
+---
+
+## 并行查询优化
+
+### 优化技巧
+
+```sql
+-- 1. 确保查询成本足够高
+SET parallel_tuple_cost = 0.01;  -- 降低阈值
+
+-- 2. 提高并行度
+SET max_parallel_workers_per_gather = 4;
+
+-- 3. 使用并行 CREATE INDEX
+CREATE INDEX CONCURRENTLY idx_orders_customer ON orders(customer_id);
+
+-- 4. 并行 VACUUM
+VACUUM (PARALLEL 4) orders;
+```
+
+### 监控并行查询
+
+```sql
+-- 查看正在使用的 worker
+SELECT
+    pid,
+    query,
+    n_workers,
+    (total_exec_time / 1000)::TEXT || 'ms' AS exec_time
+FROM pg_stat_activity
+WHERE query LIKE '%Parallel%';
+
+-- 查看并行查询统计
+SELECT
+    datname,
+    queries,
+    total_exec_time,
+    queries - queries / NULLIF(total_exec_time, 0) * 1000 AS avg_time
+FROM pg_stat_database;
+```
+
+---
+
+## 总结
+
+并行查询是 PostgreSQL 利用多核 CPU 的重要特性：
+
+1. **适用场景**：大表扫描、聚合、JOIN
+2. **配置参数**：max_parallel_workers_per_gather、parallel_tuple_cost
+3. **扫描类型**：Parallel Seq Scan、Parallel Index Scan、Parallel Bitmap Heap Scan
+4. **限制**：不支持写操作，不适合小表
+
+合理配置并行参数，可以让查询性能提升数倍。但也要注意并行带来的开销，避免在低并发场景下浪费资源。

@@ -1,0 +1,403 @@
+import { Badge } from '@rspress/core/theme';
+
+# 事务日志体系
+
+「为什么删除 1000 万条数据后，日志文件没有变小？」
+
+这是 DBA 面试中常被问到的问题。答案藏在 SQL Server 的事务日志架构中——**日志文件不会自动收缩**，只有通过备份或显式收缩才能释放空间。
+
+但更重要的理解是：日志的核心作用不是存储数据，而是保证事务的**原子性**和**持久性**。
+
+## 事务日志的作用
+
+SQL Server 的事务日志采用 **Write-Ahead Logging (WAL)** 机制，所有修改操作必须先写入日志，日志写入成功后才允许修改数据页。
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Write-Ahead Logging 流程                     │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  UPDATE Orders SET Amount = 100 WHERE OrderID = 1               │
+│          │                                                      │
+│          ▼                                                      │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                     1. 写日志（必须先完成）               │   │
+│  │  ┌─────────────────────────────────────────────────────┐ │   │
+│  │  │ LSN: 10001                                         │ │   │
+│  │  │ TransactionID: 5678                                │ │   │
+│  │  │ Operation: UPDATE                                 │ │   │
+│  │  │ Before: Amount = 50                                │ │   │
+│  │  │ After: Amount = 100                                │ │   │
+│  │  └─────────────────────────────────────────────────────┘ │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│          │                                                      │
+│          ▼                                                      │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │               2. 修改数据页（在内存中）                   │   │
+│  │                                                         │   │
+│  │  ┌─────────────────────────────────────────────────┐   │   │
+│  │  │ Buffer Pool: 标记页为脏页                         │   │   │
+│  │  └─────────────────────────────────────────────────┘   │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│          │                                                      │
+│          ▼                                                      │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │            3. 检查点异步刷新脏页到磁盘                   │   │
+│  │                                                         │   │
+│  │  脏页 ──▶ 磁盘 (.mdf)                                   │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+WAL 的核心保证：**只要日志记录被持久化，即使数据页还没刷盘，事务的修改也不会丢失。**
+
+## 日志记录结构
+
+### 虚拟日志文件（VLF）
+
+事务日志在逻辑上被划分为多个**虚拟日志文件（Virtual Log File，VLF）**。VLF 是日志收缩和管理的最小单位。
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    物理日志文件 (.ldf)                          │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌────────────┐┌────────────┐┌────────────┐┌────────────┐      │
+│  │   VLF 1   ││   VLF 2   ││   VLF 3   ││   VLF 4   │      │
+│  │  活跃日志  ││  活动日志  ││ 非活动日志  ││  非活动日志 │      │
+│  │  (ACTIVE) ││  (ACTIVE) ││ (INACTIVE)││ (INACTIVE)│      │
+│  └────────────┘└────────────┘└────────────┘└────────────┘      │
+│                                                                 │
+│  ───▶ 日志写入方向                                              │
+│                                                                 │
+│  MinLSN ◀────────────────────────────────────────                │
+│  (最小活动日志序列号)                                            │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**VLF 的状态**：
+
+| 状态 | 说明 | 能否被收缩 |
+|---|---|---|
+| ACTIVE | 包含活动事务的日志记录 | 否 |
+| RECOVERABLE | 无活动事务，但未备份 | 否 |
+| RESET | 已备份，可被覆盖 | 是 |
+
+### 日志序列号（LSN）
+
+每个日志记录有一个唯一的 **LSN（Log Sequence Number）**，用于标识记录在日志中的位置。
+
+```sql
+-- 查看日志记录
+SELECT 
+    [Current LSN],
+    Operation,
+    Context,
+    [Transaction ID],
+    [Begin Time],
+    [End Time],
+    AllocUnitId,
+    [Lock Information]
+FROM fn_dblog(NULL, NULL);
+
+-- 当前日志状态
+SELECT 
+    DB_NAME(database_id) AS DatabaseName,
+    total_log_size_in_bytes / 1024.0 / 1024 AS TotalLogMB,
+    used_log_space_in_bytes / 1024.0 / 1024 AS UsedLogMB,
+    used_log_space_in_percent AS UsedPercent,
+    log_space_in_bytes_since_last_backup / 1024.0 / 1024 AS LogSinceBackupMB
+FROM sys.dm_db_log_space_usage;
+```
+
+## 日志写入机制
+
+### 写日志 vs 写数据
+
+SQL Server 的日志写入遵循严格顺序，不同于数据页的随机写入：
+
+**日志写入特点**：
+- **顺序写入**：日志追加到日志文件末尾，磁头移动最少
+- **预写日志**：事务提交前，日志必须刷盘
+- **组提交**：多个小事务可以合并为一次刷盘操作
+
+```sql
+-- 强制日志刷盘（性能敏感场景慎用）
+CHECKPOINT;          -- 检查点，刷新脏页
+WRITE FILEMARK;      -- 强制刷盘
+
+-- 查看等待类型（针对日志的等待）
+SELECT 
+    wait_type,
+    waiting_tasks_count,
+    wait_time_ms,
+    signal_wait_time_ms
+FROM sys.dm_os_wait_stats
+WHERE wait_type LIKE '%LOG%'
+ORDER BY wait_time_ms DESC;
+```
+
+### 检查点（Checkpoint）
+
+检查点进程定期将缓冲池中的**脏页**写入磁盘，减少崩溃恢复时间。
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                       检查点机制                                 │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  检查点进程                                                      │
+│       │                                                          │
+│       ▼                                                          │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │  扫描 Buffer Pool 中的脏页                                 │  │
+│  │  - 找出比 last_checkpoint_lsn 更早的脏页                   │  │
+│  │  - 异步写入磁盘                                            │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│       │                                                          │
+│       ▼                                                          │
+│  更新 MinLSN，释放日志空间                                        │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**触发检查点的条件**：
+
+| 触发条件 | 说明 |
+|---|---|
+| 恢复间隔到达 | `sp_configure 'recovery interval'`（默认 0 = 自动） |
+| 日志 70% 满 | 为防止日志写满触发检查点 |
+| 备份前 | 备份前检查点减少日志备份量 |
+| CHECKPOINT 命令 | 手动触发 |
+| 活动表/索引删除 | DROP TABLE/INDEX 时触发 |
+
+## 日志备份
+
+### 完整恢复模式
+
+在完整恢复模式下，只有备份日志才能截断（truncate）日志，释放 VLF 空间。
+
+```sql
+-- 完整备份
+BACKUP DATABASE SalesDB
+TO DISK = 'D:\Backup\SalesDB_Full.bak'
+WITH COMPRESSION, INIT;
+
+-- 日志备份
+BACKUP LOG SalesDB
+TO DISK = 'D:\Backup\SalesDB_Log_20240301.trn'
+WITH COMPRESSION, INIT;
+
+-- 差异备份（可选）
+BACKUP DATABASE SalesDB
+TO DISK = 'D:\Backup\SalesDB_Diff.bak'
+WITH DIFFERENTIAL, COMPRESSION;
+```
+
+### 日志链
+
+每次**完整备份**后开始新的日志链。日志链是一系列连续的日志备份，将数据库恢复到任意时间点。
+
+```
+完整备份 ──▶ 日志1 ──▶ 日志2 ──▶ 日志3 ──▶ ...
+    │
+    └─ 日志链开始
+```
+
+:::warning
+如果日志链断裂（如备份介质损坏），只能恢复到最近一次完整备份的时间点。
+:::
+
+### 日志截断
+
+日志截断**不会缩小物理文件**，只是标记 VLF 为可重用：
+
+```sql
+-- 查看日志截断状态
+SELECT 
+    name AS DatabaseName,
+    recovery_model_desc AS RecoveryModel,
+    log_reuse_wait_desc AS LogReuseWait,
+    is_auto_shrink_on
+FROM sys.databases
+WHERE name = 'SalesDB';
+
+-- 可能的 LogReuseWait 值：
+-- NOTHING - 正常
+-- CHECKPOINT - 等待检查点
+-- LOG_BACKUP - 等待日志备份
+-- ACTIVE_TRANSACTION - 活动事务
+-- DATABASE_MIRRORING - 镜像同步
+-- REPLICATION - 复制
+```
+
+## 恢复模式
+
+### 三种恢复模式
+
+| 恢复模式 | 事务日志备份 | 数据丢失风险 | 用途 |
+|---|---|---|---|
+| FULL | 需要 | 最小（可恢复到任意时间点） | 生产数据库 |
+| BULK_LOGGED | 需要（部分操作不记录详细日志） | 最小到中等 | 大批量导入 |
+| SIMPLE | 不需要 | 可能丢失自上次检查点后的事务 | 开发/测试 |
+
+```sql
+-- 修改恢复模式
+ALTER DATABASE SalesDB SET RECOVERY FULL;
+ALTER DATABASE SalesDB SET RECOVERY BULK_LOGGED;
+ALTER DATABASE SalesDB SET RECOVERY SIMPLE;
+```
+
+### BULK_LOGGED 模式
+
+在 BULK_LOGGED 模式下，以下操作使用**最小日志记录**（只记录分配extent，不记录每行）：
+
+- `SELECT INTO`
+- `BULK INSERT`
+- `INSERT INTO ... SELECT`
+- `CREATE INDEX`
+- `ALTER INDEX REBUILD`
+
+```sql
+-- 查看最小日志记录的条件
+-- 1. 恢复模式为 FULL 或 BULK_LOGGED
+-- 2. 目标表不是复制表
+-- 3. 使用 TABLOCK 提示
+-- 4. 表没有触发器（非绝对）
+```
+
+:::tip
+从 BULK_LOGGED 切换到 FULL 会强制日志备份捕获所有日志。如果长时间使用 BULK_LOGGED，切换回 FULL 后应立即备份日志。
+:::
+
+## 日志文件管理
+
+### 增加日志文件
+
+```sql
+-- 添加日志文件（如果现有日志写入是瓶颈）
+ALTER DATABASE SalesDB
+ADD LOG FILE (
+    NAME = 'SalesDB_Log2',
+    FILENAME = 'E:\Logs\SalesDB_Log2.ldf',
+    SIZE = 50GB,
+    MAXSIZE = UNLIMITED,
+    FILEGROWTH = 10GB
+);
+```
+
+### 收缩日志文件
+
+```sql
+-- 查看 VLF 信息
+DBCC LOGINFO('SalesDB');
+
+-- 收缩日志文件到最小大小
+USE SalesDB;
+GO
+
+-- 方法 1：切换到 SIMPLE 模式后收缩（不推荐生产环境）
+ALTER DATABASE SalesDB SET RECOVERY SIMPLE;
+DBCC SHRINKFILE (N'SalesDB_Log', 1);
+ALTER DATABASE SalesDB SET RECOVERY FULL;
+
+-- 方法 2：备份日志后收缩
+BACKUP LOG SalesDB TO DISK = 'NUL:';  -- 或备份到设备
+DBCC SHRINKFILE (N'SalesDB_Log', 1);
+```
+
+### VLF 碎片
+
+大量小 VLF 会影响日志性能：
+
+```sql
+-- 查看 VLF 数量
+DBCC LOGINFO('SalesDB');
+-- 行数 = VLF 数量
+
+-- 推荐的 VLF 数量：少于 100 个
+-- 如果超过 1000 个，需要重新配置日志大小
+
+-- 重建日志文件（创建更大的日志文件替换）
+DBCC SHRINKFILE (N'SalesDB_Log', 1);
+ALTER DATABASE SalesDB MODIFY FILE (
+    NAME = 'SalesDB_Log',
+    SIZE = 10GB   -- 建议大小
+);
+```
+
+## 崩溃恢复
+
+### 恢复过程
+
+数据库启动时执行崩溃恢复，分为两个阶段：
+
+**阶段 1：分析（Analysis）**
+- 读取日志，确定崩溃时的状态
+- 构建脏页表（Dirty Page Table）
+
+**阶段 2：重做（Redo）和回滚（Undo）**
+- **重做**：从最后一个检查点开始，应用所有已记录但未刷盘的修改
+- **回滚**：回滚未提交事务的所有修改
+
+```sql
+-- 查看恢复时间估算
+SELECT 
+    database_name,
+    last_recovery_model,
+    last_backup_lsn,
+    redo_start_lsn,
+    redo_queue_size
+FROM sys.database_recovery_status
+WHERE database_id = DB_ID();
+```
+
+### 恢复时间控制
+
+```sql
+-- 设置恢复间隔（分钟）
+sp_configure 'recovery interval', 3;
+RECONFIGURE;
+
+-- 强制检查点（立即检查点，不是全局检查点）
+CHECKPOINT;
+```
+
+## 监控日志
+
+```sql
+-- 监控日志等待
+SELECT 
+    wait_type,
+    waiting_tasks_count,
+    wait_time_ms,
+    signal_wait_time_ms,
+    wait_time_ms - signal_wait_time_ms AS resource_wait_ms
+FROM sys.dm_os_wait_stats
+WHERE wait_type LIKE '%LOG%'
+   OR wait_type LIKE '%WRITELOG%'
+ORDER BY wait_time_ms DESC;
+
+-- 监控日志 I/O
+SELECT 
+    current_size * 8 / 1024.0 AS CurrentSizeMB,
+    used_size * 8 / 1024.0 AS UsedSizeMB,
+    (current_size - used_size) * 8 / 1024.0 AS FreeSpaceMB
+FROM sys.dm_db_log_space_usage;
+
+-- 查看活动事务
+SELECT 
+    transaction_id,
+    session_id,
+    database_id,
+    transaction_begin_time,
+    transaction_type_desc,
+    transaction_state,
+    transaction_status
+FROM sys.dm_tran_active_transactions
+WHERE database_id = DB_ID('SalesDB');
+```
+
+理解事务日志是掌握 SQL Server 备份恢复和高可用架构的基础。

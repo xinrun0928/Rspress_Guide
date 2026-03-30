@@ -1,0 +1,356 @@
+import { Badge } from '@rspress/core/theme';
+
+# 热点数据发现与处理
+
+热点数据是 Redis 永恒的话题。「如何发现热点数据？」「热点 key 如何处理？」「如何避免热点导致的性能问题？」
+
+这一讲，我们来深入探讨热点数据的识别和处理方案。
+
+## 什么是热点数据
+
+热点数据 = **被高频访问的数据**。
+
+```
+热点数据示例：
+- 微博热搜：某明星结婚，热搜 key 每秒被访问几十万次
+- 秒杀商品：库存 key 被几十万用户同时查询
+- 首页推荐：首页推荐结果被所有用户访问
+```
+
+### 热点的分类
+
+| 类型 | 特点 | 影响 |
+| --- | --- | --- |
+| 固定热点 | 如首页数据，长期热 | 缓存预热即可 |
+| 突发热点 | 突发事件导致，如热搜 | 需要实时发现 |
+| 集中热点 | 大量请求访问同一 key | 导致单节点压力 |
+
+## 热点发现
+
+### 方法一：Redis 监控
+
+```bash
+# 使用 redis-cli --hotkeys 发现热点 key
+$ redis-cli --hotkeys
+
+# Sample output:
+# Scanning 1000000 keys in 0.5015 seconds
+#     0 hot keys found:
+#     The following keys were sampled many times:
+#     keyspace calls      id    internal calls
+#     "product:hot:1001" 10000  10000
+```
+
+:::warning 注意事项
+`--hotkeys` 需要遍历所有 key，在大数据量下会对 Redis 产生压力，生产环境慎用。
+:::
+
+### 方法二：MONITOR 采样
+
+```bash
+# 实时监控命令（采样 10 秒）
+$ redis-cli --latency-history
+
+# 或者使用 monitor
+$ redis-cli monitor --limit 1000 | awk '{print $2}' | sort | uniq -c | sort -rn | head -20
+```
+
+### 方法三：Redis 埋点
+
+```java
+// 每次访问时记录
+public String getHotKey(String key) {
+    // 记录访问次数
+    redisTemplate.opsForHyperLogLog().add("hotkey:sampled", key);
+    
+    return redisTemplate.opsForValue().get(key);
+}
+
+// 定时分析
+@Scheduled(fixedRate = 60000)
+public void analyzeHotKeys() {
+    Map<String, Long> hotKeys = new HashMap<>();
+    
+    // 获取所有采样的 key
+    // 分析访问频率
+    for (String key : sampledKeys) {
+        long count = redisTemplate.opsForHyperLogLog().count("hotkey:sampled", key);
+        if (count > THRESHOLD) {
+            hotKeys.put(key, count);
+        }
+    }
+    
+    // 上报监控系统
+    monitor.reportHotKeys(hotKeys);
+}
+```
+
+### 方法四：使用 Redis 6.0 Client-side Cache
+
+```java
+// Redis 6.0 的客户端缓存
+// 客户端自动统计本地访问的 key
+```
+
+## 热点 key 问题
+
+### 单点问题
+
+```
+问题：热点 key 只有一个
+      ↓
+所有请求打到同一 Redis 节点
+      ↓
+Redis 单节点成为瓶颈
+      ↓
+即使 Redis Cluster 也无法分散压力
+```
+
+### 解决方案
+
+| 方案 | 原理 | 适用场景 |
+| --- | --- | --- |
+| 本地缓存 | 热点数据放应用本地 | 允许短暂不一致 |
+| 多级缓存 | 本地 + Redis | 数据一致性要求不高 |
+| key 打散 | 给 key 加随机后缀 | 写操作少 |
+| 热点 key 探测 | 实时发现热点，动态迁移 | 突发热点 |
+
+## 本地缓存方案
+
+### 方案一：ConcurrentHashMap
+
+```java
+public class LocalCacheService {
+    
+    private Map<String, String> localCache = new ConcurrentHashMap<>();
+    private long EXPIRE_TIME = 1000;  // 1 秒过期
+    
+    public String get(String key) {
+        CacheEntry entry = localCache.get(key);
+        
+        if (entry != null && !entry.isExpired()) {
+            return entry.getValue();
+        }
+        
+        // 缓存未命中或已过期，从 Redis 获取
+        String value = redisTemplate.opsForValue().get(key);
+        
+        if (value != null) {
+            localCache.put(key, new CacheEntry(value, System.currentTimeMillis() + EXPIRE_TIME));
+        }
+        
+        return value;
+    }
+    
+    static class CacheEntry {
+        private String value;
+        private long expireTime;
+        
+        public CacheEntry(String value, long expireTime) {
+            this.value = value;
+            this.expireTime = expireTime;
+        }
+        
+        public boolean isExpired() {
+            return System.currentTimeMillis() > expireTime;
+        }
+        
+        public String getValue() {
+            return value;
+        }
+    }
+}
+```
+
+### 方案二：Caffeine
+
+```java
+public class CaffeineCacheService {
+    
+    private Cache<String, String> cache = Caffeine.newBuilder()
+        .maximumSize(10000)              // 最大条目
+        .expireAfterWrite(1, TimeUnit.SECONDS)  // 写入后 1 秒过期
+        .recordStats()                   // 开启统计
+        .build();
+    
+    public String get(String key) {
+        String value = cache.getIfPresent(key);
+        
+        if (value == null) {
+            value = redisTemplate.opsForValue().get(key);
+            if (value != null) {
+                cache.put(key, value);
+            }
+        }
+        
+        return value;
+    }
+    
+    public void stats() {
+        CacheStats stats = cache.stats();
+        System.out.println("hit rate: " + stats.hitRate());
+        System.out.println("eviction count: " + stats.evictionCount());
+    }
+}
+```
+
+### 方案三：Guava Cache
+
+```java
+public class GuavaCacheService {
+    
+    private LoadingCache<String, String> cache = CacheBuilder.newBuilder()
+        .maximumSize(10000)
+        .expireAfterWrite(1, TimeUnit.SECONDS)
+        .recordStats()
+        .build(new CacheLoader<String, String>() {
+            @Override
+            public String load(String key) {
+                return redisTemplate.opsForValue().get(key);
+            }
+        });
+    
+    public String get(String key) {
+        return cache.getUnchecked(key);
+    }
+}
+```
+
+## key 打散方案
+
+### 固定打散
+
+```java
+public class KeyShardingService {
+    
+    private int SHARD_COUNT = 10;
+    
+    // 获取多个 key 中的随机一个
+    public String getShardedKey(String originalKey) {
+        int shardId = Math.abs(originalKey.hashCode() % SHARD_COUNT);
+        return originalKey + ":" + shardId;
+    }
+    
+    // 写入时写入所有分片
+    public void setAll(String originalKey, String value) {
+        for (int i = 0; i < SHARD_COUNT; i++) {
+            String shardKey = originalKey + ":" + i;
+            redisTemplate.opsForValue().set(shardKey, value);
+        }
+    }
+    
+    // 读取时随机选一个
+    public String get(String originalKey) {
+        int shardId = ThreadLocalRandom.current().nextInt(SHARD_COUNT);
+        String shardKey = originalKey + ":" + shardId;
+        return redisTemplate.opsForValue().get(shardKey);
+    }
+}
+```
+
+### 随机打散
+
+```java
+public String getHotValue(String key) {
+    // 给 key 加随机后缀
+    String shardedKey = key + ":" + ThreadLocalRandom.current().nextInt(10);
+    
+    // 查询（可能查不到，需要查原 key）
+    String value = redisTemplate.opsForValue().get(shardedKey);
+    
+    if (value == null) {
+        value = redisTemplate.opsForValue().get(key);
+        if (value != null) {
+            // 回填所有分片
+            fillAllShards(key, value);
+        }
+    }
+    
+    return value;
+}
+```
+
+## 热点探测与动态迁移
+
+### 实现思路
+
+```
+1. 客户端/代理层统计 key 访问频率
+2. 发现热点 key（频率 > 阈值）
+3. 将热点 key 复制到多个节点
+4. 读取时随机路由到某个节点
+```
+
+### 简化实现
+
+```java
+public class HotKeyService {
+    
+    private ConcurrentHashMap<String, Long> hotKeyCounter = new ConcurrentHashMap<>();
+    private Set<String> hotKeys = ConcurrentHashMap.newKeySet();
+    
+    private static final long HOT_KEY_THRESHOLD = 1000;
+    
+    // 记录访问
+    public void recordAccess(String key) {
+        long count = hotKeyCounter.merge(key, 1L, Long::sum);
+        
+        // 达到阈值，标记为热点
+        if (count >= HOT_KEY_THRESHOLD) {
+            hotKeys.add(key);
+            // 复制热点 key 到多个节点
+            replicateHotKey(key);
+        }
+    }
+    
+    // 获取热点 key
+    public String get(String key) {
+        recordAccess(key);
+        
+        // 如果是热点，随机选一个副本
+        if (hotKeys.contains(key)) {
+            String replicaKey = getRandomReplica(key);
+            String value = redisTemplate.opsForValue().get(replicaKey);
+            if (value != null) {
+                return value;
+            }
+        }
+        
+        // 查原 key
+        return redisTemplate.opsForValue().get(key);
+    }
+    
+    private void replicateHotKey(String key) {
+        String value = redisTemplate.opsForValue().get(key);
+        if (value != null) {
+            // 复制到多个节点（实际实现需要集群支持）
+            for (int i = 0; i < 3; i++) {
+                redisTemplate.opsForValue().set(key + ":replica:" + i, value);
+            }
+        }
+    }
+    
+    private String getRandomReplica(String key) {
+        int index = ThreadLocalRandom.current().nextInt(3);
+        return key + ":replica:" + index;
+    }
+}
+```
+
+## 面试追问方向
+
+- 如何发现热点 key？
+- 热点 key 有什么危害？
+- 本地缓存和 Redis 缓存的区别？
+- key 打散的原理是什么？
+- 如何实现热点 key 的动态探测？
+
+## 总结
+
+热点数据处理的核心是：
+
+1. **发现热点**：监控、采样、分析
+2. **处理热点**：本地缓存、key 打散、热点探测
+3. **预防问题**：合理的缓存策略
+
+记住：**热点问题不是 Redis 的问题，是架构设计的问题**。

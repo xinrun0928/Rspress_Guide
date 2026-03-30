@@ -1,0 +1,318 @@
+# 二级索引实现
+
+HBase 只有 RowKey 一个索引。对于非 RowKey 的查询，传统做法是全表扫描。但全表扫描在大数据量下是不可接受的。
+
+二级索引是解决 HBase 非主键查询问题的关键技术。这篇文章会介绍几种常见的二级索引实现方案。
+
+## 为什么需要二级索引？
+
+### 问题背景
+
+HBase 的数据模型决定了它的查询限制：
+
+```
+HBase 查询能力：
+┌─────────────────────────────────────────────────────────────┐
+│                                                              │
+│  ✓ 基于 RowKey 的精确查询                                    │
+│  ✓ 基于 RowKey 范围的扫描                                   │
+│  ✓ 基于 RowKey 前缀的扫描                                    │
+│                                                              │
+│  ✗ 基于 Column 的精确查询                                   │
+│  ✗ 基于 Column 的范围扫描                                    │
+│  ✗ 基于 Value 的查询                                        │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 场景示例
+
+```java
+// 订单表
+RowKey = orderId  // 订单 ID
+// 列：userId, productId, amount, status, createdAt
+
+// 查询某用户的所有订单
+// 需要：全表扫描，按 userId 过滤 ❌
+// 理想：基于 userId 的索引 ✅
+```
+
+## 方案一：Phoenix 二级索引
+
+Phoenix 内置了二级索引功能，是最简单的方案。
+
+### 创建索引
+
+```sql
+-- 创建全局索引
+CREATE INDEX idx_user_id ON orders(userId);
+
+-- 创建本地索引
+CREATE LOCAL INDEX idx_product_id ON orders(productId);
+
+-- 创建覆盖索引
+CREATE INDEX idx_status ON orders(status) INCLUDE(amount, createdAt);
+```
+
+### 索引工作原理
+
+```
+查询：SELECT * FROM orders WHERE userId = 'user_001'
+┌─────────────────────────────────────────────────────────────┐
+│                                                              │
+│  1. 查找索引表 idx_user_id                                 │
+│     └─ 索引表 RowKey = userId + orderId                    │
+│     └─ 查询 userId = 'user_001' 的记录                      │
+│     └─ 返回 orderId                                        │
+│                                                              │
+│  2. 根据 orderId 查询主表                                   │
+│     └─ 主表 RowKey = orderId                                │
+│     └─ 返回完整数据                                         │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## 方案二：协处理器实现
+
+使用协处理器在写入时自动维护索引表。
+
+### 设计思路
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                                                              │
+│  主表：orders                                               │
+│  ├─ RowKey = orderId                                        │
+│  └─ 列：userId, productId, amount, status                 │
+│                                                              │
+│  索引表：orders_by_userId                                   │
+│  ├─ RowKey = userId + orderId                              │
+│  └─ 列：索引信息                                           │
+│                                                              │
+│  索引表：orders_by_status                                   │
+│  ├─ RowKey = status + orderId                              │
+│  └─ 列：索引信息                                           │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 实现代码
+
+```java
+public class SecondaryIndexObserver extends RegionObserver {
+    // 维护多个索引表
+    private static final byte[][] INDEX_TABLES = {
+        Bytes.toBytes("orders_by_userId"),
+        Bytes.toBytes("orders_by_productId"),
+        Bytes.toBytes("orders_by_status")
+    };
+    
+    @Override
+    public void postPut(ObserverContext<RegionCoprocessorEnvironment> e,
+                        Put put, WALEdit edit, Durability durability) {
+        byte[] orderId = put.getRow();
+        byte[] userId = getColumnValue(put, "info", "userId");
+        byte[] productId = getColumnValue(put, "info", "productId");
+        byte[] status = getColumnValue(put, "info", "status");
+        
+        // 写入索引表
+        writeToIndexTable("orders_by_userId", userId, orderId);
+        writeToIndexTable("orders_by_productId", productId, orderId);
+        writeToIndexTable("orders_by_status", status, orderId);
+    }
+    
+    @Override
+    public void postDelete(ObserverContext<RegionCoprocessorEnvironment> e,
+                           Delete delete, WALEdit edit, Durability durability) {
+        // 从索引表中删除对应记录
+        // ...
+    }
+}
+```
+
+### 查询流程
+
+```java
+// 查询某用户的所有订单
+public List<Order> queryByUserId(String userId) throws IOException {
+    // 1. 查询索引表
+    Table indexTable = connection.getTable(TableName.valueOf("orders_by_userId"));
+    Scan scan = new Scan();
+    scan.withStartRow(Bytes.toBytes(userId));
+    scan.withStopRow(Bytes.toBytes(userId + "~"));  // "~" 在 ASCII 中最大
+    
+    // 2. 获取所有 orderId
+    List<byte[]> orderIds = new ArrayList<>();
+    try (ResultScanner scanner = indexTable.getScanner(scan)) {
+        for (Result result : scanner) {
+            orderIds.add(result.getRow());  // RowKey 中包含 orderId
+        }
+    }
+    
+    // 3. 根据 orderId 批量查询主表
+    Table mainTable = connection.getTable(TableName.valueOf("orders"));
+    List<Get> gets = orderIds.stream()
+        .map(id -> new Get(id))
+        .collect(Collectors.toList());
+    Result[] results = mainTable.get(gets);
+    
+    // 4. 组装结果
+    return convertToOrders(results);
+}
+```
+
+## 方案三：ElasticSearch 集成
+
+对于复杂查询场景，可以集成 ElasticSearch。
+
+### 架构设计
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                                                              │
+│  写入流程：                                                  │
+│  ┌─────────┐      ┌─────────┐      ┌─────────┐              │
+│  │ 应用    │ ──▶ │  HBase   │      │ ElasticSearch │       │
+│  │        │      │  主表    │ ──▶ │  索引       │       │
+│  └─────────┘      └─────────┘      └─────────┘              │
+│                          │                                  │
+│                     异步同步                                 │
+│                                                              │
+│  查询流程：                                                  │
+│  ┌─────────┐      ┌─────────┐                              │
+│  │ 应用    │ ──▶ │ ES 查询 │ ──▶ 返回 RowKey 列表       │
+│  │        │ ◀── │         │ ◀── 根据 RowKey 查 HBase  │
+│  └─────────┘      └─────────┘                              │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 实现方式
+
+使用协处理器或外部同步工具将数据同步到 ElasticSearch：
+
+```java
+// 协处理器实现
+public class ElasticSearchSyncObserver extends RegionObserver {
+    
+    @Override
+    public void postPut(ObserverContext<RegionCoprocessorEnvironment> e,
+                        Put put, WALEdit edit, Durability durability) {
+        // 异步发送到 ElasticSearch
+        asyncIndexToES(put);
+    }
+    
+    private void asyncIndexToES(Put put) {
+        // 使用线程池异步执行
+        executor.submit(() -> {
+            Document doc = convertToESDocument(put);
+            esClient.index(doc);
+        });
+    }
+}
+```
+
+### ElasticSearch 查询
+
+```java
+// ElasticSearch 查询
+public List<String> searchByConditions(String userId, String status) {
+    BoolQueryBuilder query = QueryBuilders.boolQuery();
+    query.must(QueryBuilders.termQuery("userId", userId));
+    query.must(QueryBuilders.termQuery("status", status));
+    
+    SearchResponse response = esClient.prepareSearch("orders")
+        .setQuery(query)
+        .execute()
+        .actionGet();
+    
+    return Stream.of(response.getHits().getHits())
+        .map(hit -> hit.getSourceAsMap().get("orderId").toString())
+        .collect(Collectors.toList());
+}
+```
+
+## 方案对比
+
+| 方案 | 优点 | 缺点 | 适用场景 |
+| --- | --- | --- | --- |
+| Phoenix 索引 | 简单易用，内置支持 | 功能有限，不支持复杂索引 | 简单等值查询 |
+| 协处理器 | 灵活可控 | 开发量大，需要处理一致性 | 自定义索引需求 |
+| ElasticSearch | 功能强大，支持全文搜索 | 架构复杂，数据同步延迟 | 复杂查询场景 |
+| Solr | 支持全文搜索 | 架构复杂 | 全文搜索 |
+
+## 最佳实践
+
+### 1. 索引设计原则
+
+```java
+// 索引表设计原则
+
+// 1. 索引表 RowKey = 索引字段 + 分隔符 + 主表 RowKey
+// 确保索引唯一且可排序
+String indexRowKey = userId + "_" + orderId;
+
+// 2. 控制索引数量
+// 索引数量影响写入性能和存储成本
+// 建议：每个表不超过 5 个索引
+
+// 3. 避免索引字段过长
+// 索引字段过长会浪费存储空间
+// 建议：使用编码或哈希缩短
+```
+
+### 2. 异步写入优化
+
+```java
+// 索引写入使用异步队列
+public class IndexWriteQueue {
+    private BlockingQueue<IndexOperation> queue;
+    
+    public void addOperation(IndexOperation op) {
+        queue.offer(op);
+    }
+    
+    public void processBatch() {
+        List<IndexOperation> batch = new ArrayList<>();
+        queue.drainTo(batch, 100);
+        
+        // 批量写入索引表
+        indexTable.put(batch.stream()
+            .map(IndexOperation::toPut)
+            .collect(Collectors.toList()));
+    }
+}
+```
+
+### 3. 一致性处理
+
+```java
+// 写入失败时重试
+public void writeIndexWithRetry(Put put, int maxRetries) {
+    for (int i = 0; i < maxRetries; i++) {
+        try {
+            indexTable.put(put);
+            return;
+        } catch (IOException e) {
+            if (i == maxRetries - 1) {
+                // 写入失败日志，记录到补偿表
+                writeToCompensationTable(put);
+            }
+        }
+    }
+}
+```
+
+## 面试追问方向
+
+- 为什么 HBase 需要二级索引？
+- HBase 有哪些二级索引实现方案？
+- Phoenix 二级索引的工作原理是什么？
+- 如何使用协处理器实现自定义索引？
+- ElasticSearch 集成方案的优缺点是什么？
+- 二级索引的一致性如何保证？
+- 索引表的 RowKey 如何设计？
+- 索引写入失败如何处理？
+- 索引数量是否有限制？
+
+二级索引是 HBase 开发中的高级主题。理解各种实现方案的优缺点，可以帮助你在实际项目中做出正确的技术选择。

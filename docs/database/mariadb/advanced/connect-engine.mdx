@@ -1,0 +1,228 @@
+# CONNECT 存储引擎
+
+通常，数据库的核心价值是管理「数据库内部」的数据。但现实往往更复杂：日志文件是 CSV 格式，业务系统导出 JSON，报表模板是 XML……把这些外部文件纳入数据库管理，是 CONNECT 引擎解决的问题。
+
+---
+
+## CONNECT 引擎是什么
+
+CONNECT 引擎是 MariaDB 独有的存储引擎，它允许 MariaDB 直接读写各种外部数据源，而无需 ETL 过程。安装方式很简单：
+
+```sql
+INSTALL SONAME 'ha_connect';
+```
+
+安装后，你可以创建「虚拟表」，这些表映射到外部文件或数据源：
+
+```sql
+CREATE TABLE csv_users (
+    id INT,
+    name VARCHAR(100),
+    email VARCHAR(100)
+) ENGINE=CONNECT TABLE_TYPE=CSV FILE_NAME='/data/users.csv';
+```
+
+创建完成后，你就可以用标准 SQL 查询 CSV 文件了：
+
+```sql
+SELECT * FROM csv_users WHERE id > 100;
+INSERT INTO csv_users VALUES (201, 'Alice', 'alice@example.com');
+```
+
+这听起来有点像「文件系统的 SQL 接口」，但 CONNECT 的价值远不止于此。
+
+---
+
+## 支持的数据类型
+
+CONNECT 引擎支持多种数据类型，每种类型都有其独特用途：
+
+| 类型 | 用途 | 文件格式 |
+|---|---|---|
+| DOS | 固定宽度记录 | 顺序记录，固定字节数 |
+| FIX | 定长字段表 | 类似 DOS，但字段定义更灵活 |
+| BIN | 二进制表 | C 结构体序列化 |
+| CSV | 逗号分隔值 | RFC 4180 标准 |
+| FMT | 格式化文本 | 可指定分隔符 |
+| JSON | JSON 对象数组 | 每行一个 JSON 对象 |
+| XML | XML 文档 | XPath 表达式映射到列 |
+| DBF | dBase 格式 | 老的数据库文件格式 |
+| ODBC | 外部 ODBC 数据源 | 连接其他数据库 |
+| JDBC | 外部 JDBC 数据源 | Java 数据源（需配置） |
+| PROXY | 代理其他 MariaDB 表 | 跨库查询 |
+| MYSQL | 远程 MySQL 表 | 远程连接 |
+
+这个列表很长了，但实际使用中，最常用的是 CSV、JSON、XML 和 ODBC。
+
+---
+
+## CSV 文件直连：让日志可查询
+
+假设你有一个按天分割的日志文件：
+
+```
+/var/log/app-2024-01-01.csv
+/var/log/app-2024-01-02.csv
+/var/log/app-2024-01-03.csv
+```
+
+传统方案是写定时任务导入数据库。有了 CONNECT，你可以直接创建分区表：
+
+```sql
+CREATE TABLE app_logs (
+    id INT NO_SQL NOT NULL,
+    timestamp DATETIME(3) NOT NULL,
+    level VARCHAR(10) NOT NULL,
+    message TEXT NOT NULL
+) ENGINE=CONNECT
+  TABLE_TYPE=CSV
+  FILE_NAME='/var/log/app-*.csv'
+  MULTIFILE=YES
+  SEP_CHAR=','
+  QUOTE_CHAR='"'
+  HEADER=YES;
+```
+
+- `FILE_NAME='*.csv'`：模式匹配多个文件
+- `MULTIFILE=YES`：启用多文件支持
+- `HEADER=YES`：第一行是表头，自动映射到列名
+
+现在你可以直接查询所有日志：
+
+```sql
+SELECT * FROM app_logs
+WHERE timestamp BETWEEN '2024-01-01' AND '2024-01-31'
+  AND level = 'ERROR'
+ORDER BY timestamp DESC
+LIMIT 100;
+```
+
+**性能提示**：CONNECT 引擎不会建立索引，每次查询都是全表扫描。对于高频查询场景，还是建议导入数据库；对于低频分析查询，CONNECT 的便利性无可替代。
+
+---
+
+## JSON 数据：处理 API 响应
+
+很多业务系统的导出格式是 JSON。假设你有一个 `products.json`：
+
+```json
+[
+  {"id": 1, "name": "笔记本", "price": 5999, "tags": ["电脑", "办公"]},
+  {"id": 2, "name": "鼠标", "price": 99, "tags": ["外设"]}
+]
+```
+
+创建 JSON 表：
+
+```sql
+CREATE TABLE products (
+    id INT,
+    name VARCHAR(100),
+    price DECIMAL(10,2),
+    tags VARCHAR(500)
+) ENGINE=CONNECT TABLE_TYPE=JSON;
+```
+
+CONNECT 会自动解析 JSON 数组，每行一个对象。对于嵌套对象，可以用 XPath 表达式指定列：
+
+```sql
+CREATE TABLE orders (
+    order_id INT,
+    customer_name VARCHAR(100),
+    total DECIMAL(10,2),
+    item_count INT
+) ENGINE=CONNECT TABLE_TYPE=JSON
+  COLS='order_id,customer_name,total,count(items/item) as item_count';
+```
+
+---
+
+## ODBC 桥接：查询其他数据库
+
+CONNECT 的 ODBC 类型允许你直接查询其他数据库的数据源。配置步骤：
+
+**1. 配置 ODBC 数据源（/etc/odbc.ini）**
+
+```ini
+[postgres_db]
+Description = PostgreSQL Database
+Driver = PostgreSQL Unicode
+Database = myapp
+Servername = localhost
+Port = 5432
+```
+
+**2. 创建 ODBC 表**
+
+```sql
+CREATE TABLE remote_users (
+    user_id INT,
+    username VARCHAR(50),
+    created_at DATETIME
+) ENGINE=CONNECT
+  TABLE_TYPE=ODBC
+  SRCDEF='SELECT id, username, created_at FROM users'
+  CONNECTION='DSN=postgres_db;UID=admin;PWD=secret';
+```
+
+这样，你可以在 MariaDB 中用一条 SQL 查询 PostgreSQL 的数据：
+
+```sql
+SELECT u.username, COUNT(o.order_id) as order_count
+FROM remote_users u
+LEFT JOIN local_orders o ON u.user_id = o.user_id
+GROUP BY u.username;
+```
+
+跨数据库 join 的能力，让系统集成变得简单。
+
+---
+
+## 写入限制与注意事项
+
+CONNECT 引擎的写入能力有诸多限制：
+
+| 表类型 | 插入 | 更新 | 删除 |
+|---|---|---|---|
+| CSV | 支持 | 不支持 | 不支持 |
+| JSON | 支持（整行替换） | 部分支持 | 不支持 |
+| ODBC | 不支持 | 不支持 | 不支持 |
+| PROXY | 透传 | 透传 | 透传 |
+
+CSV 表只支持追加（INSERT），不支持 UPDATE 和 DELETE。这是外部文件的固有限制。
+
+另外，**并发写入需要加锁**。多个 MariaDB 实例同时写入同一个 CSV 文件会损坏数据：
+
+```sql
+-- 加锁后再写入
+LOCK TABLES csv_table WRITE;
+INSERT INTO csv_table VALUES (...);
+UNLOCK TABLES;
+```
+
+---
+
+## 使用场景总结
+
+CONNECT 引擎最适合以下场景：
+
+- **日志分析**：低频查询的历史日志文件
+- **数据导入中间层**：CSV/JSON 中转，避免频繁 ETL
+- **系统集成**：跨数据库查询，异构数据源统一访问
+- **报表导出**：CONNECT 表可以直接导出为文件
+
+不适合的场景：
+
+- **高频 OLTP 查询**：CONNECT 不建索引，性能差
+- **强一致性要求**：外部文件无事务保护
+- **大量并发写入**：文件锁是瓶颈
+
+---
+
+## 总结
+
+CONNECT 引擎打破了「数据库只管理数据库内部数据」的边界。它让 MariaDB 成为一个**数据集成平台**，用统一的 SQL 接口访问各类外部数据。
+
+理解 CONNECT 的定位很重要：它不是替代 InnoDB，而是补充。当你的数据在外部文件、其他数据库中时，CONNECT 提供了最小侵入的访问方式。
+
+<Badge text="提示" type="tip" /> 在使用 CONNECT 之前，先问自己：这个数据需要事务保护吗？查询频率高吗？如果答案都是「否」，CONNECT 是好选择。

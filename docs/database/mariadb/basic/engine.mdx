@@ -1,0 +1,441 @@
+# MariaDB 存储引擎：Aria、XtraDB、TokuDB
+
+存储引擎是数据库的心脏。它决定了数据如何存储、如何索引、如何事务化。MySQL 的插件式存储引擎架构让 MariaDB 继承了这一优点，并在此基础上发展出了丰富的引擎家族。
+
+面试中问到存储引擎，不是要你背诵引擎名字，而是要你能说出**每种引擎的适用场景和取舍**。
+
+---
+
+## 为什么 MariaDB 需要这么多存储引擎
+
+MySQL 的成功很大程度上归功于它的插件式存储引擎架构。不同的引擎针对不同的工作负载优化，让 MySQL 能够适应从小型网站到大型数据仓库的各种场景。
+
+MariaDB 继承了这一点，并在 MySQL 的基础上增加了更多引擎选择：
+
+- **InnoDB/XtraDB**：默认引擎，通用场景
+- **Aria**：MyISAM 的安全升级
+- **TokuDB**：大数据量写入
+- **MyRocks**：极致压缩
+- **CONNECT**：异构数据源
+- **Spider**：分片
+
+理解每种引擎的设计哲学，才能做出正确的选择。
+
+---
+
+## XtraDB：默认的事务引擎
+
+### XtraDB 的前世今生
+
+XtraDB 是 Percona 对 InnoDB 的增强版，最初由 Percona 公司开发。MariaDB 从 10.2 版本开始，将 XtraDB 作为默认存储引擎。
+
+**与 InnoDB 的关系**：XtraDB 不是重新造轮子，而是在 InnoDB 基础上做加法。MariaDB 的 XtraDB 实际上是 Percona XtraDB Cluster 的产物，包含了大量生产环境验证过的改进。
+
+### 核心改进
+
+**自适应哈希索引的增强**：
+
+传统 InnoDB 的自适应哈希索引只支持单列前缀匹配。XtraDB 改进了这一算法，可以支持完整索引匹配。
+
+```sql
+CREATE TABLE users (
+    id INT PRIMARY KEY,
+    name VARCHAR(50),
+    email VARCHAR(100),
+    INDEX idx_name_email (name, email)
+);
+
+-- XtraDB 可以在这个复合索引上更好地利用哈希
+SELECT * FROM users WHERE name = 'Alice' AND email = 'alice@example.com';
+```
+
+**页面压缩**：
+
+XtraDB 原生支持页面级压缩，减少存储空间：
+
+```sql
+CREATE TABLE log_data (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    message TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB
+ROW_FORMAT=COMPRESSED
+KEY_BLOCK_SIZE=8;
+```
+
+**锁竞争的优化**：
+
+在高并发写入场景下，XtraDB 改进了锁粒度，减少了行锁的争用：
+
+```sql
+-- XtraDB 在这个场景下表现更好
+INSERT INTO orders (product_id, quantity, status)
+SELECT product_id, quantity, 'pending' 
+FROM cart_items WHERE user_id = 123;
+```
+
+### 适用场景
+
+XtraDB 是 MariaDB 的默认引擎，**没有特殊需求时直接使用它**。它适用于：
+
+- OLTP 工作负载
+- 需要事务支持的场景
+- 高并发读写混合场景
+- 对数据一致性有要求的应用
+
+---
+
+## Aria：MyISAM 的安全继承者
+
+### MyISAM 的历史包袱
+
+MyISAM 是 MySQL 早期的默认存储引擎。它简单、高效，但有两个致命缺陷：
+
+1. **不支持事务**：一旦崩溃，数据可能损坏
+2. **表级锁**：并发写入能力极差
+
+很多老系统还在使用 MyISAM，MariaDB 创建 Aria 的目的就是提供一条平滑的迁移路径。
+
+### Aria 的设计目标
+
+**Aria = MyISAM + Crash Safe**
+
+Aria 在保持 MyISAM 优点的同时，增加了崩溃恢复能力：
+
+| 特性 | MyISAM | Aria |
+|---|---|---|
+| 崩溃安全 | 否 | 是 |
+| 表级锁 | 是 | 是 |
+| 全文索引 | 支持 | 支持 |
+| 空间数据类型 | 支持 | 支持 |
+| 内存映射 | 可选 | 默认启用 |
+
+### 使用示例
+
+```sql
+CREATE TABLE config_data (
+    key_name VARCHAR(100) PRIMARY KEY,
+    value TEXT,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=Aria;
+```
+
+### Aria 的适用场景
+
+**不要用 Aria 的场景**：
+- 高并发写入
+- 需要事务支持
+- 数据一致性要求高
+
+**适合用 Aria 的场景**：
+- 很少更新的配置表
+- 只读的参考数据
+- 日志归档（批量写入后不再修改）
+- 临时中间表
+
+**最佳实践**：
+
+```sql
+-- Aria 表使用_PAGE_CHECKSUM 提高数据校验能力
+CREATE TABLE archive (
+    id INT PRIMARY KEY,
+    data TEXT
+) ENGINE=Aria 
+PAGE_CHECKSUM=1;
+```
+
+---
+
+## TokuDB：分形树的威力
+
+### LSM-Tree 的兄弟：分形树
+
+TokuDB 使用 **分形树（Fractal Tree）索引** 作为底层数据结构，与 LSM-Tree（LevelDB、RocksDB）和 B+Tree（InnoDB）并列。
+
+分形树的核心思想：**用空间换时间，同时保持写入性能**。
+
+### 分形树 vs B+树
+
+**B+树的写入过程**：
+1. 找到要插入的叶子节点
+2. 如果叶子节点有空间，直接插入
+3. 如果叶子节点满了，分裂节点
+4. 递归向上，可能一直分裂到根
+
+**分形树的写入过程**：
+1. 找到对应的叶子节点
+2. 将数据插入消息缓冲区（Message Buffer）
+3. 消息缓冲区满时，批量刷新到子节点
+4. 不会产生页面分裂
+
+**关键区别**：B+树的插入是随机的页面分裂，分形树是批量的顺序写入。
+
+### TokuDB 的核心优势
+
+**1. 高写入性能**
+
+```sql
+-- TokuDB 在这个场景下表现优异
+CREATE TABLE sensor_data (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    sensor_id VARCHAR(50),
+    reading DECIMAL(10,4),
+    timestamp TIMESTAMP
+) ENGINE=TokuDB;
+
+-- 批量写入
+INSERT INTO sensor_data VALUES 
+    (NULL, 'S001', 23.5, NOW()),
+    (NULL, 'S002', 24.1, NOW()),
+    (NULL, 'S003', 22.8, NOW());
+```
+
+**2. 高压缩比**
+
+TokuDB 支持多种压缩算法：
+
+```sql
+CREATE TABLE large_table (
+    id INT PRIMARY KEY,
+    payload BLOB
+) ENGINE=TokuDB 
+COMPRESSION='zstd';  -- 支持 zstd、lzma、quicklz、snappy
+```
+
+压缩效果：
+- 文本数据：5:1 ~ 10:1
+- 数值数据：2:1 ~ 3:1
+
+**3. 在线 DDL**
+
+TokuDB 支持在线添加索引，不阻塞读写：
+
+```sql
+-- 添加索引不会锁表
+ALTER TABLE sensor_data ADD INDEX idx_sensor_id (sensor_id);
+```
+
+### TokuDB 的局限
+
+**不适用场景**：
+- 随机单条插入（消息缓冲区需要积累）
+- 大量范围查询（B+树更适合）
+- 小数据量（启动开销不划算）
+
+**配置注意事项**：
+
+```ini
+# TokuDB 配置
+tokudb_cache_size = 4G          # 内存缓存大小
+tokudb_commit_sync = ON         # 事务提交时同步
+tokudb_directio = OFF            # 关闭直接 I/O
+tokudb_row_format = zstd         # 默认压缩算法
+```
+
+---
+
+## MyRocks：Facebook 的选择
+
+### 为什么 Facebook 选择 RocksDB
+
+Facebook 在 2017 年开源了 MyRocks，将 RocksDB（LSM-Tree 实现）引入 MySQL。
+
+**Facebook 的痛点**：
+- MySQL 数据量达到 PB 级
+- InnoDB 压缩比不够（~2:1）
+- 写入放大严重
+- 存储成本高企
+
+**RocksDB 的特点**：
+- LSM-Tree 结构
+- 极高压缩比（3:1 ~ 5:1 vs InnoDB）
+- 写入放大控制良好
+- 顺序写入优化
+
+### MyRocks vs InnoDB
+
+| 指标 | InnoDB | MyRocks |
+|---|---|---|
+| 写入性能 | 好 | 极好 |
+| 读取性能 | 好 | 一般 |
+| 存储空间 | 标准 | 节省 50%+ |
+| 压缩比 | 2:1 | 3:1 ~ 5:1 |
+| 事务支持 | ACID | ACID |
+| 崩溃恢复 | 快 | 较慢 |
+
+### MyRocks 适用场景
+
+**首选 MyRocks 的场景**：
+- 日志类数据（写入多、读取少）
+- CDN 内容元数据
+- 消息队列持久化
+- 分片后的热点数据
+
+**不适合 MyRocks 的场景**：
+- 强一致性要求的 OLTP
+- 随机读取密集型
+- 小数据量
+
+```sql
+CREATE TABLE access_logs (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    ip_address VARCHAR(45),
+    url VARCHAR(500),
+    user_agent VARCHAR(500),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+) ENGINE=MyRocks;
+```
+
+---
+
+## CONNECT 引擎：异构数据源
+
+### CONNECT 是什么
+
+CONNECT 引擎是 MariaDB 独有的存储引擎，允许你将外部数据源当作表来查询。
+
+**支持的数据格式**：
+- CSV、DOS、FIX（定长文本）
+- XML、JSON
+- ODBC、JDBC（其他数据库）
+- MYSQL（远程 MariaDB/MySQL）
+- PROXY（连接池）
+- DIR（目录文件）
+
+### 使用示例
+
+**查询 CSV 文件**：
+
+```sql
+CREATE TABLE csv_data (
+    id INT,
+    name VARCHAR(100),
+    value DECIMAL(10,2)
+) ENGINE=CONNECT 
+TABLE_TYPE=CSV
+FILE_NAME='/data/input.csv'
+SEP_CHAR=','
+HEADER=1;
+```
+
+**查询远程 MySQL**：
+
+```sql
+CREATE TABLE remote_users (
+    id INT NOT NULL,
+    name VARCHAR(100),
+    birthday DATE
+) ENGINE=CONNECT 
+TABLE_TYPE=MYSQL
+HOST='192.168.1.100'
+PORT=3306
+DATABASE='users_db';
+```
+
+**查询 ODBC 数据源**：
+
+```sql
+CREATE TABLE odbc_customers (
+    customer_id INT,
+    company_name VARCHAR(100),
+    contact_name VARCHAR(100)
+) ENGINE=CONNECT 
+TABLE_TYPE=ODBC
+SRCDEF='SELECT customer_id, company_name, contact_name FROM customers';
+```
+
+### CONNECT 引擎的局限
+
+1. **性能**：CONNECT 是连接层，不是真正的存储引擎，复杂查询性能较差
+2. **事务**：不支持事务
+3. **索引**：部分格式支持索引，但不是所有
+
+---
+
+## Spider：分片的透明化
+
+### 什么时候需要分片
+
+当单表数据量超过亿级，单机无法满足性能需求时，需要考虑分片。
+
+**传统分片方案**：
+- 应用层分片（Sharding-JDBC）
+- 中间件分片（ShardingSphere）
+- 数据库代理（Vitess）
+
+**Spider 的方案**：在数据库层面透明分片。
+
+### Spider 的工作原理
+
+```sql
+-- 创建分片节点
+CREATE SERVER shard1 FOREIGN DATA WRAPPER mysql 
+OPTIONS (HOST '192.168.1.101', DATABASE 'app');
+
+CREATE SERVER shard2 FOREIGN DATA WRAPPER mysql 
+OPTIONS (HOST '192.168.1.102', DATABASE 'app');
+
+-- 创建分片表
+CREATE TABLE orders (
+    id BIGINT,
+    customer_id BIGINT,
+    amount DECIMAL(10,2),
+    created_at TIMESTAMP
+) ENGINE=Spider
+PARTITION BY KEY(id) (
+    PARTITION p1 SERVER shard1,
+    PARTITION p2 SERVER shard2
+);
+```
+
+### Spider 的优缺点
+
+| 优点 | 缺点 |
+|---|---|
+| SQL 层透明 | 配置复杂 |
+| 支持跨分片 JOIN | 不支持分布式事务 |
+| 扩展性好 | 需要应用配合 |
+
+---
+
+## 面试追问方向
+
+### 如何选择存储引擎？
+
+面试官可能追问：**"如果我要存 10 亿条日志数据，选哪个引擎？"**
+
+**标准答案框架**：
+
+1. **分析工作负载**
+   - 写入 vs 读取比例
+   - 数据是否经常更新
+   - 需要保留多久
+
+2. **匹配引擎特性**
+
+| 场景 | 推荐引擎 | 理由 |
+|---|---|---|
+| 10亿日志写入 | TokuDB/MyRocks | 写入性能、压缩比 |
+| 高并发 OLTP | XtraDB | 事务支持、并发能力 |
+| 静态配置表 | Aria | 简单高效、崩溃安全 |
+| 异构数据查询 | CONNECT | 统一访问接口 |
+
+3. **考虑运维成本**
+   - 引擎的成熟度
+   - 社区支持程度
+   - 备份恢复方案
+
+---
+
+## 总结
+
+MariaDB 的存储引擎家族提供了丰富的选择：
+
+- **XtraDB**：默认选择，通用场景下的最优解
+- **Aria**：MyISAM 的安全替代，适合只读或低频更新
+- **TokuDB**：大数据量写入的首选，高压缩比
+- **MyRocks**：极致压缩，适合日志和归档
+- **CONNECT**：异构数据源的统一入口
+- **Spider**：数据库级分片方案
+
+没有最好的引擎，只有最适合的引擎。理解每种引擎的设计哲学，才能在面试和实际工作中做出正确的选择。

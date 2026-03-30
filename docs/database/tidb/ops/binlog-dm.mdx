@@ -1,0 +1,351 @@
+# TiDB Binlog 同步与 DM
+
+TiDB Binlog 是 TiDB 的增量同步工具，支持将数据同步到 MySQL、Kafka 等下游系统。
+
+## Binlog 概述
+
+### 什么是 Binlog
+
+TiDB Binlog 记录 TiDB 的所有变更操作，支持下游系统实时同步数据。
+
+```
+Binlog 架构：
+
+┌─────────────────────────────────────────────────────┐
+│                     TiDB Server                       │
+│                                                       │
+│   ┌─────────────────────────────────────────────┐   │
+│   │              TiDB                           │   │
+│   │  - SQL 执行                                 │   │
+│   │  - 写入 Binlog                              │   │
+│   └─────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────┘
+                      │
+                      ▼
+┌─────────────────────────────────────────────────────┐
+│                   Binlog Pump                         │
+│                                                       │
+│   ┌─────────────────────────────────────────────┐   │
+│   │  Pump 集群                                   │   │
+│   │  - 接收 Binlog 事件                          │   │
+│   │  - 持久化到本地磁盘                          │   │
+│   │  - 提供查询服务                              │   │
+│   └─────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────┘
+                      │
+                      ▼
+┌─────────────────────────────────────────────────────┐
+│                   Binlog Drainer                     │
+│                                                       │
+│   ┌─────────────────────────────────────────────┐   │
+│   │  Drainer                                    │   │
+│   │  - 消费 Pump 数据                            │   │
+│   │  - 转换为 MySQL/Binlog/Kafka               │   │
+│   │  - 同步到下游                                │   │
+│   └─────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────┘
+```
+
+## Binlog 配置
+
+### TiDB 配置
+
+```toml
+# tidb.toml
+
+[binlog]
+enable = true
+# Binlog 写入模式
+# "pump" - 写入 Pump 集群
+# "kafka" - 写入 Kafka
+sink-uri = "mysql://user:password@127.0.0.1:3306/?worker-count=10&batch-size=4096"
+
+# 安全配置
+security = ""
+
+# Pump 地址
+pd-urls = "http://127.0.0.1:2379"
+```
+
+### Pump 配置
+
+```toml
+# pump.toml
+
+# Pump 服务地址
+addr = "0.0.0.0:8250"
+advertise-addr = "127.0.0.1:8250"
+
+# 存储路径
+data-dir = "/data/pump"
+
+# PD 地址
+pd-urls = "http://127.0.0.1:2379"
+
+# GC 时间（小时）
+gc = 7
+
+# 心跳间隔
+heartbeat-interval = 2
+
+# 日志级别
+log-file = "/logs/pump.log"
+```
+
+### Drainer 配置
+
+```toml
+# drainer.toml
+
+# Drainer ID
+node-id = "drainer"
+
+# PD 地址
+pd-urls = "http://127.0.0.1:2379"
+
+# Binlog 存储目录
+data-dir = "/data/drainer"
+
+# 输出模式
+[syncer]
+# 下游类型
+syncer.to = "mysql"
+# MySQL 连接信息
+syncer.to.host = "127.0.0.1"
+syniger.to.port = 3306
+syncer.to.user = "root"
+syncer.to.password = "password"
+syncer.to.charset = "utf8mb4"
+
+# 同步点
+syncer.tso = ""
+
+# 忽略 DDL
+syncer.ignore-txn-commit-ts = []
+
+# Kafka 配置（可选）
+# [syncer.to]
+# type = "kafka"
+# kafka-addrs = "127.0.0.1:9092"
+# kafka-version = "0.11.0.0"
+# topic = "tidb_binlog"
+```
+
+## Binlog 同步到 MySQL
+
+### 配置 Drainer 输出 MySQL
+
+```toml
+# drainer_mysql.toml
+
+# PD 地址
+pd-urls = "http://127.0.0.1:2379"
+
+# 存储目录
+data-dir = "/data/drainer"
+
+# 输出模式
+[syncer]
+syncer.to = "mysql"
+syncer.to.host = "192.168.1.100"
+syncer.to.port = 3306
+syncer.to.user = "binlog_reader"
+syncer.to.password = "password"
+syncer.to.charset = "utf8mb4"
+
+# 数据库映射
+syncer.to.flavor = "mysql"
+
+# 忽略的 DDL
+# syncer.ignore-dbacies = ["ddl_database1", "ddl_database2"]
+
+# checkpoint
+checkpoint.save-interval = 60
+```
+
+### 创建同步用户
+
+```sql
+-- 在下游 MySQL 创建用户
+CREATE USER 'binlog_reader'@'%' IDENTIFIED BY 'password';
+GRANT SELECT, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'binlog_reader'@'%';
+GRANT ALL PRIVILEGES ON 'tidb_binlog'.* TO 'binlog_reader'@'%';
+FLUSH PRIVILEGES;
+
+-- 创建同步数据库
+CREATE DATABASE tidb_binlog;
+```
+
+### 启动 Drainer
+
+```bash
+# 启动 Drainer
+tiup cluster start tidb-cluster -R drainer
+
+# 或手动启动
+nohup bin/drainer -config drainer.toml > drainer.log &
+```
+
+## DM (Data Migration)
+
+### DM 概述
+
+TiDB Data Migration (DM) 是 TiDB 的数据迁移工具，支持从 MySQL 全量和增量同步到 TiDB。
+
+```
+DM 架构：
+
+┌─────────────────────────────────────────────────────┐
+│                       DM-master                       │
+│                                                       │
+│   ┌─────────────────────────────────────────────┐   │
+│   │  DM-master                                   │   │
+│   │  - 任务调度                                  │   │
+│   │  - 集群管理                                  │   │
+│   │  - 监控告警                                  │   │
+│   └─────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────┘
+          │                         ▲
+          ▼                         │
+┌─────────────────────────────────────────────────────┐
+│                       DM-worker                       │
+│                                                       │
+│   ┌──────────┐  ┌──────────┐  ┌──────────┐        │
+│   │ Worker 1  │  │ Worker 2  │  │ Worker 3  │       │
+│   │ - Dump    │  │ - Sync    │  │ - Sync    │       │
+│   │ - Load    │  │           │  │           │       │
+│   └──────────┘  └──────────┘  └──────────┘        │
+└─────────────────────────────────────────────────────┘
+          │                         ▲
+          ▼                         │
+┌───────────────┐          ┌───────────────┐
+│   MySQL       │          │     TiDB      │
+│  (上游)        │ ────── → │   (下游)       │
+└───────────────┘          └───────────────┘
+```
+
+### DM 配置
+
+```yaml
+# task.yaml - 任务配置
+
+name: mysql-to-tidb
+task-mode: all  # all/full/incremental
+
+# 上游配置
+source-id: "mysql-source"
+block-allow-list: "ba-list1"
+
+# 下游配置
+target-db:
+  host: "192.168.1.100"
+  port: 4000
+  user: "root"
+  password: ""
+
+# 同步配置
+routes:
+  route-1:
+    schema-pattern: "db_*"
+    target-schema: "db"
+
+mappers:
+  mapper-1:
+    schema-pattern: "db_*"
+    table-pattern: "table_*"
+    target-schema: "db"
+    target-table: "table"
+
+# 表配置
+table-mappings:
+  - schema-pattern: "test"
+    table-pattern: "t_*"
+    target-schema: "test"
+    target-table: "t"
+
+# 过滤规则
+binlog-filters:
+  filter-1:
+    schema-pattern: "db_*"
+    table-pattern: "table_*"
+    events: ["truncate table", "drop table"]
+    action: Ignore
+
+# 分库分表合并
+shard-mode: "pessimistic"  # pessimistic/optimistic
+```
+
+### DM 任务管理
+
+```bash
+# 1. 启动 DM-master
+tiup dm-master:9000
+
+# 2. 创建数据源
+tiup dmctl --master-addr 127.0.0.1:9000 operate-source create source.yaml
+
+# source.yaml 示例
+source-id: "mysql-source"
+from:
+  host: "192.168.1.101"
+  port: 3306
+  user: "root"
+  password: ""
+  security:
+    ssl-ca: "/path/to/ca.pem"
+    ssl-cert: "/path/to/cert.pem"
+    ssl-key: "/path/to/key.pem"
+
+# 3. 创建任务
+tiup dmctl --master-addr 127.0.0.1:9000 create-task task.yaml task-name
+
+# 4. 查看任务状态
+tiup dmctl --master-addr 127.0.0.1:9000 query-status task-name
+
+# 5. 暂停任务
+tiup dmctl --master-addr 127.0.0.1:9000 pause-task task-name
+
+# 6. 恢复任务
+tiup dmctl --master-addr 127.0.0.1:9000 resume-task task-name
+
+# 7. 停止任务
+tiup dmctl --master-addr 127.0.0.1:9000 stop-task task-name
+```
+
+## 常见问题
+
+### Binlog 问题
+
+```bash
+# 问题：Binlog 数据延迟大
+# 解决：增加 Pump 数量，优化 Drainer 性能
+
+# 问题：下游写入失败
+# 解决：检查下游连接、重启任务
+
+# 问题：DDL 同步失败
+# 解决：手动处理 DDL 后继续同步
+```
+
+### DM 问题
+
+```bash
+# 问题：全量同步慢
+# 解决：调整 dumpers 数量
+
+# 问题：增量同步冲突
+# 解决：使用 shard-mode 处理分库分表
+
+# 问题：同步中断
+# 解决：查看日志、重启任务
+```
+
+## 总结
+
+Binlog 和 DM 要点：
+
+- **Binlog**：TiDB 增量同步工具，支持 MySQL、Kafka
+- **Pump**：接收和存储 Binlog
+- **Drainer**：消费 Binlog 并同步到下游
+- **DM**：数据迁移工具，支持全量+增量同步
+- **场景**：数据灾备、异构数据库同步、数据迁移
