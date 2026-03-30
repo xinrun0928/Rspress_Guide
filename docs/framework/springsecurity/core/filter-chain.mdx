@@ -1,0 +1,458 @@
+import { Badge } from '@rspress/core/theme';
+
+# Spring Security 过滤器链
+
+你知道 Spring Security 的过滤器链有多少个过滤器吗？30 个？50 个？
+
+答案是：**取决于你的配置**。
+
+Spring Security 不会一股脑加载所有过滤器。它通过 `SecurityFilterChain` 机制，让每个应用只加载自己需要的过滤器。这种设计既灵活又高效——你配置了 OAuth2，就加载 OAuth2 相关的过滤器；你用了 Session，就加载 Session 管理的过滤器。
+
+但这也带来了理解门槛：如果不知道过滤器链是怎么组织的，一旦出问题，你根本无从下手。
+
+这一节，就是要让你彻底理解过滤器链的原理。
+
+---
+
+## FilterChainProxy：过滤器链的入口
+
+### 为什么需要 FilterChainProxy？
+
+标准的 Servlet 过滤器链只有一个 `FilterChain`，但 Spring Security 有多套过滤器链。你可能配置了 `/api/**` 需要 JWT 认证，`/admin/**` 需要 Session 认证，`/public/**` 完全开放。怎么让不同的请求走不同的链？
+
+答案是 `FilterChainProxy`。
+
+```java
+public class FilterChainProxy extends GenericFilterBean {
+    private List<SecurityFilterChain> filterChains;
+
+    public void doFilter(ServletRequest request, ServletResponse response,
+            FilterChain chain) throws IOException, ServletException {
+        HttpRequest httpRequest = (HttpRequest) request;
+        String requestUri = httpRequest.getRequestURI();
+
+        // 遍历所有 SecurityFilterChain，找到第一个匹配的
+        for (SecurityFilterChain filterChain : this.filterChains) {
+            if (filterChain.matches(httpRequest)) {
+                FilterChain proxy = filterChain.getHttpFilters().get(0);
+                // 执行匹配的过滤器链
+                doFilterInternal(proxy, request, response);
+                return;
+            }
+        }
+
+        // 没有匹配的链，执行原始 FilterChain
+        chain.doFilter(request, response);
+    }
+}
+```
+
+**核心逻辑：遍历 `SecurityFilterChain` 列表，找到第一个匹配的，然后执行该链的过滤器。**
+
+### SecurityFilterChain 接口
+
+```java
+public interface SecurityFilterChain {
+    boolean matches(HttpRequest request);  // 判断请求是否匹配
+    List<Filter> getFilters();            // 获取该链的过滤器列表
+}
+```
+
+一个典型的配置可能是：
+
+```java
+@Configuration
+public class SecurityConfig {
+
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http
+            .securityMatcher("/api/**")  // 只匹配 /api/** 路径
+            .authorizeHttpRequests(auth -> auth
+                .authenticated()
+            )
+            .addFilterBefore(jwtFilter, UsernamePasswordAuthenticationFilter.class);
+
+        return http.build();
+    }
+}
+```
+
+这样配置后，所有 `/api/**` 的请求都会走这个链，包含 JWT 过滤器。
+
+---
+
+## SecurityFilterChain 的排序
+
+### 多链配置的顺序问题
+
+你可能有多个 `SecurityFilterChain`：
+
+```java
+@Configuration
+public class SecurityConfig {
+
+    // 链 1：开放路径
+    @Bean
+    public SecurityFilterChain publicChain(HttpSecurity http) throws Exception {
+        http.securityMatcher("/public/**", "/health");
+        // ...
+        return http.build();
+    }
+
+    // 链 2：API 路径
+    @Bean
+    public SecurityFilterChain apiChain(HttpSecurity http) throws Exception {
+        http.securityMatcher("/api/**");
+        // ...
+        return http.build();
+    }
+
+    // 链 3：管理后台
+    @Bean
+    public SecurityFilterChain adminChain(HttpSecurity http) throws Exception {
+        http.securityMatcher("/admin/**");
+        // ...
+        return http.build();
+    }
+}
+```
+
+**问题是：这三个链谁先谁后？**
+
+Spring Security 按 `SecurityFilterChain` Bean 的名称排序（字母顺序）。所以：
+1. `adminChain` — 最先匹配
+2. `apiChain` — 其次
+3. `publicChain` — 最后
+
+> [!WARNING]
+> 这种隐式排序容易出错。更稳妥的做法是使用 `@Order` 注解或显式指定顺序。
+
+```java
+@Configuration
+public class SecurityConfig {
+
+    @Bean
+    @Order(1)
+    public SecurityFilterChain adminChain(HttpSecurity http) throws Exception {
+        // ...
+        return http.build();
+    }
+
+    @Bean
+    @Order(2)
+    public SecurityFilterChain apiChain(HttpSecurity http) throws Exception {
+        // ...
+        return http.build();
+    }
+
+    @Bean
+    @Order(3)
+    public SecurityFilterChain publicChain(HttpSecurity http) throws Exception {
+        // ...
+        return http.build();
+    }
+}
+```
+
+---
+
+## 核心过滤器详解
+
+### 过滤器链执行顺序
+
+Spring Security 的过滤器很多，但核心的只有几个。理解了这几个核心过滤器，就理解了大半：
+
+```
+SecurityFilterChain 中的过滤器（按顺序）
+
+1. WebAsyncManagerIntegrationFilter
+   └── 异步请求的 SecurityContext 集成
+
+2. SecurityContextPersistenceFilter ★
+   └── 从 Session 加载/保存 SecurityContext
+
+3. HeaderWriterFilter
+   └── 添加安全响应头（X-Frame-Options, CSP 等）
+
+4. CorsFilter
+   └── 处理跨域请求
+
+5. CsrfFilter ★
+   └── CSRF 防护
+
+6. LogoutFilter
+   └── 处理登出请求
+
+7. UsernamePasswordAuthenticationFilter ★
+   └── 表单登录认证
+
+8. DefaultLoginPageGeneratingFilter
+   └── 生成默认登录页
+
+9. DefaultLogoutPageGeneratingFilter
+   └── 生成默认登出页
+
+10. BasicAuthenticationFilter
+    └── HTTP Basic 认证
+
+11. RequestCacheAwareFilter
+    └── 请求缓存（登录后恢复原请求）
+
+12. SecurityContextHolderAwareRequestFilter
+    └── 包装 HttpServletRequest，支持更多安全 API
+
+13. AnonymousAuthenticationFilter ★
+    └── 为匿名用户设置 Authentication
+
+14. SessionManagementFilter ★
+    └── Session 并发控制、固定会话防护
+
+15. ExceptionTranslationFilter
+    └── 转换 AccessDeniedException 为 403
+
+16. FilterSecurityInterceptor ★
+    └── 权限校验入口
+```
+
+### SecurityContextPersistenceFilter：SecurityContext 的守护者
+
+这个过滤器负责两件事：
+1. **请求开始**：从 Session 恢复 SecurityContext 到 ThreadLocal
+2. **请求结束**：将 ThreadLocal 中的 SecurityContext 存回 Session
+
+```java
+public class SecurityContextPersistenceFilter extends GenericFilterBean {
+
+    public void doFilter(ServletRequest request, ServletResponse response,
+            FilterChain chain) throws IOException, ServletException {
+        HttpServletRequest httpRequest = (HttpServletRequest) request;
+        HttpServletResponse httpResponse = (HttpServletResponse) response;
+
+        HttpSession session = httpRequest.getSession(false);
+        SecurityContext contextBeforeChainExecution =
+            (session != null) ?
+                (SecurityContext) session.getAttribute("SPRING_SECURITY_CONTEXT") :
+                null;
+
+        try {
+            // 放入 ThreadLocal
+            SecurityContextHolder.setContext(contextBeforeChainExecution);
+            chain.doFilter(request, response);
+        } finally {
+            // 取出并存回 Session
+            SecurityContext contextAfterChainExecution =
+                SecurityContextHolder.getContext();
+            SecurityContextHolder.clearContext();
+
+            if (session != null && contextAfterChainExecution != null) {
+                session.setAttribute("SPRING_SECURITY_CONTEXT",
+                    contextAfterChainExecution);
+            }
+        }
+    }
+}
+```
+
+**重要**：如果请求处理过程中没有修改 SecurityContext（比如匿名访问），请求结束后不会写入 Session，避免无效的 Session 操作。
+
+### AnonymousAuthenticationFilter：给匿名用户的「身份证」
+
+当一个请求没有通过认证流程（比如访问公开页面），它的 `SecurityContext` 是空的。`AnonymousAuthenticationFilter` 会为这些请求创建一个「匿名 Authentication」：
+
+```java
+public class AnonymousAuthenticationFilter implements Filter {
+
+    private String key = "anonymousKey";
+    private String anonymousPrincipal = "anonymousUser";
+    private List<GrantedAuthority> anonymousAuthorities =
+        Collections.singletonList(new SimpleGrantedAuthority("ROLE_ANONYMOUS"));
+
+    public void doFilter(..., FilterChain chain) throws ... {
+        if (SecurityContextHolder.getContext().getAuthentication() == null) {
+            AnonymousAuthenticationToken token =
+                new AnonymousAuthenticationToken(key, anonymousPrincipal,
+                    anonymousAuthorities);
+            SecurityContextHolder.getContext().setAuthentication(token);
+        }
+        chain.doFilter(request, response);
+    }
+}
+```
+
+**好处**：
+- 后续过滤器不需要判断 `Authentication == null`
+- 可以在配置中使用 `permitAll()` 允许匿名访问
+- 权限配置中可以用 `hasRole("ANONYMOUS")` 限制匿名用户
+
+### FilterSecurityInterceptor：权限校验的最后一环
+
+这是过滤器链的「守门员」，负责在请求处理前做最终的权限校验：
+
+```java
+public class FilterSecurityInterceptor extends AbstractSecurityInterceptor
+        implements Filter {
+
+    public void doFilter(...) throws ... {
+        InterceptorStatusToken token = super.beforeInvocation(fi);
+
+        try {
+            filterChain.doFilter(fi.getRequest(), fi.getResponse());
+        } finally {
+            super.afterInvocation(token, null);
+        }
+    }
+
+    protected AuthorizationDecision checkSecurity(...) {
+        // 调用 AccessDecisionManager 投票
+        return this.accessDecisionManager.decide(auth, object, attributes);
+    }
+}
+```
+
+`beforeInvocation()` 的逻辑：
+1. 获取当前 Authentication
+2. 获取请求资源需要的 ConfigAttribute（权限配置）
+3. 调用 AccessDecisionManager 投票
+4. 如果投票拒绝，抛出 AccessDeniedException
+
+---
+
+## HttpSecurity 配置与过滤器链的关系
+
+### 配置即生成
+
+在 Spring Security 6.x 中，`HttpSecurity` 的配置直接决定了 `SecurityFilterChain` 中包含哪些过滤器：
+
+```java
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig {
+
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http
+            // 1. 禁用 CSRF（API 项目通常需要）
+            .csrf(csrf -> csrf.disable())
+
+            // 2. 配置 CORS
+            .cors(cors -> cors.configurationSource(corsConfigurationSource()))
+
+            // 3. 配置会话管理
+            .sessionManagement(session ->
+                session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+
+            // 4. 配置授权规则
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers("/public/**").permitAll()
+                .requestMatchers("/admin/**").hasRole("ADMIN")
+                .anyRequest().authenticated())
+
+            // 5. 添加过滤器
+            .addFilterBefore(jwtAuthenticationFilter(),
+                UsernamePasswordAuthenticationFilter.class);
+
+        return http.build();
+    }
+}
+```
+
+每一步 `.xxx()` 都在往 `SecurityFilterChain` 中添加或配置过滤器。
+
+### 常用配置速查
+
+| 配置 | 默认过滤器 | 说明 |
+|---|---|---|
+| `.formLogin()` | UsernamePasswordAuthenticationFilter | 启用表单登录 |
+| `.httpBasic()` | BasicAuthenticationFilter | 启用 HTTP Basic |
+| `.csrf()` | CsrfFilter | CSRF 防护 |
+| `.sessionManagement()` | SessionManagementFilter | Session 管理 |
+| `.authorizeHttpRequests()` | FilterSecurityInterceptor | 授权规则 |
+| `.oauth2Login()` | OAuth2LoginAuthenticationFilter | OAuth2 登录 |
+| `.addFilterBefore()` | 自定义 | 在某过滤器前插入 |
+
+---
+
+## FilterChainProxy 的完整执行流程
+
+```
+客户端请求
+    ↓
+DelegatingFilterProxy（Servlet 规范，委托给 Spring Bean）
+    ↓
+FilterChainProxy.doFilter()
+    ↓
+遍历 SecurityFilterChain 列表
+    ↓
+找到匹配的 SecurityFilterChain
+    ↓
+获取该链的 Filter 列表
+    ↓
+按顺序执行每个 Filter
+    ↓
+Filter 1.doFilter() → Filter 2.doFilter() → ... → Filter N.doFilter()
+    ↓
+最终到达 Servlet（Controller）
+    ↓
+响应返回，逐级回到 FilterChainProxy
+    ↓
+FilterChainProxy 执行后续逻辑（如保存 SecurityContext）
+```
+
+---
+
+## 面试追问预判
+
+### Q1：DelegatingFilterProxy 和 FilterChainProxy 的区别是什么？
+
+| 组件 | 作用 | 属于 |
+|---|---|---|
+| DelegatingFilterProxy | Servlet 规范过滤器，委托给 Spring Bean | Servlet 容器 |
+| FilterChainProxy | Spring Security 的核心，调度 SecurityFilterChain | Spring Security |
+
+**流程**：`DelegatingFilterProxy` 根据 `filter-name` 找到 Spring Bean `springSecurityFilterChain`，然后委托给 `FilterChainProxy` 处理。
+
+### Q2：为什么过滤器链顺序很重要？
+
+过滤器链是**责任链模式**，每个过滤器处理完后必须决定是「继续」还是「中断」。顺序错了，认证可能在授权之前发生，或者根本没发生。
+
+典型的顺序错误案例：
+
+```java
+// 错误：JWT 过滤器放在 Session 过滤器之后
+.addFilterBefore(jwtFilter, SecurityContextPersistenceFilter.class)
+```
+
+这会导致：Session 过滤器先从 Session 恢复了旧的 Authentication，JWT 过滤器检测到已认证就直接跳过了，认证逻辑根本没执行。
+
+**正确顺序**：`SecurityContextPersistenceFilter` → 你的 JWT 过滤器 → `UsernamePasswordAuthenticationFilter`
+
+### Q3：如何查看当前应用的过滤器链？
+
+```java
+@Autowired
+private FilterChainProxy filterChainProxy;
+
+@GetMapping("/debug/filters")
+public void debugFilters() {
+    List<SecurityFilterChain> chains = filterChainProxy.getFilterChains();
+    for (SecurityFilterChain chain : chains) {
+        System.out.println("=== Chain ===");
+        chain.getFilters().forEach(f ->
+            System.out.println(f.getClass().getSimpleName()));
+    }
+}
+```
+
+---
+
+## 总结
+
+Spring Security 过滤器链的核心是 `FilterChainProxy`：
+
+1. **入口**：DelegatingFilterProxy 找到 FilterChainProxy
+2. **匹配**：根据请求路径匹配 SecurityFilterChain
+3. **执行**：按顺序执行该链的所有过滤器
+4. **守卫**：FilterSecurityInterceptor 做最终的权限校验
+
+理解了这个模型，你就理解了 Spring Security 一半的原理。下一节，我们看看 [WebSecurityConfigurerAdapter 的演进](/framework/springsecurity/core/config-adapter)，了解配置方式的历史变迁。

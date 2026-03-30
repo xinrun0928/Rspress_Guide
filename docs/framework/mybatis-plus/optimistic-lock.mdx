@@ -1,0 +1,470 @@
+import { Badge } from '@rspress/core/theme';
+
+# MyBatis Plus 乐观锁：并发更新的守护者
+
+<Badge text="MyBatis Plus" type="tip" /> <Badge text="核心功能" type="info" />
+
+版本号是怎么防止并发更新的？
+
+在高并发场景下，多个线程同时更新同一条数据，如果不加以控制，就会出现"更新丢失"的问题。
+
+乐观锁，就是解决这类问题的一种方案。
+
+## 为什么需要乐观锁？
+
+### 并发更新问题
+
+假设有这样一个场景：用户余额 100 元，两个请求同时发起：
+
+```
+请求 A：读取余额 100
+请求 B：读取余额 100
+请求 A：余额 + 50 = 150，更新
+请求 B：余额 + 30 = 130，更新  ← 覆盖了 A 的更新！
+```
+
+最终余额是 130 元，而不是正确的 180 元。这就是**更新丢失**问题。
+
+### 解决方案
+
+| 方案 | 说明 | 适用场景 |
+|------|------|---------|
+| 悲观锁 | 读取时加锁，其他人不能修改 | 冲突频繁 |
+| 乐观锁 | 更新时检查版本号，冲突则重试 | 冲突较少 |
+
+**悲观锁**：`SELECT ... FOR UPDATE`，适合冲突频繁的场景，但影响并发性能。
+
+**乐观锁**：通过版本号控制，适合冲突较少的场景，性能更好。
+
+## 乐观锁原理
+
+### 版本号机制
+
+```sql
+-- 初始数据
+SELECT * FROM account WHERE id = 1;
+-- id=1, balance=100, version=1
+
+-- 请求 A：读取
+SELECT balance, version FROM account WHERE id = 1;
+-- balance=100, version=1
+
+-- 请求 B：读取
+SELECT balance, version FROM account WHERE id = 1;
+-- balance=100, version=1
+
+-- 请求 A：更新（检查 version = 1）
+UPDATE account SET balance = 150, version = version + 1
+WHERE id = 1 AND version = 1;
+-- 影响行数：1（成功）
+
+-- 请求 B：更新（检查 version = 1，但 version 已经变成 2 了）
+UPDATE account SET balance = 130, version = version + 1
+WHERE id = 1 AND version = 1;
+-- 影响行数：0（失败！）
+```
+
+**关键点**：
+- WHERE 条件包含 `version = ?`
+- 只有 version 匹配时才更新
+- 更新成功时 version + 1
+
+### 失败的更新
+
+当请求 B 的更新返回 0 行时，说明：
+1. 数据已经被其他请求修改了
+2. 当前请求的更新条件不满足
+
+这时需要：
+1. 重新读取最新数据
+2. 再次尝试更新
+3. 或者提示用户"更新失败"
+
+## MyBatis Plus 实现
+
+### 第一步：实体类添加版本字段
+
+```java
+@TableName("account")
+public class Account {
+
+    @TableId(type = IdType.AUTO)
+    private Long id;
+
+    private BigDecimal balance;
+
+    @Version  // 乐观锁字段
+    private Integer version;
+}
+```
+
+### 第二步：配置乐观锁插件
+
+```java
+@Configuration
+public class MyBatisPlusConfig {
+
+    @Bean
+    public MybatisPlusInterceptor mybatisPlusInterceptor() {
+        MybatisPlusInterceptor interceptor = new MybatisPlusInterceptor();
+
+        // 添加乐观锁插件
+        interceptor.addInnerInterceptor(new OptimisticLockerInnerInterceptor());
+
+        return interceptor;
+    }
+}
+```
+
+### 第三步：使用
+
+```java
+// 查询
+Account account = accountMapper.selectById(1L);
+// account.version = 1
+
+// 更新
+account.setBalance(account.getBalance().add(new BigDecimal("50")));
+accountMapper.updateById(account);
+
+// 自动变成：
+// UPDATE account SET balance = 150, version = version + 1
+// WHERE id = 1 AND version = 1;
+```
+
+## @Version 注解详解
+
+### 基本配置
+
+```java
+@TableName("account")
+public class Account {
+
+    @TableId(type = IdType.AUTO)
+    private Long id;
+
+    private BigDecimal balance;
+
+    // 乐观锁版本号
+    @Version
+    private Integer version;
+}
+```
+
+### 支持的类型
+
+```java
+// Integer 类型
+@Version
+private Integer version;
+
+// Long 类型
+@Version
+private Long version;
+
+// Short 类型
+@Version
+private Short version;
+
+// Timestamp 类型
+@Version
+private LocalDateTime version;
+```
+
+### 自动更新
+
+```java
+// 插入时 version = 0 或 1（取决于数据库配置）
+Account account = new Account();
+account.setBalance(new BigDecimal("100"));
+accountMapper.insert(account);
+// INSERT INTO account (balance, version) VALUES (100, 1)
+
+// 更新时 version 自动 + 1
+account.setBalance(new BigDecimal("150"));
+accountMapper.updateById(account);
+// UPDATE account SET balance = 150, version = version + 1 WHERE id = ? AND version = 1
+```
+
+## OptimisticLockerInnerInterceptor
+
+### 工作原理
+
+```java
+// 伪代码展示乐观锁插件的内部逻辑
+public class OptimisticLockerInnerInterceptor implements InnerInterceptor {
+
+    @Override
+    public void beforeUpdate(Executor executor, MappedStatement ms,
+                             Object parameter, BoundSql boundSql) {
+        // 1. 获取实体对象的 version 字段值
+        Object versionValue = getVersionValue(parameter);
+
+        // 2. 生成 WHERE 条件：version = ?
+        BoundSql newBoundSql = addVersionCondition(boundSql, versionValue);
+
+        // 3. 更新 SET 子句：version = version + 1
+        BoundSql updatedBoundSql = incrementVersion(newBoundSql);
+
+        // 4. 继续执行更新
+    }
+}
+```
+
+### 插件配置
+
+```java
+@Configuration
+public class MyBatisPlusConfig {
+
+    @Bean
+    public MybatisPlusInterceptor mybatisPlusInterceptor() {
+        MybatisPlusInterceptor interceptor = new MybatisPlusInterceptor();
+
+        // 乐观锁插件
+        interceptor.addInnerInterceptor(new OptimisticLockerInnerInterceptor());
+
+        return interceptor;
+    }
+}
+```
+
+## 乐观锁失败处理
+
+### 检测更新失败
+
+```java
+public boolean updateAccount(Long id, BigDecimal amount) {
+    // 1. 查询当前数据
+    Account account = accountMapper.selectById(id);
+    if (account == null) {
+        return false;
+    }
+
+    // 2. 更新
+    account.setBalance(account.getBalance().add(amount));
+    int rows = accountMapper.updateById(account);
+
+    // 3. 检查更新是否成功
+    if (rows == 0) {
+        // 更新失败，版本号不匹配
+        throw new OptimisticLockException("数据已被其他用户修改，请重试");
+    }
+
+    return true;
+}
+```
+
+### 重试机制
+
+```java
+public boolean updateAccountWithRetry(Long id, BigDecimal amount, int maxRetries) {
+    for (int i = 0; i < maxRetries; i++) {
+        try {
+            // 1. 查询当前数据
+            Account account = accountMapper.selectById(id);
+            if (account == null) {
+                return false;
+            }
+
+            // 2. 更新
+            account.setBalance(account.getBalance().add(amount));
+            int rows = accountMapper.updateById(account);
+
+            // 3. 检查更新是否成功
+            if (rows > 0) {
+                return true;
+            }
+
+            // 4. 失败后短暂等待
+            Thread.sleep(100);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+    }
+
+    return false;
+}
+```
+
+### Service 层处理
+
+```java
+@Service
+public class AccountServiceImpl extends ServiceImpl<AccountMapper, Account>
+    implements AccountService {
+
+    @Override
+    public boolean updateBalance(Long id, BigDecimal amount) {
+        for (int i = 0; i < 3; i++) {
+            Account account = baseMapper.selectById(id);
+            if (account == null) {
+                throw new RuntimeException("账户不存在");
+            }
+
+            account.setBalance(account.getBalance().add(amount));
+            int rows = baseMapper.updateById(account);
+
+            if (rows > 0) {
+                return true;
+            }
+
+            log.warn("乐观锁冲突，第 {} 次重试", i + 1);
+        }
+
+        throw new RuntimeException("更新失败，请稍后重试");
+    }
+}
+```
+
+## 乐观锁 vs 悲观锁
+
+### 对比
+
+| 特性 | 乐观锁 | 悲观锁 |
+|------|--------|--------|
+| 实现方式 | 版本号 | 数据库锁 |
+| 并发性能 | 好 | 较差 |
+| 适用场景 | 冲突较少 | 冲突频繁 |
+| 实现复杂度 | 低 | 中 |
+| 更新失败 | 需要重试 | 自动等待 |
+
+### 选择建议
+
+```java
+// 冲突较少 → 乐观锁
+// 示例：用户信息更新、配置修改
+@Version
+private Integer version;
+
+// 冲突频繁 → 悲观锁
+// 示例：库存扣减、余额操作
+SELECT * FROM stock WHERE id = ? FOR UPDATE;
+```
+
+## 分布式场景
+
+### 单机乐观锁的局限
+
+在单机环境下，乐观锁可以正常工作。但在分布式环境下：
+
+```
+服务器 A：读取 version = 1
+服务器 B：读取 version = 1
+服务器 A：更新成功，version = 2
+服务器 B：更新失败（version 不匹配）
+
+← 正常工作
+```
+
+```
+服务器 A：读取 version = 1
+服务器 B：读取 version = 1
+服务器 B：更新成功，version = 2
+服务器 A：更新失败（version 不匹配）
+
+← 需要重试
+```
+
+### Redis + 乐观锁
+
+在分布式环境下，可以使用 Redis 实现分布式锁配合乐观锁：
+
+```java
+@Service
+public class DistributedAccountService {
+
+    @Autowired
+    private AccountMapper accountMapper;
+
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+
+    public boolean updateBalance(Long id, BigDecimal amount) {
+        String lockKey = "account:lock:" + id;
+
+        // 1. 获取分布式锁
+        Boolean acquired = redisTemplate.opsForValue()
+            .setIfAbsent(lockKey, "1", Duration.ofSeconds(10));
+
+        if (!acquired) {
+            throw new RuntimeException("系统繁忙，请稍后重试");
+        }
+
+        try {
+            // 2. 执行乐观锁更新
+            Account account = accountMapper.selectById(id);
+            account.setBalance(account.getBalance().add(amount));
+            return accountMapper.updateById(account) > 0;
+        } finally {
+            // 3. 释放锁
+            redisTemplate.delete(lockKey);
+        }
+    }
+}
+```
+
+## 常见问题
+
+### Q1：更新失败后数据会回滚吗？
+
+**不会**。更新失败只是返回 0 行，不会回滚事务。如果需要重试，需要手动处理。
+
+### Q2：可以用时间戳代替版本号吗？
+
+**可以**，但有风险：
+
+```java
+// 使用时间戳
+@Version
+private LocalDateTime updateTime;
+```
+
+**问题**：如果服务器时钟回拨，可能导致版本号回退。
+
+### Q3：可以更新 version 字段吗？
+
+**可以**，但通常不需要。`@Version` 注解会自动处理版本号。
+
+### Q4：批量更新支持乐观锁吗？
+
+```java
+// 批量更新（每个对象单独处理）
+List<Account> accounts = accountMapper.selectList(wrapper);
+for (Account account : accounts) {
+    account.setBalance(account.getBalance().add(amount));
+}
+accountMapper.updateBatchById(accounts);  // 每个对象单独更新
+```
+
+## 总结
+
+### 配置步骤
+
+1. **添加 version 字段**：数据库表增加 `version` 列
+2. **实体类添加 `@Version` 注解**
+3. **配置乐观锁插件**：`OptimisticLockerInnerInterceptor`
+
+### 工作原理
+
+```
+UPDATE account SET balance = 150, version = version + 1
+WHERE id = 1 AND version = 1
+        ↑ 执行前 version = 1
+              ↓ 执行后 version = 2
+                  ↓ version 不匹配
+                  ↓ 返回 0 行
+                  ↓ 抛出异常或重试
+```
+
+### 注意事项
+
+| 注意事项 | 说明 |
+|---------|------|
+| version 字段必须有默认值 | 数据库需要设置默认值为 0 或 1 |
+| version 字段不能为 null | 首次插入时自动填充 |
+| 更新失败需要重试 | 业务层需要处理重试逻辑 |
+| 冲突频繁时不适用 | 乐观锁适合低冲突场景 |
+
+乐观锁是解决并发更新问题的一种有效方案，合理使用可以保护数据的一致性，同时保持良好的并发性能。

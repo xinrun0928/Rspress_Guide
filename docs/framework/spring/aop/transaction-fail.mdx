@@ -1,0 +1,546 @@
+import { Badge } from '@rspress/core/theme';
+
+# Spring 事务失效场景：@Transactional 为什么没有生效
+
+`@Transactional` 用了，但没生效——这是很多人踩过的坑。
+
+你明明在方法上加了 `@Transactional`，方法也执行完了，但数据没有提交，数据库里的数据还是原来的样子。你排查了半天，发现代码没问题，注解也加对了，但事务就是没生效。
+
+为什么会这样？
+
+今天，我们来详细分析 `@Transactional` 失效的各种场景，以及如何避免这些问题。
+
+## 场景一：自调用问题（最常见）
+
+### 问题描述
+
+在同一个类中，方法 A 调用方法 B，方法 B 有 `@Transactional`，但事务不生效：
+
+```java
+@Service
+public class UserService {
+
+    public void createUser(User user) {
+        // 这里调用的是 this，即目标对象，而不是代理对象
+        // 所以不会经过 TransactionInterceptor
+        this.saveUser(user);
+    }
+
+    @Transactional
+    public void saveUser(User user) {
+        userDao.insert(user);
+        throw new RuntimeException("模拟异常");
+    }
+}
+```
+
+### 原因分析
+
+`@Transactional` 是通过 `TransactionInterceptor` 拦截器实现的。这个拦截器是通过 Spring AOP 代理触发的。
+
+当你在同一个类中调用 `this.saveUser()` 时：
+- `this` 指向的是**目标对象**（Target）
+- 而不是**代理对象**（Proxy）
+- 所以调用不会经过代理，事务不会生效
+
+### 解决方案
+
+**方案一：注入自身代理**
+
+```java
+@Service
+public class UserService {
+
+    @Autowired
+    private UserService self;  // 注入自身代理
+
+    public void createUser(User user) {
+        self.saveUser(user);  // 调用代理对象
+    }
+
+    @Transactional
+    public void saveUser(User user) {
+        userDao.insert(user);
+    }
+}
+```
+
+**方案二：使用 ApplicationContext**
+
+```java
+@Service
+public class UserService implements ApplicationContextAware {
+
+    private ApplicationContext context;
+
+    @Override
+    public void setApplicationContext(ApplicationContext context) {
+        this.context = context;
+    }
+
+    public void createUser(User user) {
+        context.getBean(UserService.class).saveUser(user);
+    }
+}
+```
+
+**方案三：使用 AopContext.currentProxy()**
+
+```java
+@Service
+@EnableAspectJAutoProxy(exposeProxy = true)
+public class UserService {
+
+    public void createUser(User user) {
+        ((UserService) AopContext.currentProxy()).saveUser(user);
+    }
+
+    @Transactional
+    public void saveUser(User user) {
+        userDao.insert(user);
+    }
+}
+```
+
+**方案四：重构代码，将事务方法移到另一个类**
+
+```java
+@Service
+public class UserService {
+
+    @Autowired
+    private UserTransactionalService transactionalService;
+
+    public void createUser(User user) {
+        transactionalService.saveUser(user);
+    }
+}
+
+@Service
+public class UserTransactionalService {
+
+    @Transactional
+    public void saveUser(User user) {
+        userDao.insert(user);
+    }
+}
+```
+
+## 场景二：异常被 catch 吞掉
+
+### 问题描述
+
+异常被 catch 后，事务不会回滚：
+
+```java
+@Service
+public class UserService {
+
+    @Transactional
+    public void createUser(User user) {
+        try {
+            userDao.insert(user);
+            throw new RuntimeException("模拟异常");
+        } catch (Exception e) {
+            // 异常被吞掉了
+            // 事务管理器认为方法正常执行完毕
+            // 不会回滚！
+        }
+    }
+}
+```
+
+### 原因分析
+
+Spring 事务的回滚机制是通过捕获 `Throwable` 来判断的。如果你 catch 了异常并没有重新抛出，Spring 不知道发生了异常。
+
+### 解决方案
+
+**方案一：重新抛出异常**
+
+```java
+@Transactional
+public void createUser(User user) {
+    try {
+        userDao.insert(user);
+        throw new RuntimeException("模拟异常");
+    } catch (Exception e) {
+        throw e;  // 重新抛出
+    }
+}
+```
+
+**方案二：手动回滚**
+
+```java
+@Transactional(rollbackFor = Exception.class)
+public void createUser(User user) {
+    try {
+        userDao.insert(user);
+        throw new RuntimeException("模拟异常");
+    } catch (Exception e) {
+        TransactionAspectSupport.currentTransactionStatus().setRollbackOnly();
+    }
+}
+```
+
+## 场景三：异常类型不匹配
+
+### 问题描述
+
+默认情况下，Spring 只对 `RuntimeException` 和 `Error` 回滚：
+
+```java
+@Service
+public class UserService {
+
+    @Transactional  // 默认不回滚受检异常
+    public void createUser(User user) throws Exception {
+        userDao.insert(user);
+        throw new Exception("模拟异常");  // 不会回滚！
+    }
+}
+```
+
+### 原因分析
+
+Spring 事务默认的回滚规则是：
+
+```java
+public boolean rollbackOn(Throwable ex) {
+    return (ex instanceof RuntimeException || ex instanceof Error);
+}
+```
+
+受检异常（`Exception`）不会触发回滚。
+
+### 解决方案
+
+**方案一：配置 rollbackFor**
+
+```java
+@Transactional(rollbackFor = Exception.class)
+public void createUser(User user) throws Exception {
+    userDao.insert(user);
+    throw new Exception("模拟异常");  // 会回滚
+}
+```
+
+**方案二：使用具体异常类型**
+
+```java
+@Transactional(rollbackFor = {BusinessException.class, SystemException.class})
+public void createUser(User user) throws BusinessException {
+    userDao.insert(user);
+}
+```
+
+## 场景四：非 public 方法
+
+### 问题描述
+
+`@Transactional` 只能作用于 `public` 方法：
+
+```java
+@Service
+public class UserService {
+
+    @Transactional  // 不生效！
+    private void saveUser(User user) {
+        userDao.insert(user);
+    }
+
+    public void createUser(User user) {
+        saveUser(user);  // 直接调用私有方法
+    }
+}
+```
+
+### 原因分析
+
+Spring AOP 默认使用 JDK 动态代理，而 JDK 动态代理只能代理 `public` 方法。虽然 CGLIB 可以代理 `protected` 和 `package-private` 方法，但 Spring AOP 的事务增强通常只对 public 方法生效。
+
+### 解决方案
+
+将方法改为 `public`：
+
+```java
+@Service
+public class UserService {
+
+    @Transactional  // 生效
+    public void saveUser(User user) {
+        userDao.insert(user);
+    }
+}
+```
+
+## 场景五：Bean 没有被 Spring 管理
+
+### 问题描述
+
+手动 `new` 出来的对象不会被代理：
+
+```java
+@Service
+public class OrderService {
+
+    public void createOrder(Order order) {
+        // 手动 new 的对象不会被 Spring 管理
+        // 所以 @Transactional 不生效
+        PaymentService paymentService = new PaymentService();
+        paymentService.processPayment(order);
+    }
+}
+
+public class PaymentService {
+
+    @Transactional  // 不生效！
+    public void processPayment(Order order) {
+        paymentDao.process(order);
+    }
+}
+```
+
+### 解决方案
+
+确保 Bean 被 Spring 管理：
+
+```java
+@Service
+public class OrderService {
+
+    @Autowired
+    private PaymentService paymentService;
+
+    public void createOrder(Order order) {
+        paymentService.processPayment(order);  // 走代理
+    }
+}
+
+@Service
+public class PaymentService {
+
+    @Transactional  // 生效
+    public void processPayment(Order order) {
+        paymentDao.process(order);
+    }
+}
+```
+
+## 场景六：多数据源问题
+
+### 问题描述
+
+涉及多个数据源时，单数据源事务无法保证跨库一致性：
+
+```java
+@Service
+public class TransferService {
+
+    @Transactional  // 只管理默认数据源的事务
+    public void transfer(Long fromId, Long toId, BigDecimal amount) {
+        // 使用默认数据源
+        accountDao.deduct(fromId, amount);
+
+        // 使用另一个数据源（不会被事务管理！）
+        anotherDataSourceAccountDao.credit(toId, amount);
+    }
+}
+```
+
+### 解决方案
+
+**方案一：使用 JTA 分布式事务**
+
+```xml
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-jta-atomikos</artifactId>
+</dependency>
+```
+
+```java
+@Configuration
+@EnableJta
+public class JtaConfig {
+}
+```
+
+**方案二：使用编程式事务，手动管理多个数据源**
+
+**方案三：使用 Seata AT 模式**
+
+## 场景七：事务方法内部获取连接
+
+### 问题描述
+
+在事务方法中手动获取数据库连接，可能导致连接泄露：
+
+```java
+@Service
+public class UserService {
+
+    @Transactional
+    public void createUser(User user) {
+        // 手动获取连接
+        Connection conn = dataSource.getConnection();
+        // ... 使用连接
+        // 如果忘记关闭，连接会泄露
+    }
+}
+```
+
+### 解决方案
+
+使用 `JdbcTemplate` 或 `TransactionAwareDataSourceProxy`：
+
+```java
+@Service
+public class UserService {
+
+    @Autowired
+    private JdbcTemplate jdbcTemplate;
+
+    @Transactional
+    public void createUser(User user) {
+        jdbcTemplate.update("INSERT INTO user ...", user.getName());
+    }
+}
+```
+
+## 场景八：timeout 设置过短
+
+### 问题描述
+
+事务超时时间设置过短，导致方法还没执行完就超时回滚：
+
+```java
+@Service
+public class UserService {
+
+    @Transactional(timeout = 1)  // 1 秒超时
+    public void batchImport(List<User> users) {
+        for (User user : users) {
+            userDao.insert(user);
+            Thread.sleep(100);  // 假设每次插入需要 100ms
+        }
+    }
+}
+```
+
+### 解决方案
+
+**方案一：调大 timeout**
+
+```java
+@Transactional(timeout = 300)  // 5 分钟
+```
+
+**方案二：使用异步处理**
+
+```java
+@Transactional(timeout = 60)
+public void startImport(List<User> users) {
+    // 保存任务到数据库
+    importTaskDao.save(new ImportTask(users));
+
+    // 异步执行
+    asyncService.executeImport(users);
+}
+```
+
+## 场景九：@Transactional 注解属性配置错误
+
+### 问题描述
+
+常见配置错误：
+
+```java
+@Service
+public class UserService {
+
+    @Transactional(propagation = Propagation.NOT_SUPPORTED)  // 不支持事务！
+    public void createUser(User user) {
+        userDao.insert(user);
+    }
+}
+```
+
+### 解决方案
+
+检查 `@Transactional` 属性配置：
+
+```java
+// 常见配置
+@Transactional(
+    propagation = Propagation.REQUIRED,  // 默认，通常不需要显式设置
+    isolation = Isolation.DEFAULT,        // 使用数据库默认隔离级别
+    timeout = -1,                       // 不超时
+    readOnly = false,                   // 默认不是只读
+    rollbackFor = Exception.class       // 根据需要配置
+)
+```
+
+## 事务失效场景总结表
+
+| 场景 | 原因 | 解决方案 |
+|---|---|---|
+| 自调用 | 绕过了代理 | 注入自身、使用 `AopContext.currentProxy()` |
+| 异常被 catch | Spring 不知道发生了异常 | 重新抛出或手动回滚 |
+| 受检异常 | 默认不回滚受检异常 | 配置 `rollbackFor` |
+| 非 public 方法 | Spring AOP 限制 | 改为 public 方法 |
+| Bean 未被 Spring 管理 | 手动 new 对象 | 使用依赖注入 |
+| 多数据源 | 单数据源事务无法跨库 | 使用 JTA 或 Seata |
+| timeout 过短 | 方法执行时间超过超时时间 | 调大 timeout 或异步处理 |
+| 传播行为错误 | `NOT_SUPPORTED` 等不支持事务 | 检查 `propagation` 配置 |
+
+## 正确的使用方式总结
+
+```java
+@Service
+@RequiredArgsConstructor
+public class UserService {
+
+    private final UserDao userDao;
+    private final UserService self;  // 解决自调用
+
+    // 1. 确保是 public 方法
+    // 2. 确保是 Spring 管理的 Bean
+    // 3. 配置正确的 rollbackFor
+    @Transactional(rollbackFor = Exception.class)
+    public void createUser(User user) {
+        userDao.insert(user);
+
+        // 4. 不要 catch 异常后不抛出
+        // try {
+        //     doSomething();
+        // } catch (Exception e) {
+        //     throw e;  // 或者手动回滚
+        // }
+
+        // 5. 如果需要调用同类方法，使用代理
+        self.relatedOperation(user);
+    }
+
+    @Transactional(rollbackFor = Exception.class)
+    public void relatedOperation(User user) {
+        // ...
+    }
+}
+```
+
+## 面试追问方向
+
+- `@Transactional` 失效最常见的原因是什么？如何解决？
+- 为什么自调用会绕过 Spring AOP 代理？
+- Spring 默认只对哪些异常回滚？如何配置？
+- 多数据源场景下如何保证事务一致性？
+- `AopContext.currentProxy()` 和注入自身代理，哪种方式更好？
+- 如何在代码层面检测 `@Transactional` 是否生效？
+
+---
+
+到这里，Spring AOP 和事务管理就全部讲完了。从 AOP 核心概念到代理实现，从源码分析到实战应用，从事务原理到失效场景——希望这些内容能帮助你真正理解 Spring 的切面编程。
+
+如果有任何问题，欢迎在评论区交流。

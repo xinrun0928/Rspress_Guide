@@ -1,0 +1,452 @@
+import { Badge } from '@rspress/core/theme';
+
+# StatementHandler：SQL 预编译的心脏
+
+<Badge text="MyBatis" type="tip" /> <Badge text="核心原理" type="info" />
+
+PreparedStatement 预编译的好处，不只是防 SQL 注入。
+
+很多同学知道使用 `PreparedStatement` 可以防止 SQL 注入，但如果你以为它的作用仅此而已，那就太低估它了。预编译还能带来**性能提升**、**参数绑定**、**类型安全**等好处。
+
+MyBatis 的 `StatementHandler` 正是基于 `PreparedStatement` 构建的。理解它，就理解了 MyBatis 与 JDBC 交互的核心。
+
+## 为什么需要 StatementHandler？
+
+直接使用 JDBC 时，我们需要这样写：
+
+```java
+Connection conn = dataSource.getConnection();
+PreparedStatement ps = conn.prepareStatement("SELECT * FROM user WHERE id = ?");
+ps.setLong(1, 1L);
+ResultSet rs = ps.executeQuery();
+while (rs.next()) {
+    User user = new User();
+    user.setId(rs.getLong("id"));
+    user.setName(rs.getString("name"));
+    // ...
+}
+rs.close();
+ps.close();
+conn.close();
+```
+
+这段代码有几个问题：
+
+1. **SQL 和参数分离**：参数设置和 SQL 绑定分散在多处
+2. **ResultSet 处理复杂**：每次都要手动映射字段到对象
+3. **资源管理繁琐**：多个资源需要手动关闭，容易遗漏
+
+`StatementHandler` 封装了这一切。它将 SQL 执行拆分成几个清晰的步骤，每个步骤由不同的组件负责。
+
+## StatementHandler 接口体系
+
+MyBatis 的 `StatementHandler` 体系采用了**适配器模式**：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    StatementHandler (接口)                    │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │              BaseStatementHandler (抽象类)           │   │
+│  │  ┌────────────────┐ ┌────────────────┐ ┌───────────┐│   │
+│  │  │  SimpleStatement │ │ PreparedStatement│ │ Callable ││   │
+│  │  │    Handler     │ │    Handler     │ │ Statement ││   │
+│  │  │                │ │                │ │  Handler  ││   │
+│  │  └────────────────┘ └────────────────┘ └───────────┘│   │
+│  └──────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────┘
+                           ↑
+                    RoutingStatementHandler
+                    (根据配置选择具体实现)
+```
+
+### 核心接口定义
+
+```java
+public interface StatementHandler {
+
+    // 准备 Statement（创建、设置超时等）
+    Statement prepare(Connection connection, Integer transactionTimeout)
+        throws SQLException;
+
+    // 执行查询
+    <E> List<E> query(Statement statement, ResultHandler resultHandler)
+        throws SQLException;
+
+    // 执行游标查询
+    <E> Cursor<E> queryCursor(Statement statement)
+        throws SQLException;
+
+    // 执行增删改
+    int update(Statement statement)
+        throws SQLException;
+
+    // 执行批量
+    int batch(Statement statement)
+        throws SQLException;
+
+    // 获取 BoundSql
+    BoundSql getBoundSql();
+
+    // 获取 ParameterHandler
+    ParameterHandler getParameterHandler();
+}
+```
+
+## RoutingStatementHandler：智能路由
+
+`RoutingStatementHandler` 是整个体系的入口，它根据配置决定使用哪种具体的 Handler：
+
+```java
+public class RoutingStatementHandler implements StatementHandler {
+
+    private final StatementHandler delegate;
+
+    public RoutingStatementHandler(StatementHandlerRegistry registry,
+                                     MappedStatement ms,
+                                     Object parameter,
+                                     RowBounds rowBounds,
+                                     ResultHandler resultHandler,
+                                     BoundSql boundSql) {
+        // 根据 MappedStatement 中的 statementType 选择具体的 Handler
+        switch (ms.getStatementType()) {
+            case STATEMENT:
+                delegate = registry.getHandler(StatementHandler.class);
+                break;
+            case PREPARED:
+                delegate = registry.getHandler(PreparedStatementHandler.class);
+                break;
+            case CALLABLE:
+                delegate = registry.getHandler(CallableStatementHandler.class);
+                break;
+            default:
+                throw new ExecutorException("Unknown statement type: " + ms.getStatementType());
+        }
+    }
+
+    @Override
+    public Statement prepare(Connection connection, Integer transactionTimeout) {
+        return delegate.prepare(connection, transactionTimeout);
+    }
+
+    @Override
+    public <E> List<E> query(Statement statement, ResultHandler resultHandler) {
+        return delegate.query(statement, resultHandler);
+    }
+
+    // ... 其他方法委托给 delegate
+}
+```
+
+**为什么这样设计？**
+
+适配器模式的好处是：**对调用方透明**。无论选择哪种 Handler，调用方都只需面向 `StatementHandler` 接口编程。
+
+## BaseStatementHandler：公共逻辑
+
+`BaseStatementHandler` 定义了所有 Handler 的公共流程：
+
+```java
+public abstract class BaseStatementHandler implements StatementHandler {
+
+    protected final Configuration configuration;
+    protected final ObjectFactory objectFactory;
+    protected final TypeHandlerRegistry typeHandlerRegistry;
+
+    protected final MappedStatement mappedStatement;
+    protected final RowBounds rowBounds;
+    protected final ParameterHandler parameterHandler;
+    protected final ResultSetHandler resultSetHandler;
+
+    protected final BoundSql boundSql;
+
+    @Override
+    public Statement prepare(Connection connection, Integer transactionTimeout) {
+        Statement statement = null;
+        try {
+            // 1. 实例化具体的 Statement
+            statement = instantiateStatement(connection);
+
+            // 2. 设置超时
+            statement.setQueryTimeout(transactionTimeout);
+
+            // 3. 设置批量大小
+            if (mappedStatement.getFetchSize() != null) {
+                statement.setFetchSize(mappedStatement.getFetchSize());
+            }
+
+            return statement;
+        } catch (Exception e) {
+            closeStatement(statement);
+            throw new ExecutorException("...");
+        }
+    }
+
+    // 子类实现：创建什么类型的 Statement
+    protected abstract Statement instantiateStatement(Connection connection) throws SQLException;
+}
+```
+
+## PreparedStatementHandler：最常用的实现
+
+`PreparedStatementHandler` 是最常用的实现类，它与 JDBC 的 `PreparedStatement` 对应：
+
+```java
+public class PreparedStatementHandler extends BaseStatementHandler {
+
+    @Override
+    protected Statement instantiateStatement(Connection connection) throws SQLException {
+        String sql = boundSql.getSql();
+        return connection.prepareStatement(sql);
+    }
+
+    @Override
+    public <E> List<E> query(Statement statement, ResultHandler resultHandler) throws SQLException {
+        PreparedStatement ps = (PreparedStatement) statement;
+
+        // 1. 执行查询
+        ps.execute();
+
+        // 2. 处理结果集
+        return resultSetHandler.<E>handleResultSets(ps);
+    }
+
+    @Override
+    public int update(Statement statement) throws SQLException {
+        PreparedStatement ps = (PreparedStatement) statement;
+
+        // 执行更新并返回影响行数
+        ps.executeUpdate();
+
+        return ps.getUpdateCount();
+    }
+}
+```
+
+**执行流程图：**
+
+```
+RoutingStatementHandler.prepare()
+        ↓
+PreparedStatementHandler.instantiateStatement()
+        ↓
+connection.prepareStatement(sql)  ← 预编译 SQL
+        ↓
+parameterHandler.setParameters()  ← 绑定参数
+        ↓
+ps.execute()  ← 执行 SQL
+        ↓
+resultSetHandler.handleResultSets()  ← 处理结果集
+```
+
+## ParameterHandler：参数绑定的核心
+
+参数绑定是预编译最关键的一步。`ParameterHandler` 负责将 Java 对象的属性值绑定到 `PreparedStatement` 的占位符上：
+
+```java
+public interface ParameterHandler {
+
+    // 获取参数对象
+    Object getParameterObject();
+
+    // 设置参数到 PreparedStatement
+    void setParameters(PreparedStatement ps) throws SQLException;
+}
+```
+
+`DefaultParameterHandler` 是其默认实现：
+
+```java
+public class DefaultParameterHandler implements ParameterHandler {
+
+    private final TypeHandlerRegistry typeHandlerRegistry;
+    private final MappedStatement mappedStatement;
+    private final Object parameterObject;
+    private final BoundSql boundSql;
+
+    @Override
+    public void setParameters(PreparedStatement ps) {
+        // 获取参数映射列表
+        List<ParameterMapping> parameterMappings = boundSql.getParameterMappings();
+
+        if (parameterMappings == null || parameterMappings.isEmpty()) {
+            return;
+        }
+
+        for (int i = 0; i < parameterMappings.size(); i++) {
+            ParameterMapping parameterMapping = parameterMappings.get(i);
+
+            // 跳过 OUT 参数
+            if (parameterMapping.getMode() == ParameterMode.OUT) {
+                continue;
+            }
+
+            // 获取属性值
+            Object value = getParameterValue(parameterMapping);
+
+            // 获取类型处理器
+            TypeHandler typeHandler = parameterMapping.getTypeHandler();
+
+            // 获取 JDBC 类型
+            JdbcType jdbcType = parameterMapping.getJdbcType();
+
+            // 设置空值处理
+            if (value == null && jdbcType == null) {
+                jdbcType = configuration.getJdbcTypeForNull();
+            }
+
+            // 核心：调用 TypeHandler 设置参数
+            try {
+                typeHandler.setParameter(ps, i + 1, value, jdbcType);
+            } catch (SQLException e) {
+                throw new ExecutorException("...");
+            }
+        }
+    }
+
+    private Object getParameterValue(ParameterMapping parameterMapping) {
+        // 获取属性路径，如 user.name
+        String propertyName = parameterMapping.getProperty();
+
+        // 使用 MetaObject 获取嵌套属性值
+        MetaObject metaObject = parameterObjectWrapper.getMetaObject(propertyName);
+
+        return metaObject == null ? null : metaObject.getOriginalObject();
+    }
+}
+```
+
+**参数绑定的关键流程：**
+
+```
+BoundSql.getParameterMappings()
+        ↓
+遍历每个 ParameterMapping
+        ↓
+获取属性值（支持嵌套属性 user.address.city）
+        ↓
+获取对应的 TypeHandler
+        ↓
+TypeHandler.setParameter(ps, position, value, jdbcType)
+```
+
+## 预编译的优势
+
+### 1. SQL 注入防护
+
+预编译语句中，`?` 占位符的值会被当作**字面量**，而不是 SQL 语法的一部分：
+
+```java
+// 恶意输入：id = "1 OR 1=1"
+String sql = "SELECT * FROM user WHERE id = ?";
+PreparedStatement ps = connection.prepareStatement(sql);
+ps.setString(1, "1 OR 1=1");
+
+// 最终执行的 SQL：
+// SELECT * FROM user WHERE id = '1 OR 1=1'  ← 这是字符串，不是 SQL！
+```
+
+### 2. 性能提升
+
+数据库会对预编译语句进行**编译缓存**：
+
+- 第一次执行：编译 SQL → 执行
+- 后续执行：直接执行（跳过编译步骤）
+
+```java
+// 假设执行 1000 次查询
+// 非预编译：1000 次编译 + 1000 次执行
+// 预编译：1 次编译 + 1000 次执行
+```
+
+### 3. 类型安全
+
+`PreparedStatement` 提供了类型安全的参数设置方法：
+
+```java
+ps.setString(1, "name");      // 必须是 String
+ps.setInt(2, 18);             // 必须是 int
+ps.setLong(3, 1000L);         // 必须是 long
+ps.setDate(4, new Date());    // 必须是 Date
+```
+
+## Statement 类型对比
+
+| 类型 | 用途 | SQL 注入风险 | 性能 |
+|------|------|-------------|------|
+| `STATEMENT` | 直接拼接 SQL | 高 | 每次都编译 |
+| `PREPARED` | 预编译 SQL（默认） | 低 | 编译一次，多次执行 |
+| `CALLABLE` | 调用存储过程 | 低 | 取决于存储过程 |
+
+### STATEMENT 的危险
+
+```xml
+<!-- 不推荐：使用 STATEMENT + ${} -->
+<select id="selectByName" resultType="User" statementType="STATEMENT">
+    SELECT * FROM user WHERE name = '${name}'
+</select>
+```
+
+如果 `name = "'; DROP TABLE user; --"`，最终 SQL 会变成：
+
+```sql
+SELECT * FROM user WHERE name = ''; DROP TABLE user; --'
+```
+
+这就是经典的 SQL 注入攻击。
+
+### PREPARED 的安全
+
+```xml
+<!-- 推荐：使用 PREPARED + #{} -->
+<select id="selectByName" resultType="User">
+    SELECT * FROM user WHERE name = #{name}
+</select>
+```
+
+无论输入什么，都会被当作字符串字面量处理。
+
+## 延伸思考
+
+### 预编译的局限性
+
+预编译虽好，但也不是万能的：
+
+1. **表名不能使用占位符**：SQL 标准不允许表名为 `?`
+2. **列名不能使用占位符**：同样不支持
+3. **ORDER BY 和 GROUP BY 字段**：动态排序字段需要 ` ${}` 或其他方案
+
+### 动态表名/列名的解决方案
+
+```java
+// 方式一：白名单校验
+public String getTableName(String tableName) {
+    Set<String> allowedTables = Set.of("user", "order", "product");
+    if (!allowedTables.contains(tableName)) {
+        throw new IllegalArgumentException("Invalid table name");
+    }
+    return tableName;
+}
+
+// 方式二：使用 @Select 注解 + OGNL 表达式
+@Select("SELECT * FROM ${tableName} WHERE id = #{id}")
+User selectByTableName(@Param("tableName") String tableName, @Param("id") Long id);
+```
+
+### 你可能想问的问题
+
+**Q1：预编译一定能防止 SQL 注入吗？**
+
+大多数情况下是的，但有以下例外：
+- 使用 `${}` 而不是 `#{}`
+- 在不允许使用占位符的地方（如 ORDER BY）
+- 存储过程中的动态 SQL
+
+**Q2：预编译会影响性能吗？**
+
+在单次执行时，预编译会有轻微开销。但当同一 SQL 执行多次时，预编译会**节省**编译时间，总体性能更好。
+
+**Q3：MyBatis 默认使用哪种 Statement 类型？**
+
+默认是 `PREPARED`。通常不需要也不建议改成 `STATEMENT`。
+
+理解 `StatementHandler` 的设计，你就已经掌握了 MyBatis 执行 SQL 的核心。下一步，可以深入了解 `ParameterHandler` 如何处理复杂参数，以及 `ResultSetHandler` 如何完成对象映射。

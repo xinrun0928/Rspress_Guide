@@ -1,0 +1,463 @@
+import { Badge } from '@rspress/core/theme';
+
+# 自定义 Realm：继承 AuthorizingRealm 实现完整认证授权
+
+JdbcRealm 的 SQL 写死了，IniRealm 的数据在内存里——在真实的业务系统中，你需要一个真正可控的 Realm。
+
+自定义 Realm 是 Shiro 生产环境的标配。它让你完全掌控认证逻辑（`doGetAuthenticationInfo`）和授权逻辑（`doGetAuthorizationInfo`），对接任何数据源（MySQL、Redis、MongoDB），实现任何加密算法（MD5、SHA-256、BCrypt）。
+
+## AuthorizingRealm：自定义 Realm 的基类
+
+Shiro 提供了两种 Realm 基类：
+
+| 基类 | 适用场景 |
+|---|---|
+| `AuthenticatingRealm` | 只做认证，不做授权 |
+| `AuthorizingRealm` | 既做认证，又做授权（最常用） |
+
+`AuthorizingRealm` 继承自 `AuthenticatingRealm`，在认证基础上增加了授权功能：
+
+```
+Realm (接口)
+└── AuthenticatingRealm (只认证)
+    └── AuthorizingRealm (认证 + 授权) ← 自定义 Realm 继承这个
+        ├── JdbcRealm
+        ├── IniRealm
+        └── 自定义 Realm（我们写的）
+```
+
+## 两个核心方法
+
+自定义 Realm 只需要实现两个方法：
+
+```java
+public class UserRealm extends AuthorizingRealm {
+
+    // 认证：验证用户名密码
+    @Override
+    protected AuthenticationInfo doGetAuthenticationInfo(
+            AuthenticationToken token) throws AuthenticationException {
+        // 1. 获取用户名
+        String username = (String) token.getPrincipal();
+
+        // 2. 查询用户（从数据库、Redis 等）
+        User user = userService.findByUsername(username);
+        if (user == null) {
+            throw new UnknownAccountException("用户不存在");
+        }
+
+        // 3. 检查账户状态
+        if (user.isLocked()) {
+            throw new LockedAccountException("账户已被锁定");
+        }
+
+        // 4. 返回认证信息（包含加密后的密码）
+        return new SimpleAuthenticationInfo(
+            user.getUsername(),      // principal
+            user.getPassword(),       // hashed credentials
+            ByteSource.Util.bytes(user.getSalt()),  // credentials salt
+            getName()                // realm name
+        );
+    }
+
+    // 授权：查询角色和权限
+    @Override
+    protected AuthorizationInfo doGetAuthorizationInfo(
+            PrincipalCollection principals) {
+        // 1. 获取用户名
+        String username = (String) principals.getPrimaryPrincipal();
+
+        // 2. 查询角色
+        Set<String> roles = roleService.findByUsername(username);
+
+        // 3. 查询权限
+        Set<String> permissions = permissionService.findByUsername(username);
+
+        // 4. 返回授权信息
+        SimpleAuthorizationInfo info = new SimpleAuthorizationInfo();
+        info.setRoles(roles);
+        info.setStringPermissions(permissions);
+        return info;
+    }
+}
+```
+
+## 完整的 UserRealm 实现
+
+### 项目结构
+
+```
+src/main/java/com/example/shiro/
+├── realm/
+│   └── UserRealm.java
+├── service/
+│   ├── UserService.java
+│   ├── RoleService.java
+│   └── PermissionService.java
+└── entity/
+    ├── User.java
+    ├── Role.java
+    └── Permission.java
+```
+
+### 实体类
+
+```java
+// User.java
+@Data
+public class User {
+    private Long id;
+    private String username;
+    private String password;
+    private String salt;       // 密码盐值
+    private Boolean locked;    // 是否锁定
+    private Date createTime;
+}
+
+// Role.java
+@Data
+public class Role {
+    private Long id;
+    private String roleCode;    // 角色代码，如 "admin"
+    private String roleName;   // 角色名称，如 "管理员"
+}
+
+// Permission.java
+@Data
+public class Permission {
+    private Long id;
+    private String permissionCode;  // 权限代码，如 "user:create"
+    private String permissionName;    // 权限名称，如 "创建用户"
+}
+```
+
+### Service 层
+
+```java
+// UserService.java
+@Service
+public class UserService {
+    @Autowired
+    private UserMapper userMapper;
+
+    public User findByUsername(String username) {
+        return userMapper.findByUsername(username);
+    }
+}
+
+// UserMapper.java（MyBatis-Plus）
+@Mapper
+public interface UserMapper extends BaseMapper<User> {
+    User findByUsername(@Param("username") String username);
+}
+```
+
+```xml title="UserMapper.xml"
+<select id="findByUsername" resultType="User">
+    SELECT * FROM sys_user
+    WHERE username = #{username}
+</select>
+```
+
+### Realm 实现
+
+```java title="src/main/java/com/example/shiro/realm/UserRealm.java"
+@Component
+@DependsOn("hashedCredentialsMatcher")  // 确保 CredentialsMatcher 先初始化
+public class UserRealm extends AuthorizingRealm {
+
+    @Autowired
+    private UserService userService;
+
+    @Autowired
+    private RoleService roleService;
+
+    @Autowired
+    private PermissionService permissionService;
+
+    /**
+     * 认证：验证用户身份
+     * Shiro 会自动调用此方法进行认证
+     */
+    @Override
+    protected AuthenticationInfo doGetAuthenticationInfo(
+            AuthenticationToken token) throws AuthenticationException {
+
+        UsernamePasswordToken upToken = (UsernamePasswordToken) token;
+        String username = upToken.getUsername();
+
+        // 1. 根据用户名查询用户
+        User user = userService.findByUsername(username);
+        if (user == null) {
+            throw new UnknownAccountException("用户 [" + username + "] 不存在");
+        }
+
+        // 2. 检查账户状态
+        if (Boolean.TRUE.equals(user.getLocked())) {
+            throw new LockedAccountException("账户 [" + username + "] 已被锁定");
+        }
+
+        // 3. 构建认证信息返回
+        // Shiro 会自动用 CredentialsMatcher 比较密码
+        return new SimpleAuthenticationInfo(
+            user.getUsername(),               // principal：登录的用户名
+            user.getPassword(),               // credentials：数据库中的密码
+            ByteSource.Util.bytes(user.getSalt()),  // credentialsSalt：盐值
+            getName()                         // realmName：当前 Realm 的名称
+        );
+    }
+
+    /**
+     * 授权：查询用户的角色和权限
+     * Shiro 会自动调用此方法进行权限验证
+     */
+    @Override
+    protected AuthorizationInfo doGetAuthorizationInfo(
+            PrincipalCollection principals) {
+
+        String username = (String) principals.getPrimaryPrincipal();
+
+        // 1. 查询用户的角色
+        Set<String> roles = roleService.findRoleCodesByUsername(username);
+
+        // 2. 查询用户的权限
+        Set<String> permissions = permissionService.findPermissionCodesByUsername(username);
+
+        // 3. 返回授权信息
+        SimpleAuthorizationInfo info = new SimpleAuthorizationInfo();
+        info.setRoles(roles);
+        info.setStringPermissions(permissions);
+        return info;
+    }
+
+    /**
+     * 清理缓存
+     * 在用户权限变更时调用
+     */
+    public void clearCache(PrincipalCollection principals) {
+        clearAuthenticationCache();
+        clearAuthorizationCache(principals);
+    }
+}
+```
+
+## 密码加密配置：HashedCredentialsMatcher
+
+自定义 Realm 通常需要配合密码加密使用：
+
+### 生成密码的工具类
+
+```java
+public class PasswordUtil {
+
+    /**
+     * 生成随机盐值
+     */
+    public static String generateSalt() {
+        SecureRandom random = new SecureRandom();
+        byte[] salt = new byte[16];
+        random.nextBytes(salt);
+        return Base64.getEncoder().encodeToString(salt);
+    }
+
+    /**
+     * 计算密码哈希
+     *
+     * @param password 明文密码
+     * @param salt     盐值
+     * @return 哈希后的密码
+     */
+    public static String hashPassword(String password, String salt) {
+        // SHA-256, 迭代 1024 次
+        HashRequest request = new HashRequest.Builder()
+            .algorithm("SHA-256")
+            .numberOfIterations(1024)
+            .salt(salt.getBytes())
+            .build();
+
+        HashCode hashCode = new HashingCredenialsUtil()
+            .hash(request, password.getBytes(StandardCharsets.UTF_8));
+
+        return Base64.getEncoder().encodeToString(hashCode.asBytes());
+    }
+
+    /**
+     * 验证密码
+     */
+    public static boolean verifyPassword(String inputPassword,
+                                         String hashedPassword,
+                                         String salt) {
+        String hashed = hashPassword(inputPassword, salt);
+        return hashed.equals(hashedPassword);
+    }
+}
+```
+
+### Shiro 配置
+
+```java
+@Configuration
+public class ShiroConfig {
+
+    @Bean
+    public HashedCredentialsMatcher hashedCredentialsMatcher() {
+        HashedCredentialsMatcher matcher = new HashedCredentialsMatcher();
+        matcher.setHashAlgorithmName("SHA-256");
+        matcher.setHashIterations(1024);
+        matcher.setStoredCredentialsHexEncoded(false);  // Base64 编码
+        return matcher;
+    }
+
+    @Bean
+    public UserRealm userRealm(HashedCredentialsMatcher matcher) {
+        UserRealm realm = new UserRealm();
+        realm.setCredentialsMatcher(matcher);  // 注入密码匹配器
+        realm.setCachingEnabled(true);
+        realm.setAuthorizationCachingEnabled(true);
+        realm.setAuthorizationCacheName("authorizationCache");
+        return realm;
+    }
+}
+```
+
+## 多数据源场景
+
+当系统需要同时连接多个数据库时，可以配置多个 Realm：
+
+```java
+@Configuration
+public class ShiroConfig {
+
+    // 主库 Realm（用户认证）
+    @Bean
+    public UserRealm userRealm() {
+        UserRealm realm = new UserRealm();
+        realm.setDataSource(primaryDataSource);
+        // ...
+        return realm;
+    }
+
+    // 订单库 Realm（订单权限）
+    @Bean
+    public OrderRealm orderRealm() {
+        OrderRealm realm = new OrderRealm();
+        realm.setDataSource(orderDataSource);
+        // ...
+        return realm;
+    }
+
+    // 配置 ModularRealmAuthenticator
+    @Bean
+    public ModularRealmAuthenticator authenticator() {
+        ModularRealmAuthenticator authenticator = new ModularRealmAuthenticator();
+        // 设置认证策略
+        authenticator.setAuthenticationStrategy(new AtLeastOneSuccessfulStrategy());
+        return authenticator;
+    }
+}
+```
+
+## Realm 的优先级
+
+当配置多个 Realm 时，`ModularRealmAuthenticator` 会按顺序尝试认证：
+
+```java
+// 认证策略
+public interface AuthenticationStrategy {
+    // 在认证前调用
+    AuthenticationInfo beforeAttempt(Realm realm, AuthenticationToken token,
+                                     AuthenticationInfo info);
+
+    // 在认证后调用
+    AuthenticationInfo afterAttempt(Realm realm, AuthenticationToken token,
+                                    AuthenticationInfo info,
+                                    AuthenticationInfo aggregateInfo);
+}
+```
+
+Shiro 提供了四种认证策略：
+
+| 策略 | 说明 |
+|---|---|
+| `AtLeastOneSuccessfulStrategy` | 至少一个 Realm 成功（默认） |
+| `FirstSuccessfulStrategy` | 第一个 Realm 成功即返回 |
+| `AllSuccessfulStrategy` | 所有 Realm 都必须成功 |
+| `AtLeastTwoSuccessfulStrategy` | 至少两个 Realm 成功 |
+
+## 认证和授权缓存
+
+为了减少数据库查询，应该启用缓存：
+
+```java
+@Bean
+public UserRealm userRealm(HashedCredentialsMatcher matcher,
+                            CacheManager cacheManager) {
+    UserRealm realm = new UserRealm();
+    realm.setCredentialsMatcher(matcher);
+    realm.setCacheManager(cacheManager);      // 设置缓存管理器
+    realm.setAuthenticationCachingEnabled(true);   // 启用认证缓存
+    realm.setAuthorizationCachingEnabled(true);    // 启用授权缓存
+    realm.setAuthorizationCacheName("authorizationCache");
+    return realm;
+}
+```
+
+### 手动清除缓存
+
+当用户权限变更时，必须清除缓存：
+
+```java
+@Service
+public class RoleServiceImpl implements RoleService {
+
+    @Autowired
+    private UserRealm userRealm;
+
+    @Override
+    @Transactional
+    public void assignRoleToUser(String username, String roleCode) {
+        // 1. 分配角色
+        userRoleMapper.insert(...);
+
+        // 2. 清除用户的授权缓存
+        PrincipalCollection principals =
+            new SimplePrincipalCollection(username, UserRealm.class.getName());
+        userRealm.clearCache(principals);
+    }
+}
+```
+
+## 面试高频问题
+
+**问：自定义 Realm 需要重写哪些方法？**
+
+需要重写两个核心方法：
+- `doGetAuthenticationInfo(AuthenticationToken)`：处理用户认证，返回 `AuthenticationInfo`
+- `doGetAuthorizationInfo(PrincipalCollection)`：处理权限授权，返回 `AuthorizationInfo`
+
+**问：Shiro 的认证流程是什么？**
+
+```
+Subject.login(token)
+    → SecurityManager.login()
+    → Authenticator.authenticate()
+    → Realm.getAuthenticationInfo()
+    → CredentialsMatcher.verify()
+```
+
+**问：Realm 支持哪些认证策略？**
+
+支持四种：`AtLeastOneSuccessfulStrategy`（默认）、`FirstSuccessfulStrategy`、`AllSuccessfulStrategy`、`AtLeastTwoSuccessfulStrategy`。
+
+## 总结
+
+自定义 Realm 是 Shiro 生产的标配：
+
+1. **继承 `AuthorizingRealm`**，实现 `doGetAuthenticationInfo` 和 `doGetAuthorizationInfo`
+2. **配合 `HashedCredentialsMatcher`** 使用，确保密码安全
+3. **启用缓存**，减少数据库查询
+4. **权限变更时清除缓存**，保持数据一致
+5. **多 Realm 场景**，配置认证策略
+
+> 下一节我们会讲 `HashedCredentialsMatcher` 的密码加密细节，以及如何正确使用盐值。
+

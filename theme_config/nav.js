@@ -14,7 +14,7 @@ export const nav = [
     ],
   },
   {
-    "text": "Java",
+    "text": "Java 基础",
     "link": "/java/",
     "items": [
       { "text": "🧱 Java 基础", "link": "/java/basic/" },
@@ -24,6 +24,19 @@ export const nav = [
       { "text": "🌊 Java I/O 与网络", "link": "/java/io/" },
       { "text": "✨ Java 17+ 新特性", "link": "/java/new-features/" }
     ],
+  },
+  {
+    "text": "常用框架",
+    "link": "/framework/",
+    "items": [
+      { "text": "🍃 Spring Framework", "link": "/framework/spring/" },
+      { "text": "🥾 Spring Boot", "link": "/framework/springboot/" },
+      { "text": "🗃️ MyBatis", "link": "/framework/mybatis/" },
+      { "text": "📊 ORM 与数据库访问", "link": "/framework/orm/" },
+      { "text": "☁️ Spring Cloud 全家桶", "link": "/framework/springcloud/" },
+      { "text": "🔐 Spring Security", "link": "/framework/springsecurity/" },
+      { "text": "🛡️ Shiro", "link": "/framework/shiro/" }
+    ]
   },
   {
     "text": "三高架构",

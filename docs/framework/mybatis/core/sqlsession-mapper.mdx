@@ -1,0 +1,324 @@
+# SqlSession 获取 Mapper 代理对象
+
+import { Badge } from '@rspress/core/theme';
+
+你知道 `session.getMapper(UserMapper.class)` 返回的是什么吗？它不是 UserMapper 的实现类，也不是 UserMapper 的子类。它是一个由 JDK 动态代理生成的代理对象。
+
+但这个代理对象是怎么知道要执行哪条 SQL 的？接口方法没有实现，SQL 语句写在了 XML 文件里，它们是怎么关联起来的？
+
+## SqlSession 与 Mapper 的关系
+
+```
+┌──────────────┐         ┌──────────────────┐         ┌─────────────┐
+│ SqlSession   │ ───────→ │ MapperRegistry   │ ───────→ │ MapperProxy │
+│              │          │ (knownMappers)   │          │  Factory    │
+└──────────────┘          └──────────────────┘          └──────┬──────┘
+                                                                │
+                                                                ↓
+                                                        ┌─────────────┐
+                                                        │ MapperProxy │
+                                                        │  (JDK 代理) │
+                                                        └─────────────┘
+```
+
+## getMapper 完整流程
+
+```java title="DefaultSqlSession.java"
+public class DefaultSqlSession implements SqlSession {
+
+    private final Configuration configuration;
+
+    @Override
+    public <T> T getMapper(Class<T> type) {
+        // 委托给 Configuration
+        return configuration.getMapper(type, this);
+    }
+}
+```
+
+```java title="Configuration.java"
+public class Configuration {
+
+    // Mapper 接口注册表
+    protected final Map<Class<?>, MapperProxyFactory<?>> knownMappers = new HashMap<>();
+
+    public <T> T getMapper(Class<T> type, SqlSession sqlSession) {
+        // 从注册表获取 MapperProxyFactory
+        MapperProxyFactory<T> mapperProxyFactory = knownMappers.get(type);
+        if (mapperProxyFactory == null) {
+            throw new BindingException("Type " + type + " is not known to the MapperRegistry.");
+        }
+
+        // 创建代理对象
+        return mapperProxyFactory.newInstance(sqlSession);
+    }
+
+    // 注册 Mapper
+    public <T> void addMapper(Class<T> type) {
+        knownMappers.put(type, new MapperProxyFactory<>(type));
+    }
+}
+```
+
+## MapperProxyFactory 创建代理对象
+
+```java title="MapperProxyFactory.java"
+public class MapperProxyFactory<T> {
+
+    private final Class<T> mapperInterface;
+
+    public MapperProxyFactory(Class<T> mapperInterface) {
+        this.mapperInterface = mapperInterface;
+    }
+
+    @SuppressWarnings("unchecked")
+    public T newInstance(SqlSession sqlSession) {
+        // 创建 MapperProxy
+        final MapperProxy<T> mapperProxy = new MapperProxy<>(sqlSession, mapperInterface);
+
+        // 使用 JDK 动态代理创建代理对象
+        return (T) Proxy.newProxyInstance(
+            mapperInterface.getClassLoader(),
+            new Class[]{mapperInterface},
+            mapperProxy
+        );
+    }
+}
+```
+
+## MapperProxy 的结构
+
+```java title="MapperProxy.java"
+public class MapperProxy<T> implements InvocationHandler {
+
+    private final SqlSession sqlSession;
+    private final Class<T> mapperInterface;
+
+    // 方法缓存：method → MapperMethod
+    private final Map<Method, MapperMethod> methodCache;
+
+    public MapperProxy(SqlSession sqlSession, Class<T> mapperInterface) {
+        this.sqlSession = sqlSession;
+        this.mapperInterface = mapperInterface;
+        this.methodCache = new ConcurrentHashMap<>();
+    }
+
+    @Override
+    public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+        // 如果是 Object 的方法（toString, equals 等），直接执行
+        if (Object.class.equals(method.getDeclaringClass())) {
+            return method.invoke(this, args);
+        }
+
+        // 从缓存获取 MapperMethod
+        final MapperMethod mapperMethod = cachedMapperMethod(method);
+
+        // 执行 SQL
+        return mapperMethod.execute(sqlSession, args);
+    }
+
+    private MapperMethod cachedMapperMethod(Method method) {
+        return methodCache.computeIfAbsent(method,
+            k -> new MapperMethod(mapperInterface, method, sqlSession.getConfiguration()));
+    }
+}
+```
+
+## MapperMethod 执行 SQL
+
+```java title="MapperMethod.java"
+public class MapperMethod {
+
+    private final SqlCommand sqlCommand;
+    private final MethodSignature method;
+
+    public MapperMethod(Class<?> mapperInterface, Method method, Configuration config) {
+        this.sqlCommand = new SqlCommand(config, mapperInterface, method);
+        this.method = new MethodSignature(config, mapperInterface, method);
+    }
+
+    public Object execute(SqlSession sqlSession, Object[] args) {
+        Object result;
+
+        // 根据 SQL 命令类型执行
+        switch (sqlCommand.getType()) {
+            case SELECT:
+                // 处理查询结果
+                result = executeForResult(sqlSession, args);
+                break;
+            case INSERT:
+                result = executeForInsert(sqlSession, args);
+                break;
+            case UPDATE:
+                result = executeForUpdate(sqlSession, args);
+                break;
+            case DELETE:
+                result = executeForDelete(sqlSession, args);
+                break;
+        }
+
+        // 返回值处理
+        if (result == null && method.returnsVoid()) {
+            result = null;
+        } else if (method.returnsMany()) {
+            // ...
+        }
+
+        return result;
+    }
+
+    private Object executeForResult(SqlSession sqlSession, Object[] args) {
+        // 获取参数
+        Object param = method.convertArgsToSqlCommandParam(args);
+
+        // 获取 resultMap 或 resultType
+        ResultMapping resultMapping = sqlCommand.getResultMap();
+        Class<?> resultType = sqlCommand.getResultType();
+
+        // 根据返回类型调用 SqlSession 的不同方法
+        if (method.returnsMany()) {
+            return sqlSession.selectList(sqlCommand.getStatement(), param);
+        } else if (method.returnsCursor()) {
+            return sqlSession.selectCursor(sqlCommand.getStatement(), param);
+        } else {
+            return sqlSession.selectOne(sqlCommand.getStatement(), param);
+        }
+    }
+}
+```
+
+## 完整的调用链路
+
+```
+session.getMapper(UserMapper.class)
+        │
+        ▼
+Configuration.getMapper(UserMapper.class, session)
+        │
+        ▼
+MapperProxyFactory.newInstance(sqlSession)
+        │
+        ├── 创建 MapperProxy(sqlSession, UserMapper.class)
+        │
+        └── Proxy.newProxyInstance(...) → 返回代理对象
+                │
+                ▼
+代理对象调用 selectById(1)
+                │
+                ▼
+MapperProxy.invoke(proxy, method, args)
+                │
+                ├── 检查是否 Object 方法
+                │
+                ├── cachedMapperMethod(method) → MapperMethod
+                │
+                └── mapperMethod.execute(sqlSession, args)
+                        │
+                        ├── 获取 statementId = "com.example.UserMapper.selectById"
+                        │
+                        ├── 获取参数
+                        │
+                        └── sqlSession.selectOne(statementId, param)
+                                │
+                                ▼
+                        Executor.query(...)
+                                │
+                                ▼
+                        后续流程...
+```
+
+## statementId 的解析
+
+`SqlCommand` 构造函数中会解析 statementId：
+
+```java title="SqlCommand.java"
+public SqlCommand(Configuration configuration, Class<?> mapperInterface, Method method) {
+    String statementName = mapperInterface.getName() + "." + method.getName();
+
+    // 在 Configuration 中查找 MappedStatement
+    MappedStatement ms = configuration.getMappedStatement(statementName);
+
+    this.name = statementName;
+    this.type = ms.getSqlCommandType();
+}
+```
+
+## 为什么需要接口和 XML 的 namespace 一致？
+
+```java
+// Mapper 接口
+package com.example.mapper;
+
+public interface UserMapper {
+    User selectById(Long id);
+}
+
+// XML mapper
+<mapper namespace="com.example.mapper.UserMapper">
+    <select id="selectById" ...>
+```
+
+因为 `statementName = mapperInterface.getName() + "." + methodName`
+
+即：`com.example.mapper.UserMapper` + `.` + `selectById` = `com.example.mapper.UserMapper.selectById`
+
+这个 statementId 必须在 Configuration 的 `mappedStatements` 中存在，否则会抛出 `BindingException`。
+
+## 常见错误分析
+
+### 错误一：namespace 不匹配
+
+```java
+// 接口全限定名
+com.example.mapper.UserMapper
+```
+
+```xml
+<!-- 错误：少了 UserMapper -->
+<mapper namespace="com.example.mapper">
+```
+
+导致：`BindingException: Invalid bound statement (not found)`
+
+### 错误二：方法名不一致
+
+```java
+// 接口中定义的方法
+User selectById(Long id);
+```
+
+```xml
+<!-- 错误：方法名不一致 -->
+<select id="findById" resultType="User">
+```
+
+导致：`BindingException: Invalid bound statement (not found)`
+
+### 错误三：Mapper 接口没有被扫描
+
+```java
+// Spring Boot 应用
+@MapperScan("com.example.mapper")  // 注意这个配置
+public class Application { }
+```
+
+没有配置扫描路径，Mapper 接口不会被注册，导致：`NoSuchBeanDefinitionException`
+
+---
+
+## 面试重点
+
+| 问题 | 回答要点 |
+|---|---|
+| getMapper 返回的是什么？ | JDK 动态代理生成的 MapperProxy |
+| 代理对象怎么知道执行哪条 SQL？ | statementId = namespace + "." + methodName |
+| 为什么接口名要和 namespace 一致？ | 用于拼接完整的 statementId |
+| MapperProxy.invoke() 做了什么？ | 缓存 MapperMethod，调用 execute() 执行 SQL |
+
+---
+
+## 延伸思考
+
+既然 `session.selectList("com.example.UserMapper.selectById", 1)` 这种写法也能工作，为什么我们推荐使用 `getMapper()` 的方式？
+
+主要原因是类型安全。使用接口方式，IDE 会在编译期检查方法是否存在、参数类型是否匹配、返回值类型是否正确。而字符串方式在运行时才会报错，排查问题成本更高。

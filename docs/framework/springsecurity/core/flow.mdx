@@ -1,0 +1,470 @@
+import { Badge } from '@rspress/core/theme';
+
+# Spring Security 认证与授权核心流程
+
+你登录一个系统，输入用户名密码，点击登录，系统告诉你「登录成功」。这个过程背后发生了什么？
+
+大部分人的答案是：「密码验证通过了。」
+
+这个答案没有错，但太浅了。密码是怎么比对的？验证通过后用户信息存在哪里？后续请求怎么知道你已经登录了？授权的依据是什么？
+
+这一节，就是要回答这些问题。
+
+---
+
+## Authentication 认证机制
+
+### Authentication 接口
+
+Authentication 是 Spring Security 的核心接口，封装了「当前用户是谁」以及「有什么权限」。
+
+```java
+public interface Authentication extends Principal, Serializable {
+    // 获取用户的权限列表
+    Collection<? extends GrantedAuthority> getAuthorities();
+
+    // 获取凭证（密码等），认证完成后通常被清空
+    Object getCredentials();
+
+    // 获取附加信息（如 IP 地址、Session ID）
+    Object getDetails();
+
+    // 获取主体（通常是 UserDetails 或用户名）
+    Object getPrincipal();
+
+    // 是否已认证
+    boolean isAuthenticated();
+
+    // 设置认证状态
+    void setAuthenticated(boolean isAuthenticated) throws IllegalArgumentException;
+}
+```
+
+**理解这个接口，是理解整个认证流程的基础。**
+
+认证前，Authentication 对象是「未认证状态」的 Token；认证后，Authentication 对象是「已认证状态」的凭证。
+
+### 认证的三个阶段
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      认证前（Unauthenticated）                │
+├─────────────────────────────────────────────────────────────┤
+│ principal: "zhangsan"                                        │
+│ credentials: "123456"                                       │
+│ authorities: []（空）                                        │
+│ authenticated: false                                        │
+└─────────────────────────────────────────────────────────────┘
+                              ↓
+                     AuthenticationProvider
+                              ↓
+┌─────────────────────────────────────────────────────────────┐
+│                      认证后（Authenticated）                 │
+├─────────────────────────────────────────────────────────────┤
+│ principal: UserDetails(zhangsan, ...)                       │
+│ credentials: null（已清空）                                  │
+│ authorities: [ROLE_USER, ROLE_ADMIN]                        │
+│ authenticated: true                                         │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## SecurityContextHolder 与 ThreadLocal
+
+### 为什么需要 SecurityContextHolder？
+
+每个 HTTP 请求都是独立的线程。认证信息需要在请求处理过程中被所有组件访问，但你不能把信息存在局部变量里——因为一个请求的不同组件之间没有直接的调用链。
+
+Spring Security 的解决方案是 `SecurityContextHolder`：一个持有 SecurityContext 的容器。
+
+```java
+// 存储认证信息
+SecurityContext context = SecurityContextHolder.createEmptyContext();
+context.setAuthentication(authentication);
+SecurityContextHolder.setContext(context);
+
+// 读取认证信息
+SecurityContext currentContext = SecurityContextHolder.getContext();
+Authentication currentAuth = currentContext.getAuthentication();
+```
+
+### ThreadLocal 存储机制
+
+SecurityContextHolder 默认使用 `ThreadLocalSecurityContextHolderStrategy`，内部通过 `ThreadLocal<SecurityContext>` 存储上下文：
+
+```java
+// 简化版源码逻辑
+public class ThreadLocalSecurityContextHolderStrategy {
+    private static final ThreadLocal<SecurityContext> contextHolder =
+        new ThreadLocal<>();
+
+    public void setContext(SecurityContext context) {
+        contextHolder.set(context);
+    }
+
+    public SecurityContext getContext() {
+        SecurityContext context = contextHolder.get();
+        if (context == null) {
+            context = createEmptyContext();
+            contextHolder.set(context);
+        }
+        return context;
+    }
+
+    public void clearContext() {
+        contextHolder.remove();
+    }
+}
+```
+
+**ThreadLocal 的特性是什么？每个线程有自己的独立存储区域，互不干扰。** 这完美契合了 HTTP 请求的处理模型——每个请求由一个线程处理，该线程的 SecurityContext 只属于这个请求。
+
+### 父子线程的问题
+
+但这里有一个坑。
+
+如果你在请求处理中创建了新线程（比如异步任务、定时任务），新线程**不会继承**父线程的 ThreadLocal：
+
+```java
+@GetMapping("/test")
+public void test() {
+    SecurityContext context = SecurityContextHolder.getContext();
+    // 认证信息存在 context 中
+
+    // 异步执行：新线程无法访问父线程的 SecurityContext
+    CompletableFuture.runAsync(() -> {
+        SecurityContext childContext = SecurityContextHolder.getContext();
+        // childContext 是空的！没有认证信息
+    });
+}
+```
+
+**解决方案有三种：**
+
+1. **使用 `DelegatingSecurityContextRunnable`**：自动传递 SecurityContext 到子线程
+2. **使用 Spring Security 的 TaskDecorator**：配置 `TaskExecutor` 自动注入 SecurityContext
+3. **使用 `SecurityContextHolder.MODE_INHERITABLETHREADLOCAL`**：允许子线程继承（不推荐，有安全风险）
+
+```java
+@Configuration
+public class AsyncConfig {
+    @Bean
+    public TaskExecutor taskExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setTaskDecorator(new DelegatingSecurityContextTaskDecorator(
+            new VisibleForTestingSecurityContextTaskExecutor(
+                new TaskExecutorAdapter(Executors.newVirtualThreadPerTaskExecutor())
+            )
+        ));
+        return executor;
+    }
+}
+```
+
+---
+
+## 认证流程详解
+
+### 完整认证链路
+
+Spring Security 的认证流程是一套精心设计的流水线：
+
+```
+用户提交登录请求
+    ↓
+FilterChainProxy（过滤器链入口）
+    ↓
+SecurityContextPersistenceFilter
+    ↓
+UsernamePasswordAuthenticationFilter
+    ↓
+生成未认证的 UsernamePasswordAuthenticationToken
+    ↓
+AuthenticationManager
+    ↓
+遍历 AuthenticationProvider（找能处理这个 Token 的）
+    ↓
+DaoAuthenticationProvider
+    ↓
+UserDetailsService.loadUserByUsername()
+    ↓
+获取用户信息（UserDetails）
+    ↓
+PasswordEncoder.matches()
+    ↓
+密码校验通过
+    ↓
+Authentication.authenticated = true
+    ↓
+SecurityContextHolder.getContext().setAuthentication()
+    ↓
+保存到 Session
+    ↓
+认证成功，跳转或返回
+```
+
+### 每一步都在做什么？
+
+#### 第一步：生成 Authentication Token
+
+`UsernamePasswordAuthenticationFilter` 从请求中提取用户名和密码，封装成 Token：
+
+```java
+// 简化版
+String username = request.getParameter("username");
+String password = request.getParameter("password");
+
+UsernamePasswordAuthenticationToken authRequest =
+    new UsernamePasswordAuthenticationToken(username, password);
+
+setDetails(request, authRequest);
+```
+
+注意：这时候 `authRequest.isAuthenticated()` 返回 `false`，它只是一个「凭证载体」。
+
+#### 第二步：AuthenticationManager 决策
+
+`AuthenticationManager` 是一个接口，定义了认证方法：
+
+```java
+public interface AuthenticationManager {
+    Authentication authenticate(Authentication authentication)
+        throws AuthenticationException;
+}
+```
+
+最常用的实现是 `ProviderManager`，内部维护一个 `AuthenticationProvider` 列表：
+
+```java
+public class ProviderManager implements AuthenticationManager {
+    private List<AuthenticationProvider> providers;
+
+    public Authentication authenticate(Authentication authentication)
+            throws AuthenticationException {
+        for (AuthenticationProvider provider : providers) {
+            if (provider.supports(authentication.getClass())) {
+                return provider.authenticate(authentication);
+            }
+        }
+        throw new ProviderNotFoundException("...");
+    }
+}
+```
+
+**为什么是列表？** 因为可能有多种认证方式：表单登录、短信登录、OAuth2 登录……每个 `AuthenticationProvider` 负责一种。
+
+#### 第三步：UserDetailsService 加载用户
+
+`DaoAuthenticationProvider` 是处理表单登录的 Provider，它会调用 `UserDetailsService`：
+
+```java
+public class DaoAuthenticationProvider extends AbstractUserDetailsAuthenticationProvider {
+    private UserDetailsService userDetailsService;
+
+    protected UserDetails retrieveUser(String username,
+            UsernamePasswordAuthenticationToken authentication) {
+        UserDetails loadedUser =
+            this.userDetailsService.loadUserByUsername(username);
+        return loadedUser;
+    }
+}
+```
+
+`UserDetailsService` 的实现决定了用户数据从哪里来——数据库、LDAP、内存……
+
+#### 第四步：密码校验
+
+拿到 UserDetails 后，`DaoAuthenticationProvider` 会校验密码：
+
+```java
+protected void additionalAuthenticationChecks(UserDetails userDetails,
+        UsernamePasswordAuthenticationToken authentication)
+        throws AuthenticationException {
+    String presentedPassword = authentication.getCredentials().toString();
+    if (!passwordEncoder.matches(presentedPassword, userDetails.getPassword())) {
+        throw new BadCredentialsException("密码错误");
+    }
+}
+```
+
+**密码校验使用的是 `PasswordEncoder.matches()`，而不是 equals()。** 这是因为密码通常经过加密存储，不能直接比对明文。
+
+#### 第五步：保存认证结果
+
+密码校验通过后，`AbstractAuthenticationProcessingFilter` 会保存认证结果：
+
+```java
+// 认证成功后
+SecurityContext context = SecurityContextHolder.createEmptyContext();
+context.setAuthentication(authResult);
+SecurityContextHolder.setContext(context);
+
+// 如果需要记住登录状态，保存到 Session
+if (rememberMe) {
+    rememberMeServices.loginSuccess(request, response, authResult);
+}
+
+// 发布认证成功事件
+successHandler.onAuthenticationSuccess(request, response, authResult);
+```
+
+---
+
+## Authorization 授权机制
+
+### 授权 vs 认证
+
+认证是「验证身份」，授权是「判断权限」。两者是不同的阶段，但都在过滤器链中完成。
+
+```
+认证过滤器 → ... → FilterSecurityInterceptor → ... → 响应
+                    ↑
+                    授权在这里
+```
+
+### 授权的依据：GrantedAuthority
+
+每个已认证的 Authentication 都包含一个 `GrantedAuthority` 列表，代表用户的权限：
+
+```java
+public interface GrantedAuthority extends Serializable {
+    String getAuthority();  // 返回权限字符串，如 "ROLE_ADMIN"
+}
+```
+
+常见的实现：
+
+| 实现类 | 说明 | 示例 |
+|---|---|---|
+| `SimpleGrantedAuthority` | 简单的权限包装 | `new SimpleGrantedAuthority("ROLE_ADMIN")` |
+| `JaasGrantedAuthority` | JAAS 权限 | 很少使用 |
+| 自定义实现 | 根据业务逻辑生成 | 数据库权限 |
+
+### 授权决策过程
+
+```
+请求到达 FilterSecurityInterceptor
+    ↓
+获取当前 Authentication
+    ↓
+获取请求的资源（URL + Method）
+    ↓
+获取资源需要的权限（ConfigAttribute）
+    ↓
+AccessDecisionManager.vote()
+    ↓
+各 Voter 投票
+    ↓
+根据策略决定结果
+    ↓
+AccessDeniedException / 继续执行
+```
+
+---
+
+## SecurityContextPersistenceFilter 的特殊作用
+
+### 为什么需要这个过滤器？
+
+每个请求都需要从 Session 中恢复上一次的认证状态。这个工作由 `SecurityContextPersistenceFilter` 完成。
+
+```java
+public class SecurityContextPersistenceFilter extends GenericFilterBean {
+
+    public void doFilter(ServletRequest request, ServletResponse response,
+            FilterChain chain) throws IOException, ServletException {
+        HttpSession session = httpRequest.getSession(false);
+        SecurityContext contextBeforeChainExecution = null;
+
+        try {
+            // 尝试从 Session 恢复 SecurityContext
+            if (session != null) {
+                contextBeforeChainExecution =
+                    (SecurityContext) session.getAttribute(
+                        "SPRING_SECURITY_CONTEXT");
+            }
+
+            // 如果 Session 中没有，创建一个空的
+            if (contextBeforeChainExecution == null) {
+                contextBeforeChainExecution =
+                    SecurityContextHolder.createEmptyContext();
+            }
+
+            // 放入 ThreadLocal，供后续过滤器使用
+            SecurityContextHolder.setContext(contextBeforeChainExecution);
+
+            // 执行后续过滤器链
+            chain.doFilter(request, response);
+        } finally {
+            // 请求结束后，将 SecurityContext 存回 Session
+            SecurityContext contextAfterChainExecution =
+                SecurityContextHolder.getContext();
+            SecurityContextHolder.clearContext();
+
+            if (!contextAfterChainExecution.equals(
+                    contextBeforeChainExecution) && session != null) {
+                session.setAttribute(
+                    "SPRING_SECURITY_CONTEXT",
+                    contextAfterChainExecution);
+            }
+        }
+    }
+}
+```
+
+### 关键流程
+
+1. **请求开始**：从 Session 读取 `SPRING_SECURITY_CONTEXT`，存入 `ThreadLocal`
+2. **请求结束**：将 `ThreadLocal` 中的 `SecurityContext` 存回 `Session`，然后清空 `ThreadLocal`
+
+> [!WARNING]
+> 这里有一个性能问题：如果每个请求都读写 Session，会影响性能。解决方案是前端每次请求带上 Session Cookie，后端不做 Session 持久化（使用 JWT Token）。
+
+---
+
+## 面试追问预判
+
+### Q1：SecurityContextHolder 有几种存储策略？
+
+SecurityContextHolder 支持三种策略：
+
+```java
+SecurityContextHolder.setStrategyName(
+    "org.springframework.security.core.context.ThreadLocalSecurityContextHolderStrategy"
+    // 或
+    // "org.springframework.security.core.context.InheritableThreadLocalSecurityContextHolderStrategy"
+    // 或
+    // "org.springframework.security.core.context.GlobalSecurityContextHolderStrategy"
+);
+```
+
+| 策略 | 说明 | 适用场景 |
+|---|---|---|
+| ThreadLocal（默认） | 仅当前线程可见 | 标准 Web 请求 |
+| InheritableThreadLocal | 父子线程共享 | 异步任务、线程池 |
+| Global | 全局静态变量 | 不推荐，有并发问题 |
+
+### Q2：Authentication 和 SecurityContext 的区别是什么？
+
+- **Authentication** 是「认证信息」的抽象，包含用户、密码、权限
+- **SecurityContext** 是「存储认证信息」的容器，持有 Authentication
+
+类比：一个保险箱（SecurityContext），里面放了一本证件（Authentication）。
+
+### Q3：认证失败后，SecurityContext 会被清空吗？
+
+会的。在 `SecurityContextHolder.clearContext()` 执行后，ThreadLocal 会被清空。如果配置了 Session 持久化，Session 中的 `SPRING_SECURITY_CONTEXT` 也会被清除。
+
+---
+
+## 总结
+
+Spring Security 的认证授权流程，本质上是：
+
+1. **认证阶段**：通过 `AuthenticationManager` → `AuthenticationProvider` → `UserDetailsService` → `PasswordEncoder` 的流水线，验证用户身份
+2. **存储阶段**：将认证结果存入 `SecurityContext`，并通过 `ThreadLocal` 在请求内传递
+3. **持久化阶段**：`SecurityContextPersistenceFilter` 将 `SecurityContext` 存入 Session
+4. **授权阶段**：`FilterSecurityInterceptor` 根据 `Authentication` 中的 `GrantedAuthority` 列表决定是否有权访问
+
+理解了这四个阶段，你对 Spring Security 的理解就上了一个台阶。下一节，我们深入 [过滤器链](/framework/springsecurity/core/filter-chain)，看看这些组件是怎么串联起来的。

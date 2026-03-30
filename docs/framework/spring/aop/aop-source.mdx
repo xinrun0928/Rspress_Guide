@@ -1,0 +1,490 @@
+# AOP 源码解析：ProxyFactory 与 JdkDynamicAopProxy
+
+import { Badge } from '@rspress/core/theme';
+
+<Badge text="源码分析" type="danger" /> <Badge text="核心原理" type="warning" /> <Badge text="高级进阶" type="info" />
+
+理解了 AOP 的概念和代理选择规则后，我们来深入源码，看看 Spring 是如何创建 AOP 代理的。
+
+这一节，我们从 `ProxyFactory` 开始，追踪到 `JdkDynamicAopProxy` 和 `CglibAopProxy`，彻底搞懂 AOP 的实现原理。
+
+---
+
+## 一、AOP 源码全景图
+
+```
+AOP 源码调用链
+────────────────────────────────────────────────────────────────────────
+
+用户调用：context.getBean("userService")
+       ↓
+BeanFactory.getBean()
+       ↓
+AbstractBeanFactory.doGetBean()
+       ↓
+createBean()
+       ↓
+AbstractAutowireCapableBeanFactory.doCreateBean()
+       ↓
+initializeBean()
+       ↓
+applyBeanPostProcessorsAfterInitialization()
+       ↓
+┌──────────────────────────────────────────────────────────────┐
+│  AutoProxyCreator.postProcessAfterInitialization()          │
+│       ↓                                                    │
+│  AnnotationAwareAspectJAutoProxyCreator                    │
+│       ↓                                                    │
+│  AopProxyFactory.createAopProxy()                          │
+│       ↓                                                    │
+│  ┌───────────────────┐   ┌───────────────────────────────┐  │
+│  │ JdkDynamicAopProxy │   │ CglibAopProxy                │  │
+│  │ (JDK 动态代理)     │   │ (CGLIB 动态代理)             │  │
+│  └───────────────────┘   └───────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 二、AutoProxyCreator：自动代理创建器
+
+### 2.1 体系结构
+
+```
+BeanPostProcessor
+    ↓
+InstantiationAwareBeanPostProcessor
+    ↓
+AbstractAutoProxyCreator
+    ↓
+AnnotationAwareAspectJAutoProxyCreator（最常用）
+```
+
+### 2.2 核心方法
+
+`AbstractAutoProxyCreator.postProcessAfterInitialization()`：
+
+```java
+@Override
+public Object postProcessAfterInitialization(Object bean, String beanName) throws BeansException {
+    if (bean != null) {
+        // 1. 如果是基础设施组件（Advice、Pointcut 等），直接返回
+        if (isInfrastructureClass(bean.getClass())) {
+            return bean;
+        }
+
+        // 2. 获取匹配当前 Bean 的切面
+        Object[] specificInterceptors = getAdvicesAndAdvisorsForBean(
+            bean.getClass(), beanName, null);
+
+        // 3. 如果有匹配的切面，创建代理
+        if (specificInterceptors != DO_NOT_PROXY) {
+            return createProxy(
+                bean.getClass(), beanName, specificInterceptors, new SingletonTargetSource(bean));
+        }
+    }
+    return bean;
+}
+```
+
+### 2.3 获取匹配的切面
+
+```java
+protected Object[] getAdvicesAndAdvisorsForBean(
+        Class<?> beanClass, String beanName, TargetSource targetSource) {
+    // 找到所有匹配的切面
+    List<Advisor> advisors = findEligibleAdvisors(beanClass, beanName);
+    if (advisors.isEmpty()) {
+        return DO_NOT_PROXY; // 不需要代理
+    }
+    return advisors.toArray();
+}
+
+protected List<Advisor> findEligibleAdvisors(Class<?> beanClass, String beanName) {
+    // 1. 获取所有候选切面
+    List<Advisor> candidateAdvisors = findCandidateAdvisors();
+
+    // 2. 筛选匹配的切面
+    List<Advisor> eligibleAdvisors = new ArrayList<>();
+    for (Advisor advisor : candidateAdvisors) {
+        if (canApply(advisor, beanClass, beanName)) {
+            eligibleAdvisors.add(advisor);
+        }
+    }
+    return eligibleAdvisors;
+}
+```
+
+---
+
+## 三、ProxyFactory：代理工厂
+
+### 3.1 创建代理
+
+```java
+protected Object createProxy(Class<?> beanClass, String beanName,
+        Object[] specificInterceptors, TargetSource targetSource) {
+
+    // 1. 创建 ProxyFactory
+    ProxyFactory proxyFactory = new ProxyFactory();
+    proxyFactory.setTargetClass(beanClass);
+    proxyFactory.setTargetSource(targetSource);
+
+    // 2. 添加切面
+    proxyFactory.setAdvisors(advisors);
+
+    // 3. 设置代理方式
+    proxyFactory.setProxyTargetClass(isProxyTargetClass());
+
+    // 4. 设置暴露代理
+    proxyFactory.setExposeProxy(isExposeProxy());
+
+    // 5. 创建代理对象
+    return proxyFactory.getProxy();
+}
+```
+
+### 3.2 getProxy() 方法
+
+```java
+public Object getProxy() {
+    return createAopProxy().getProxy();
+}
+
+public Object getProxy(ClassLoader classLoader) {
+    return createAopProxy().getProxy(classLoader);
+}
+```
+
+---
+
+## 四、JdkDynamicAopProxy：JDK 动态代理实现
+
+### 4.1 实现 InvocationHandler
+
+```java
+public class JdkDynamicAopProxy implements AopProxy, InvocationHandler {
+
+    private final AdvisedSupport advised;
+
+    public JdkDynamicAopProxy(AdvisedSupport config) throws AopConfigException {
+        this.advised = config;
+    }
+
+    // InvocationHandler.invoke()：代理方法调用的入口
+    @Override
+    public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+        // 1. 获取方法匹配的通知
+        List<Object> chain = this.advised.getInterceptorsAndDynamicInterceptionAdvice(
+            method, targetClass);
+
+        // 2. 如果没有通知，直接执行目标方法
+        if (chain.isEmpty()) {
+            return method.invoke(target, args);
+        }
+
+        // 3. 创建 ReflectiveMethodInvocation
+        MethodInvocation invocation = new ReflectiveMethodInvocation(
+            proxy, target, method, args, targetClass, chain);
+
+        // 4. 执行拦截器链
+        return invocation.proceed();
+    }
+}
+```
+
+### 4.2 ReflectiveMethodInvocation：拦截器链执行
+
+```java
+public class ReflectiveMethodInvocation implements MethodInvocation {
+
+    @Override
+    public Object proceed() throws Throwable {
+        // 1. 如果所有拦截器都执行完了，执行目标方法
+        if (this.currentInterceptorIndex == this.interceptors.size() - 1) {
+            return invokeJoinpoint();
+        }
+
+        // 2. 获取下一个拦截器
+        MethodInterceptor interceptor =
+            this.interceptors.get(++this.currentInterceptorIndex);
+
+        // 3. 执行拦截器（注意：拦截器可能调用 proceed()）
+        return interceptor.invoke(this);
+    }
+
+    private Object invokeJoinpoint() throws Throwable {
+        return AopUtils.invokeJoinpointUsingReflection(target, method, args);
+    }
+}
+```
+
+### 4.3 拦截器链的执行流程
+
+```
+调用链
+─────────────────────────────────────────────────────────────────────
+
+proxy.method()
+    ↓
+JdkDynamicAopProxy.invoke()
+    ↓
+ReflectiveMethodInvocation.proceed()
+    ↓
+┌────────────────────────────────────────────────────────────────────┐
+│  拦截器 1.invoke(this)                                             │
+│       ↓                                                            │
+│  拦截器 2.invoke(this)                                             │
+│       ↓                                                            │
+│  ...                                                               │
+│       ↓                                                            │
+│  拦截器 N.invoke(this)                                             │
+│       ↓                                                            │
+│  invocation.proceed() → 目标方法                                    │
+│       ↓                                                            │
+│  拦截器 N.invoke() 返回                                            │
+│       ↓                                                            │
+│  ...                                                               │
+│       ↓                                                            │
+│  拦截器 1.invoke() 返回                                           │
+└────────────────────────────────────────────────────────────────────┘
+    ↓
+返回结果
+```
+
+---
+
+## 五、CglibAopProxy：CGLIB 动态代理实现
+
+### 5.1 创建代理
+
+```java
+public class CglibAopProxy implements AopProxy {
+
+    @Override
+    public Object getProxy() {
+        return getProxy(this.advised.getTargetClass());
+    }
+
+    @Override
+    public Object getProxy(ClassLoader classLoader) {
+        // 1. 创建 Enhancer
+        Enhancer enhancer = new Enhancer();
+
+        // 2. 设置目标类
+        enhancer.setSuperclass(this.advised.getTargetClass());
+
+        // 3. 设置 Callback
+        enhancer.setCallbackFilter(new ProxyCallbackFilter(this.advised));
+
+        // 4. 创建代理
+        return enhancer.create();
+    }
+}
+```
+
+### 5.2 DynamicAdvisedInterceptor
+
+CGLIB 使用 `DynamicAdvisedInterceptor` 作为回调：
+
+```java
+private class DynamicAdvisedInterceptor implements MethodInterceptor {
+
+    @Override
+    public Object intercept(Object proxy, Method method, Object[] args,
+                           MethodProxy methodProxy) throws Throwable {
+        // 1. 获取匹配的拦截器
+        List<Object> chain = CglibMethodInvocation
+            .getInterceptors(method, this.advised);
+
+        // 2. 创建 CglibMethodInvocation
+        CglibMethodInvocation invocation = new CglibMethodInvocation(
+            proxy, target, method, args, targetClass, chain, methodProxy);
+
+        // 3. 执行
+        return invocation.proceed();
+    }
+}
+```
+
+### 5.3 CglibMethodInvocation
+
+```java
+public class CglibMethodInvocation extends ReflectiveMethodInvocation {
+
+    private final MethodProxy methodProxy;
+
+    public CglibMethodInvocation(Object proxy, Object target, Method method,
+            Object[] args, Class<?> targetClass, List<Object> interceptors,
+            MethodProxy methodProxy) {
+        super(proxy, target, method, args, targetClass, interceptors);
+        this.methodProxy = methodProxy;
+    }
+
+    @Override
+    protected Object invokeJoinpoint() throws Throwable {
+        // 使用 MethodProxy 提高性能
+        return this.methodProxy.invoke(this.target, this.arguments);
+    }
+}
+```
+
+---
+
+## 六、通知链的创建
+
+### 6.1 DefaultAdvisorChainFactory
+
+```java
+public class DefaultAdvisorChainFactory implements AdvisorChainFactory {
+
+    @Override
+    public List<Object> getInterceptorsAndDynamicInterceptionAdvice(
+            Advised config, Method method, Class<?> targetClass) {
+
+        List<Object> interceptorList = new ArrayList<>(config.getAdvisors().length);
+
+        // 遍历所有切面
+        for (Advisor advisor : config.getAdvisors()) {
+            if (advisor instanceof PointcutAdvisor) {
+                PointcutAdvisor pca = (PointcutAdvisor) advisor;
+
+                // 检查切点是否匹配
+                if (pca.getPointcut().getMethodMatcher().matches(method, targetClass)) {
+                    // 将通知转换为 MethodInterceptor
+                    MethodInterceptor[] interceptors =
+                        this.advisorAdapterRegistry.getInterceptors(advisor);
+                    interceptorList.addAll(Arrays.asList(interceptors));
+                }
+            }
+        }
+
+        return interceptorList;
+    }
+}
+```
+
+### 6.2 通知适配器
+
+```java
+public class DefaultAdvisorAdapterRegistry implements AdvisorAdapterRegistry {
+
+    @Override
+    public MethodInterceptor[] getInterceptors(Advisor advisor) throws UnknownAdviceTypeException {
+        List<MethodInterceptor> interceptors = new ArrayList<>(3);
+
+        // 适配不同类型的通知
+        if (advisor instanceof MethodBeforeAdviceAdapter) {
+            interceptors.add(new MethodBeforeAdviceInterceptor(
+                (MethodBeforeAdvice) advisor.getAdvice()));
+        }
+        if (advisor instanceof AfterReturningAdviceAdapter) {
+            interceptors.add(new AfterReturningAdviceInterceptor(
+                (AfterReturningAdvice) advisor.getAdvice()));
+        }
+        if (advisor instanceof ThrowsAdviceAdapter) {
+            interceptors.add(new ThrowsAdviceInterceptor(
+                (ThrowsAdvice) advisor.getAdvice()));
+        }
+
+        return interceptors.toArray(new MethodInterceptor[0]);
+    }
+}
+```
+
+---
+
+## 七、事务拦截器源码
+
+### 7.1 TransactionInterceptor
+
+`@Transactional` 的核心实现：
+
+```java
+public class TransactionInterceptor extends TransactionAspectSupport
+        implements MethodInterceptor {
+
+    @Override
+    public Object invoke(MethodInvocation invocation) throws Throwable {
+        // 1. 获取事务属性
+        TransactionAttributeSource tas = getTransactionAttributeSource();
+
+        // 2. 获取方法的事务属性
+        TransactionAttribute txAttr = (tas != null ?
+            tas.getTransactionAttribute(invocation.getMethod(), invocation.getThis().getClass()) : null);
+
+        // 3. 获取事务管理器
+        PlatformTransactionManager tm = determineTransactionManager(txAttr);
+
+        // 4. 执行方法
+        return invokeWithinTransaction(invocation.getMethod(), invocation.getThis().getClass(),
+            () -> invocation.proceed(), txAttr, tm);
+    }
+}
+```
+
+### 7.2 invokeWithinTransaction()
+
+```java
+protected Object invokeWithinTransaction(Method method, Class<?> targetClass,
+        TransactionCallback txCallback, TransactionAttribute txAttr,
+        PlatformTransactionManager tm) {
+
+    // 1. 如果是编程式事务，直接执行
+    if (txAttr == null || !(tm instanceof CallbackPreferringPlatformTransactionManager)) {
+        // 2. 获取或创建事务
+        TransactionInfo txInfo = createTransactionIfNecessary(tm, txAttr, txAttr.getName());
+
+        Object retVal;
+        try {
+            // 3. 执行目标方法
+            retVal = txCallback.call();
+        } catch (Throwable ex) {
+            // 4. 异常处理：回滚或提交
+            completeTransactionAfterThrowing(txInfo, ex);
+            throw ex;
+        } finally {
+            // 5. 清理事务信息
+            cleanupTransactionInfo(txInfo);
+        }
+
+        // 6. 提交事务
+        commitTransactionAfterReturning(txInfo);
+
+        return retVal;
+    }
+}
+```
+
+---
+
+## 八、面试追问方向
+
+**「AOP 代理是在什么时候创建的？」**
+
+在 `BeanPostProcessor.postProcessAfterInitialization()` 阶段创建。所有单例 Bean 初始化完成后，代理就创建好了。
+
+**「拦截器链是怎么执行的？」**
+
+通过 `ReflectiveMethodInvocation.proceed()` 方法，采用递归的方式执行：首先执行第一个拦截器，拦截器内部调用 `proceed()` 执行下一个拦截器，最后执行目标方法。
+
+**「为什么 CGLIB 性能更好？」**
+
+因为 `CglibMethodInvocation` 使用 `MethodProxy.invoke()` 而不是 `Method.invoke()`。`MethodProxy` 在调用时会生成一个 FastClass，避免了反射的性能开销。
+
+**「TransactionInterceptor 是怎么实现事务的？」**
+
+通过 `TransactionAspectSupport.createTransactionIfNecessary()` 获取事务，然后通过 `completeTransactionAfterThrowing()` 处理异常回滚。
+
+---
+
+## 总结
+
+Spring AOP 的源码实现：
+
+1. **代理创建入口**：`AnnotationAwareAspectJAutoProxyCreator.postProcessAfterInitialization()`
+2. **代理工厂**：`ProxyFactory` 根据配置选择 `JdkDynamicAopProxy` 或 `CglibAopProxy`
+3. **方法调用**：`ReflectiveMethodInvocation.proceed()` 递归执行拦截器链
+4. **通知适配**：`DefaultAdvisorAdapterRegistry` 将通知转换为 `MethodInterceptor`
+
+理解源码实现，能够帮助你更深入地理解 AOP 的工作原理，并排查相关问题。

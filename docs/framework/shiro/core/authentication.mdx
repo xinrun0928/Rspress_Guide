@@ -1,0 +1,359 @@
+import { Badge } from '@rspress/core/theme';
+
+# Shiro 认证流程：从 Subject.login() 到 Realm 验证
+
+用户输入用户名密码，点击登录——几毫秒后，页面跳转到了首页。这背后发生了什么？
+
+Shiro 的认证流程，比 Spring Security 更直接、更透明。**从 `Subject.login()` 到 `Realm.doGetAuthenticationInfo()`，中间只有三个关键步骤。** 理解了这三步，你就能看懂 Shiro 认证的全貌。
+
+## 认证的核心：谁来验证，怎么验证？
+
+在 Shiro 中，认证（Authentication）的本质是回答一个问题：**"你声称你是谁，我怎么相信？"**
+
+答案藏在三个组件里：
+
+- **AuthenticationToken**：用户提交的凭证（用户名 + 密码）
+- **AuthenticationInfo**：从数据源查出的认证信息（用户名 + 加密后的密码）
+- **CredentialsMatcher**：比较 Token 和 Info 中密码是否一致
+
+```java
+// AuthenticationToken：用户提交
+UsernamePasswordToken token = new UsernamePasswordToken("zhangsan", "123456");
+
+// AuthenticationInfo：数据库中存储
+// 用户名: zhangsan
+// 密码: 5f4dcc3b5aa765d61d8327deb882cf99 (MD5("123456"))
+SimpleAccount account = new SimpleAccount("zhangsan", "5f4dcc3b5aa765d61d8327deb882cf99", "jdbcRealm");
+
+// CredentialsMatcher：比对密码
+// 输入: "123456"  → 加密 → 5f4dcc3b5aa765d61d8327deb882cf99
+// 存储: 5f4dcc3b5aa765d61d8327deb882cf99
+// 结果: 匹配！认证成功
+```
+
+## Subject.login() 的完整流程
+
+让我们从源码层面拆解一次完整的认证流程。
+
+### 第一步：Subject 发起登录
+
+```java
+// 获取当前用户
+Subject subject = SecurityUtils.getSubject();
+
+// 登录
+subject.login(new UsernamePasswordToken("zhangsan", "123456"));
+```
+
+`Subject.login()` 内部会创建一个 `UsernamePasswordToken`，包含用户名和明文密码，然后委托给 SecurityManager。
+
+```java
+// org.apache.shiro.subject.Subject
+public class Subject {
+    public void login(AuthenticationToken token) throws AuthenticationException {
+        Subject subject = this.securityManager.login(this, token);
+        // ... 省略状态更新代码
+    }
+}
+```
+
+### 第二步：SecurityManager 委托认证
+
+`SecurityManager` 并不自己处理认证，而是委托给内部的 `Authenticator`。
+
+```java
+// org.apache.shiro.mgt.DefaultSecurityManager
+public class DefaultSecurityManager extends AuthorizingSecurityManager {
+    public Subject login(Subject subject, AuthenticationToken token) {
+        AuthenticationInfo info;
+        try {
+            // 核心：调用 Authenticator.authenticate()
+            info = this.authenticate(token);
+        } catch (AuthenticationException e) {
+            // 认证失败
+            throw e;
+        }
+        // 认证成功，创建已认证的 Subject
+        Subject loggedIn = createSubjectContext();
+        loggedIn.setAuthenticated(true);
+        loggedIn.mergePrincipalInfo(info);
+        return loggedIn;
+    }
+}
+```
+
+### 第三步：ModularRealmAuthenticator 遍历 Realm
+
+`ModularRealmAuthenticator` 是 Shiro 默认的认证器实现。它的策略是：**遍历所有 Realm，找到支持该 Token 类型的 Realm，用它来完成认证**。
+
+```java
+// org.apache.shiro.mgt.ModularRealmAuthenticator
+protected AuthenticationInfo doAuthenticate(AuthenticationToken token) {
+    Collection<Realm> realms = getRealms();
+
+    // 单 Realm：直接认证
+    if (realms.size() == 1) {
+        return doSingleRealmAuthentication(realms.iterator().next(), token);
+    }
+
+    // 多 Realm：按顺序尝试
+    return doMultiRealmAuthentication(realms, token);
+}
+
+protected AuthenticationInfo doMultiRealmAuthentication(
+        Collection<Realm> realms, AuthenticationToken token) {
+    AuthenticationInfo aggregatedAccountInfo = null;
+
+    for (Realm realm : realms) {
+        // 只处理支持该 Token 的 Realm
+        if (realm.supports(token)) {
+            AuthenticationInfo info = realm.getAuthenticationInfo(token);
+            // 第一个成功的 Realm 结果
+            if (info != null) {
+                aggregatedAccountInfo = mergeAuthenticationInfo(info);
+            }
+        }
+    }
+
+    return aggregatedAccountInfo;
+}
+```
+
+### 第四步：Realm 获取认证信息
+
+Realm 是认证流程的最后一环。它从数据源（数据库、INI 文件、Redis 等）获取用户信息，与用户提交的凭证对比。
+
+```java
+// org.apache.shiro.realm.AuthenticatingRealm
+public final AuthenticationInfo getAuthenticationInfo(AuthenticationToken token) {
+    // 1. 先查缓存
+    AuthenticationInfo info = getCachedAuthenticationInfo(token);
+    if (info != null) {
+        return info;
+    }
+
+    // 2. 调用子类的认证方法获取用户信息
+    info = doGetAuthenticationInfo(token);
+
+    // 3. 如果配置了 CredentialsMatcher，验证凭证
+    if (info != null) {
+        assertCredentialsMatch(token, info);
+    }
+
+    // 4. 写入缓存（可选）
+    if (info != null) {
+        cacheAuthenticationInfoIfPossible(token, info);
+    }
+
+    return info;
+}
+```
+
+## AuthenticationInfo 的三个实现
+
+Shiro 提供了三种 `AuthenticationInfo` 的实现，复杂度递增：
+
+### SimpleAuthenticationInfo：最常用
+
+```java
+// 三个参数：principal、credentials、realmName
+return new SimpleAuthenticationInfo(
+    user.getUsername(),      // 主键（用户名）
+    user.getPassword(),       // 加密后的密码
+    ByteSource.Util.bytes(user.getSalt()),  // 盐值
+    getName()                // Realm 名称
+);
+```
+
+### SimpleAccountRealm：IniRealm 的内部类
+
+```java
+// SimpleAccountRealm 内部维护了一个账户集合
+// 支持添加账户
+simpleAccountRealm.addAccount("zhangsan", "password",
+    "role1", "role2",
+    "user:create", "user:delete");
+
+// Realm.getAuthenticationInfo() 返回 SimpleAccount
+return this.getSystemAccount();
+```
+
+### MergableAuthenticationInfo：多 Realm 聚合
+
+当配置了多个 Realm 时，`ModularRealmAuthenticator` 会把多个 Realm 的认证信息合并。合并后的信息包含所有 Realm 返回的角色和权限。
+
+## CredentialsMatcher：密码验证的核心
+
+密码怎么存才安全？直接存明文是找死，存 MD5 也不够——彩虹表攻击可以在秒级破解。
+
+Shiro 通过 `CredentialsMatcher` 提供了一套可配置的密码加密机制：
+
+### 最简单的实现：SimpleCredentialsMatcher
+
+```java
+// 直接比对明文密码（不安全，生产环境禁用）
+realm.setCredentialsMatcher(new SimpleCredentialsMatcher());
+```
+
+### 推荐实现：HashedCredentialsMatcher
+
+```java
+// 配置加密算法和迭代次数
+HashedCredentialsMatcher matcher = new HashedCredentialsMatcher();
+matcher.setHashAlgorithmName("SHA-256");
+matcher.setHashIterations(1024);  // 迭代 1024 次
+matcher.setStoredCredentialsHexEncoded(false);  // Base64 编码
+realm.setCredentialsMatcher(matcher);
+```
+
+加密过程如下：
+
+```
+用户输入: "123456"
++ 盐值: "randomSalt"
+= SHA-256("123456randomSalt")
+= 第一次哈希
+= SHA-256(第一次结果)
+= 第二次哈希
+... 重复 1024 次 ...
+= 最终存储的密码
+```
+
+这样即使数据库泄露，攻击者也无法直接用彩虹表破解——每次都用不同的盐值，每次都迭代多次，计算成本极高。
+
+## Subject 的状态管理
+
+认证成功后，Subject 会记录认证状态：
+
+```java
+// 判断是否已认证（登录成功过）
+subject.isAuthenticated();  // true
+
+// 获取主体信息（用户名）
+subject.getPrincipal();  // "zhangsan"
+
+// 获取主体集合
+subject.getPrincipals();  // PrincipalCollection，包含所有 Realm 返回的 principal
+
+// 判断是否 RememberMe
+subject.isRemembered();  // false（登录场景下）
+```
+
+### Principal 和 PrincipalCollection
+
+一个用户可能有多个身份标识，比如用户名、手机号、邮箱。在多 Realm 场景下，每个 Realm 可能返回不同的 principal。
+
+```java
+// 获取第一个 principal
+String username = (String) subject.getPrimaryPrincipal();
+
+// 获取所有 principal
+PrincipalCollection principals = subject.getPrincipals();
+Set<String> allPrincipals = principals.byType(String.class);
+```
+
+## RememberMe：自动登录
+
+Shiro 内置了 RememberMe 功能，让用户在关闭浏览器后再次访问时无需重新登录。
+
+```java
+// 登录时指定 RememberMe
+UsernamePasswordToken token = new UsernamePasswordToken(username, password);
+token.setRememberMe(true);
+subject.login(token);
+```
+
+实现原理：
+
+1. 登录成功后，`SimpleRememberMeManager` 生成一个 Cookie
+2. Cookie 内容包含用户 principal，使用 AES 加密
+3. 每次请求时，过滤器解析 Cookie，自动创建 Subject（但不设置 authenticated 状态）
+
+```java
+// RememberMe 和 认证状态的对比
+subject.isAuthenticated();  // false（RememberMe 用户）
+subject.isRemembered();     // true（自动登录用户）
+```
+
+:::warning 安全注意
+RememberMe 用户只能访问公开资源，不能执行敏感操作（如修改密码、转账）。敏感操作前必须强制用户重新输入密码。
+:::
+
+## 认证异常体系
+
+Shiro 定义了一套完整的认证异常体系，每个异常都有明确的含义：
+
+| 异常 | 说明 | 常见原因 |
+|---|---|---|
+| `UnknownAccountException` | 账户不存在 | 用户名输入错误 |
+| `IncorrectCredentialsException` | 密码错误 | 密码输入错误 |
+| `LockedAccountException` | 账户被锁定 | 多次登录失败、账户被禁用 |
+| `ExpiredCredentialsException` | 凭证过期 | 密码超过有效期 |
+| `AuthenticationException` | 认证失败（父类） | 其他未知原因 |
+| `DisabledAccountException` | 账户被禁用 | 用户主动禁用或管理员禁用 |
+
+```java
+try {
+    subject.login(token);
+} catch (UnknownAccountException e) {
+    // 用户不存在
+} catch (IncorrectCredentialsException e) {
+    // 密码错误
+} catch (LockedAccountException e) {
+    // 账户被锁定
+} catch (AuthenticationException e) {
+    // 其他认证异常
+}
+```
+
+## 完整的认证时序图
+
+```
+用户浏览器
+    │
+    │  1. POST /login (username, password)
+    ▼
+ ShiroFilter
+    │
+    │  2. FormAuthenticationFilter 拦截请求
+    │     创建 UsernamePasswordToken
+    ▼
+ Subject.login(token)
+    │
+    │  3. 委托给 SecurityManager
+    ▼
+ SecurityManager.login()
+    │
+    │  4. 调用 Authenticator.authenticate()
+    ▼
+ ModularRealmAuthenticator.doAuthenticate()
+    │
+    │  5. 遍历 Realm，调用 realm.supports(token)
+    ▼
+ AuthenticatingRealm.getAuthenticationInfo()
+    │
+    │  6. 查缓存（AuthenticationCache）
+    │  7. 调用 doGetAuthenticationInfo()（子类实现）
+    │  8. 凭证匹配（CredentialsMatcher）
+    ▼
+ AuthenticationInfo（SimpleAuthenticationInfo）
+    │
+    │  9. 写入 AuthenticationCache
+    ▼
+ Subject 设置认证状态
+    │
+    │  10. 认证成功，跳转首页
+    ▼
+ 登录成功
+```
+
+## 总结：认证流程的关键点
+
+1. **Subject 是门面**：所有认证操作都通过 Subject 发起，但真正处理的是 SecurityManager
+2. **Authenticator 是协调器**：ModularRealmAuthenticator 遍历所有 Realm，找到支持该 Token 的 Realm
+3. **Realm 是数据源**：Realm 从数据库/配置文件获取用户信息，封装成 AuthenticationInfo
+4. **CredentialsMatcher 是验证器**：比较用户提交的密码和存储的密码是否一致
+5. **缓存是优化**：认证信息会被缓存，减少数据库查询
+
+> **面试追问**：如果配置了多个 Realm，每个 Realm 都返回了不同的 AuthenticationInfo，会发生什么？答案是 ModularRealmAuthenticator 会合并所有 Realm 的结果，用 MergableAuthenticationInfo 聚合角色和权限。但认证成功只需要一个 Realm 返回有效信息即可。
+

@@ -1,0 +1,448 @@
+import { Badge } from '@rspress/core/theme';
+
+# Session 会话管理：登录状态是如何保持的
+
+HttpSession 和 SecurityContext 的关系是什么？
+
+认证成功后，Spring Security 把用户信息存在 SecurityContext 里。但 SecurityContext 是存在 ThreadLocal 中的，请求结束后 ThreadLocal 就清空了。下一次请求来的时候，Spring Security 怎么知道用户已经登录了？
+
+这就是 Session 的作用。
+
+---
+
+## Session 与 SecurityContext 的关系
+
+### 为什么需要 Session？
+
+每个 HTTP 请求都是独立的，没有状态。但安全机制需要状态——你不能每次请求都让用户重新登录。所以需要一个地方存储登录状态，在多次请求间共享。
+
+Session 就是这个「多次请求间共享状态」的机制。
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                  Session 工作原理                            │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  第一次请求 /login（POST）                                   │
+│       ↓                                                      │
+│  验证通过，生成 Authentication                                │
+│       ↓                                                      │
+│  创建 HttpSession，Session ID 返回给浏览器（Cookie）          │
+│       ↓                                                      │
+│  Session 中保存 SecurityContext（包含 Authentication）        │
+│       ↓                                                      │
+│  ───────────────────────────────────────────────────────    │
+│  第二次请求 /api/user（GET）                                │
+│       ↓                                                      │
+│  请求携带 Cookie（Session ID）                               │
+│       ↓                                                      │
+│  服务端找到对应的 HttpSession                                │
+│       ↓                                                      │
+│  Session 中取出 SecurityContext                              │
+│       ↓                                                      │
+│  SecurityContext 中取出 Authentication                       │
+│       ↓                                                      │
+│  验证用户已登录，继续处理请求                                 │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### SecurityContextPersistenceFilter 的桥梁作用
+
+这个过滤器负责把 SecurityContext 和 Session 连接起来：
+
+```java
+public class SecurityContextPersistenceFilter extends GenericFilterBean {
+
+    public void doFilter(ServletRequest request, ServletResponse response,
+            FilterChain chain) throws IOException, ServletException {
+
+        HttpSession session = httpRequest.getSession(false);
+
+        try {
+            // 【请求开始】从 Session 恢复 SecurityContext
+            SecurityContext contextBeforeChainExecution = null;
+            if (session != null) {
+                contextBeforeChainExecution =
+                    (SecurityContext) session.getAttribute(
+                        "SPRING_SECURITY_CONTEXT");
+            }
+
+            // 如果 Session 中没有，创建一个空的
+            if (contextBeforeChainExecution == null) {
+                contextBeforeChainExecution =
+                    SecurityContextHolder.createEmptyContext();
+            }
+
+            // 存入 ThreadLocal
+            SecurityContextHolder.setContext(contextBeforeChainExecution);
+
+            // 执行后续过滤器
+            chain.doFilter(request, response);
+
+        } finally {
+            // 【请求结束】将 SecurityContext 存回 Session
+            SecurityContext contextAfterChainExecution =
+                SecurityContextHolder.getContext();
+
+            // 清除 ThreadLocal
+            SecurityContextHolder.clearContext();
+
+            // 如果 SecurityContext 变了（认证了），存回 Session
+            if (!contextAfterChainExecution.equals(contextBeforeChainExecution)
+                    && session != null) {
+                session.setAttribute(
+                    "SPRING_SECURITY_CONTEXT",
+                    contextAfterChainExecution);
+            }
+        }
+    }
+}
+```
+
+**关键点**：
+
+- 请求开始：从 Session 读 SecurityContext 到 ThreadLocal
+- 请求结束：从 ThreadLocal 写 SecurityContext 到 Session，然后清空 ThreadLocal
+
+---
+
+## Session 会话管理的关键配置
+
+### 会话创建策略
+
+```java
+http.sessionManagement(session -> session
+    .sessionCreationPolicy(SessionCreationPolicy.IF_REQUIRED)
+);
+```
+
+| 策略 | 行为 | 适用场景 |
+|---|---|---|
+| `IF_REQUIRED`（默认） | 需要时创建 Session | 大多数 Web 应用 |
+| `NEVER` | 不主动创建，但使用已有 Session | 不想创建 Session |
+| `STATELESS` | 不使用 Session，不创建也不使用 | RESTful API、JWT |
+| `ALWAYS` | 每次请求都创建 Session | 很少使用 |
+
+### STATELESS 和 JWT 的关系
+
+```java
+.sessionCreationPolicy(SessionCreationPolicy.STATELESS)
+```
+
+设置为 `STATELESS` 后：
+
+- 请求不会创建 Session
+- `HttpServletRequest.getSession(false)` 返回 null
+- `SecurityContextPersistenceFilter` 不会尝试读写 Session
+- 适合配合 JWT Token 使用，实现真正的无状态
+
+:::warning
+设置为 `STATELESS` 后，Spring Security 的很多功能会失效：
+
+- Remember-Me（依赖 Session 存储 Token）
+- Session 并发控制
+- Session fixation 防护
+
+如果你的应用是纯 RESTful API，推荐使用 JWT + STATELESS。如果你的应用是 Web + API 混合，建议保留 Session。
+:::
+
+---
+
+## 会话固定攻击防护
+
+### 什么是会话固定攻击？
+
+攻击者先访问目标网站，获取一个 Session ID（此时未登录）。然后诱使受害者使用这个 Session ID 登录。登录成功后，攻击者使用同样的 Session ID 就能冒充受害者。
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│              会话固定攻击的三个步骤                           │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  步骤1：攻击者访问网站                                        │
+│  网站返回 Session ID: ABC123                                  │
+│  攻击者知道 ABC123                                              │
+│                                                              │
+│  步骤2：诱使受害者使用 Session ID ABC123 登录                  │
+│  受害者用自己的账户登录                                        │
+│  登录成功后，Session ABC123 中有了受害者的认证信息              │
+│                                                              │
+│  步骤3：攻击者使用 Session ID ABC123 访问                      │
+│  服务器认为这是受害者的会话                                    │
+│  攻击者冒充受害者操作                                         │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Spring Security 的防护策略
+
+```java
+http.sessionManagement(session -> session
+    // 会话固定攻击防护
+    .sessionFixation().newSession()  // 登录后创建新 Session
+    // 或
+    .sessionFixation().migrateSession()  // 登录后迁移 Session（复制属性）
+    // 或
+    .sessionFixation().changeSessionId()  // 登录后仅改变 Session ID（Spring Security 5.1+，推荐）
+    // 或
+    .sessionFixation().none()  // 不做任何防护（不推荐）
+)
+```
+
+**推荐使用 `changeSessionId()`**：
+
+- 保持用户体验（不创建新 Session）
+- 又能防护会话固定攻击（Session ID 变了）
+
+---
+
+## 会话并发控制
+
+### 为什么需要并发控制？
+
+一个账户同时只能在一个地方登录——这是很多业务场景的需求。Spring Security 通过 `maximumSessions` 配置实现这个功能。
+
+```java
+http.sessionManagement(session -> session
+    .maximumSessions(1)  // 每个用户最多 1 个 Session
+)
+```
+
+### 配置示例
+
+```java
+http.sessionManagement(session -> session
+    .maximumSessions(1)
+    // 当达到最大会话数时，新登录会被踢掉旧会话
+    .expiredUrl("/session-expired")  // 旧会话过期后的跳转页面
+    .maxSessionsPreventsLogin(false)  // false: 踢掉旧会话；true: 拒绝新登录
+)
+```
+
+### `maxSessionsPreventsLogin` 的两种策略
+
+| 策略 | 值 | 效果 |
+|---|---|---|
+| 踢旧登录 | `false`（默认） | 新登录成功后，旧会话立即失效 |
+| 阻止新登录 | `true` | 已有最大数量的会话时，禁止新登录 |
+
+### 并发控制的实现原理
+
+```
+用户 A 第一次登录
+    ↓
+SessionRegistry 注册 Session（userA → [session1]）
+    ↓
+用户 A 第二次登录
+    ↓
+SessionRegistry 发现已有 session1
+    ↓
+session1 失效（发送 Session expired 事件）
+    ↓
+SessionRegistry 注册 Session（userA → [session2]）
+```
+
+### 手动踢人下线
+
+```java
+@Autowired
+private SessionRegistry sessionRegistry;
+
+// 踢掉某个用户的所有会话
+public void kickOutUser(String username) {
+    List<Object> allSessions = sessionRegistry.getAllPrincipals()
+        .stream()
+        .filter(p -> p instanceof UserDetails)
+        .filter(p -> ((UserDetails) p).getUsername().equals(username))
+        .flatMap(p -> sessionRegistry.getAllSessions(p).stream())
+        .collect(Collectors.toList());
+
+    for (SessionInformation session : allSessions) {
+        session.expireNow();  // 立即过期
+    }
+}
+
+// 踢掉指定 Session
+public void kickOutSession(String sessionId) {
+    for (Object principal : sessionRegistry.getAllPrincipals()) {
+        List<SessionInformation> sessions = sessionRegistry.getAllSessions(principal);
+        for (SessionInformation session : sessions) {
+            if (session.getSessionId().equals(sessionId)) {
+                session.expireNow();
+            }
+        }
+    }
+}
+```
+
+---
+
+## Session 超时配置
+
+### 服务端超时
+
+```properties
+# application.properties
+server.servlet.session.timeout=30m  # 30分钟无活动，Session 过期
+```
+
+### 客户端超时（Cookie）
+
+```java
+http.sessionManagement(session -> session
+    .sessionFixation().changeSessionId()
+    .maximumSessions(1)
+)
+.cookie()  // 自定义 Cookie 配置
+    .name("JSESSIONID")
+    .httpOnly(true)      // 禁止 JavaScript 读取
+    .secure(true)        // 仅 HTTPS 传输
+    .sameSite("Lax")     // SameSite 属性
+;
+```
+
+### 超时验证
+
+```java
+@Controller
+public class SessionController {
+
+    @GetMapping("/check-session")
+    @ResponseBody
+    public Map<String, Object> checkSession(HttpSession session) {
+        Map<String, Object> result = new HashMap<>();
+        result.put("sessionId", session.getId());
+        result.put("creationTime", new Date(session.getCreationTime()));
+        result.put("maxInactiveInterval", session.getMaxInactiveInterval());
+        result.put("lastAccessedTime", new Date(session.getLastAccessedTime()));
+        return result;
+    }
+}
+```
+
+---
+
+## Session 集群化
+
+### 为什么需要集群化？
+
+单机部署时，Session 存在应用服务器的内存中。但当应用部署多台机器做负载均衡时，用户第一次请求被路由到机器 A，第二次请求可能被路由到机器 B——机器 B 上没有用户 A 的 Session。
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Session 共享问题                          │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  负载均衡器（Round Robin）                                    │
+│       ↓              ↓              ↓                       │
+│   ┌─────┐      ┌─────┐      ┌─────┐                       │
+│   │ A机 │      │ B机 │      │ C机 │                       │
+│   │Session│    │Session│    │Session│                     │
+│   │ 用户A │     │  空  │     │  空  │                       │
+│   └─────┘      └─────┘      └─────┘                       │
+│       ↓                                                    │
+│   用户A登录，Session 存在 A 机                                │
+│       ↓                                                    │
+│   第二次请求被路由到 B 机                                     │
+│       ↓                                                    │
+│   B 机没有用户 A 的 Session → 需要重新登录                    │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 解决方案：Spring Session + Redis
+
+Spring Session 把 Session 存储在 Redis 中，所有机器都从 Redis 读写 Session。
+
+```xml
+<!-- pom.xml -->
+<dependency>
+    <groupId>org.springframework.session</groupId>
+    <artifactId>spring-session-data-redis</artifactId>
+</dependency>
+```
+
+```java
+@Configuration
+@EnableRedisHttpSession(maxInactiveIntervalInSeconds = 3600)  // 1小时
+public class RedisSessionConfig {
+    // Spring Boot 自动配置，无需手动配置 Redis
+}
+```
+
+**原理**：
+
+```
+用户请求 → 机器 A
+    ↓
+机器 A 从 Redis 获取 Session
+    ↓
+Session 读写都在 Redis 中
+    ↓
+负载均衡到机器 B
+    ↓
+机器 B 同样从 Redis 获取 Session
+    ↓
+Session 共享，无缝切换
+```
+
+### Session 序列化的注意事项
+
+Session 中存储的对象必须实现 `Serializable`。Spring Security 的核心对象（如 `UserDetails`）都实现了 `Serializable`，但如果你自定义了用户对象：
+
+```java
+public class CustomUserDetails implements UserDetails, Serializable {
+    private static final long serialVersionUID = 1L;
+
+    // 如果有非序列化的字段，用 transient 修饰
+    // transient private SomeService someService;
+
+    // ...
+}
+```
+
+---
+
+## 面试追问预判
+
+### Q1：Session 和 Cookie 的区别是什么？
+
+Session 是服务端的存储，Cookie 是客户端的存储。Session 依赖 Cookie 传递 Session ID。Cookie 可以存储少量数据（如用户偏好），Session 可以存储大量数据（如认证信息）。
+
+### Q2：禁用 Cookie 后 Session 还能用吗？
+
+可以，但需要用 URL 重写的方式传递 Session ID：
+
+```java
+response.encodeURL("/path");  // 会在 URL 中附加 ;jsessionid=xxx
+```
+
+不过这种方式不推荐，已基本被淘汰。
+
+### Q3：Session 和 JWT Token 的适用场景分别是什么？
+
+| 场景 | 推荐方案 | 原因 |
+|---|---|---|
+| 传统 Web 应用 | Session | 简单，已被 Spring Security 良好支持 |
+| RESTful API | JWT | 无状态，适合分布式 |
+| Web + API 混合 | Session 或 JWT | 取决于具体需求 |
+| 微服务架构 | JWT | 服务间调用无需共享 Session |
+
+### Q4：分布式 Session 和 JWT Token 哪个更好？
+
+没有绝对的好坏，只有适用不适用。分布式 Session 需要额外的 Redis 存储，但支持实时踢人下线。JWT Token 无需服务端存储，但一旦签发就无法撤销（除非维护黑名单）。
+
+---
+
+## 总结
+
+Session 是 Spring Security 保持登录状态的核心机制：
+
+1. **SecurityContextPersistenceFilter** 是 Session 和 SecurityContext 的桥梁
+2. **SessionCreationPolicy** 控制是否创建 Session
+3. **sessionFixation()** 防护会话固定攻击
+4. **maximumSessions()** 控制并发登录
+5. **Spring Session + Redis** 解决集群部署的 Session 共享问题
+
+理解了 Session 管理，下一节我们来看 [Remember-Me](/framework/springsecurity/auth/remember-me)——两周免登录是怎么实现的。

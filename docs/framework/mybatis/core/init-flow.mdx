@@ -1,0 +1,375 @@
+# MyBatis 初始化流程
+
+import { Badge } from '@rspress/core/theme';
+
+你有没有想过，当你调用 `SqlSessionFactoryBuilder.build(inputStream)` 时，MyBatis 内部发生了什么？配置文件是如何被解析的？Mapper 接口是如何被扫描并注册到容器中的？
+
+理解 MyBatis 的初始化流程，是掌握其核心原理的第一步。很多奇怪的报错——比如"找不到 SQL"、"resultMap 引用错误"——追根溯源都是初始化阶段埋下的坑。
+
+## 初始化入口：SqlSessionFactoryBuilder
+
+一切的起点，是这段熟悉的代码：
+
+```java
+String resource = "mybatis-config.xml";
+InputStream inputStream = Resources.getResourceAsStream(resource);
+SqlSessionFactory sqlSessionFactory = new SqlSessionFactoryBuilder().build(inputStream);
+```
+
+`SqlSessionFactoryBuilder.build()` 方法重载了多个版本，但最终都殊途同归：
+
+```java title="SqlSessionFactoryBuilder.java"
+public SqlSessionFactory build(InputStream inputStream) {
+    // 委托给 XMLConfigBuilder 解析
+    return build(new XMLConfigBuilder(inputStream).parse());
+}
+
+public SqlSessionFactory build(Configuration config) {
+    // 创建 DefaultSqlSessionFactory
+    return new DefaultSqlSessionFactory(config);
+}
+```
+
+核心逻辑只有两步：
+
+1. **XMLConfigBuilder.parse()** → 将 XML 解析为 `Configuration` 对象
+2. **DefaultSqlSessionFactory(config)** → 创建 SqlSession 工厂
+
+## XMLConfigBuilder 解析链路
+
+`XMLConfigBuilder.parse()` 是初始化的核心，它会按照严格的顺序解析配置的各个部分：
+
+```java title="XMLConfigBuilder.java"
+public Configuration parse() {
+    // 防止重复解析
+    if (parsed) {
+        throw new BuilderException("Each XMLConfigBuilder can only be parsed once!");
+    }
+    parsed = true;
+
+    // 解析 <configuration> 根节点
+    parseConfiguration(parser.evalNode("/configuration"));
+
+    return configuration;
+}
+
+private void parseConfiguration(XNode root) {
+    // 按顺序解析各子节点
+    propertiesElement(root.evalNode("properties"));          // 1. <properties>
+    settingsAsNodes(root.evalNode("settings"));              // 2. <settings>
+    typeAliasesElement(root.evalNode("typeAliases"));        // 3. <typeAliases>
+    pluginsElement(root.evalNode("plugins"));                // 4. <plugins>
+    objectFactoryElement(root.evalNode("objectFactory"));    // 5. <objectFactory>
+    objectWrapperFactoryElement(root.evalNode("objectWrapperFactory"));
+    reflectorFactoryElement(root.evalNode("reflectorFactory"));
+    environmentsElement(root.evalNode("environments"));      // 6. <environments>
+    databaseIdProviderElement(root.evalNode("databaseIdProvider")); // 7. <databaseIdProvider>
+    typeHandlerElement(root.evalNode("typeHandlers"));       // 8. <typeHandlers>
+    mapperElement(root.evalNode("mappers"));                 // 9. <mappers>
+}
+```
+
+这个顺序非常重要——某些配置依赖于前面的配置。例如，`mappers` 中引用的 `resultMap` 必须在 `typeAliases` 之后解析，否则类型别名无法识别。
+
+## 关键配置解析详解
+
+### 1. environments 配置解析
+
+```java title="XMLConfigBuilder.java"
+private void environmentsElement(XNode context) throws Exception {
+    if (context != null) {
+        String environment = context.getStringAttribute("default");
+
+        // 遍历 <environment> 子节点
+        for (XNode child : context.getChildren()) {
+            String id = child.getStringAttribute("id");
+            if (environment.equals(id)) {
+                // 创建 TransactionFactory
+                TransactionFactory txFactory = transactionManagerElement(child.evalNode("transactionManager"));
+                // 创建 DataSource
+                DataSourceFactory dsFactory = dataSourceElement(child.evalNode("dataSource"));
+                DataSource dataSource = dsFactory.getDataSource();
+
+                // 创建 Environment
+                Environment environment = new Environment(id, txFactory, dataSource);
+                configuration.setEnvironment(environment);
+            }
+        }
+    }
+}
+```
+
+### 2. mapper 配置解析（核心重点）
+
+mapper 配置的解析是初始化过程中最复杂的部分，因为它支持多种配置方式：
+
+```java title="XMLConfigBuilder.java"
+private void mapperElement(XNode parent) throws Exception {
+    if (parent != null) {
+        for (XNode child : parent.getChildren()) {
+            String resource = child.getStringAttribute("resource");
+            String url = child.getStringAttribute("url");
+            String mapperClass = child.getStringAttribute("class");
+
+            // 四种配置方式
+            if (resource != null && url == null && mapperClass == null) {
+                // 方式一：<mapper resource="..." />
+                XMLMapperBuilder mapperParser = new XMLMapperBuilder(
+                    resourceAsStream,
+                    configuration,
+                    resource,
+                    configuration.getSqlFragments()
+                );
+                mapperParser.parse();
+            } else if (resource == null && url != null && mapperClass == null) {
+                // 方式二：<mapper url="..." />
+                XMLMapperBuilder mapperParser = new XMLMapperBuilder(
+                    urlAsStream,
+                    configuration,
+                    url,
+                    configuration.getSqlFragments()
+                );
+                mapperParser.parse();
+            } else if (resource == null && url == null && mapperClass != null) {
+                // 方式三：<mapper class="..." /> - 注解方式
+                Class<?> mapperInterface = Resources.classForName(mapperClass);
+                configuration.addMapper(mapperInterface);
+            } else {
+                throw new BuilderException("A mapper element may only specify a url, resource or class reference, but not more than one.");
+            }
+        }
+    }
+}
+```
+
+### 3. XMLMapperBuilder 解析 Mapper XML
+
+当使用 XML 方式配置 Mapper 时，会创建 `XMLMapperBuilder` 进行解析：
+
+```java title="XMLMapperBuilder.java"
+public void parse() {
+    // 防止重复解析
+    if (!configuration.isResourceLoaded(resource)) {
+        // 解析 <mapper> 节点
+        configurationElement(parser.evalNode("/mapper"));
+
+        // 标记已加载
+        configuration.addLoadedResource(resource);
+
+        // 绑定 Mapper 接口
+        bindMapperForNamespace();
+    }
+
+    // 处理未完成的 resultMap 引用
+    resultMapElements(resultMapsNodes);
+
+    // 处理未完成的 sql 片段
+    buildFragmentsFromFragmentsNode();
+}
+
+private void configurationElement(XNode context) {
+    // 获取命名空间（必须有！）
+    String namespace = context.getStringAttribute("namespace");
+    if (namespace == null || namespace.isEmpty()) {
+        throw new BuilderException("Mapper's namespace cannot be empty");
+    }
+
+    // 设置当前 namespace
+    builderAssistant.setCurrentNamespace(namespace);
+
+    // 解析缓存引用
+    cacheRefElement(context.evalNode("cache-ref"));
+
+    // 解析缓存配置
+    cacheElement(context.evalNode("cache"));
+
+    // 解析 ResultMap
+    resultMapElements(context.evalNodes("/mapper/resultMap"));
+
+    // 解析 SQL 片段
+    sqlElements(context.evalNodes("/mapper/sql"));
+
+    // 解析 CRUD 语句
+    buildStatementFromContext(context.evalNodes("select|insert|update|delete"));
+}
+```
+
+## MappedStatement 的注册过程
+
+每一条 SQL 语句都会被解析为一个 `MappedStatement` 对象，并注册到 `Configuration` 中：
+
+```java title="XMLStatementBuilder.java"
+public void parseStatement() {
+    String namespace = builderAssistant.getCurrentNamespace();
+    String id = statement.getStringAttribute("id");
+
+    // 完整的 statement id = namespace + "." + id
+    String statementId = namespace + "." + id;
+
+    // 创建 MappedStatement.Builder
+    MappedStatement.Builder statementBuilder = new MappedStatement.Builder(
+        configuration,
+        statementId,
+        sqlSource,
+        sqlCommandType
+    );
+
+    // 设置结果映射
+    resultMapElements(statement.getRoot());
+
+    // 构建 MappedStatement
+    MappedStatement mappedStatement = statementBuilder.build();
+
+    // 注册到 Configuration
+    configuration.addMappedStatement(mappedStatement);
+}
+```
+
+**MappedStatement 的结构**：
+
+```java title="MappedStatement.java"
+public final class MappedStatement {
+
+    private String id;                    // statement id
+    private SqlCommandType sqlCommandType; // SELECT/INSERT/UPDATE/DELETE
+    private SqlSource sqlSource;           // SQL 源码（DynamicSqlSource/RawSqlSource）
+    private ResultMap resultMap;          // 结果映射
+    private boolean useCache;             // 是否使用二级缓存
+    private boolean flushCache;           // 是否刷新缓存
+
+    // ... 其他属性
+}
+```
+
+## Configuration 容器结构
+
+`Configuration` 是 MyBatis 的核心容器，所有配置解析完成后都存储在这里：
+
+```java title="Configuration.java"
+public class Configuration {
+
+    // 环境配置
+    protected Environment environment;
+
+    // 是否启用二级缓存（默认 true）
+    protected boolean cacheEnabled = true;
+
+    // 执行器类型
+    protected ExecutorType defaultExecutorType = ExecutorType.SIMPLE;
+
+    // MappedStatement 容器：key = namespace + "." + id
+    protected final Map<String, MappedStatement> mappedStatements = new StrictMap<>();
+
+    // ResultMap 容器：key = namespace + "." + resultMapId
+    protected final Map<String, ResultMap> resultMaps = new StrictMap<>();
+
+    // ParameterMap 容器（已废弃）
+    protected final Map<String, ParameterMap> parameterMaps = new StrictMap<>();
+
+    // TypeHandler 容器
+    protected final TypeHandlerRegistry typeHandlerRegistry = new TypeHandlerRegistry();
+
+    // Mapper 接口容器：key = mapperInterface.class
+    protected final Map<Class<?>, MapperProxyFactory<?>> knownMappers = new HashMap<>();
+
+    // ... 其他配置
+}
+```
+
+**容器的 key 设计**：
+
+| 容器 | key 格式 | 示例 |
+|---|---|---|
+| `mappedStatements` | `namespace + "." + id` | `com.example.UserMapper.selectById` |
+| `resultMaps` | `namespace + "." + resultMapId` | `com.example.UserMapper.BaseResultMap` |
+| `knownMappers` | `mapperInterface.class` | `com.example.UserMapper.class` |
+
+## 初始化流程图
+
+```
+SqlSessionFactoryBuilder.build(inputStream)
+        │
+        ▼
+XMLConfigBuilder.parse()
+        │
+        ├── propertiesElement()          ← 加载 properties
+        ├── settingsAsNodes()             ← 加载全局配置
+        ├── typeAliasesElement()          ← 注册类型别名
+        ├── pluginsElement()              ← 注册插件
+        ├── environmentsElement()         ← 配置数据源和事务
+        ├── typeHandlerElement()          ← 注册 TypeHandler
+        │
+        └── mapperElement()               ← 注册 Mapper
+                │
+                ├── XMLMapperBuilder.parse()
+                │       │
+                │       ├── cacheElement()              ← 解析缓存
+                │       ├── resultMapElements()         ← 解析 resultMap
+                │       ├── sqlElements()                ← 解析 SQL 片段
+                │       └── buildStatementFromContext()  ← 解析 CRUD
+                │               │
+                │               └── XMLStatementBuilder.parseStatement()
+                │                       │
+                │                       └── MappedStatement.build()
+                │                               │
+                │                               └── Configuration.addMappedStatement()
+                │
+                └── bindMapperForNamespace()    ← 绑定 Mapper 接口
+                        │
+                        └── MapperProxyFactory.newInstance()
+```
+
+## 常见初始化错误及排查
+
+### 1. namespace 为空
+
+```xml
+<!-- 错误：没有 namespace -->
+<mapper>
+    <select id="selectById" resultType="User">
+        SELECT * FROM user WHERE id = #{id}
+    </select>
+</mapper>
+```
+
+报错：`BindingException: Invalid bound statement (not found)`
+
+### 2. resultMap 引用错误
+
+```xml
+<!-- 错误：resultMap 的 namespace 写错了 -->
+<select id="selectUser" resultMap="com.example.WrongMapper.BaseResultMap">
+```
+
+报错：`BindingException: Could not find result map 'com.example.WrongMapper.BaseResultMap'`
+
+### 3. 重复解析
+
+```java
+// 错误：同一个 mapper 路径被加载两次
+SqlSessionFactoryBuilder.build(inputStream1);
+SqlSessionFactoryBuilder.build(inputStream2); // 同一文件
+```
+
+报错：`BuilderException: Each XMLConfigBuilder can only be parsed once!`
+
+---
+
+## 面试重点
+
+| 问题 | 回答要点 |
+|---|---|
+| SqlSessionFactoryBuilder.build() 做了什么？ | 解析 XML 配置，创建 Configuration，注册 Mapper |
+| Configuration 中存储了哪些内容？ | MappedStatement、ResultMap、TypeHandler、Mapper 接口 |
+| MappedStatement 的 id 格式是什么？ | `namespace + "." + id` |
+| 为什么 mapper XML 必须有 namespace？ | 用于唯一标识 SQL 语句，区分不同 Mapper 的同名 SQL |
+
+---
+
+## 延伸思考
+
+MyBatis 的初始化过程是顺序敏感的——`<typeAliases>` 必须在 `<mappers>` 之前解析。如果顺序错了会发生什么？
+
+假设你定义了类型别名 `alias="User"`，但在解析 Mapper XML 时还没有注册这个别名，那么 `resultType="User"` 就会解析失败。
+
+这也是为什么 MyBatis 官方文档强调配置顺序的原因。

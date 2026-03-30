@@ -1,0 +1,463 @@
+import { Badge } from '@rspress/core/theme';
+
+# Shiro CSRF 防护：OncePerRequestFilter 实现 Token 校验
+
+Shiro 没有内置 CSRF 防护？别担心，自己写一个也不难。
+
+CSRF（Cross-Site Request Forgery，跨站请求伪造）是一种常见的 Web 安全漏洞。攻击者诱导用户访问恶意页面，该页面自动向目标网站发起请求，由于用户已登录，请求会携带用户的认证信息，导致未授权的操作被执行。
+
+## CSRF 攻击原理
+
+```
+1. 用户登录银行网站
+   Session ID: abc123
+
+2. 用户被诱导访问恶意网站
+
+3. 恶意网站包含以下代码：
+   <img src="https://bank.com/transfer?to=hacker&amount=10000">
+
+4. 浏览器自动携带 Cookie 发起请求
+   GET /transfer?to=hacker&amount=10000
+   Cookie: JSESSIONID=abc123
+
+5. 银行服务器以为是用户操作，执行转账
+```
+
+## Shiro 防护方案
+
+### 整体思路
+
+```
+CSRF Token 防护流程：
+
+1. 登录成功后，生成 CSRF Token
+   └── 存入 Session 或 Redis
+
+2. 页面渲染时，将 Token 注入表单
+   └── <input type="hidden" name="_csrf" value="xxx">
+
+3. AJAX 请求时，将 Token 放入 Header
+   └── X-CSRF-Token: xxx
+
+4. 服务器验证 Token
+   └── 不匹配则拒绝请求
+```
+
+### 1. CSRF Token 生成和存储
+
+```java
+@Service
+public class CsrfTokenService {
+
+    private static final String CSRF_TOKEN_KEY = "csrf:token:";
+    private static final int TOKEN_LENGTH = 32;
+
+    /**
+     * 生成 CSRF Token
+     */
+    public String generateToken(HttpSession session) {
+        String token = generateRandomToken();
+
+        // 存入 Session
+        session.setAttribute("_csrf_token", token);
+        session.setAttribute("_csrf_token_time", System.currentTimeMillis());
+
+        // 也存入 Redis（可选，支持分布式）
+        redisTemplate.opsForValue().set(
+            CSRF_TOKEN_KEY + session.getId(),
+            token,
+            30, TimeUnit.MINUTES
+        );
+
+        return token;
+    }
+
+    /**
+     * 验证 CSRF Token
+     */
+    public boolean validateToken(HttpSession session, String token) {
+        if (token == null || token.isEmpty()) {
+            return false;
+        }
+
+        // 从 Session 获取
+        Object sessionToken = session.getAttribute("_csrf_token");
+        if (sessionToken != null && sessionToken.equals(token)) {
+            return true;
+        }
+
+        // 从 Redis 获取
+        String redisToken = redisTemplate.opsForValue()
+            .get(CSRF_TOKEN_KEY + session.getId());
+        return token.equals(redisToken);
+    }
+
+    /**
+     * 生成随机 Token
+     */
+    private String generateRandomToken() {
+        SecureRandom random = new SecureRandom();
+        byte[] bytes = new byte[TOKEN_LENGTH];
+        random.nextBytes(bytes);
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
+    }
+
+    /**
+     * 清除 Token（登出时调用）
+     */
+    public void clearToken(HttpSession session) {
+        session.removeAttribute("_csrf_token");
+        session.removeAttribute("_csrf_token_time");
+        redisTemplate.delete(CSRF_TOKEN_KEY + session.getId());
+    }
+}
+```
+
+### 2. 自定义 CSRF 过滤器
+
+```java
+public class CsrfFilter extends OncePerRequestFilter {
+
+    private CsrfTokenService csrfTokenService;
+
+    // 排除的路径
+    private Set<String> excludePaths = new HashSet<>();
+
+    public CsrfFilter(CsrfTokenService csrfTokenService) {
+        this.csrfTokenService = csrfTokenService;
+
+        // 默认排除公开路径
+        excludePaths.add("/login");
+        excludePaths.add("/register");
+        excludePaths.add("/static");
+        excludePaths.add("/api/public");
+    }
+
+    @Override
+    protected boolean isAccessAllowed(ServletRequest request,
+                                     ServletResponse response,
+                                     Object mappedValue) {
+
+        HttpServletRequest httpRequest = (HttpServletRequest) request;
+        HttpServletResponse httpResponse = (HttpServletResponse) response;
+        HttpSession session = httpRequest.getSession(false);
+
+        String requestURI = httpRequest.getRequestURI();
+
+        // 1. 排除路径不检查
+        if (isExcluded(requestURI)) {
+            return true;
+        }
+
+        // 2. Session 不存在不检查（未登录）
+        if (session == null) {
+            return true;
+        }
+
+        // 3. GET 请求不检查（CSRF 主要针对写操作）
+        if ("GET".equalsIgnoreCase(httpRequest.getMethod())) {
+            return true;
+        }
+
+        // 4. 获取请求中的 Token
+        String token = getCsrfToken(httpRequest);
+
+        // 5. 验证 Token
+        if (!csrfTokenService.validateToken(session, token)) {
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * 从请求中获取 CSRF Token
+     * 支持三种方式：Header、请求参数、Cookie
+     */
+    private String getCsrfToken(HttpServletRequest request) {
+        // 1. 从 Header 获取（推荐）
+        String token = request.getHeader("X-CSRF-Token");
+
+        // 2. 从请求参数获取（表单提交）
+        if (token == null) {
+            token = request.getParameter("_csrf");
+        }
+
+        // 3. 从 Cookie 获取
+        if (token == null) {
+            Cookie[] cookies = request.getCookies();
+            if (cookies != null) {
+                for (Cookie cookie : cookies) {
+                    if ("_csrf".equals(cookie.getName())) {
+                        token = cookie.getValue();
+                        break;
+                    }
+                }
+            }
+        }
+
+        return token;
+    }
+
+    @Override
+    protected boolean onAccessDenied(ServletRequest request,
+                                    ServletResponse response) {
+        HttpServletResponse httpResponse = (HttpServletResponse) response;
+        httpResponse.setStatus(HttpServletResponse.SC_FORBIDDEN);
+        httpResponse.setContentType("application/json;charset=UTF-8");
+
+        try {
+            httpResponse.getWriter().write(
+                "{\"code\": 403, \"message\": \"CSRF Token 验证失败，请刷新页面重试\"}"
+            );
+        } catch (IOException e) {
+            log.error("CSRF 响应写入失败", e);
+        }
+
+        return false;
+    }
+
+    private boolean isExcluded(String uri) {
+        for (String exclude : excludePaths) {
+            if (uri.startsWith(exclude)) {
+                return true;
+            }
+        }
+        return false;
+    }
+}
+```
+
+### 3. Shiro 配置
+
+```java
+@Configuration
+public class ShiroConfig {
+
+    @Autowired
+    private CsrfTokenService csrfTokenService;
+
+    @Bean
+    public ShiroFilterFactoryBean shiroFilterFactoryBean(SecurityManager securityManager) {
+        ShiroFilterFactoryBean factory = new ShiroFilterFactoryBean();
+        factory.setSecurityManager(securityManager);
+
+        Map<String, Filter> filters = new HashMap<>();
+        // 注册 CSRF 过滤器
+        filters.put("csrf", new CsrfFilter(csrfTokenService));
+        factory.setFilters(filters);
+
+        Map<String, String> filterChain = new LinkedHashMap<>();
+
+        // 公开路径
+        filterChain.put("/login", "anon");
+        filterChain.put("/register", "anon");
+        filterChain.put("/static/**", "anon");
+
+        // CSRF 过滤器：所有 POST/PUT/DELETE 请求都需要验证
+        filterChain.put("/**", "csrf, authc");
+
+        factory.setFilterChainDefinitionMap(filterChain);
+        return factory;
+    }
+}
+```
+
+### 4. 登录时生成 Token
+
+```java
+@Controller
+public class LoginController {
+
+    @Autowired
+    private CsrfTokenService csrfTokenService;
+
+    @PostMapping("/login")
+    public String login(@RequestParam String username,
+                       @RequestParam String password,
+                       HttpSession session,
+                       RedirectAttributes attributes) {
+        Subject subject = SecurityUtils.getSubject();
+
+        try {
+            subject.login(new UsernamePasswordToken(username, password));
+
+            // 登录成功后生成 CSRF Token
+            String csrfToken = csrfTokenService.generateToken(session);
+
+            return "redirect:/index?csrf=" + csrfToken;
+
+        } catch (AuthenticationException e) {
+            attributes.addFlashAttribute("error", "用户名或密码错误");
+            return "redirect:/login";
+        }
+    }
+}
+```
+
+### 5. 前端页面集成
+
+#### HTML 表单
+
+```html
+<form action="/user/update" method="post">
+    <!-- CSRF Token -->
+    <input type="hidden" name="_csrf" th:value="${csrfToken}" />
+
+    <input type="text" name="username" />
+    <button type="submit">提交</button>
+</form>
+```
+
+#### AJAX 请求
+
+```javascript
+// 使用 jQuery
+$.ajaxSetup({
+    beforeSend: function(xhr, settings) {
+        // 从 meta 标签读取 Token
+        var token = $('meta[name="csrf-token"]').attr('content');
+        xhr.setRequestHeader('X-CSRF-Token', token);
+    }
+});
+
+$.post('/user/update', { username: 'newName' });
+
+// 或手动设置
+$.ajax({
+    url: '/user/update',
+    type: 'POST',
+    headers: {
+        'X-CSRF-Token': csrfToken
+    },
+    data: { username: 'newName' },
+    success: function(response) {
+        console.log('更新成功');
+    }
+});
+```
+
+#### Thymeleaf 模板
+
+```html
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org">
+<head>
+    <!-- 将 CSRF Token 注入 meta -->
+    <meta name="csrf-token" th:content="${csrfToken}" />
+</head>
+<body>
+    <form th:action="@{/user/update}" method="post">
+        <input type="hidden" name="_csrf" th:value="${csrfToken}" />
+        <input type="text" name="username" />
+        <button type="submit">提交</button>
+    </form>
+
+    <script>
+        // AJAX 请求时读取 Token
+        var csrfToken = document.querySelector('meta[name="csrf-token"]').content;
+
+        fetch('/api/user/update', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-CSRF-Token': csrfToken
+            },
+            body: JSON.stringify({ username: 'newName' })
+        });
+    </script>
+</body>
+</html>
+```
+
+## Cookie 方式的注意事项
+
+### HttpOnly 属性
+
+如果使用 Cookie 存储 CSRF Token，不能设置为 `HttpOnly=true`，否则 JavaScript 无法读取：
+
+```java
+SimpleCookie cookie = new SimpleCookie("_csrf");
+cookie.setHttpOnly(false);  // 必须为 false，JS 需要读取
+cookie.setSecure(true);     // 只在 HTTPS 下传输
+cookie.setMaxAge(3600);     // 1 小时
+```
+
+### SameSite 属性
+
+现代浏览器支持 SameSite Cookie 属性，可以进一步防护 CSRF：
+
+```java
+// Shiro 的 SimpleCookie 不直接支持 SameSite，可以通过响应头设置
+response.addHeader("Set-Cookie",
+    "_csrf=xxx; Path=/; SameSite=Strict");
+```
+
+SameSite 取值：
+
+| 值 | 说明 |
+|---|---|
+| `Strict` | 完全禁止跨站请求携带 Cookie |
+| `Lax` | 允许导航请求携带 Cookie（点击链接跳转） |
+| `None` | 允许所有跨站请求（需配合 Secure） |
+
+## 与 Spring Security CSRF 的对比
+
+| 对比项 | Shiro + 自定义 | Spring Security |
+|---|---|---|
+| 实现难度 | 需要自己写 Filter | 内置支持 |
+| Token 存储 | Session / Redis | Session |
+| Token 获取 | Header / 参数 / Cookie | Cookie 自动读取 |
+| 配置复杂度 | 中等 | 简单 |
+
+## 常见问题
+
+### 问题一：Token 过期
+
+Token 设置合理的过期时间，并在页面过期时提示用户刷新页面。
+
+### 问题二：多 Tab 操作
+
+每个 Tab 都有自己的 Session，Token 互不影响。如果使用 Redis 存储 Token，注意 Key 要包含 Session ID。
+
+### 问题三：移动端兼容
+
+移动端 APP 无法使用 Cookie 读取 Token。建议：
+
+1. 登录接口返回 Token
+2. 客户端存储 Token
+3. 请求时放在 Header 中
+
+## 面试高频问题
+
+**问：CSRF 攻击的原理是什么？**
+
+攻击者诱导用户访问恶意页面，该页面自动向目标站点发起请求，由于用户已登录，请求会携带用户的认证 Cookie，导致未授权操作被执行。
+
+**问：如何防护 CSRF？**
+
+1. 使用 CSRF Token
+2. 验证 Referer/Origin 头
+3. 使用 SameSite Cookie
+4. 敏感操作使用验证码
+
+**问：Shiro 如何实现 CSRF 防护？**
+
+通过自定义 OncePerRequestFilter，验证请求中的 CSRF Token 与 Session 中存储的是否一致。
+
+## 总结
+
+CSRF 防护要点：
+
+```
+CSRF 防护方案：
+├── Token 生成：随机字符串，存入 Session/Redis
+├── Token 注入：表单隐藏字段、meta 标签
+├── Token 验证：Filter 拦截 POST/PUT/DELETE 请求
+├── SameSite Cookie：浏览器层面防护
+└── 排除公开接口：登录、静态资源等
+```
+
+> 最后一节，我们来总结 Shiro 面试高频问题。
+

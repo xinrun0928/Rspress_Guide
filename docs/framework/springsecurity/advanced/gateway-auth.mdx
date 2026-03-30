@@ -1,0 +1,538 @@
+import { Badge } from '@rspress/core/theme';
+
+# Spring Security 与微服务：Gateway 统一鉴权中心
+
+微服务架构下，每个服务都做认证，还是统一鉴权？
+
+当你的系统从单体架构拆分成微服务架构后，认证的问题变得复杂了。每个微服务都需要认证吗？还是统一在网关层做认证？
+
+---
+
+## 两种认证方案
+
+### 方案一：分散认证
+
+每个微服务都集成 Spring Security，各自验证 Token。
+
+```
+请求 → 服务 A（验证 Token）→ 服务 B（验证 Token）→ 服务 C（验证 Token）
+```
+
+**优点**：
+- 每个服务独立，不依赖网关
+- 服务可以单独部署
+
+**缺点**：
+- 重复代码
+- 每个服务都要存储 Token 验证所需的信息（如公钥）
+
+### 方案二：统一鉴权
+
+所有认证在网关层完成，后端服务不再验证 Token。
+
+```
+请求 → Gateway（统一验证 Token）→ 服务 A → 服务 B → 服务 C
+```
+
+**优点**：
+- 代码复用
+- 统一管理
+- 后端服务专注于业务
+
+**缺点**：
+- 网关成为单点
+- 网关性能要求高
+
+---
+
+## 统一鉴权方案架构
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                  微服务统一鉴权架构                            │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│                        用户请求                               │
+│                            ↓                                 │
+│                    Spring Cloud Gateway                      │
+│                            ↓                                 │
+│                 【统一鉴权中心】                               │
+│                 验证 JWT / Session                           │
+│                            ↓                                 │
+│              提取用户信息，注入请求头                          │
+│                            ↓                                 │
+│    ┌────────────┬────────────┬────────────┐               │
+│    ↓            ↓            ↓                                │
+│  服务 A       服务 B       服务 C                            │
+│  （只做       （只做       （只做                              │
+│   业务）       业务）       业务）                            │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 网关层实现
+
+### 网关配置
+
+```yaml
+# application.yml
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: user-service
+          uri: lb://user-service
+          predicates:
+            - Path=/api/user/**
+          filters:
+            - StripPrefix=1
+        - id: order-service
+          uri: lb://order-service
+          predicates:
+            - Path=/api/order/**
+          filters:
+            - StripPrefix=1
+```
+
+### 网关鉴权过滤器
+
+```java
+@Component
+public class JwtAuthFilter implements GlobalFilter, Ordered {
+
+    @Autowired
+    private JwtTokenProvider jwtTokenProvider;
+
+    private static final String USER_INFO_HEADER = "X-User-Id";
+    private static final String USER_NAME_HEADER = "X-User-Name";
+    private static final String USER_ROLES_HEADER = "X-User-Roles";
+
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        String path = exchange.getRequest().getURI().getPath();
+
+        // 公开接口不需要认证
+        if (isPublicPath(path)) {
+            return chain.filter(exchange);
+        }
+
+        String authHeader = exchange.getRequest().getHeaders()
+            .getFirst("Authorization");
+
+        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+            exchange.getResponse().setStatusCode(HttpStatus.UNAUTHORIZED);
+            return exchange.getResponse().setComplete();
+        }
+
+        String token = authHeader.substring(7);
+
+        try {
+            // 验证 Token
+            if (!jwtTokenProvider.validateToken(token)) {
+                exchange.getResponse().setStatusCode(HttpStatus.UNAUTHORIZED);
+                return exchange.getResponse().setComplete();
+            }
+
+            // 提取用户信息
+            Long userId = jwtTokenProvider.getUserIdFromToken(token);
+            String username = jwtTokenProvider.getUsernameFromToken(token);
+            List<String> roles = jwtTokenProvider.getRolesFromToken(token);
+
+            // 注入请求头
+            ServerHttpRequest modifiedRequest = exchange.getRequest().mutate()
+                .header(USER_INFO_HEADER, String.valueOf(userId))
+                .header(USER_NAME_HEADER, username)
+                .header(USER_ROLES_HEADER, String.join(",", roles))
+                .build();
+
+            return chain.filter(
+                exchange.mutate().request(modifiedRequest).build()
+            );
+
+        } catch (Exception e) {
+            exchange.getResponse().setStatusCode(HttpStatus.UNAUTHORIZED);
+            return exchange.getResponse().setComplete();
+        }
+    }
+
+    private boolean isPublicPath(String path) {
+        return path.startsWith("/auth/")
+            || path.startsWith("/public/")
+            || path.startsWith("/actuator/health");
+    }
+
+    @Override
+    public int getOrder() {
+        return -100;  // 优先级高，先执行
+    }
+}
+```
+
+### JWT Token Provider（网关版）
+
+```java
+@Component
+public class JwtTokenProvider {
+
+    private final SecretKey secretKey;
+    private final JwtParser jwtParser;
+
+    public JwtTokenProvider() {
+        // 网关只需验证，不需要生成 Token
+        this.secretKey = Keys.secretKeyFor(SignatureAlgorithm.HS256);
+        this.jwtParser = Jwts.parser()
+            .verifyWith(secretKey)
+            .build();
+    }
+
+    public boolean validateToken(String token) {
+        try {
+            jwtParser.parseSignedClaims(token);
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    public Long getUserIdFromToken(String token) {
+        Claims claims = jwtParser
+            .parseSignedClaims(token)
+            .getPayload();
+        return Long.parseLong(claims.getSubject());
+    }
+
+    public String getUsernameFromToken(String token) {
+        Claims claims = jwtParser
+            .parseSignedClaims(token)
+            .getPayload();
+        return claims.get("username", String.class);
+    }
+
+    public List<String> getRolesFromToken(String token) {
+        Claims claims = jwtParser
+            .parseSignedClaims(token)
+            .getPayload();
+        return claims.get("roles", List.class);
+    }
+}
+```
+
+---
+
+## 后端服务实现
+
+### 后端服务配置
+
+后端服务不再需要 Spring Security 的认证模块，只需要授权模块：
+
+```xml
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-security</artifactId>
+    <!-- 移除依赖，不使用认证 -->
+</dependency>
+```
+
+### 从请求头获取用户信息
+
+```java
+@RestController
+@RequestMapping("/user")
+public class UserController {
+
+    @GetMapping("/profile")
+    public UserProfile getProfile(HttpServletRequest request) {
+        // 从网关注入的请求头中获取用户信息
+        String userId = request.getHeader("X-User-Id");
+        String username = request.getHeader("X-User-Name");
+
+        return userService.getProfile(Long.parseLong(userId));
+    }
+}
+```
+
+### Spring Security 简化配置
+
+如果后端服务仍需要 Spring Security，可以简化配置：
+
+```java
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig {
+
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http
+            // 网关已认证，这里只需要配置授权
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers("/public/**").permitAll()
+                .anyRequest().authenticated()
+            )
+            // 禁用 CSRF（网关已处理）
+            .csrf(csrf -> csrf.disable())
+            // 禁用 Session（使用 Token）
+            .sessionManagement(session ->
+                session.sessionCreationPolicy(SessionCreationPolicy.STATELESS)
+            );
+
+        return http.build();
+    }
+}
+```
+
+---
+
+## 服务间认证
+
+### 内部服务调用
+
+后端服务之间互相调用时，也需要认证：
+
+```
+服务 A 调用 服务 B
+    ↓
+服务 A 在请求头中添加认证信息
+    ↓
+服务 B 验证认证信息
+```
+
+### Feign Client 传递 Token
+
+```java
+@Configuration
+public class FeignConfig {
+
+    @Autowired
+    private HttpServletRequest httpServletRequest;
+
+    @Bean
+    public RequestInterceptor requestInterceptor() {
+        return template -> {
+            // 传递用户信息
+            String userId = httpServletRequest.getHeader("X-User-Id");
+            String userName = httpServletRequest.getHeader("X-User-Name");
+            String roles = httpServletRequest.getHeader("X-User-Roles");
+
+            if (userId != null) {
+                template.header("X-User-Id", userId);
+            }
+            if (userName != null) {
+                template.header("X-User-Name", userName);
+            }
+            if (roles != null) {
+                template.header("X-User-Roles", roles);
+            }
+        };
+    }
+}
+```
+
+### 网关白名单
+
+内部服务之间的调用，不需要再次认证。可以在网关配置白名单：
+
+```java
+@Component
+public class InternalAuthFilter implements GlobalFilter, Ordered {
+
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        String from = exchange.getRequest().getHeaders()
+            .getFirst("X-From-Service");
+
+        // 如果是内部服务调用，跳过认证
+        if (isInternalService(from)) {
+            return chain.filter(exchange);
+        }
+
+        // 否则进行正常认证
+        // ...
+    }
+}
+```
+
+---
+
+## 权限隔离
+
+### 网关层权限校验
+
+网关可以在路由配置中指定需要的权限：
+
+```yaml
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: admin-service
+          uri: lb://admin-service
+          predicates:
+            - Path=/api/admin/**
+          filters:
+            - StripPrefix=1
+            - name: AuthFilter
+              args:
+                requiredRole: ROLE_ADMIN
+```
+
+### 自定义权限路由过滤器
+
+```java
+@Component
+public class RoleAuthFilter implements GlobalFilter, Ordered {
+
+    @Autowired
+    private JwtTokenProvider jwtTokenProvider;
+
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        String path = exchange.getRequest().getURI().getPath();
+
+        // 获取路径需要的权限
+        String requiredRole = getRequiredRole(path);
+
+        if (requiredRole == null) {
+            return chain.filter(exchange);
+        }
+
+        // 获取用户权限
+        String rolesHeader = exchange.getRequest().getHeaders()
+            .getFirst("X-User-Roles");
+
+        if (rolesHeader == null) {
+            exchange.getResponse().setStatusCode(HttpStatus.UNAUTHORIZED);
+            return exchange.getResponse().setComplete();
+        }
+
+        List<String> roles = Arrays.asList(rolesHeader.split(","));
+
+        // 检查权限
+        if (!roles.contains(requiredRole)) {
+            exchange.getResponse().setStatusCode(HttpStatus.FORBIDDEN);
+            return exchange.getResponse().setComplete();
+        }
+
+        return chain.filter(exchange);
+    }
+
+    private String getRequiredRole(String path) {
+        // 从配置中获取路径对应的权限
+        // 这里简化为 Map
+        Map<String, String> roleMap = Map.of(
+            "/api/admin", "ROLE_ADMIN",
+            "/api/user/manage", "ROLE_MANAGER"
+        );
+
+        for (Map.Entry<String, String> entry : roleMap.entrySet()) {
+            if (path.startsWith(entry.getKey())) {
+                return entry.getValue();
+            }
+        }
+
+        return null;
+    }
+}
+```
+
+---
+
+## 性能考虑
+
+### JWT 本地验证
+
+网关验证 JWT 不需要查询数据库，只需要验证签名：
+
+```java
+// 本地验证，不需要 Redis
+public boolean validateToken(String token) {
+    try {
+        jwtParser.parseSignedClaims(token);
+        return true;
+    } catch (ExpiredJwtException e) {
+        return false;
+    }
+}
+```
+
+### 缓存验证结果
+
+如果需要实时撤销 Token，可以在 Redis 中缓存黑名单：
+
+```java
+@Component
+public class TokenBlacklistCache {
+
+    @Autowired
+    private StringRedisTemplate redisTemplate;
+
+    public boolean isBlacklisted(String tokenId) {
+        String key = "token:blacklist:" + tokenId;
+        return Boolean.TRUE.equals(redisTemplate.hasKey(key));
+    }
+
+    public void addToBlacklist(String tokenId, long ttlSeconds) {
+        String key = "token:blacklist:" + tokenId;
+        redisTemplate.opsForValue().set(key, "1", Duration.ofSeconds(ttlSeconds));
+    }
+}
+```
+
+---
+
+## 常见问题与解决方案
+
+### 问题一：网关成为性能瓶颈
+
+**解决**：
+1. JWT 验证是 CPU 密集型操作，使用异步非阻塞
+2. 部署多个网关实例
+3. 使用本地缓存
+
+### 问题二：内部服务之间的调用如何认证
+
+**解决**：
+1. 使用服务间认证（如 mTLS）
+2. 使用内部 Token
+3. 在请求头中传递用户信息
+
+### 问题三：Token 过期后如何处理
+
+**解决**：
+1. 使用短期 Access Token + 长期 Refresh Token
+2. 网关返回 401，前端刷新 Token
+3. 用户重新登录
+
+---
+
+## 面试追问预判
+
+### Q1：微服务架构下如何实现单点登录？
+
+在网关层统一认证，所有服务信任网关注入的用户信息。用户登录后获得 Token，后续请求携带 Token，网关验证 Token 后注入用户信息到请求头。
+
+### Q2：网关认证失败后如何处理？
+
+网关返回 401，前端收到 401 后尝试刷新 Token 或跳转登录页。
+
+### Q3：如何防止内部服务被恶意调用？
+
+1. 使用 mTLS（双向 TLS）
+2. 在请求头中验证调用来源
+3. 使用 API Key 或内部 Token
+
+---
+
+## 总结
+
+微服务统一鉴权方案：
+
+1. **网关层统一认证**：验证 Token，提取用户信息
+2. **后端服务专注业务**：从请求头获取用户信息
+3. **服务间认证**：通过请求头传递用户信息
+4. **权限隔离**：网关层或服务层做权限校验
+
+这种方案代码复用高，统一管理，适合大多数微服务架构。
+
+理解微服务统一鉴权后，我们来看 [Spring Security 6.x 新特性](/framework/springsecurity/advanced/v6)——Breaking Changes 全解析。

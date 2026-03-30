@@ -1,0 +1,398 @@
+# Mapper 代理对象生成：JDK 动态代理
+
+MyBatis 最大的设计亮点之一，就是可以用接口调用 SQL。你定义了一个 Java 接口，写了一些抽象方法，但这些方法没有实现类——MyBatis 却能让这些方法正常工作。
+
+这一切的背后，是 JDK 动态代理在默默工作。但 MyBatis 的动态代理实现，比你想象的复杂得多。
+
+## JDK 动态代理基础回顾
+
+在深入 MyBatis 之前，先回顾一下 JDK 动态代理的核心概念：
+
+```java
+public interface UserService {
+    void save(User user);
+    User findById(Long id);
+}
+
+public class UserServiceImpl implements InvocationHandler {
+
+    @Override
+    public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+        // 在调用真实对象方法之前/之后添加逻辑
+        System.out.println("Before method: " + method.getName());
+        Object result = method.invoke(target, args);
+        System.out.println("After method: " + method.getName());
+        return result;
+    }
+}
+
+// 创建代理对象
+UserService proxy = (UserService) Proxy.newProxyInstance(
+    UserService.class.getClassLoader(),
+    new Class[]{UserService.class},
+    new UserServiceImpl()
+);
+```
+
+**JDK 动态代理的要求**：被代理的类必须实现接口。
+
+## MyBatis 中 Mapper 代理的工作方式
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                           用户代码                                    │
+│                                                                      │
+│   UserMapper mapper = session.getMapper(UserMapper.class);          │
+│   User user = mapper.selectById(1);                                 │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                                ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│                     MapperProxy.invoke()                             │
+│                                                                      │
+│   1. 检查方法：Object 方法直接执行                                     │
+│   2. 获取 MappedStatement                                            │
+│   3. 转换参数                                                        │
+│   4. 调用 SqlSession 的相应方法                                       │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                                ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│                       SqlSession                                     │
+│                                                                      │
+│   → selectList(statement, param)                                     │
+│   → selectOne(statement, param)                                      │
+│   → insert(statement, param)                                         │
+│   → update(statement, param)                                         │
+│   → delete(statement, param)                                         │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+## MapperProxy 源码详解
+
+### 代理对象的创建
+
+```java title="MapperProxyFactory.java"
+public class MapperProxyFactory<T> {
+
+    private final Class<T> mapperInterface;
+
+    // 方法缓存
+    private final Map<Method, MapperMethod> methodCache = new ConcurrentHashMap<>();
+
+    public MapperProxyFactory(Class<T> mapperInterface) {
+        this.mapperInterface = mapperInterface;
+    }
+
+    @SuppressWarnings("unchecked")
+    public T newInstance(SqlSession sqlSession) {
+        // 1. 创建 InvocationHandler
+        final MapperProxy<T> mapperProxy = new MapperProxy<>(
+            sqlSession,
+            mapperInterface,
+            methodCache
+        );
+
+        // 2. 创建 JDK 动态代理
+        return (T) Proxy.newProxyInstance(
+            mapperInterface.getClassLoader(),
+            new Class[]{mapperInterface},
+            mapperProxy
+        );
+    }
+}
+```
+
+### InvocationHandler 实现
+
+```java title="MapperProxy.java"
+public class MapperProxy<T> implements InvocationHandler {
+
+    private final SqlSession sqlSession;
+    private final Class<T> mapperInterface;
+    private final Map<Method, MapperMethod> methodCache;
+
+    public MapperProxy(SqlSession sqlSession, Class<T> mapperInterface,
+                       Map<Method, MapperMethod> methodCache) {
+        this.sqlSession = sqlSession;
+        this.mapperInterface = mapperInterface;
+        this.methodCache = methodCache;
+    }
+
+    @Override
+    public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+        try {
+            // 1. 如果是 Object 的方法，直接执行（不拦截 toString, equals, hashCode）
+            if (Object.class.equals(method.getDeclaringClass())) {
+                return method.invoke(this, args);
+            }
+        } catch (Throwable t) {
+            throw t;
+        }
+
+        // 2. 获取或创建 MapperMethod（带缓存）
+        final MapperMethod mapperMethod = cachedMapperMethod(method);
+
+        // 3. 执行 SQL
+        return mapperMethod.execute(sqlSession, args);
+    }
+
+    private MapperMethod cachedMapperMethod(Method method) {
+        // 使用 ConcurrentHashMap 的 computeIfAbsent 保证线程安全
+        return methodCache.computeIfAbsent(method,
+            k -> new MapperMethod(mapperInterface, method, sqlSession.getConfiguration()));
+    }
+}
+```
+
+### 为什么需要缓存？
+
+每次调用 `mapper.selectById(1)` 都会触发 `invoke()`，如果每次都创建新的 `MapperMethod`，会产生大量对象。
+
+```java
+// 优化前：每次调用都创建新对象
+return new MapperMethod(mapperInterface, method, config).execute(sqlSession, args);
+
+// 优化后：缓存复用
+return methodCache.computeIfAbsent(method,
+    k -> new MapperMethod(mapperInterface, method, config)).execute(sqlSession, args);
+```
+
+`methodCache` 的 key 是 `Method` 对象（由方法签名唯一确定），同一个接口方法多次调用会复用同一个 `MapperMethod`。
+
+## MapperMethod 详解
+
+### SqlCommand：SQL 命令信息
+
+```java title="SqlCommand.java"
+public static class SqlCommand {
+
+    private final String name;           // statementId: com.xxx.UserMapper.selectById
+    private final SqlCommandType type;   // SELECT/INSERT/UPDATE/DELETE
+
+    public SqlCommand(Configuration configuration, Class<?> mapperInterface,
+                      Method method) {
+        // 拼接 statementId
+        String statementName = mapperInterface.getName() + "." + method.getName();
+
+        // 在 Configuration 中查找 MappedStatement
+        MappedStatement ms = configuration.getMappedStatement(statementName);
+
+        this.name = ms.getId();
+        this.type = ms.getSqlCommandType();
+    }
+}
+```
+
+### MethodSignature：方法签名
+
+```java title="MethodSignature.java"
+public static class MethodSignature {
+
+    private final Class<?> returnType;    // 返回类型
+    private final boolean returnsVoid;     // 是否 void 方法
+    private final boolean returnsMany;     // 是否返回集合
+    private final boolean returnsMap;      // 是否返回 Map
+    private final boolean returnsCursor;   // 是否返回 Cursor
+
+    private final Integer primaryKeyIndex;  // 主键参数索引
+    private final List<ParamNameResolver.ParamMapping> params;
+
+    public MethodSignature(Configuration configuration, Class<?> mapperInterface,
+                           Method method) {
+        // 解析方法签名，提取参数信息
+        // ...
+    }
+}
+```
+
+### 参数名解析：ParamNameResolver
+
+MyBatis 通过 `ParamNameResolver` 将方法参数与 SQL 中的 `#{}` 占位符关联：
+
+```java title="ParamNameResolver.java"
+public class ParamNameResolver {
+
+    public static class ParamMapping {
+        private final String name;
+        private final Class<?> type;
+        private final Object value;
+    }
+
+    public ParamNameResolver(Method method) {
+        // 获取所有参数
+        final Class<?>[] paramTypes = method.getParameterTypes();
+        final Annotation[][] paramAnnotations = method.getParameterAnnotations();
+
+        // 处理参数
+        for (int i = 0; i < paramTypes.length; i++) {
+            // 如果有 @Param 注解，使用注解的值作为参数名
+            // 否则使用 param1, param2, ... 作为默认名称
+        }
+    }
+
+    // 将 args 转换为 Map<String, Object>
+    public Object getNamedParams(Object[] args) {
+        final int paramCount = params.size();
+
+        if (args == null || paramCount == 0) {
+            return null;
+        } else if (paramCount == 1 && !params.get(0).isProvideParam) {
+            // 单参数且没有 @Param，返回原始参数
+            return args[0];
+        } else {
+            // 多参数或有 @Param，转换为 Map
+            final Map<String, Object> param = new ParamMap<>();
+            for (int i = 0; i < paramCount; i++) {
+                param.put(params.get(i).name, args[i]);
+            }
+            return param;
+        }
+    }
+}
+```
+
+**为什么 MyBatis 支持两种参数写法？**
+
+```java
+// 方式一：单个参数（无 @Param）
+User selectById(Long id);
+
+// 方式二：多个参数（需要 @Param）
+User selectByNameAndAge(@Param("name") String name, @Param("age") Integer age);
+```
+
+SQL 中可以这样写：
+
+```sql
+-- 方式一
+SELECT * FROM user WHERE id = #{id}
+
+-- 方式二
+SELECT * FROM user WHERE name = #{name} AND age = #{age}
+```
+
+## 完整的代理调用流程
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           1. 获取代理对象                                      │
+│                                                                              │
+│   SqlSession session = sqlSessionFactory.openSession();                       │
+│   UserMapper mapper = session.getMapper(UserMapper.class);                   │
+│                                                                              │
+│   → MapperProxyFactory.newInstance()                                         │
+│       → new MapperProxy(sqlSession, UserMapper.class, methodCache)            │
+│       → Proxy.newProxyInstance(classLoader, [UserMapper], proxy)             │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ↓
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           2. 调用接口方法                                      │
+│                                                                              │
+│   User user = mapper.selectById(1L);                                         │
+│                                                                              │
+│   → 触发 MapperProxy.invoke(proxy, method, [1L])                             │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ↓
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           3. 解析 statementId                                │
+│                                                                              │
+│   SqlCommand sqlCommand = new SqlCommand(config, UserMapper.class, method)   │
+│       → statementId = "com.xxx.UserMapper.selectById"                        │
+│       → MappedStatement ms = config.getMappedStatement(statementId)         │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ↓
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           4. 参数转换                                         │
+│                                                                              │
+│   ParamNameResolver.getNamedParams(args)                                    │
+│       → 如果是单个参数，直接返回                                             │
+│       → 如果是多参数，转换为 Map<String, Object>                              │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ↓
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           5. 调用 SqlSession 执行                             │
+│                                                                              │
+│   mapperMethod.execute(sqlSession, args)                                    │
+│       → sqlSession.selectOne(statementId, param)                            │
+│           → DefaultSqlSession.selectOne(...)                                 │
+│               → executor.query(ms, param, ...)                               │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+## 为什么 MyBatis 选择 JDK 动态代理？
+
+### 技术对比
+
+| 代理方式 | 优点 | 缺点 | MyBatis 适用性 |
+|---|---|---|---|
+| JDK 动态代理 | 原生支持，无需额外依赖 | 只能代理接口 | Mapper 是接口，适合 |
+| CGLIB 代理 | 可代理类 | 需要额外依赖，可能有性能问题 | 不需要 |
+| Javassist | 字节码生成，性能好 | 学习成本高 | 不需要 |
+
+### MyBatis 的设计选择
+
+1. **Mapper 本身就是接口**：接口不需要实现类，JDK 动态代理完美契合
+2. **无侵入设计**：用户不需要知道代理的存在，只需要定义接口
+3. **职责分离**：MyBatis 负责生成代理，用户专注于定义 SQL
+
+## 面试高频问题
+
+### Q1：MyBatis 是如何找到 Mapper 接口对应的 SQL 的？
+
+1. `getMapper()` 时记录接口全限定名和 SqlSession
+2. 调用接口方法时，触发 `MapperProxy.invoke()`
+3. 拼接 statementId = `接口全限定名 + "." + 方法名`
+4. 在 Configuration 的 `mappedStatements` 中查找 MappedStatement
+5. 调用 SqlSession 的相应方法执行 SQL
+
+### Q2：为什么 Mapper 接口不需要实现类？
+
+因为 MyBatis 在运行时生成了 JDK 动态代理。代理对象的 `invoke()` 方法会拦截所有接口调用，将调用路由到正确的 SQL 执行逻辑。
+
+### Q3：#{} 和 ${} 在代理中如何区分？
+
+参数绑定阶段，`ParameterHandler` 会根据 ParameterMapping 的配置决定：
+- `#{}`：使用 PreparedStatement 的参数绑定（`setString(1, value)`）
+- `${}`：直接字符串拼接
+
+### Q4：为什么 Mapper 方法可以返回 void、单个对象、List？
+
+`MapperMethod.execute()` 根据 `MethodSignature` 的返回类型判断：
+- `returnsVoid`：不处理返回值
+- `returnsMany`：调用 `sqlSession.selectList()`
+- 其他：调用 `sqlSession.selectOne()`
+
+---
+
+## 延伸思考
+
+MyBatis 的 Mapper 代理机制隐藏了一个有趣的细节：代理对象被创建后，`MapperProxy` 实例持有了 `SqlSession` 的引用。
+
+这意味着：所有调用共享同一个 `SqlSession`，也就是共享同一个 `Executor` 和同一个数据库连接。
+
+这也是为什么 `SqlSession` 不是线程安全的——多个线程共享同一个代理对象会导致数据竞争。
+
+如果需要多线程操作，应该每个线程获取自己的 `SqlSession`：
+
+```java
+// 每个线程获取自己的 SqlSession
+public void doWork() {
+    try (SqlSession session = sqlSessionFactory.openSession()) {
+        UserMapper mapper = session.getMapper(UserMapper.class);
+        // ...
+    }
+}
+```

@@ -1,0 +1,397 @@
+# Gateway 熔断降级：CircuitBreaker 与 Resilience4j
+
+import { Badge } from '@rspress/core/theme';
+
+后端服务挂了，网关怎么防止故障蔓延？
+
+微服务架构中，服务 A 调用服务 B，如果服务 B 一直不响应或者响应超时，服务 A 的线程会被阻塞。如果大量请求都阻塞在这里，服务 A 也会被拖垮，最终可能导致整个系统雪崩。
+
+熔断器（Circuit Breaker）就是为了解决这个问题。
+
+<Badge text="熔断器" type="tip" /> <Badge text="CircuitBreaker" type="tip" /> <Badge text="Resilience4j" type="info" />
+
+---
+
+## 一、CircuitBreakerGatewayFilterFactory
+
+### 1.1 引入依赖
+
+Spring Cloud Gateway 从 3.0 开始不再内置 Hystrix，需要引入 Resilience4j：
+
+```xml
+<dependency>
+    <groupId>org.springframework.cloud</groupId>
+    <artifactId>spring-cloud-starter-circuitbreaker-reactor-resilience4j</artifactId>
+</dependency>
+<dependency>
+    <groupId>io.github.resilience4j</groupId>
+    <artifactId>resilience4j-spring-boot2</artifactId>
+</dependency>
+```
+
+### 1.2 基本配置
+
+```yaml title="application.yml"
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: circuit-breaker-route
+          uri: lb://order-service
+          predicates:
+            - Path=/api/orders/**
+          filters:
+            - name: CircuitBreaker
+              args:
+                # 熔断器名称
+                name: orderCircuitBreaker
+                # 降级处理 URI
+                fallbackUri: forward:/fallback
+```
+
+---
+
+## 二、熔断器的三个状态
+
+### 2.1 状态机详解
+
+熔断器有三种状态：
+
+```
+        ┌────────────────────────────────────────────┐
+        │                                            │
+        │    失败率/慢调用率超过阈值                   │
+        │                                            │
+        ↓                                            │
+┌───────────┐  失败率超过阈值   ┌───────────┐ 等待时间结束 ┌───────────┐
+│  CLOSED   │ ───────────────→ │   OPEN    │ ──────────→ │HALF_OPEN  │
+│  (关闭)   │                  │  (打开)   │             │ (半开)    │
+│ 正常熔断  │ ←─────────────── │  拒绝请求  │ ←────────── │  尝试请求  │
+└───────────┘  成功处理请求     └───────────┘  失败/超时   └───────────┘
+     ↑                                     │
+     │                                     │
+     │            所有请求通过              │
+     │                                     │
+     └─────────────────────────────────────┘
+     
+     半开状态下：成功次数超过阈值 → 回到 CLOSED
+                失败次数超过阈值 → 回到 OPEN
+```
+
+| 状态 | 说明 | 行为 |
+| --- | --- | --- |
+| CLOSED | 熔断器关闭 | 所有请求正常通过，失败计入统计 |
+| OPEN | 熔断器打开 | 所有请求直接拒绝，快速失败 |
+| HALF_OPEN | 熔断器半开 | 允许部分请求通过，试探服务是否恢复 |
+
+### 2.2 状态转换规则
+
+**CLOSED → OPEN**：
+- 在统计窗口内，失败率或慢调用率超过阈值
+- 默认配置：10 秒内 50% 请求失败
+
+**OPEN → HALF_OPEN**：
+- OPEN 状态持续一定时间后（`waitDurationInOpenState`）
+- 默认配置：60 秒后自动进入半开状态
+
+**HALF_OPEN → CLOSED**：
+- 在半开状态下，允许通过的请求全部成功
+- 默认配置：50% 成功则回到 CLOSED
+
+**HALF_OPEN → OPEN**：
+- 在半开状态下，允许通过的请求仍然失败
+- 立即回到 OPEN 状态
+
+---
+
+## 三、Resilience4j 配置详解
+
+### 3.1 完整配置示例
+
+```yaml title="application.yml"
+resilience4j:
+  circuitbreaker:
+    configs:
+      default:
+        # 熔断器配置名称
+        registerHealthIndicator: true
+        
+        # 滑动窗口类型：COUNT_BASED（基于请求数）/ TIME_BASED（基于时间）
+        slidingWindowType: COUNT_BASED
+        
+        # 滑动窗口大小
+        slidingWindowSize: 100
+        
+        # 最小调用次数（达到这个次数才开始计算失败率）
+        minimumNumberOfCalls: 10
+        
+        # 失败率阈值（百分比）
+        failureRateThreshold: 50
+        
+        # 慢调用率阈值（百分比）
+        slowCallRateThreshold: 80
+        
+        # 慢调用阈值（秒）
+        slowCallDurationThreshold: 2s
+        
+        # OPEN 状态持续时间
+        waitDurationInOpenState: 60s
+        
+        # 半开状态允许通过的请求数
+        permittedNumberOfCallsInHalfOpenState: 10
+        
+        # 自动从 OPEN 回到 HALF_OPEN
+        automaticTransitionFromOpenToHalfOpenEnabled: true
+    instances:
+      # 针对特定熔断器的配置
+      orderCircuitBreaker:
+        baseConfig: default  # 继承 default 配置
+        slidingWindowSize: 50  # 覆盖特定配置
+        failureRateThreshold: 40
+```
+
+### 3.2 关键参数解析
+
+| 参数 | 说明 | 默认值 |
+| --- | --- | --- |
+| `slidingWindowSize` | 滑动窗口大小 | 100 次请求 |
+| `failureRateThreshold` | 失败率阈值 | 50% |
+| `slowCallRateThreshold` | 慢调用率阈值 | 100% |
+| `slowCallDurationThreshold` | 慢调用阈值 | 60 秒 |
+| `waitDurationInOpenState` | OPEN 持续时间 | 60 秒 |
+| `minimumNumberOfCalls` | 最小调用次数 | 10 次 |
+
+### 3.3 配置调优建议
+
+| 场景 | 推荐配置 |
+| --- | --- |
+| 保护高可用服务 | 失败率阈值 30%，最小调用 20 次 |
+| 保护低可用服务 | 失败率阈值 50%，最小调用 10 次 |
+| 快速失败 | 失败率阈值 20%，等待时间 10 秒 |
+| 容忍瞬时抖动 | 失败率阈值 60%，最小调用 50 次 |
+
+---
+
+## 四、FallbackUri 配置：降级处理
+
+### 4.1 本地降级
+
+当熔断器打开时，请求会转发到指定的降级 URI：
+
+```yaml title="application.yml"
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: order-circuit-breaker
+          uri: lb://order-service
+          predicates:
+            - Path=/api/orders/**
+          filters:
+            - name: CircuitBreaker
+              args:
+                name: orderCircuitBreaker
+                fallbackUri: forward:/fallback/order
+```
+
+```java
+@RestController
+public class FallbackController {
+    
+    @GetMapping("/fallback/order")
+    public ResponseEntity<Map<String, Object>> orderFallback() {
+        Map<String, Object> response = new HashMap<>();
+        response.put("code", 503);
+        response.put("message", "服务暂时不可用，请稍后再试");
+        response.put("timestamp", System.currentTimeMillis());
+        return ResponseEntity.status(503).body(response);
+    }
+}
+```
+
+### 4.2 降级方法
+
+除了转发到 URI，还可以通过 Java 方法处理降级：
+
+```java
+@Service
+public class OrderFallbackProvider implements CircuitBreakerFallbackProvider {
+    
+    @Override
+    public String getRoute() {
+        return "order-service";  // 对应的路由 ID
+    }
+    
+    @Override
+    public Mono<ServerResponse> fallbackResponse(ServerWebExchange exchange, Throwable cause) {
+        return ServerResponse
+            .status(HttpStatus.SERVICE_UNAVAILABLE)
+            .contentType(MediaType.APPLICATION_JSON)
+            .bodyValue(Map.of(
+                "code", 503,
+                "message", "服务暂时不可用: " + cause.getMessage(),
+                "timestamp", System.currentTimeMillis()
+            ));
+    }
+}
+```
+
+### 4.3 降级响应的设计
+
+好的降级响应应该包含：
+
+```json
+{
+    "code": 503,
+    "message": "服务暂时不可用",
+    "data": null,
+    "timestamp": 1704067200000,
+    "traceId": "abc123",
+    "suggestion": "请稍后再试，或联系客服"
+}
+```
+
+---
+
+## 五、熔断与限流的配合
+
+### 5.1 双重保护
+
+限流和熔断是两种不同层面的保护：
+
+| 保护类型 | 作用 | 层面 |
+| --- | --- | --- |
+| 限流 | 控制请求速率，防止瞬时流量过大 | 流量层面 |
+| 熔断 | 快速失败，防止故障蔓延 | 可用性层面 |
+
+### 5.2 配置示例
+
+```yaml title="application.yml"
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: order-protected
+          uri: lb://order-service
+          predicates:
+            - Path=/api/orders/**
+          filters:
+            # 先限流，再熔断
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 100
+                redis-rate-limiter.burstCapacity: 200
+            - name: CircuitBreaker
+              args:
+                name: orderCircuitBreaker
+                fallbackUri: forward:/fallback/order
+```
+
+### 5.3 触发顺序
+
+```
+请求进入
+    ↓
+限流检查（KeyResolver 限流）
+    ↓ 通过
+熔断检查（失败率/慢调用率）
+    ↓ 通过
+实际调用服务
+    ↓
+响应返回
+    ↓ 异常/超时
+记录失败 → 触发熔断
+```
+
+---
+
+## 六、监控与告警
+
+### 6.1 Actuator 端点
+
+Resilience4j 提供了丰富的监控端点：
+
+```yaml title="application.yml"
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,circuitbreakers,circuitbreakerevents
+  endpoint:
+    health:
+      show-details: always
+  health:
+    circuitbreakers:
+      enabled: true
+```
+
+访问端点查看熔断器状态：
+
+```bash
+# 查看熔断器状态
+curl http://localhost:8080/actuator/circuitbreakers
+
+# 查看熔断事件
+curl http://localhost:8080/actuator/circuitbreakerevents
+```
+
+### 6.2 熔断事件类型
+
+| 事件 | 说明 |
+| --- | --- |
+| `SUCCESS` | 请求成功 |
+| `ERROR` | 请求失败 |
+| `SLOW_SUCCESS` | 慢调用成功 |
+| `SLOW_ERROR` | 慢调用失败 |
+| `MISSED_NOT_PERMITTED` | OPEN 状态请求被拒绝 |
+| `FORBIDDEN_NOT_PERMITTED` | HALF_OPEN 状态请求被拒绝 |
+
+### 6.3 告警配置
+
+```java
+@Component
+public class CircuitBreakerEventListener {
+    
+    @EventListener
+    public void onCircuitBreakerEvent(CircuitBreakerEvent event) {
+        if (event.getEventType() == EventType.ERROR) {
+            log.warn("熔断器 {} 记录到错误请求", event.getCircuitBreakerName());
+        }
+        
+        if (event.getEventType() == EventType.STATE_TRANSITION) {
+            log.error("熔断器 {} 状态变更: {} → {}", 
+                event.getCircuitBreakerName(),
+                event.getStateTransition().getFromState(),
+                event.getStateTransition().getToState());
+            
+            // 发送告警通知
+            if (event.getStateTransition().getToState() == State.OPEN) {
+                sendAlert(event.getCircuitBreakerName());
+            }
+        }
+    }
+}
+```
+
+---
+
+## 七、面试追问方向
+
+- **熔断器的三个状态是什么？** CLOSED（关闭）、OPEN（打开）、HALF_OPEN（半开）。
+- **熔断器是如何防止雪崩的？** 当失败率超过阈值时，打开熔断器，快速拒绝后续请求，避免线程阻塞和资源耗尽。
+- **Resilience4j 和 Hystrix 的区别是什么？** Hystrix 已停止维护，Resilience4j 是其替代方案；Resilience4j 轻量级、支持响应式编程、配置更简洁。
+- **限流和熔断的区别是什么？** 限流控制请求速率，熔断处理故障传播。限流在流量层面保护，熔断在可用性层面保护。
+
+---
+
+## 八、总结
+
+Gateway 熔断降级通过 Resilience4j 实现，为后端服务提供了强大的保护：
+
+- **CircuitBreakerGatewayFilterFactory**：熔断过滤器
+- **三种状态**：CLOSED / OPEN / HALF_OPEN
+- **失败率/慢调用率**：触发熔断的条件
+- **FallbackUri**：降级处理
+- **监控端点**：实时了解熔断器状态
+
+配合限流使用，可以构建一个既有流量控制，又有故障保护的网关系统。

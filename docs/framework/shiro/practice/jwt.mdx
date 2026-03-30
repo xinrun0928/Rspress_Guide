@@ -1,0 +1,505 @@
+import { Badge } from '@rspress/core/theme';
+
+# Shiro + JWT：让 Shiro 支持无状态认证
+
+Shiro 原生支持 Session，但微服务需要无状态——怎么改造？
+
+JWT（JSON Web Token）是一种开放标准，用于在各方之间安全地传输信息。配合 Shiro，我们可以让 Shiro 在无状态环境下工作。
+
+## Session 模式 vs JWT 模式
+
+| 对比项 | Shiro Session | JWT 无状态 |
+|---|---|---|
+| 存储 | 服务端存储 Session | 无状态，Token 包含用户信息 |
+| 扩展性 | 需要 Session 共享 | 天然支持水平扩展 |
+| 跨域 | 受 Cookie 限制 | 无限制，Header 传递 |
+| 性能 | 需要查询 Session | 无需查询，直接解析 |
+| 注销 | 清除 Session | 难实现（Token 未过期前仍然有效） |
+
+## JWT 结构
+
+JWT 由三部分组成：Header、Payload、Signature。
+
+```
+eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9
+.
+eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ
+.
+SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c
+
+Header.Payload.Signature
+```
+
+- **Header**：算法和类型
+- **Payload**：用户信息（Claims）
+- **Signature**：签名，防止篡改
+
+## 实现方案
+
+### 整体架构
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                        客户端                            │
+│  登录成功后，存储 JWT Token                             │
+│  请求时，携带 Authorization: Bearer <token>            │
+└─────────────────────────┬───────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────┐
+│                     JwtFilter                            │
+│  1. 从 Header 提取 Token                                │
+│  2. 验证 Token 签名                                      │
+│  3. 解析用户信息                                        │
+│  4. 构建 Subject                                         │
+│  5. 传递给后续过滤器                                    │
+└─────────────────────────┬───────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────┐
+│                    UserRealm                             │
+│  从 Token 中获取用户信息（不查数据库）                   │
+└─────────────────────────────────────────────────────────┘
+```
+
+### 1. JWT 工具类
+
+```java
+public class JwtUtil {
+
+    private static final String SECRET = "your-256-bit-secret-key-here";
+    private static final long EXPIRATION = 86400000;  // 24 小时
+
+    /**
+     * 生成 Token
+     */
+    public static String generateToken(String username, Map<String, Object> claims) {
+        Date now = new Date();
+        Date expiration = new Date(now.getTime() + EXPIRATION);
+
+        return Jwts.builder()
+            .setSubject(username)
+            .addClaims(claims)
+            .setIssuedAt(now)
+            .setExpiration(expiration)
+            .signWith(SignatureAlgorithm.HS256, SECRET)
+            .compact();
+    }
+
+    /**
+     * 解析 Token
+     */
+    public static Claims parseToken(String token) {
+        return Jwts.parser()
+            .setSigningKey(SECRET)
+            .parseClaimsJws(token)
+            .getBody();
+    }
+
+    /**
+     * 验证 Token 是否有效
+     */
+    public static boolean validateToken(String token) {
+        try {
+            parseToken(token);
+            return true;
+        } catch (JwtException e) {
+            return false;
+        }
+    }
+
+    /**
+     * 获取用户名
+     */
+    public static String getUsername(String token) {
+        return parseToken(token).getSubject();
+    }
+
+    /**
+     * 获取过期时间
+     */
+    public static Date getExpiration(String token) {
+        return parseToken(token).getExpiration();
+    }
+
+    /**
+     * 判断是否过期
+     */
+    public static boolean isExpired(String token) {
+        try {
+            Date expiration = getExpiration(token);
+            return expiration.before(new Date());
+        } catch (Exception e) {
+            return true;
+        }
+    }
+}
+```
+
+### 2. 自定义 StatelessToken
+
+```java
+public class JwtToken implements AuthenticationToken {
+
+    private String token;
+
+    public JwtToken(String token) {
+        this.token = token;
+    }
+
+    @Override
+    public Object getPrincipal() {
+        return JwtUtil.getUsername(token);
+    }
+
+    @Override
+    public Object getCredentials() {
+        return token;
+    }
+
+    public String getToken() {
+        return token;
+    }
+}
+```
+
+### 3. 自定义 JwtFilter
+
+```java
+public class JwtFilter extends OncePerRequestFilter {
+
+    private static final String AUTHORIZATION_HEADER = "Authorization";
+    private static final String BEARER_PREFIX = "Bearer ";
+
+    @Override
+    protected boolean isAccessAllowed(ServletRequest request,
+                                     ServletResponse response,
+                                     Object mappedValue) {
+        HttpServletRequest httpRequest = (HttpServletRequest) request;
+
+        // 1. 从 Header 获取 Token
+        String authHeader = httpRequest.getHeader(AUTHORIZATION_HEADER);
+        if (authHeader == null || !authHeader.startsWith(BEARER_PREFIX)) {
+            return false;  // 没有 Token，不允许访问
+        }
+
+        String token = authHeader.substring(BEARER_PREFIX.length());
+
+        // 2. 验证 Token
+        if (!JwtUtil.validateToken(token)) {
+            return false;  // Token 无效
+        }
+
+        // 3. 解析用户信息
+        Claims claims = JwtUtil.parseToken(token);
+        String username = claims.getSubject();
+        Map<String, Object> roles = claims.get("roles", Map.class);
+
+        // 4. 构建 Subject
+        Subject subject = new Subject.Builder()
+            .subjectContext(new SimpleSubjectContext())
+            .principals(new SimplePrincipalCollection(username, "jwtRealm"))
+            .authenticated(true)
+            .buildSubject();
+
+        SubjectHolder.setSubject(subject);
+
+        // 5. 将 Token 存入请求属性，供后续使用
+        httpRequest.setAttribute("jwt_token", token);
+        httpRequest.setAttribute("jwt_username", username);
+        httpRequest.setAttribute("jwt_roles", roles);
+
+        return true;
+    }
+
+    @Override
+    protected boolean onAccessDenied(ServletRequest request,
+                                    ServletResponse response) {
+        HttpServletResponse httpResponse = (HttpServletResponse) response;
+        httpResponse.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
+        httpResponse.setContentType("application/json;charset=UTF-8");
+        httpResponse.getWriter().write(
+            "{\"code\": 401, \"message\": \"未授权：请先登录\"}"
+        );
+        return false;
+    }
+}
+```
+
+### 4. 自定义 JwtRealm
+
+```java
+public class JwtRealm extends AuthorizingRealm {
+
+    public JwtRealm() {
+        this.setCachingEnabled(false);  // JWT 无状态，不需要缓存
+    }
+
+    @Override
+    public boolean supports(AuthenticationToken token) {
+        return token instanceof JwtToken;
+    }
+
+    @Override
+    protected AuthenticationInfo doGetAuthenticationInfo(
+            AuthenticationToken token) throws AuthenticationException {
+
+        JwtToken jwtToken = (JwtToken) token;
+        String username = (String) jwtToken.getPrincipal();
+
+        // JWT 模式：直接从 Token 获取用户信息，不再查数据库
+        return new SimpleAuthenticationInfo(
+            username,
+            jwtToken.getCredentials(),
+            getName()
+        );
+    }
+
+    @Override
+    protected AuthorizationInfo doGetAuthorizationInfo(
+            PrincipalCollection principals) {
+
+        String username = (String) principals.getPrimaryPrincipal();
+
+        // 从请求属性中获取角色信息（由 JwtFilter 设置）
+        HttpServletRequest request =
+            ((HttpServletRequest) RequestContextHolder.getRequestContext()
+                .getServletRequest());
+
+        @SuppressWarnings("unchecked")
+        Map<String, Object> roles = (Map<String, Object>)
+            request.getAttribute("jwt_roles");
+
+        SimpleAuthorizationInfo info = new SimpleAuthorizationInfo();
+        if (roles != null) {
+            info.setRoles(roles.keySet());
+            @SuppressWarnings("unchecked")
+            Set<String> permissions = (Set<String>) roles.get("permissions");
+            info.setStringPermissions(permissions);
+        }
+
+        return info;
+    }
+}
+```
+
+### 5. 登录接口
+
+```java
+@RestController
+@RequestMapping("/auth")
+public class AuthController {
+
+    @Autowired
+    private UserService userService;
+
+    @PostMapping("/login")
+    public Result<String> login(@RequestBody LoginRequest request) {
+        // 1. 验证用户名密码
+        User user = userService.findByUsername(request.getUsername());
+        if (user == null || !user.getPassword().equals(request.getPassword())) {
+            return Result.fail("用户名或密码错误");
+        }
+
+        // 2. 构建 Token Claims
+        Map<String, Object> claims = new HashMap<>();
+        claims.put("roles", Map.of(
+            "admin", Set.of("user:create", "user:read"),
+            "user", Set.of("user:read")
+        ));
+
+        // 3. 生成 JWT
+        String token = JwtUtil.generateToken(user.getUsername(), claims);
+
+        return Result.success(token);
+    }
+
+    @GetMapping("/logout")
+    public Result<Void> logout(HttpServletRequest request) {
+        // JWT 模式下，注销只需客户端删除 Token
+        // 服务端无需处理
+        return Result.success();
+    }
+}
+```
+
+### 6. Shiro 配置
+
+```java
+@Configuration
+public class ShiroConfig {
+
+    @Bean
+    public JwtRealm jwtRealm() {
+        return new JwtRealm();
+    }
+
+    @Bean
+    public SecurityManager securityManager(JwtRealm jwtRealm) {
+        DefaultSecurityManager manager = new DefaultWebSecurityManager();
+        manager.setRealm(jwtRealm);
+        // JWT 模式不需要 Session
+        manager.setSubjectDAO(new DefaultSubjectDAO());
+        manager.getSubjectDAO().setSessionStorageEvaluator(
+            new DefaultSessionStorageEvaluator() {
+                @Override
+                public boolean isSessionStorageEnabled(Subject subject) {
+                    return false;
+                }
+            }
+        );
+        return manager;
+    }
+
+    @Bean
+    public ShiroFilterFactoryBean shiroFilterFactoryBean(SecurityManager securityManager) {
+        ShiroFilterFactoryBean factory = new ShiroFilterFactoryBean();
+        factory.setSecurityManager(securityManager);
+
+        Map<String, Filter> filters = new HashMap<>();
+        filters.put("jwt", new JwtFilter());
+        factory.setFilters(filters);
+
+        Map<String, String> filterChain = new LinkedHashMap<>();
+        // 登录接口匿名访问
+        filterChain.put("/auth/login", "anon");
+        filterChain.put("/auth/register", "anon");
+        // 其他接口需要 JWT
+        filterChain.put("/**", "jwt");
+
+        factory.setFilterChainDefinitionMap(filterChain);
+        return factory;
+    }
+}
+```
+
+## Refresh Token 方案
+
+Access Token 有效期短（15-30 分钟），需要 Refresh Token 续期：
+
+```java
+// 生成 Access Token 和 Refresh Token
+public class AuthController {
+
+    @PostMapping("/login")
+    public Result<TokenPair> login(@RequestBody LoginRequest request) {
+        // 生成 Access Token（短期）
+        String accessToken = JwtUtil.generateToken(username, claims);
+
+        // 生成 Refresh Token（长期，存 Redis）
+        String refreshToken = JwtUtil.generateRefreshToken(username);
+        redisTemplate.opsForValue().set(
+            "refresh:" + username,
+            refreshToken,
+            7, TimeUnit.DAYS
+        );
+
+        return Result.success(new TokenPair(accessToken, refreshToken));
+    }
+
+    @PostMapping("/refresh")
+    public Result<String> refresh(@RequestBody RefreshRequest request) {
+        // 验证 Refresh Token
+        String storedToken = redisTemplate.opsForValue()
+            .get("refresh:" + request.getUsername());
+
+        if (!request.getRefreshToken().equals(storedToken)) {
+            return Result.fail("Refresh Token 无效");
+        }
+
+        // 生成新的 Access Token
+        String newAccessToken = JwtUtil.generateToken(
+            request.getUsername(), claims);
+
+        return Result.success(newAccessToken);
+    }
+}
+```
+
+## 完整请求流程
+
+```
+1. 登录请求
+POST /auth/login
+{"username": "admin", "password": "123456"}
+
+响应：
+{"code": 200, "data": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."}
+
+
+2. 后续请求
+GET /api/user/list
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+
+请求流程：
+JwtFilter 拦截 → 解析 Token → 构建 Subject → 验证通过 → Controller
+
+
+3. Token 过期
+GET /api/user/list
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+
+响应：
+{"code": 401, "message": "Token 已过期"}
+
+
+4. 使用 Refresh Token 续期
+POST /auth/refresh
+{"username": "admin", "refreshToken": "eyJ..."}
+
+响应：
+{"code": 200, "data": "新的 accessToken"}
+```
+
+## 与 Spring Security JWT 方案的对比
+
+| 对比项 | Shiro + JWT | Spring Security JWT |
+|---|---|---|
+| 改动量 | 需要自定义 Filter + Realm | Spring Security 内置支持 |
+| 配置复杂度 | 中等 | 较高 |
+| Session 支持 | 需要关闭 | 需要关闭 |
+| 生态 | 较弱 | 强（OAuth2、JWT 都有） |
+
+## 面试高频问题
+
+**问：JWT Token 泄露了怎么办？**
+
+JWT 一旦泄露，在过期前无法撤销。缓解措施：
+
+1. Token 有效期设置短一些（15-30 分钟）
+2. 使用 HTTPS 传输
+3. 敏感操作需要额外验证（如短信验证码）
+4. 可以维护一个 Token 黑名单（但违背了无状态初衷）
+
+**问：如何实现 Token 注销？**
+
+JWT 无法主动注销。方案：
+
+1. 将 Token ID 存入 Redis，验证时检查是否存在
+2. 设置较短的过期时间
+3. 使用短期 Access Token + 长期 Refresh Token
+
+**问：Shiro Session 和 JWT Token 如何选择？**
+
+| 场景 | 推荐方案 |
+|---|---|
+| 传统 Web 应用 | Shiro Session |
+| 前后端分离 | JWT Token |
+| 微服务架构 | JWT Token |
+| 需要实时注销 | Shiro Session 或 Token 黑名单 |
+
+## 总结
+
+Shiro + JWT 实现了无状态认证：
+
+```
+JWT 改造要点：
+├── 自定义 JwtToken：封装 Token 信息
+├── 自定义 JwtFilter：验证 Token，构建 Subject
+├── 自定义 JwtRealm：从 Token 获取用户信息
+├── 关闭 Shiro Session：无状态模式
+└── Refresh Token：解决 Token 续期问题
+```
+
+> 下一节我们来看权限数据模型——如何设计灵活的用户-角色-权限结构。
+

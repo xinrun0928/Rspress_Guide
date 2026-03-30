@@ -1,0 +1,482 @@
+import { Badge } from '@rspress/core/theme';
+
+# Shiro Session 分布式化：RedisSessionDAO
+
+Shiro 的 Session 默认存在 JVM 内存里。当你的应用部署多个实例时，用户在实例 A 登录，下次请求可能到了实例 B——实例 B 的内存里没有这个用户的 Session，体验就是"刚登录又要登录"。
+
+把 Session 存储到 Redis，让所有实例共享同一个 Session 数据，就能解决这个问题。
+
+## 分布式 Session 架构
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                         用户浏览器                           │
+└─────────────────────────────┬───────────────────────────────┘
+                              │ Session ID Cookie
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                      Nginx 负载均衡                         │
+│                                                           │
+│   ┌─────────┐    ┌─────────┐    ┌─────────┐              │
+│   │ 实例 A   │    │ 实例 B   │    │ 实例 C   │              │
+│   │  :8080  │    │  :8081  │    │  :8082  │              │
+│   └───┬─────┘    └───┬─────┘    └───┬─────┘              │
+└───────┼──────────────┼──────────────┼───────────────────────┘
+        │              │              │
+        │              │              │
+        ▼              ▼              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                          Redis                              │
+│                                                           │
+│   shiro:session:abc123  →  Session 数据 (JSON/Kryo)         │
+│   shiro:session:def456  →  Session 数据                    │
+│                                                           │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## 方案一：使用 shiro-redis
+
+### 引入依赖
+
+```xml
+<dependency>
+    <groupId>org.apache.shiro</groupId>
+    <artifactId>shiro-redis</artifactId>
+    <version>4.5.3</version>
+</dependency>
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-data-redis</artifactId>
+</dependency>
+```
+
+### 配置
+
+```java
+@Configuration
+public class ShiroConfig {
+
+    @Bean
+    public RedisManager redisManager() {
+        RedisManager manager = new RedisManager();
+        manager.setHost("127.0.0.1");
+        manager.setPort(6379);
+        manager.setPassword("123456");
+        manager.setDatabase(0);
+        manager.setTimeout(1800000);  // 30 分钟
+        return manager;
+    }
+
+    @Bean
+    public RedisSessionDAO redisSessionDAO(RedisManager redisManager) {
+        RedisSessionDAO sessionDAO = new RedisSessionDAO();
+        sessionDAO.setRedisManager(redisManager);
+        sessionDAO.setSessionIdGenerator(new JavaUuidSessionIdGenerator());
+        return sessionDAO;
+    }
+
+    @Bean
+    public DefaultWebSessionManager sessionManager(RedisSessionDAO redisSessionDAO) {
+        DefaultWebSessionManager sessionManager = new DefaultWebSessionManager();
+        sessionManager.setSessionDAO(redisSessionDAO);
+        sessionManager.setGlobalSessionTimeout(1800000);  // 30 分钟
+        sessionManager.setSessionIdCookieEnabled(true);
+        sessionManager.setSessionValidationSchedulerEnabled(true);
+        return sessionManager;
+    }
+
+    @Bean
+    public SecurityManager securityManager(Realm realm,
+                                          DefaultWebSessionManager sessionManager,
+                                          RememberMeManager rememberMeManager,
+                                          CacheManager cacheManager) {
+        DefaultWebSecurityManager manager = new DefaultWebSecurityManager(realm);
+        manager.setSessionManager(sessionManager);
+        manager.setRememberMeManager(rememberMeManager);
+        manager.setCacheManager(cacheManager);
+        return manager;
+    }
+}
+```
+
+## 方案二：自定义 RedisSessionDAO
+
+如果 shiro-redis 不满足需求，可以自己实现：
+
+### Session 实体类
+
+```java
+@Data
+public class ShiroSession implements Serializable {
+    private static final long serialVersionUID = 1L;
+
+    private String id;
+    private Date startTimestamp;
+    private Date lastAccessTime;
+    private long timeout;
+    private boolean expired;
+    private Map<String, Object> attributes;
+
+    // 标记为停止
+    private boolean stopped;
+
+    public boolean isValid() {
+        return !stopped && !expired &&
+               (startTimestamp.getTime() + timeout) > System.currentTimeMillis();
+    }
+}
+```
+
+### RedisSessionDAO 实现
+
+```java
+@Component
+public class CustomRedisSessionDAO extends AbstractSessionDAO {
+
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    private static final String SESSION_KEY_PREFIX = "shiro:session:";
+    private static final long SESSION_EXPIRE_SECONDS = 1800;  // 30 分钟
+
+    @Override
+    protected void doCreate(Session session) {
+        // 生成 Session ID
+        Serializable sessionId = generateSessionId(session);
+        assignSessionId(session, sessionId);
+
+        // 保存到 Redis
+        saveSession(session);
+    }
+
+    @Override
+    public Session readSession(Serializable id) throws UnknownSessionException {
+        if (id == null) {
+            return null;
+        }
+        Session session = getSession(id);
+        if (session == null) {
+            throw new UnknownSessionException("Session 不存在: " + id);
+        }
+        return session;
+    }
+
+    @Override
+    public void update(Session session) throws UnknownSessionException {
+        saveSession(session);
+    }
+
+    @Override
+    public void delete(Session session) {
+        String key = getSessionKey(session.getId());
+        redisTemplate.delete(key);
+    }
+
+    @Override
+    public Collection<Session> getActiveSessions() {
+        Set<String> keys = redisTemplate.keys(SESSION_KEY_PREFIX + "*");
+        if (keys == null || keys.isEmpty()) {
+            return Collections.emptySet();
+        }
+
+        List<Session> sessions = new ArrayList<>();
+        for (String key : keys) {
+            String id = key.substring(SESSION_KEY_PREFIX.length());
+            Session session = getSession(id);
+            if (session != null && session.isValid()) {
+                sessions.add(session);
+            }
+        }
+        return sessions;
+    }
+
+    private void saveSession(Session session) {
+        if (session == null || session.getId() == null) {
+            return;
+        }
+
+        String key = getSessionKey(session.getId());
+
+        // 转换为可存储的对象
+        ShiroSession shiroSession = convertToShiroSession(session);
+
+        // 设置过期时间
+        redisTemplate.opsForValue().set(
+            key,
+            shiroSession,
+            SESSION_EXPIRE_SECONDS,
+            TimeUnit.SECONDS
+        );
+    }
+
+    private Session getSession(Serializable id) {
+        String key = getSessionKey(id);
+        ShiroSession shiroSession = (ShiroSession) redisTemplate.opsForValue().get(key);
+
+        if (shiroSession == null) {
+            return null;
+        }
+
+        return convertToSession(shiroSession);
+    }
+
+    private String getSessionKey(Serializable id) {
+        return SESSION_KEY_PREFIX + id;
+    }
+
+    private ShiroSession convertToShiroSession(Session session) {
+        ShiroSession shiroSession = new ShiroSession();
+        shiroSession.setId(session.getId().toString());
+        shiroSession.setStartTimestamp(session.getStartTimestamp());
+        shiroSession.setLastAccessTime(session.getLastAccessTime());
+        shiroSession.setTimeout(session.getTimeout());
+        shiroSession.setExpired(session.isExpired());
+
+        // 转换属性
+        Map<String, Object> attrs = new HashMap<>();
+        for (Object key : session.getAttributeKeys()) {
+            attrs.put(key.toString(), session.getAttribute(key));
+        }
+        shiroSession.setAttributes(attrs);
+
+        return shiroSession;
+    }
+
+    private Session convertToSession(ShiroSession shiroSession) {
+        SimpleSession session = new SimpleSession();
+        session.setId(shiroSession.getId());
+        session.setStartTimestamp(shiroSession.getStartTimestamp());
+        session.setLastAccessTime(shiroSession.getLastAccessTime());
+        session.setTimeout(shiroSession.getTimeout());
+
+        // 恢复属性
+        if (shiroSession.getAttributes() != null) {
+            for (Map.Entry<String, Object> entry : shiroSession.getAttributes().entrySet()) {
+                session.setAttribute(entry.getKey(), entry.getValue());
+            }
+        }
+
+        return session;
+    }
+}
+```
+
+## 序列化问题
+
+### Java 原生序列化
+
+默认使用 Java 序列化：
+
+```java
+// 会存储类名和字段，效率低，跨语言不兼容
+redisTemplate.setValueSerializer(new JdkSerializationRedisSerializer());
+```
+
+### JSON 序列化
+
+推荐使用 JSON：
+
+```java
+@Bean
+public RedisTemplate<String, Object> redisTemplate(
+        RedisConnectionFactory connectionFactory) {
+    RedisTemplate<String, Object> template = new RedisTemplate<>();
+    template.setConnectionFactory(connectionFactory);
+
+    // Key 使用 String 序列化
+    template.setKeySerializer(new StringRedisSerializer());
+
+    // Value 使用 JSON 序列化
+    GenericJackson2JsonRedisSerializer jsonSerializer =
+        new GenericJackson2JsonRedisSerializer();
+    template.setValueSerializer(jsonSerializer);
+
+    // Hash 的 Value 也使用 JSON
+    template.setHashValueSerializer(jsonSerializer);
+
+    template.afterPropertiesSet();
+    return template;
+}
+```
+
+### Kryo 序列化（性能最优）
+
+```xml
+<dependency>
+    <groupId>com.esotericsoftware</groupId>
+    <artifactId>kryo</artifactId>
+    <version>5.4.0</version>
+</dependency>
+```
+
+```java
+public class KryoSerializer {
+
+    private static final ThreadLocal<Kryo> kryoLocal = ThreadLocal.withInitial(() -> {
+        Kryo kryo = new Kryo();
+        kryo.setRegistrationRequired(false);
+        kryo.setReferences(true);
+        kryo.register(SimpleSession.class);
+        kryo.register(HashMap.class);
+        kryo.register(ArrayList.class);
+        return kryo;
+    });
+
+    public byte[] serialize(Object obj) {
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        Output output = new Output(baos);
+        kryoLocal.get().writeObject(output, obj);
+        output.close();
+        return baos.toByteArray();
+    }
+
+    public <T> T deserialize(byte[] bytes, Class<T> clazz) {
+        ByteArrayInputStream bais = new ByteArrayInputStream(bytes);
+        Input input = new Input(bais);
+        T obj = kryoLocal.get().readObject(input, clazz);
+        input.close();
+        return obj;
+    }
+}
+```
+
+## Session 过期时间
+
+### 全局超时配置
+
+```java
+@Bean
+public DefaultWebSessionManager sessionManager(RedisSessionDAO redisSessionDAO) {
+    DefaultWebSessionManager sessionManager = new DefaultWebSessionManager();
+    sessionManager.setSessionDAO(redisSessionDAO);
+    sessionManager.setGlobalSessionTimeout(1800000);  // 30 分钟
+    return sessionManager;
+}
+```
+
+### Redis TTL 配置
+
+```java
+// 确保 Session 的 TTL 大于 Shiro 的 globalSessionTimeout
+// 一般设置为 globalSessionTimeout + 缓冲时间
+private static final long SESSION_EXPIRE_SECONDS = 2100;  // 35 分钟
+
+redisTemplate.opsForValue().set(
+    key,
+    session,
+    SESSION_EXPIRE_SECONDS,
+    TimeUnit.SECONDS
+);
+```
+
+### 动态续期
+
+用户每次操作时，刷新 Session 的过期时间：
+
+```java
+@Override
+public void update(Session session) throws UnknownSessionException {
+    // 每次访问都刷新过期时间
+    saveSession(session);
+}
+```
+
+## 与 Spring Session 的对比
+
+| 对比项 | Shiro RedisSessionDAO | Spring Session |
+|---|---|---|
+| 依赖 | Shiro | Spring Framework |
+| 功能 | Session 存储 | Session + HttpSession |
+| 注解支持 | Shiro 注解 | Spring Security 注解 |
+| Session 共享 | 只支持 Shiro | 支持任意 HttpSession |
+| 序列化 | 可自定义 | JSON/ JDK 序列化 |
+| 集群支持 | 多实例共享 | 多实例共享 |
+
+## 常见问题
+
+### 问题一：Session 数据丢失
+
+```java
+// 确保 Redis 连接正常
+redisTemplate.getConnectionFactory().getConnection().ping();
+
+// 检查序列化是否正常
+Session session = new SimpleSession();
+session.setAttribute("user", new User());
+redisSessionDAO.create(session);
+```
+
+### 问题二：Session ID 不一致
+
+检查 Cookie 配置：
+
+```java
+SimpleCookie cookie = new SimpleCookie("SHIROSESSIONID");
+cookie.setPath("/");
+cookie.setHttpOnly(true);
+cookie.setSecure(true);  // 生产环境设为 true
+```
+
+### 问题三：分布式锁冲突
+
+多个实例同时操作同一个 Session：
+
+```java
+// 使用 Redis 分布式锁
+ValueOperations<String, Object> ops = redisTemplate.opsForValue();
+String lockKey = "lock:session:" + sessionId;
+Boolean locked = ops.setIfAbsent(lockKey, "1", 10, TimeUnit.SECONDS);
+
+if (Boolean.TRUE.equals(locked)) {
+    try {
+        // 更新 Session
+        doUpdate(session);
+    } finally {
+        redisTemplate.delete(lockKey);
+    }
+}
+```
+
+## 面试高频问题
+
+**问：Shiro Session 存 Redis 有什么好处？**
+
+1. **多实例共享**：所有实例访问同一个 Session
+2. **故障恢复**：实例重启不影响 Session
+3. **水平扩展**：可以随时增加实例
+
+**问：Session 数据存在 Redis 里安全吗？**
+
+Redis 可以设置密码、开启 RDB/AOF 持久化、生产环境使用集群模式保证高可用。
+
+**问：如何处理 Session 过期？**
+
+Redis 中 Session 过期后自动删除。可以监听 Redis Keyspace Notifications 通知：
+
+```java
+@EventListener
+public void onSessionExpired(RedisKeyspaceNotificationEvent event) {
+    if (event.getType() == ExpiryEvent.KEY_EXPIRED) {
+        String key = event.getKey();
+        if (key.startsWith("shiro:session:")) {
+            log.info("Session 已过期: {}", key);
+        }
+    }
+}
+```
+
+## 总结
+
+RedisSessionDAO 让 Shiro Session 分布式化：
+
+```
+分布式 Session 配置要点：
+├── RedisSessionDAO：Session 持久化到 Redis
+├── Session ID Cookie：跨实例共享
+├── 序列化选择：JSON 或 Kryo
+├── TTL 配置：略大于 globalSessionTimeout
+└── 动态续期：每次访问刷新过期时间
+```
+
+> 下一节我们来看 Shiro 实战——如何结合 JWT 实现无状态认证。
+

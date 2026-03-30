@@ -1,0 +1,338 @@
+import { Badge } from '@rspress/core/theme';
+
+# MyBatis SQL 执行流程：从 Mapper 到结果集
+
+<Badge text="MyBatis" type="tip" /> <Badge text="核心原理" type="info" />
+
+你在 IDE 里敲下这行代码时，有没有想过 MyBatis 背后经历了什么？
+
+```java
+User user = userMapper.selectById(1L);
+```
+
+就一行代码，MyBatis 却在暗地里完成了一系列复杂的操作：获取连接、创建执行器、路由 SQL、预编译语句、绑定参数、执行查询、处理结果集、关闭资源……
+
+这一套流程，是 MyBatis 最核心的执行链路。
+
+## 执行流程全景图
+
+让我们先从宏观上把握整个流程：
+
+```
+用户调用 Mapper 方法
+        ↓
+SqlSession 调用 getMapper() 获取代理对象
+        ↓
+MapperProxy 拦截方法调用
+        ↓
+SqlSession 根据 StatementId 获取 MappedStatement
+        ↓
+Executor 执行器开始工作
+        ↓
+    ┌─────────────────────────┐
+    │  CachingExecutor         │  ← 二级缓存包装
+    │  (如有二级缓存)           │
+    └───────────┬─────────────┘
+                ↓
+    ┌─────────────────────────┐
+    │  BaseExecutor            │  ← 模板方法模式
+    │  (一级缓存、事务管理)      │
+    └───────────┬─────────────┘
+                ↓
+    ┌─────────────────────────┐
+    │  Simple/Reuse/Batch      │  ← 具体的执行策略
+    └───────────┬─────────────┘
+                ↓
+RoutingStatementHandler 路由
+                ↓
+StatementHandler 创建 PreparedStatement
+                ↓
+        ParameterHandler 绑定参数
+                ↓
+        JDBC 执行 SQL
+                ↓
+        ResultSetHandler 处理结果集
+                ↓
+        关闭资源，释放连接
+```
+
+这个流程看似复杂，但每一步都有其存在的意义。接下来，我们会对每个关键节点进行深入剖析。
+
+## 入口：SqlSession 与 MapperProxy
+
+`SqlSession` 是 MyBatis 的大门，所有的数据库操作都要经过它。当你调用 `sqlSession.getMapper(UserMapper.class)` 时，MyBatis 返回的其实是一个 `MapperProxy` 代理对象。
+
+```java
+// 伪代码展示
+public class MapperProxy<T> implements InvocationHandler {
+
+    @Override
+    public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+        // 1. 判断是否是 Object 方法（toString、equals 等）
+        if (Object.class.equals(method.getDeclaringClass())) {
+            return method.invoke(this, args);
+        }
+
+        // 2. 获取 MapperMethod（缓存 SQL 信息）
+        final MapperMethod mapperMethod = cachedMapperMethod(method);
+
+        // 3. 调用 SqlSession 执行
+        return sqlSession.execute(mapperMethod, args);
+    }
+}
+```
+
+**为什么要用代理对象？** 这是 MyBatis 设计的精髓——你定义的是接口，MyBatis 在运行时帮你生成了实现类。这个实现类里封装了所有的 SQL 调用逻辑，对业务代码完全透明。
+
+## MappedStatement：SQL 的元数据
+
+每一个映射语句，在 MyBatis 内部都对应一个 `MappedStatement` 对象。这个对象包含了执行这条 SQL 所需的全部信息：
+
+- `SqlCommandType`：SELECT / INSERT / UPDATE / DELETE
+- `SqlSource`：SQL 语句的来源（静态 SQL 或动态 SQL）
+- `ResultMap`：结果映射规则
+- `ParameterMap`：参数映射规则
+- `StatementId`：唯一标识符
+
+```java
+public class MappedStatement {
+    private String id;                    // 唯一标识
+    private SqlCommandType sqlCommandType; // SQL 类型
+    private SqlSource sqlSource;           // SQL 源码
+    private ResultMap resultMaps[];        // 结果映射
+    private ParameterMap parameterMap;     // 参数映射
+    private Integer fetchSize;            // 抓取大小
+    private Integer timeout;              // 超时时间
+    // ... 更多配置
+}
+```
+
+当你在 XML 中定义一条 `<select id="selectById">` 时，MyBatis 启动阶段就会解析这个 XML，生成对应的 `MappedStatement`，并存入 `Configuration` 的 `mappedStatements` Map 中。
+
+## 执行器：策略模式的应用
+
+执行器是整个流程中最核心的组件。MyBatis 提供了三种执行器：
+
+| 执行器 | 特点 | 适用场景 |
+|--------|------|----------|
+| `SimpleExecutor` | 每次创建新的 `PreparedStatement` | 默认，适用于大多数场景 |
+| `ReuseExecutor` | 复用预编译的 `Statement` | 批量操作，但 SQL 重复率高 |
+| `BatchExecutor` | 批量执行 SQL | 批量插入、更新，性能最优 |
+
+`BaseExecutor` 是这三个执行器的基类，采用了**模板方法模式**。它定义了一套完整的执行骨架，子类只需要关注 `doQuery()` 和 `doUpdate()` 的具体实现。
+
+```java
+public abstract class BaseExecutor implements Executor {
+
+    @Override
+    public <E> List<E> query(MappedStatement ms, Object parameter, RowBounds rowBounds,
+                              ResultHandler resultHandler, CacheKey cacheKey, BoundSql boundSql) {
+        // 1. 检查一级缓存
+        if (queryFromCache(cacheKey)) {
+            return LIST_EMPTY;
+        }
+
+        // 2. 调用子类方法执行查询
+        List<E> list = doQuery(ms, parameter, rowBounds, resultHandler, boundSql);
+
+        // 3. 存入一级缓存
+        queryFromCache(cacheKey, list);
+
+        return list;
+    }
+
+    // 子类实现
+    protected abstract <E> List<E> doQuery(MappedStatement ms, Object parameter,
+                                            RowBounds rowBounds, ResultHandler resultHandler,
+                                            BoundSql boundSql);
+}
+```
+
+## StatementHandler：SQL 的执行者
+
+`StatementHandler` 才是真正与 JDBC 交互的组件。它负责：
+
+1. 创建 `PreparedStatement`
+2. 设置参数
+3. 执行 SQL
+4. 处理结果集
+
+MyBatis 提供了三种 `StatementHandler`：
+
+```java
+// 1. PreparedStatementHandler（最常用）
+// 处理预编译SQL，防止SQL注入
+public class PreparedStatementHandler extends BaseStatementHandler {
+    @Override
+    protected Statement instantiateStatement(Connection connection) throws SQLException {
+        String sql = boundSql.getSql();
+        return connection.prepareStatement(sql);
+    }
+}
+
+// 2. StatementHandler
+// 直接拼接SQL，有SQL注入风险
+public class StatementHandler extends BaseStatementHandler {
+    @Override
+    protected Statement instantiateStatement(Connection connection) throws SQLException {
+        String sql = boundSql.getSql();
+        return connection.createStatement();
+    }
+}
+
+// 3. CallableStatementHandler
+// 处理存储过程调用
+public class CallableStatementHandler extends BaseStatementHandler {
+    @Override
+    protected Statement instantiateStatement(Connection connection) throws SQLException {
+        String sql = boundSql.getSql();
+        return connection.prepareCall(sql);
+    }
+}
+```
+
+`RoutingStatementHandler` 是一个路由类，它根据配置选择合适的 `StatementHandler`：
+
+```java
+public class RoutingStatementHandler implements StatementHandler {
+
+    private final StatementHandler delegate;
+
+    public RoutingStatementHandler(StatementHandlerRegistry registry,
+                                     MappedStatement ms, Object parameter,
+                                     RowBounds rowBounds, ResultHandler resultHandler,
+                                     BoundSql boundSql) {
+        // 根据 Statement 类型选择具体的 Handler
+        switch (ms.getStatementType()) {
+            case STATEMENT:
+                delegate = registry.getHandler(StatementHandler.class);
+                break;
+            case PREPARED:
+                delegate = registry.getHandler(PreparedStatementHandler.class);
+                break;
+            case CALLABLE:
+                delegate = registry.getHandler(CallableStatementHandler.class);
+                break;
+            default:
+                throw new IllegalArgumentException("Invalid StatementType");
+        }
+    }
+}
+```
+
+## 参数绑定：ParameterHandler
+
+参数绑定是防止 SQL 注入的关键步骤。`ParameterHandler` 负责将 Java 对象的属性值绑定到 `PreparedStatement` 的占位符上。
+
+```java
+public interface ParameterHandler {
+
+    /**
+     * 获取绑定了参数的 PreparedStatement
+     */
+    Object getParameterObject();
+
+    /**
+     * 将参数设置到 PreparedStatement 中
+     */
+    void setParameters(PreparedStatement ps) throws SQLException;
+}
+```
+
+`DefaultParameterHandler` 是其默认实现，它会遍历 SQL 中的每个占位符 `?`，根据参数类型调用相应的 `TypeHandler` 进行类型转换。
+
+```java
+public class DefaultParameterHandler implements ParameterHandler {
+
+    @Override
+    public void setParameters(PreparedStatement ps) {
+        BoundSql boundSql = this.boundSql;
+        List<ParameterMapping> parameterMappings = boundSql.getParameterMappings();
+
+        for (int i = 0; i < parameterMappings.size(); i++) {
+            ParameterMapping parameterMapping = parameterMappings.get(i);
+            Object value = getParameterValue(parameterMapping);
+
+            // 调用 TypeHandler 进行类型转换
+            TypeHandler typeHandler = parameterMapping.getTypeHandler();
+            JdbcType jdbcType = parameterMapping.getJdbcType();
+
+            typeHandler.setParameter(ps, i + 1, value, jdbcType);
+        }
+    }
+}
+```
+
+## 结果集映射：ResultSetHandler
+
+最后一步是将 JDBC 返回的 `ResultSet` 转换成 Java 对象。这是 MyBatis 映射能力最强大的地方。
+
+```java
+public interface ResultSetHandler {
+
+    // 处理普通查询结果
+    <E> List<E> handleResultSets(Statement stmt) throws SQLException;
+
+    // 处理游标结果（存储过程）
+    <E> Cursor<E> handleCursorResultSets(Statement stmt) throws SQLException;
+
+    // 处理输出参数
+    void handleOutputParameters(Statement stmt) throws SQLException;
+}
+```
+
+`DefaultResultSetHandler` 的处理流程非常精妙：
+
+1. **自动映射**：根据字段名自动匹配（开启 `mapUnderscoreToCamelCase` 自动映射下划线到驼峰）
+2. **ResultMap 映射**：按照显式配置的映射规则进行映射
+3. **嵌套映射**：处理 `<association>` 和 `<collection>` 的嵌套查询
+4. **延迟加载**：在真正访问关联对象时才执行查询
+
+## 完整的时序图
+
+```
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+│   Mapper     │    │  SqlSession  │    │   Executor   │    │   Statement  │
+│   Proxy      │    │              │    │              │    │   Handler    │
+└──────┬───────┘    └──────┬───────┘    └──────┬───────┘    └──────┬───────┘
+       │                   │                   │                   │
+       │ selectById()     │                   │                   │
+       │──────────────────>│                   │                   │
+       │                   │ execute()         │                   │
+       │                   │──────────────────>│                   │
+       │                   │                   │ query()           │
+       │                   │                   │──────────────────>│
+       │                   │                   │                   │
+       │                   │                   │   创建PreparedStatement
+       │                   │                   │<──────────────────│
+       │                   │                   │                   │
+       │                   │                   │   设置参数         │
+       │                   │                   │──────────────────>│
+       │                   │                   │                   │
+       │                   │                   │   执行查询         │
+       │                   │                   │──────────────────>│
+       │                   │                   │                   │
+       │                   │                   │   处理结果集       │
+       │                   │                   │<──────────────────│
+       │                   │                   │                   │
+       │                   │   返回结果         │                   │
+       │                   │<──────────────────│                   │
+       │   返回结果         │                   │                   │
+       │<──────────────────│                   │                   │
+```
+
+## 延伸思考
+
+这一讲我们梳理了 MyBatis SQL 执行的全流程。核心脉络是：
+
+```
+MapperProxy → SqlSession → Executor → StatementHandler → JDBC
+```
+
+但你有没有想过几个问题：
+
+1. **二级缓存是什么时候起作用的？** 它和一级缓存的关系是什么？
+2. **延迟加载是如何实现的？** 为什么只在访问关联对象时才触发查询？
+3. **动态 SQL（`<if>`、`<where>`）是在哪个阶段处理的？** 为什么参数绑定能识别动态标签？
+
+这些问题，会在后续的专题中逐一解答。理解了这个执行流程，你就已经掌握了 MyBatis 的骨架。后续的每一处细节，都是在这个骨架上长出的血肉。

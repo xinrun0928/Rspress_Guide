@@ -1,0 +1,451 @@
+import { Badge } from '@rspress/core/theme';
+
+# #{} vs ${}：MyBatis 参数绑定的两种方式
+
+<Badge text="MyBatis" type="tip" /> <Badge text="核心原理" type="info" />
+
+#{} 和 ${} 都能接收参数，但背后的原理完全不同。
+
+大多数 MyBatis 教程会告诉你：#{} 是预编译，${} 是字符串替换。但你真的理解这意味着什么吗？为什么一个可以防注入，另一个却不行？什么时候该用 #{}，什么时候不得不用 ${}？
+
+这篇文章，让你彻底搞懂参数绑定的本质。
+
+## 一个简单的对比
+
+先看一个例子：
+
+```xml
+<select id="selectByName" resultType="User">
+    SELECT * FROM user WHERE name = #{name}
+</select>
+
+<select id="selectByNameUnsafe" resultType="User">
+    SELECT * FROM user WHERE name = '${name}'
+</select>
+```
+
+当 `name = "张三"` 时，两者的最终 SQL 分别是：
+
+```sql
+-- #{}：参数绑定
+SELECT * FROM user WHERE name = ?
+
+-- ${}：字符串替换
+SELECT * FROM user WHERE name = '张三'
+```
+
+看起来效果一样？但当 `name = "张 三' OR '1'='1"` 时：
+
+```sql
+-- #{}：安全
+SELECT * FROM user WHERE name = '张 三'' OR ''1''=''1'
+
+-- ${}：危险！SQL 注入！
+SELECT * FROM user WHERE name = 张 三' OR '1'='1
+```
+
+## #{} 的预编译机制
+
+### 源码解析
+
+当使用 `#{}` 时，MyBatis 会经过以下处理流程：
+
+```java
+// 1. SQL 解析阶段：#{} 被替换为 ?
+public class GenericTokenParser {
+
+    public String parse(String text) {
+        StringBuilder builder = new StringBuilder();
+        // 解析 #{} 占位符
+        // user WHERE name = #{name}
+        //           ↓
+        // user WHERE name = ?
+        return builder.toString();
+    }
+}
+
+// 2. 参数绑定阶段：使用 PreparedStatement 设置参数
+public class DefaultParameterHandler {
+
+    public void setParameters(PreparedStatement ps) {
+        // 获取 #{name} 对应的参数值 "张三"
+        Object value = getParameterValue("name");
+
+        // 调用 setString 设置参数
+        ps.setString(parameterIndex, (String) value);
+        // 底层实现：PreparedStatement 会对特殊字符进行转义
+        // ' 变成 \'
+    }
+}
+```
+
+### PreparedStatement 的防注入原理
+
+JDBC 的 `PreparedStatement` 采用了**参数化查询**：
+
+```java
+PreparedStatement ps = connection.prepareStatement(
+    "SELECT * FROM user WHERE name = ?"
+);
+
+// 参数会被当作**数据**，而不是 SQL 的一部分
+ps.setString(1, "张 三' OR '1'='1");
+
+// 最终执行的 SQL 是：
+// SELECT * FROM user WHERE name = '张 三'' OR ''1''=''1'
+//                                        ↑↑↑↑↑↑↑↑↑↑↑↑↑
+//                                        特殊字符被转义了！
+```
+
+数据库看到的不是 `name = 'xxx' OR '1'='1'`（这是 SQL 逻辑），而是 `name = '张 三'' OR ''1''=''1'`（这是一个完整的字符串值）。
+
+### TypeHandler 的类型转换
+
+`#{}` 不仅防注入，还负责类型转换：
+
+```java
+// 假设 User 对象有 birthDate 字段（java.util.Date 类型）
+// 数据库中存储的是 DATE 类型
+
+// #{birthDate} 会根据 TypeHandler 进行类型转换
+public class DateTypeHandler implements TypeHandler<Date> {
+
+    @Override
+    public void setParameter(PreparedStatement ps, int i, Date parameter, JdbcType jdbcType) {
+        // Date → java.sql.Date
+        ps.setDate(i, new java.sql.Date(parameter.getTime()));
+    }
+
+    @Override
+    public Date getNullableResult(ResultSet rs, String columnName) {
+        // java.sql.Date → Date
+        java.sql.Date sqlDate = rs.getDate(columnName);
+        return new Date(sqlDate.getTime());
+    }
+}
+```
+
+## ${} 的字符串替换
+
+### 源码解析
+
+当使用 `${}` 时，MyBatis 直接做字符串拼接：
+
+```java
+// 1. SQL 解析阶段：${} 被直接替换为参数值
+public class GenericTokenParser {
+
+    public String parse(String text) {
+        StringBuilder builder = new StringBuilder();
+        // 解析 ${} 占位符
+        // user WHERE name = ${name}
+        //           ↓
+        // user WHERE name = 张三
+        String value = getParameterValue("name");
+        builder.append(value);
+        return builder.toString();
+    }
+}
+
+// 2. 没有参数绑定，直接拼接到 SQL 中
+// 注意：完全没有类型转换，直接 toString()
+```
+
+### 危险示例
+
+```java
+// UserMapper.xml
+<select id="selectByCondition" resultType="User">
+    SELECT * FROM user
+    WHERE status = ${status}
+      AND order = ${orderField}
+</select>
+```
+
+**场景一：数字类型注入**
+
+```java
+// 调用
+userMapper.selectByCondition(1, "id");  // 正常
+
+// 如果传入
+userMapper.selectByCondition(-1, "id; DROP TABLE user; --");
+// 生成的 SQL：
+SELECT * FROM user
+WHERE status = ; DROP TABLE user; --
+  AND order = id
+```
+
+**场景二：字符串拼接**
+
+```java
+<select id="search" resultType="User">
+    SELECT * FROM user
+    WHERE name LIKE '%${keyword}%'
+</select>
+```
+
+如果 `keyword = "' OR '1'='1"`，生成的 SQL：
+
+```sql
+SELECT * FROM user WHERE name LIKE '%%' OR '1'='1%'
+```
+
+## 什么时候必须用 ${}？
+
+`#{}` 的限制在于：它只能作为**值**出现，不能用于：
+
+1. **动态表名**
+2. **动态列名**
+3. **ORDER BY 的排序字段**
+4. **GROUP BY 的分组字段**
+
+### 场景一：动态表名
+
+```xml
+<!-- 报表系统：根据不同表名查询 -->
+<select id="queryByTable" resultType="map">
+    SELECT * FROM ${tableName} WHERE create_time > #{startTime}
+</select>
+```
+
+### 场景二：动态列名
+
+```xml
+<!-- 动态排序字段 -->
+<select id="selectUsers" resultType="User">
+    SELECT id, name, email
+    FROM user
+    ORDER BY ${sortField} ${sortOrder}
+</select>
+```
+
+### 场景三：in 子句（特殊情况）
+
+```xml
+<!-- in 子句的正确做法是用 #{} -->
+<select id="selectByIds" resultType="User">
+    SELECT * FROM user WHERE id IN
+    <foreach collection="ids" item="id" open="(" separator="," close=")">
+        #{id}
+    </foreach>
+</select>
+```
+
+但有时候需要拼接 ID 列表（不推荐，但确实有场景）：
+
+```xml
+<!-- 不推荐：使用 ${} 拼接 -->
+<select id="selectByIds" resultType="User">
+    SELECT * FROM user WHERE id IN (${ids})
+</select>
+
+<!-- 推荐：使用 foreach 拼接 -->
+<select id="selectByIds" resultType="User">
+    SELECT * FROM user WHERE id IN
+    <foreach collection="ids" item="id" open="(" separator="," close=")">
+        #{id}
+    </foreach>
+</select>
+```
+
+## #{} 在 LIKE 查询中的特殊处理
+
+LIKE 查询是 #{} 最容易出错的地方。
+
+### 错误写法
+
+```xml
+<!-- 错误：生成的 SQL 会变成 WHERE name LIKE '%'张三'%'，语法错误 -->
+<select id="searchByName" resultType="User">
+    SELECT * FROM user WHERE name LIKE '%#{name}%'
+</select>
+```
+
+### 正确写法一：CONCAT 拼接
+
+```xml
+<select id="searchByName" resultType="User">
+    SELECT * FROM user
+    WHERE name LIKE CONCAT('%', #{name}, '%')
+</select>
+```
+
+### 正确写法二：bind 标签
+
+```xml
+<select id="searchByName" resultType="User">
+    <bind name="pattern" value="'%' + _parameter.getName() + '%'"/>
+    SELECT * FROM user
+    WHERE name LIKE #{pattern}
+</select>
+```
+
+### 正确写法三：ONGL 表达式
+
+```xml
+<select id="searchByName" resultType="User">
+    SELECT * FROM user
+    WHERE name LIKE '%' || #{name} || '%'
+</select>
+```
+
+## @Param 注解的作用
+
+### 没有 @Param 的情况
+
+```java
+// Mapper 接口
+User selectByNameAndAge(String name, Integer age);
+```
+
+```xml
+<select id="selectByNameAndAge" resultType="User">
+    SELECT * FROM user
+    WHERE name = #{param1} AND age = #{param2}
+</select>
+
+<!-- 或者使用参数索引（不推荐） -->
+<select id="selectByNameAndAge" resultType="User">
+    SELECT * FROM user
+    WHERE name = #{0} AND age = #{1}
+</select>
+```
+
+### 使用 @Param 的情况
+
+```java
+// Mapper 接口
+User selectByNameAndAge(@Param("name") String name, @Param("age") Integer age);
+```
+
+```xml
+<select id="selectByNameAndAge" resultType="User">
+    SELECT * FROM user
+    WHERE name = #{name} AND age = #{age}
+</select>
+```
+
+### @Param vs 参数索引
+
+| 方式 | 优点 | 缺点 |
+|------|------|------|
+| `#{param1}` | 无需修改接口 | 可读性差，容易出错 |
+| `#{0}` | 无需修改接口 | 索引容易错位 |
+| `@Param` | 可读性好，类型安全 | 需要修改接口（推荐） |
+
+### 命名参数 vs 位置参数
+
+MyBatis 对多参数的处理有三种方式：
+
+```java
+// 方式一：默认 param1, param2, ...
+User select(String name, Integer age);
+// 使用：#{param1}, #{param2}
+
+// 方式二：使用索引
+User select(String name, Integer age);
+// 使用：#{0}, #{1}
+
+// 方式三：@Param 注解（推荐）
+User select(@Param("name") String name, @Param("age") Integer age);
+// 使用：#{name}, #{age}
+```
+
+## 安全使用 ${} 的最佳实践
+
+### 原则一：永远不要直接使用用户输入的 ${}
+
+```java
+// 永远不要这样做！
+@Select("SELECT * FROM ${tableName}")
+List<User> selectAll(String tableName);
+```
+
+### 原则二：白名单校验
+
+```java
+// 对表名、列名进行白名单校验
+private static final Set<String> ALLOWED_TABLES = Set.of("user", "order", "product");
+
+public List<User> selectByTable(String table) {
+    if (!ALLOWED_TABLES.contains(table)) {
+        throw new IllegalArgumentException("Invalid table name");
+    }
+    return mapper.selectByTable(table);
+}
+```
+
+### 原则三：使用 OGNL 表达式做转义
+
+```xml
+<!-- 使用 @PrjpertyName 获取静态方法 -->
+<select id="search" resultType="User">
+    SELECT * FROM user
+    WHERE name LIKE '%${name,escaped=''}%'
+</select>
+```
+
+## 总结对比
+
+| 特性 | `#{}` | `${}` |
+|------|-------|-------|
+| 机制 | 预编译参数绑定 | 字符串替换 |
+| SQL 注入 | 安全 | 危险 |
+| 类型转换 | 支持 | 不支持 |
+| 适用场景 | 普通值 | 动态表名/列名/排序字段 |
+| 性能 | 预编译缓存 | 每次重新编译 |
+| NULL 处理 | 可处理 | 不会处理 |
+
+## 延伸思考
+
+### 为什么预编译的 SQL 会缓存？
+
+数据库会对预编译语句进行缓存：
+
+```sql
+-- 第一次执行
+PREPARE stmt FROM 'SELECT * FROM user WHERE id = ?'
+SET @id = 1
+EXECUTE stmt USING @id
+
+-- 第二次执行（复用缓存）
+SET @id = 2
+EXECUTE stmt USING @id
+```
+
+这避免了每次都重新解析 SQL。
+
+### MyBatis 的 SQL 缓存
+
+MyBatis 也会缓存解析后的 MappedStatement：
+
+```
+用户代码
+    ↓
+SqlSession.getMapper()
+    ↓
+从缓存获取 MapperProxy（方法级别）
+    ↓
+代理对象调用方法
+    ↓
+获取 MappedStatement（SQL 语句 + 映射配置）
+    ↓
+执行 SQL
+```
+
+### 你可能想问的问题
+
+**Q1：能用 #{} 替代所有 ${} 吗？**
+
+不能。`#{}` 不能用于表名、列名等标识符位置。只能用于值的位置。
+
+**Q2：${} 一定不安全吗？**
+
+如果参数来源完全可控（如代码中固定的枚举值），${} 也可以安全使用。但通常建议避免。
+
+**Q3：动态 SQL 中的 #{} 是预编译吗？**
+
+是。MyBatis 的动态 SQL（`<if>`、`<where>`）中的 `#{}` 仍然是预编译的。但 `${}` 在动态 SQL 中同样有安全风险。
+
+理解参数绑定的本质，你就能在日常开发中做出正确的选择。记住一个原则：**能用 #{} 的地方，坚决不用 ${}**。

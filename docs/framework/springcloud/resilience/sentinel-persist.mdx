@@ -1,0 +1,424 @@
+# Sentinel 规则持久化：规则变了，应用怎么知道？
+
+import { Badge } from '@rspress/core/theme';
+
+Sentinel Dashboard 上配置的规则，应用重启后就没了。
+
+这是 Sentinel 使用中最常见的问题之一。Sentinel 默认将规则存储在**内存**中，一旦应用重启，所有的限流规则和熔断规则都会丢失。在生产环境中，这显然是不可接受的。
+
+**规则的持久化，是 Sentinel 生产级使用的必备能力。**
+
+<Badge text="规则持久化" type="tip" /> <Badge text="DataSource" type="tip" /> <Badge text="推拉模式" type="info" />
+
+---
+
+## 一、规则在内存中存储的问题
+
+### 1.1 默认存储方式
+
+Sentinel 默认使用 `MemoryExpandableDataSource`，将规则存储在 JVM 内存中：
+
+```java
+// Sentinel 内部默认使用
+private static volatile DataSource<String, List<FlowRule>> flowDataSource = 
+    new MemoryExpandableDataSource<>(null, Parser);
+```
+
+### 1.2 问题场景
+
+```
+用户在 Sentinel Dashboard 配置限流规则：
+  FlowRule: getOrder → QPS=100
+
+规则生效了，正常运行 1 天...
+
+应用重启：
+  ↓
+内存中的规则丢失
+  ↓
+用户发现：限流规则怎么不见了？
+  ↓
+重新在 Dashboard 配置...
+  ↓
+应用又重启...
+  ↓
+规则又丢了
+```
+
+### 1.3 解决方案
+
+Sentinel 提供了 `DataSource` 接口，支持多种持久化方式：
+
+```java
+public interface ReadableDataSource<S, T> {
+    // 读取规则
+    T loadConfig();
+    
+    // 注册监听器，规则变化时自动回调
+    void registerPropertyListener(PropertyListener<T> listener);
+}
+
+public interface WritableDataSource<T> {
+    // 写入规则
+    void write(T value);
+    
+    // 删除规则
+    void delete();
+}
+```
+
+---
+
+## 二、推模式 vs 拉模式
+
+### 2.1 推模式（Push）
+
+推模式是指**注册中心主动推送**规则到客户端：
+
+```
+Nacos / Apollo / Zookeeper
+        ↓ 主动推送
+Sentinel Client
+        ↓
+应用内存
+```
+
+**优点**：
+- 规则变更即时生效
+- 无需客户端轮询
+
+**缺点**：
+- 需要注册中心支持（如 Nacos）
+- 实现相对复杂
+
+### 2.2 拉模式（Pull）
+
+拉模式是指**客户端主动拉取**规则：
+
+```
+Sentinel Client
+        ↓ 定时轮询
+文件系统 / 数据库
+```
+
+**优点**：
+- 实现简单
+- 不依赖特定注册中心
+
+**缺点**：
+- 有延迟（轮询间隔决定）
+- 对文件系统/数据库有压力
+
+### 2.3 对比
+
+| 维度 | 推模式 | 拉模式 |
+| --- | --- | --- |
+| 实时性 | 高（即时生效） | 中（轮询间隔决定） |
+| 实现复杂度 | 高 | 低 |
+| 依赖 | Nacos/Apollo/Zookeeper | 文件系统 |
+| 适用场景 | 生产环境 | 开发测试 |
+
+---
+
+## 三、Nacos 推模式
+
+### 3.1 引入依赖
+
+```xml
+<dependency>
+    <groupId>com.alibaba.csp</groupId>
+    <artifactId>sentinel-datasource-nacos</artifactId>
+</dependency>
+```
+
+### 3.2 配置 Nacos DataSource
+
+```yaml title="application.yml"
+spring:
+  cloud:
+    sentinel:
+      datasource:
+        # 流控规则
+        flow:
+          nacos:
+            server-addr: nacos-server:8848
+            data-id: ${spring.application.name}-flow-rules
+            group-id: SENTINEL_GROUP
+            data-type: json
+            rule-type: flow  # 规则类型：flow / degrade / system / authority
+        # 熔断规则
+        degrade:
+          nacos:
+            server-addr: nacos-server:8848
+            data-id: ${spring.application.name}-degrade-rules
+            group-id: SENTINEL_GROUP
+            data-type: json
+            rule-type: degrade
+```
+
+### 3.3 在 Nacos 中配置规则
+
+在 Nacos 控制台添加配置：
+
+```json title="order-service-flow-rules"
+[
+    {
+        "resource": "getOrder",
+        "limitApp": "default",
+        "grade": 1,
+        "count": 100,
+        "strategy": 0,
+        "controlBehavior": 0,
+        "clusterMode": false
+    }
+]
+```
+
+配置参数说明：
+
+| 参数 | 说明 | 值 |
+| --- | --- | --- |
+| `resource` | 资源名 | `getOrder` |
+| `limitApp` | 限制的调用来源 | `default` 表示不区分来源 |
+| `grade` | 限流模式 | `1` = QPS，`0` = 并发线程数 |
+| `count` | 阈值 | `100` |
+| `strategy` | 流控策略 | `0` = 直接，`1` = 关联，`2` = 链路 |
+| `controlBehavior` | 流控效果 | `0` = 直接拒绝，`1` = 冷启动，`2` = 匀速排队 |
+| `clusterMode` | 是否集群模式 | `false` |
+
+### 3.4 工作原理
+
+```
+Nacos 控制台修改规则
+        ↓
+Nacos Server 推送变更到客户端
+        ↓
+NacosDataSource 接收变更
+        ↓
+解析 JSON 规则
+        ↓
+调用 FlowRuleManager.loadRules()
+        ↓
+规则生效
+```
+
+---
+
+## 四、Zookeeper 推模式
+
+### 4.1 引入依赖
+
+```xml
+<dependency>
+    <groupId>com.alibaba.csp</groupId>
+    <artifactId>sentinel-datasource-zookeeper</artifactId>
+</dependency>
+```
+
+### 4.2 配置
+
+```yaml title="application.yml"
+spring:
+  cloud:
+    sentinel:
+      datasource:
+        flow:
+          zk:
+            server-addr: zookeeper-server:2181
+            path: /sentinel/rules/flow
+            data-type: json
+```
+
+### 4.3 Zookeeper 中的数据
+
+```json
+/sentinel/rules/flow
+  ├── getOrder: [...]
+  ├── createOrder: [...]
+  └── listOrders: [...]
+```
+
+---
+
+## 五、文件 + WatchDog 拉模式
+
+### 5.1 引入依赖
+
+```xml
+<dependency>
+    <groupId>com.alibaba.csp</groupId>
+    <artifactId>sentinel-datasource-file</artifactId>
+</dependency>
+```
+
+### 5.2 配置文件
+
+```yaml title="application.yml"
+spring:
+  cloud:
+    sentinel:
+      datasource:
+        # 本地文件
+        file:
+          file: classpath: flow-rules.json
+          data-type: json
+          rule-type: flow
+```
+
+### 5.3 规则文件
+
+```json title="flow-rules.json"
+[
+    {
+        "resource": "getOrder",
+        "limitApp": "default",
+        "grade": 1,
+        "count": 100,
+        "strategy": 0,
+        "controlBehavior": 0,
+        "clusterMode": false
+    }
+]
+```
+
+### 5.4 动态更新文件
+
+对于拉模式，可以通过定时任务刷新：
+
+```java
+@Configuration
+public class SentinelConfig {
+    
+    @PostConstruct
+    public void init() {
+        // 每分钟刷新一次规则
+        ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor();
+        executor.scheduleAtFixedRate(() -> {
+            // 重新加载规则
+            FileDataSource dataSource = new FileDataSource("flow-rules.json", 
+                text -> JSON.parseArray(text, FlowRule.class));
+            FlowRuleManager.register2DataSource(dataSource);
+        }, 0, 1, TimeUnit.MINUTES);
+    }
+}
+```
+
+---
+
+## 六、Apollo 推模式
+
+### 6.1 引入依赖
+
+```xml
+<dependency>
+    <groupId>com.alibaba.csp</groupId>
+    <artifactId>sentinel-datasource-apollo</artifactId>
+</dependency>
+```
+
+### 6.2 配置
+
+```yaml title="application.yml"
+spring:
+  cloud:
+    sentinel:
+      datasource:
+        flow:
+          apollo:
+            apollo-meta: http://apollo-config:8080
+            app-id: sentinel-app
+            namespace: application
+            rules-key: flow-rules
+            data-type: json
+```
+
+---
+
+## 七、规则的优先级和动态生效
+
+### 7.1 多 DataSource 的优先级
+
+可以同时配置多个 DataSource：
+
+```yaml title="application.yml"
+spring:
+  cloud:
+    sentinel:
+      datasource:
+        # 优先级：zk > nacos > file
+        flow:
+          zk:
+            # ... Zookeeper 配置
+          nacos:
+            # ... Nacos 配置
+          file:
+            # ... 文件配置
+```
+
+当多个 DataSource 同时存在时，**后加载的会覆盖先加载的**。
+
+### 7.2 规则的动态生效
+
+Sentinel 的规则是**动态生效**的，无需重启应用：
+
+```java
+// 动态添加规则
+FlowRule rule = new FlowRule("getOrder")
+    .setGrade(RuleConstant.FLOW_GRADE_QPS)
+    .setCount(100);
+
+FlowRuleManager.loadRules(Collections.singletonList(rule));
+
+// 规则立即生效
+// 无需重启应用
+```
+
+### 7.3 规则变更监听
+
+可以监听规则变更事件：
+
+```java
+@Component
+public class SentinelRuleListener {
+    
+    @PostConstruct
+    public void init() {
+        // 监听流控规则变更
+        FlowRuleManager.register2PropertyListener(
+            new PropertyListener<List<FlowRule>>() {
+                @Override
+                public void configUpdate(List<FlowRule> rules) {
+                    System.out.println("流控规则已更新: " + rules);
+                }
+                
+                @Override
+                public void configLoad(List<FlowRule> rules) {
+                    System.out.println("流控规则已加载: " + rules);
+                }
+            }
+        );
+    }
+}
+```
+
+---
+
+## 八、面试追问方向
+
+- **Sentinel 规则持久化有哪两种模式？** 推模式和拉模式。推模式由注册中心主动推送，拉模式由客户端轮询拉取。
+- **Nacos DataSource 的工作原理是什么？** 客户端订阅 Nacos 配置变更，Nacos 推送变更到客户端，客户端解析并加载规则。
+- **多 DataSource 同时配置时，优先级是怎样的？** 后加载的 DataSource 会覆盖先加载的。
+- **规则变更后需要重启应用吗？** 不需要，Sentinel 的规则是动态生效的。
+
+---
+
+## 九、总结
+
+Sentinel 规则持久化解决了规则丢失的问题：
+
+- **推模式**：Nacos、Zookeeper、Apollo 作为配置中心，规则变更即时推送
+- **拉模式**：文件系统 + 定时轮询，实现简单但有延迟
+- **DataSource 接口**：统一的持久化抽象，支持多种存储后端
+- **动态生效**：规则变更无需重启，即时生效
+
+选择合适的持久化方案，才能让 Sentinel 在生产环境中稳定运行。

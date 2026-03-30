@@ -1,0 +1,521 @@
+import { Badge } from '@rspress/core/theme';
+
+# ResultSetHandler：从 ResultSet 到 Java 对象的映射
+
+<Badge text="MyBatis" type="tip" /> <Badge text="核心原理" type="info" />
+
+查询结果是怎么变成 Java 对象的？
+
+当你执行一条 SELECT 语句时，数据库返回的是一个二维表结构（ResultSet），而你的代码期望的是一个个 Java 对象。ResultSetHandler 就是负责这个转换的核心组件。
+
+这篇文章，让你彻底搞懂 MyBatis 的结果映射机制。
+
+## 为什么需要 ResultSetHandler？
+
+JDBC 原生的结果处理是这样的：
+
+```java
+ResultSet rs = statement.executeQuery("SELECT id, name, age, email FROM user");
+List<User> users = new ArrayList<>();
+
+while (rs.next()) {
+    User user = new User();
+    user.setId(rs.getLong("id"));
+    user.setName(rs.getString("name"));
+    user.setAge(rs.getInt("age"));
+    user.setEmail(rs.getString("email"));
+    users.add(user);
+}
+```
+
+问题在于：
+
+1. **字段映射繁琐**：每次都要手动 set 每个字段
+2. **类型转换复杂**：数据库类型和 Java 类型不一样
+3. **嵌套查询困难**：一对一、一对多关系的处理
+4. **命名转换**：数据库下划线命名 vs Java 驼峰命名
+
+ResultSetHandler 封装了这一切，让你只需声明映射规则，MyBatis 自动完成转换。
+
+## ResultSetHandler 接口
+
+```java
+public interface ResultSetHandler {
+
+    // 处理普通查询结果（返回列表）
+    <E> List<E> handleResultSets(Statement stmt) throws SQLException;
+
+    // 处理游标结果（用于大数据量查询）
+    <E> Cursor<E> handleCursorResultSets(Statement stmt) throws SQLException;
+
+    // 处理存储过程的输出参数
+    void handleOutputParameters(CallableStatement cs) throws SQLException;
+}
+```
+
+`DefaultResultSetHandler` 是其默认实现类，负责所有结果映射逻辑。
+
+## ResultSetWrapper：包装 ResultSet
+
+在处理结果之前，MyBatis 会先将 JDBC 的 ResultSet 包装成 `ResultSetWrapper`，方便后续处理：
+
+```java
+public class ResultSetWrapper {
+
+    // 原始的 JDBC ResultSet
+    private final ResultSet resultSet;
+
+    // 数据库字段名列表
+    private final List<String> columnNames = new ArrayList<>();
+
+    // 对应的 JDBC 类型
+    private final List<JdbcType> jdbcTypes = new ArrayList<>();
+
+    // 对应的 Java 类型
+    private final List<Class<?>> javaTypes = new ArrayList<>();
+
+    public ResultSetWrapper(ResultSet rs, Configuration configuration) throws SQLException {
+        this.resultSet = rs;
+
+        // 获取结果集的元数据
+        ResultSetMetaData metaData = rs.getMetaData();
+        int columnCount = metaData.getColumnCount();
+
+        for (int i = 1; i <= columnCount; i++) {
+            // 字段名（下划线转驼峰）
+            String columnName = ConfigCase.formatName(configuration, metaData.getColumnLabel(i));
+            columnNames.add(columnName);
+
+            // JDBC 类型
+            jdbcTypes.add(JdbcType.forCode(metaData.getColumnType(i)));
+
+            // Java 类型（根据 TypeHandler 反推）
+            Class<?> javaType = resolveType(metaData.getColumnClassName(i), jdbcTypes.get(i - 1));
+            javaTypes.add(javaType);
+        }
+    }
+
+    // 获取结果集包装
+    public ResultSet getResultSet() {
+        return resultSet;
+    }
+
+    // 获取字段名
+    public List<String> getColumnNames() {
+        return columnNames;
+    }
+
+    // 获取 Java 类型
+    public List<Class<?>> getJdbcType() {
+        return javaTypes;
+    }
+}
+```
+
+## 自动映射机制
+
+MyBatis 提供了自动映射功能，开启后可以根据字段名自动匹配：
+
+```xml
+<settings>
+    <!-- NONE：不自动映射 -->
+    <!-- PARTIAL：自动映射非嵌套 resultMap（默认） -->
+    <!-- FULL：自动映射所有 -->
+    <setting name="autoMappingBehavior" value="PARTIAL"/>
+</settings>
+```
+
+同时还需要开启下划线到驼峰的自动转换：
+
+```xml
+<settings>
+    <setting name="mapUnderscoreToCamelCase" value="true"/>
+</settings>
+```
+
+### 自动映射的原理
+
+```java
+public class DefaultResultSetHandler {
+
+    private ResultSetWrapper unwrapResultSet(ResultSet rs) {
+        return new ResultSetWrapper(rs, configuration);
+    }
+
+    private Object getRowValue(ResultSetWrapper rsw, ResultMap resultMap) {
+        // 1. 创建空的对象
+        Object resultObject = createResultObject(rsw, resultMap);
+
+        // 2. 如果开启了自动映射
+        if (resultObject != null && !resultMap.hasNestedResultMaps()) {
+            // 3. 自动映射：字段名匹配
+            applyAutomaticMappings(rsw, resultMap, metaObject, null);
+        }
+
+        return resultObject;
+    }
+
+    private int applyAutomaticMappings(ResultSetWrapper rsw, ResultMap resultMap,
+                                        MetaObject resultObject, String columnPrefix) {
+        // 1. 获取所有未映射的字段
+        List<UnMappedColumnAutoMapping> autoMapping = createAutomaticMapping(rsw, resultMap, columnPrefix);
+
+        // 2. 遍历并设置值
+        for (UnMappedColumnAutoMapping mapping : autoMapping) {
+            // 3. 获取结果值
+            Object value = getJdbcValue(rsw, mapping.columnIndex);
+
+            // 4. 类型转换
+            value = mapping.typeHandler.getResult(rs, mapping.columnName);
+
+            // 5. 设置到对象
+            resultObject.setValue(mapping.property, value);
+        }
+
+        return autoMapping.size();
+    }
+}
+```
+
+## ResultMap 映射规则
+
+对于复杂场景，需要使用 `resultMap` 显式定义映射规则：
+
+```xml
+<resultMap id="userResultMap" type="User">
+    <!-- 主键映射 -->
+    <id property="id" column="user_id"/>
+
+    <!-- 普通字段映射 -->
+    <result property="name" column="user_name"/>
+    <result property="age" column="user_age"/>
+
+    <!-- 嵌套结果映射（一对一） -->
+    <association property="department" javaType="Department">
+        <id property="id" column="dept_id"/>
+        <result property="name" column="dept_name"/>
+    </association>
+
+    <!-- 嵌套结果映射（一对多） -->
+    <collection property="orders" ofType="Order">
+        <id property="id" column="order_id"/>
+        <result property="orderNo" column="order_no"/>
+    </collection>
+</resultMap>
+```
+
+### `<id>` vs `<result>`
+
+| 元素 | 作用 | 特点 |
+|------|------|------|
+| `<id>` | 主键映射 | 用于标识对象的唯一性，参与缓存 key 计算 |
+| `<result>` | 普通字段映射 | 非主键字段 |
+
+```java
+// id 字段会被用于：
+// 1. 缓存 key 的计算
+// 2. 一级缓存的命中
+// 3. 嵌套结果映射的去重
+
+// result 字段：
+// 仅用于普通字段的映射
+```
+
+### 嵌套结果映射
+
+#### association（一对一）
+
+```xml
+<!-- 方式一：嵌套 select（多次查询） -->
+<resultMap id="userResultMap" type="User">
+    <id property="id" column="id"/>
+    <result property="name" column="name"/>
+    <association property="department"
+                 column="dept_id"
+                 select="com.example.DepartmentMapper.selectById"/>
+</resultMap>
+
+<!-- 方式二：嵌套 resultMap（一次 JOIN） -->
+<resultMap id="userResultMap" type="User">
+    <id property="id" column="id"/>
+    <result property="name" column="name"/>
+    <association property="department" javaType="Department">
+        <id property="id" column="dept_id"/>
+        <result property="name" column="dept_name"/>
+    </association>
+</resultMap>
+```
+
+**方式一（N+1 问题）**：查用户列表后，再分别查每个用户的部门
+
+```sql
+-- 第一次查询
+SELECT * FROM user
+
+-- 第二次查询（N 次）
+SELECT * FROM department WHERE id = ?
+SELECT * FROM department WHERE id = ?
+SELECT * FROM department WHERE id = ?
+...
+```
+
+**方式二（推荐）**：一次 JOIN 查完
+
+```sql
+SELECT u.id, u.name, u.dept_id,
+       d.id AS dept_id, d.name AS dept_name
+FROM user u
+LEFT JOIN department d ON u.dept_id = d.id
+```
+
+#### collection（一对多）
+
+```xml
+<!-- 方式一：嵌套 select -->
+<resultMap id="userResultMap" type="User">
+    <id property="id" column="id"/>
+    <result property="name" column="name"/>
+    <collection property="orders"
+                ofType="Order"
+                column="id"
+                select="com.example.OrderMapper.selectByUserId"/>
+</resultMap>
+
+<!-- 方式二：嵌套 resultMap -->
+<resultMap id="userResultMap" type="User">
+    <id property="id" column="id"/>
+    <result property="name" column="name"/>
+    <collection property="orders" ofType="Order">
+        <id property="id" column="order_id"/>
+        <result property="orderNo" column="order_no"/>
+        <result property="userId" column="id"/>
+    </collection>
+</resultMap>
+```
+
+## 延迟加载
+
+MyBatis 支持延迟加载（懒加载），在真正访问关联对象时才执行查询：
+
+```xml
+<settings>
+    <!-- 开启延迟加载（默认 true） -->
+    <setting name="lazyLoadingEnabled" value="true"/>
+
+    <!-- 是否积极加载（false = 按需加载） -->
+    <setting name="aggressiveLazyLoading" value="false"/>
+</settings>
+```
+
+### 延迟加载的实现原理
+
+```java
+public class ResultObjectProxyHandler implements InvocationHandler {
+
+    @Override
+    public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+        // 1. 如果调用的是 getDepartment() 方法
+        if ("getDepartment".equals(method.getName())) {
+            // 2. 触发加载
+            return lazyLoader.load((Object) object);
+        }
+
+        // 3. 其他方法转发给原对象
+        return method.invoke(object, args);
+    }
+}
+```
+
+### fetchType 配置
+
+```xml
+<resultMap id="userResultMap" type="User">
+    <!-- 覆盖全局配置，强制立即加载 -->
+    <association property="department"
+                 javaType="Department"
+                 fetchType="eager">
+        <id property="id" column="dept_id"/>
+        <result property="name" column="dept_name"/>
+    </association>
+
+    <!-- 覆盖全局配置，强制延迟加载 -->
+    <collection property="orders"
+                ofType="Order"
+                fetchType="lazy">
+        <id property="id" column="order_id"/>
+        <result property="orderNo" column="order_no"/>
+    </collection>
+</resultMap>
+```
+
+## 构造器注入
+
+MyBatis 支持通过构造器创建对象：
+
+```xml
+<resultMap id="userResultMap" type="User">
+    <constructor>
+        <!-- 构造器参数 -->
+        <idArg column="id" javaType="long"/>
+        <arg column="name" javaType="String"/>
+        <arg column="age" javaType="int"/>
+    </constructor>
+</resultMap>
+```
+
+对应的 Java 实体类：
+
+```java
+public class User {
+    private Long id;
+    private String name;
+    private int age;
+
+    // 必须提供全参构造器
+    public User(Long id, String name, int age) {
+        this.id = id;
+        this.name = name;
+        this.age = age;
+    }
+}
+```
+
+## 鉴别器（discriminator）
+
+鉴别器可以根据某个字段的值，选择不同的映射规则：
+
+```xml
+<resultMap id="vehicleResultMap" type="Vehicle">
+    <id property="id" column="id"/>
+
+    <!-- 鉴别器：根据 vehicle_type 选择映射方式 -->
+    <discriminator javaType="string" column="vehicle_type">
+        <!-- 轿车 -->
+        <case value="car" resultMap="carResultMap"/>
+        <!-- 卡车 -->
+        <case value="truck" resultMap="truckResultMap"/>
+        <!-- 默认 -->
+        <case value="default" resultMap="baseVehicleResultMap"/>
+    </discriminator>
+</resultMap>
+
+<resultMap id="carResultMap" type="Car" extends="vehicleResultMap">
+    <result property="doors" column="doors"/>
+</resultMap>
+```
+
+## 多结果集处理
+
+当 SQL 返回多个结果集时：
+
+```java
+// Mapper 接口
+@Select(value = "SELECT * FROM user; SELECT * FROM department", resultSetType = FORWARD_ONLY)
+@Results({
+    @Result(id = true, property = "id", column = "id"),
+    @Result(property = "name", column = "name")
+})
+@ResultMap("userResultMap")
+List<User> selectUsersAndDepartments(Object parameters);
+```
+
+```java
+public class DefaultResultSetHandler {
+
+    private void handleResults(ResultContext context) {
+        // 1. 获取第一个结果集
+        List<Object> results = handleResultSets(statement);
+
+        // 2. 如果有多个结果集，继续处理
+        if (configuration.hasResultSets()) {
+            while (hasMoreResultSets()) {
+                ResultSet nextResultSet = getNextResultSet();
+                // 处理下一个结果集
+            }
+        }
+    }
+}
+```
+
+## 结果映射流程总结
+
+```
+JDBC ResultSet
+        ↓
+ResultSetWrapper（包装元数据）
+        ↓
+applyAutomaticMappings（自动映射）
+        ↓
+applyResultMappings（resultMap 映射）
+        ↓
+createProxies（创建延迟加载代理）
+        ↓
+Java Object / List
+```
+
+## 延伸思考
+
+### N+1 问题的根源
+
+嵌套 select 为什么会产生 N+1 问题？
+
+```xml
+<resultMap id="userResultMap" type="User">
+    <id property="id" column="id"/>
+    <association property="department"
+                 column="dept_id"
+                 select="com.example.DepartmentMapper.selectById"/>
+</resultMap>
+```
+
+当查询 10 个用户时：
+
+```sql
+-- 第一次查询：获取用户列表
+SELECT * FROM user LIMIT 10
+
+-- 第二次查询：获取第 1 个用户的部门
+SELECT * FROM department WHERE id = ?
+
+-- 第三次查询：获取第 2 个用户的部门
+SELECT * FROM department WHERE id = ?
+
+... （重复 10 次）
+```
+
+**解决方案**：使用嵌套 resultMap，一次 JOIN 完成：
+
+```xml
+<resultMap id="userResultMap" type="User">
+    <id property="id" column="id"/>
+    <association property="department" javaType="Department">
+        <id property="id" column="dept_id"/>
+        <result property="name" column="dept_name"/>
+    </association>
+</resultMap>
+
+<select id="selectUsers" resultMap="userResultMap">
+    SELECT u.*, d.id AS dept_id, d.name AS dept_name
+    FROM user u
+    LEFT JOIN department d ON u.dept_id = d.id
+    LIMIT 10
+</select>
+```
+
+### 你可能想问的问题
+
+**Q1：自动映射和 resultMap 可以同时使用吗？**
+
+可以。开启 `autoMappingBehavior = PARTIAL` 时，未在 resultMap 中显式映射的字段会自动映射。
+
+**Q2：延迟加载的代理对象是什么时候创建的？**
+
+在结果映射阶段，对带有 `<association>` 或 `<collection>` 的对象，会创建延迟加载代理。当访问关联属性时，触发 SQL 查询。
+
+**Q3：如何避免 N+1 问题？**
+
+1. 使用嵌套 resultMap 而不是嵌套 select
+2. 关闭延迟加载（`fetchType = "eager"`）
+3. 使用 `fetchJoin` 或类似机制（需要自定义拦截器）
+
+理解 ResultSetHandler 的设计，你就能根据不同场景选择最优的映射策略，在性能和功能之间找到平衡。

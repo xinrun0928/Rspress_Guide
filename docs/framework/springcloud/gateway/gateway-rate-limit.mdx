@@ -1,0 +1,463 @@
+# Gateway 限流：令牌桶与 Redis 的结合
+
+import { Badge } from '@rspress/core/theme';
+
+瞬时流量太大，网关怎么保护后端服务？
+
+双十一零点，促销页面瞬间涌入 10 万并发请求。如果这些请求全部打到后端服务，数据库会直接被打爆。限流，就是在网关层把这 10 万请求"拦住"一部分，只让后端服务承受它能承受的流量。
+
+这就是 Gateway 限流的价值。
+
+<Badge text="限流" type="tip" /> <Badge text="令牌桶" type="tip" /> <Badge text="Redis" type="info" />
+
+---
+
+## 一、RequestRateLimiterGatewayFilterFactory
+
+### 1.1 引入依赖
+
+使用 Gateway 限流功能，需要引入 Redis 相关依赖：
+
+```xml
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-data-redis-reactive</artifactId>
+</dependency>
+<dependency>
+    <groupId>org.springframework.cloud</groupId>
+    <artifactId>spring-cloud-starter-gateway</artifactId>
+</dependency>
+```
+
+### 1.2 基本配置
+
+```yaml title="application.yml"
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: limiter-route
+          uri: lb://order-service
+          predicates:
+            - Path=/api/orders/**
+          filters:
+            - name: RequestRateLimiter
+              args:
+                # 每秒允许的请求数（令牌补充速率）
+                redis-rate-limiter.replenishRate: 100
+                # 令牌桶容量
+                redis-rate-limiter.burstCapacity: 200
+```
+
+---
+
+## 二、Redis + Lua 令牌桶算法实现
+
+### 2.1 令牌桶算法原理
+
+令牌桶算法的核心思想：
+
+```
+┌─────────────────────────────────────┐
+│          令牌桶                      │
+│                                     │
+│     令牌补充速率 = 100/秒            │
+│     桶容量 = 200                     │
+│                                     │
+│   [Token][Token][Token]...         │
+│                                     │
+└─────────────────────────────────────┘
+         ↓ 每次请求取走一个令牌
+         ↓
+      请求通过
+```
+
+**规则**：
+1. 令牌以固定速率（`replenishRate`）补充到桶中
+2. 桶最多存储 `burstCapacity` 个令牌
+3. 每次请求从桶中取走一个令牌
+4. 如果桶为空，请求被拒绝
+
+### 2.2 为什么选择 Redis + Lua
+
+令牌桶的实现需要**原子性**操作。如果用普通代码实现：
+
+```java
+// 非原子操作，有并发问题
+if (tokenCount > 0) {
+    tokenCount--;
+    // ← 在这个间隙，其他线程可能也进来了
+    return true;
+}
+return false;
+```
+
+Redis + Lua 的组合完美解决这个问题：Lua 脚本在 Redis 中**原子执行**，不会有并发问题。
+
+### 2.3 Gateway 限流的 Lua 脚本
+
+Gateway 内部使用的 Lua 脚本：
+
+```lua
+-- Lua 脚本：令牌桶限流
+-- KEYS[1] = 限流 key（如 "request_rate_limiter.order-service")
+-- ARGV[1] = 令牌桶容量（burstCapacity）
+-- ARGV[2] = 令牌补充速率（replenishRate）
+-- ARGV[3] = 当前时间戳（纳秒）
+
+local key = KEYS[1]
+local capacity = tonumber(ARGV[1])
+local rate = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+
+-- 1. 获取当前令牌数
+local last_request = tonumber(redis.call('get', key) or 0)
+
+-- 2. 计算从上次请求到现在应该补充的令牌数
+local time_passed = now - last_request
+local tokens_to_add = time_passed / 1000000000.0 * rate  -- 纳秒转秒
+
+-- 3. 更新令牌数（不能超过容量）
+local new_tokens = math.min(capacity, math.max(0, tokens_to_add))
+
+-- 4. 检查是否有令牌
+if new_tokens >= 1 then
+    -- 有令牌，消耗一个
+    redis.call('setex', key, 1, now)
+    return 1  -- 通过
+else
+    -- 没有令牌，拒绝
+    return 0  -- 拒绝
+end
+```
+
+### 2.4 更完善的令牌桶实现
+
+Gateway 实际使用的 Lua 脚本更复杂，支持更精确的计算：
+
+```lua
+-- 完整版令牌桶 Lua 脚本
+local key = KEYS[1]
+local capacity = tonumber(ARGV[1])
+local rate = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+
+-- 获取当前状态
+local last_request = redis.call('hgetall', key)
+local last_tokens = tonumber(last_request[2]) or capacity
+local last_time = tonumber(last_request[4]) or now
+
+-- 计算应该补充的令牌数
+local time_elapsed = now - last_time
+local tokens_to_add = time_elapsed / 1000000000.0 * rate
+
+-- 更新令牌数
+local new_tokens = math.min(capacity, last_tokens + tokens_to_add)
+
+if new_tokens >= 1 then
+    -- 有令牌，更新状态
+    redis.call('hmset', key, 'tokens', new_tokens - 1, 'timestamp', now)
+    redis.call('expire', key, 1)
+    return 1
+else
+    -- 无令牌，状态不变
+    redis.call('hmset', key, 'tokens', new_tokens, 'timestamp', now)
+    redis.call('expire', key, 1)
+    return 0
+end
+```
+
+---
+
+## 三、KeyResolver 的三种模式
+
+### 3.1 KeyResolver 的作用
+
+KeyResolver 决定限流的"维度"——是对 IP 限流？还是对用户限流？还是对路由限流？
+
+```java
+public interface KeyResolver {
+    Mono<String> resolve(ServerWebExchange exchange);
+}
+```
+
+### 3.2 IP 限流：按客户端地址
+
+最常用的限流方式，按 IP 地址限流：
+
+```java
+@Component
+public class IpKeyResolver implements KeyResolver {
+    
+    @Override
+    public Mono<String> resolve(ServerWebExchange exchange) {
+        String ip = exchange.getRequest()
+            .getRemoteAddress()
+            .getAddress()
+            .getHostAddress();
+        return Mono.just(ip);
+    }
+}
+```
+
+```yaml title="application.yml"
+spring:
+  cloud:
+    gateway:
+      filters:
+        - name: RequestRateLimiter
+          args:
+            key-resolver: '#{@ipKeyResolver}'  # 引用上面的 Bean
+            redis-rate-limiter.replenishRate: 100
+            redis-rate-limiter.burstCapacity: 200
+```
+
+### 3.3 路由限流：按服务名
+
+按目标服务限流，保护后端服务：
+
+```java
+@Component
+public class RouteKeyResolver implements KeyResolver {
+    
+    @Override
+    public Mono<String> resolve(ServerWebExchange exchange) {
+        // 按目标服务名限流
+        String routeId = exchange.getAttribute(GATEWAY_REQUEST_URL_ATTR);
+        return Mono.just(routeId);
+    }
+}
+```
+
+### 3.4 用户限流：按用户 ID
+
+按登录用户限流：
+
+```java
+@Component
+public class UserKeyResolver implements KeyResolver {
+    
+    @Override
+    public Mono<String> resolve(ServerWebExchange exchange) {
+        String authHeader = exchange.getRequest()
+            .getHeaders()
+            .getFirst("Authorization");
+        
+        if (StringUtils.isNotEmpty(authHeader)) {
+            // 从 Token 中解析用户 ID
+            String userId = parseUserId(authHeader);
+            return Mono.just(userId);
+        }
+        
+        // 未登录用户按 IP 限流
+        return Mono.just(exchange.getRequest()
+            .getRemoteAddress()
+            .getAddress()
+            .getHostAddress());
+    }
+}
+```
+
+### 3.5 组合限流
+
+可以组合多种维度：
+
+```java
+@Component
+public class CompositeKeyResolver implements KeyResolver {
+    
+    private final IpKeyResolver ipKeyResolver;
+    
+    @Override
+    public Mono<String> resolve(ServerWebExchange exchange) {
+        String routeId = exchange.getAttribute(GATEWAY_REQUEST_URL_ATTR);
+        String ip = exchange.getRequest()
+            .getRemoteAddress()
+            .getAddress()
+            .getHostAddress();
+        
+        // 格式：服务名 + IP
+        return Mono.just(routeId + ":" + ip);
+    }
+}
+```
+
+---
+
+## 四、BurstCapacity 和 ReplenishRate 的关系
+
+### 4.1 参数解释
+
+| 参数 | 含义 | 作用 |
+| --- | --- | --- |
+| `burstCapacity` | 令牌桶容量 | 允许的**最大并发**请求数 |
+| `replenishRate` | 令牌补充速率 | 每秒补充的令牌数 |
+
+### 4.2 场景分析
+
+**场景 1：平滑限流**
+```yaml
+redis-rate-limiter.replenishRate: 100
+redis-rate-limiter.burstCapacity: 100
+```
+- 桶容量 = 补充速率
+- 每秒最多 100 个请求
+- 超出直接拒绝
+
+**场景 2：允许突发**
+```yaml
+redis-rate-limiter.replenishRate: 100
+redis-rate-limiter.burstCapacity: 500
+```
+- 桶容量 > 补充速率
+- 平时每秒处理 100 个请求
+- 突发时最多处理 500 个请求
+- 突发后，令牌会逐渐补充回来
+
+**场景 3：高突发保护**
+```yaml
+redis-rate-limiter.replenishRate: 100
+redis-rate-limiter.burstCapacity: 1000
+```
+- 桶容量是补充速率的 10 倍
+- 可以应对很大的突发流量
+- 但突发后恢复时间较长
+
+### 4.3 选择建议
+
+| 场景 | 推荐配置 |
+| --- | --- |
+| 保护后端服务（严格限流） | `replenishRate = burstCapacity` |
+| 允许短时突发 | `burstCapacity = replenishRate * 2~5` |
+| 削峰填谷 | `burstCapacity = 预估峰值` |
+
+---
+
+## 五、限流后的响应
+
+### 5.1 默认行为
+
+默认情况下，限流后 Gateway 会返回 HTTP 429（Too Many Requests）：
+
+```http
+HTTP/1.1 429 Too Many Requests
+Content-Type: application/json
+
+{
+    "status": 429,
+    "message": "API rate limit exceeded"
+}
+```
+
+### 5.2 自定义限流响应
+
+可以配置限流后的返回内容：
+
+```yaml title="application.yml"
+spring:
+  cloud:
+    gateway:
+      default-filters:
+        - name: RequestRateLimiter
+          args:
+            redis-rate-limiter.replenishRate: 100
+            redis-rate-limiter.burstCapacity: 200
+            # 配置状态码（默认 429）
+            redis-rate-limiter.requestedTooMuchStatus: 429
+```
+
+### 5.3 自定义错误处理
+
+通过自定义错误处理返回 JSON：
+
+```java
+@Component
+public class RateLimitExceptionHandler implements ErrorWebExceptionHandler {
+    
+    @Override
+    public Mono<Void> handle(ServerWebExchange exchange, Throwable ex) {
+        if (ex instanceof RequestRateLimitException) {
+            exchange.getResponse().setStatusCode(HttpStatus.TOO_MANY_REQUESTS);
+            exchange.getResponse().getHeaders().setContentType(MediaType.APPLICATION_JSON);
+            
+            String body = "{\"code\":429,\"message\":\"请求太频繁，请稍后再试\"}";
+            DataBuffer buffer = exchange.getResponse().bufferFactory().wrap(body.getBytes());
+            
+            return exchange.getResponse().writeWith(Mono.just(buffer));
+        }
+        return Mono.error(ex);
+    }
+}
+```
+
+---
+
+## 六、分布式限流 vs 单机限流
+
+### 6.1 单机限流的问题
+
+如果每个 Gateway 实例独立限流：
+
+```
+请求: 1000/秒
+Gateway 实例: 3 个
+每个实例限流: 400/秒
+
+总请求: 1000
+总处理: 400 * 3 = 1200
+
+问题：后端服务实际收到了 1200 请求，但实际只应该处理 1000！
+```
+
+### 6.2 分布式限流的解决
+
+使用 Redis 作为共享存储：
+
+```
+┌────────────┐
+│   Redis    │
+│  共享计数器 │
+└─────┬──────┘
+      │
+┌─────┴─────┬────────────┐
+↓           ↓            ↓
+┌───────┐ ┌───────┐ ┌───────┐
+│GW节点1│ │GW节点2│ │GW节点3│
+└───────┘ └───────┘ └───────┘
+
+所有实例共用同一个计数器，保证全局精确限流
+```
+
+Gateway 的 `RequestRateLimiter` 默认使用 Redis 实现分布式限流，所有 Gateway 实例共享同一个计数器。
+
+### 6.3 限流粒度选择
+
+| 粒度 | Key 格式 | 适用场景 |
+| --- | --- | --- |
+| 全局限流 | `rate_limit:global` | 限制总流量 |
+| 服务限流 | `rate_limit:order-service` | 保护单个服务 |
+| IP 限流 | `rate_limit:192.168.1.100` | 防止恶意请求 |
+| 用户限流 | `rate_limit:user_123` | 防止用户过度使用 |
+
+---
+
+## 七、面试追问方向
+
+- **令牌桶算法的原理是什么？** 令牌以固定速率补充到桶中，桶有最大容量。请求到来时从桶中取令牌，无令牌则拒绝。
+- **为什么使用 Lua 脚本实现限流？** Lua 脚本在 Redis 中原子执行，避免并发问题。
+- **BurstCapacity 和 ReplenishRate 的关系是什么？** BurstCapacity 是令牌桶最大容量，ReplenishRate 是每秒补充的令牌数。`BurstCapacity >= ReplenishRate`。
+- **分布式限流和单机限流的区别是什么？** 分布式限流使用共享存储（如 Redis）保存计数器，所有节点共用；单机限流各节点独立计数，可能导致总流量超出预期。
+
+---
+
+## 八、总结
+
+Gateway 限流通过 Redis + 令牌桶算法，实现了高效的分布式限流：
+
+- **RequestRateLimiterGatewayFilterFactory**：限流过滤器
+- **令牌桶算法**：精确控制请求速率
+- **Redis + Lua**：保证限流的原子性和一致性
+- **KeyResolver**：灵活的限流维度（IP / 用户 / 服务）
+- **BurstCapacity**：允许突发流量的能力
+
+合理配置限流参数，可以在保护后端服务的同时，容忍正常的流量波动。

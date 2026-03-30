@@ -1,0 +1,415 @@
+import { Badge } from '@rspress/core/theme';
+
+# Spring 事务管理：@Transactional 是如何保证一致性的
+
+`@Transactional` 写在方法上，Spring 怎么就知道这是个事务？
+
+很多人写代码时，`@Transactional` 是标配：
+
+```java
+@Transactional
+public void transfer(String from, String to, double amount) {
+    accountDao.deduct(from, amount);
+    accountDao.credit(to, amount);
+}
+```
+
+这看起来很简单，但背后的原理是什么？Spring 是如何知道要在方法开始时开启事务，在方法结束时提交事务，在异常时回滚事务的？
+
+今天，我们从源码层面，把 Spring 事务管理的完整链路拆解一遍。
+
+## Spring 事务的整体架构
+
+Spring 事务管理分为三层：
+
+```
+┌──────────────────────────────────────┐
+│         应用层                        │
+│   @Transactional 注解                 │
+└──────────────────────────────────────┘
+                │
+                ▼
+┌──────────────────────────────────────┐
+│         核心层                        │
+│   TransactionInterceptor               │
+│   PlatformTransactionManager          │
+└──────────────────────────────────────┘
+                │
+                ▼
+┌──────────────────────────────────────┐
+│         实现层                        │
+│   DataSourceTransactionManager        │
+│   JpaTransactionManager               │
+│   JtaTransactionManager               │
+└──────────────────────────────────────┘
+```
+
+## TransactionInterceptor：事务拦截器
+
+`TransactionInterceptor` 是 Spring 事务的核心拦截器。它实现了 `MethodInterceptor` 接口，在方法调用前后添加事务逻辑：
+
+```java title="TransactionInterceptor.invoke() 源码"
+public class TransactionInterceptor extends TransactionAspectSupport
+        implements MethodInterceptor, Serializable {
+
+    @Override
+    public Object invoke(MethodInvocation invocation) throws Throwable {
+        // 获取目标类
+        Class<?> targetClass = (invocation.getThis() != null ?
+            AopUtils.getTargetClass(invocation.getThis()) : null);
+
+        // 核心方法：执行带事务的方法
+        return invokeWithinTransaction(invocation.getMethod(), targetClass, invocation::proceed);
+    }
+}
+```
+
+`invokeWithinTransaction` 是事务处理的核心逻辑：
+
+```java title="TransactionAspectSupport.invokeWithinTransaction() 源码"
+protected Object invokeWithinTransaction(Method method, @Nullable Class<?> targetClass,
+        final TransactionAspectSupport.InvocationCallback invocation) throws Throwable {
+
+    // 1. 获取事务属性
+    TransactionAttributeSource tas = getTransactionAttributeSource();
+    TransactionAttribute txAttr = (tas != null ?
+        tas.getTransactionAttribute(method, targetClass) : null);
+
+    // 2. 获取事务管理器
+    PlatformTransactionManager tm = determineTransactionManager(txAttr);
+
+    // 3. 构建事务信息
+    String joinpointIdentification = methodIdentification(method, targetClass, txAttr);
+
+    if (txAttr == null || !(tm instanceof CallbackPreferringPlatformTransactionManager)) {
+        // 标准事务处理
+        TransactionInfo txInfo = createTransactionIfNecessary(tm, txAttr, joinpointIdentification);
+
+        Object retVal;
+        try {
+            // 4. 执行目标方法
+            retVal = invocation.proceed();
+        } catch (Throwable ex) {
+            // 5. 异常处理：回滚
+            completeTransactionAfterThrowing(txInfo, ex);
+            throw ex;
+        } finally {
+            // 6. 清理事务信息
+            cleanupTransactionInfo(txInfo);
+        }
+
+        // 7. 正常结束：提交事务
+        commitTransactionAfterReturning(txInfo);
+
+        return retVal;
+    } else {
+        // CallbackPreferringTransactionManager 的处理...
+    }
+}
+```
+
+## PlatformTransactionManager：事务管理器接口
+
+`PlatformTransactionManager` 是事务管理的核心接口：
+
+```java title="PlatformTransactionManager 接口"
+public interface PlatformTransactionManager {
+
+    // 获取事务状态
+    TransactionStatus getTransaction(@Nullable TransactionDefinition definition) throws TransactionException;
+
+    // 提交事务
+    void commit(TransactionStatus status) throws TransactionException;
+
+    // 回滚事务
+    void rollback(TransactionStatus status) throws TransactionException;
+}
+```
+
+Spring 提供了多种实现：
+
+| 实现类 | 适用场景 |
+|---|---|
+| `DataSourceTransactionManager` | JDBC/MyBatis 单数据源 |
+| `JpaTransactionManager` | JPA/Hibernate |
+| `JtaTransactionManager` | 分布式事务（XA） |
+| `HibernateTransactionManager` | Hibernate（已废弃） |
+
+## DataSourceTransactionManager 的实现原理
+
+以 `DataSourceTransactionManager` 为例，分析事务的开启、提交、回滚：
+
+### getTransaction()：开启事务
+
+```java title="DataSourceTransactionManager.doGetTransaction() 源码"
+@Override
+protected Object doGetTransaction() {
+    DataSourceTransactionObject txObject = new DataSourceTransactionObject();
+    txObject.setSavepointAllowed(isNestedTransactionAllowed());
+
+    // 从 ThreadLocal 中获取数据库连接
+    ConnectionHolder conHolder =
+        (ConnectionHolder) TransactionSynchronizationManager.getResource(obtainDataSource());
+    txObject.setConnectionHolder(conHolder, false);
+
+    return txObject;
+}
+```
+
+### doBegin()：开始事务
+
+```java title="DataSourceTransactionManager.doBegin() 源码"
+@Override
+protected void doBegin(Object transaction, TransactionDefinition definition) {
+    DataSourceTransactionObject txObject = (DataSourceTransactionObject) transaction;
+    Connection con = null;
+
+    try {
+        if (txObject.getConnectionHolder() == null ||
+                txObject.getConnectionHolder().isSynchronizedWithTransaction()) {
+            // 获取新的数据库连接
+            Connection newCon = obtainDataSource().getConnection();
+            txObject.setConnectionHolder(new ConnectionHolder(newCon), true);
+        }
+
+        con = txObject.getConnectionHolder().getConnection();
+
+        // 设置隔离级别
+        Integer previousIsolationLevel = DataSourceUtils.prepareConnectionForTransaction(
+            con, definition);
+        txObject.setPreviousIsolationLevel(previousIsolationLevel);
+
+        // 关闭自动提交
+        if (con.getAutoCommit()) {
+            txObject.setMustRestoreAutoCommit(true);
+            con.setAutoCommit(false);
+        }
+
+        // 判断是否是只读事务
+        if (definition.isReadOnly()) {
+            // 设置只读
+            prepareReadOnly(con);
+        }
+
+        // 将连接标记为事务中
+        txObject.getConnectionHolder().setSynchronizedWithTransaction(true);
+        con.createSavepoint();
+
+    } catch (Throwable ex) {
+        // 异常处理
+        closeConnectionAfterError(con, txObject);
+        throw new CannotCreateTransactionException(...);
+    }
+}
+```
+
+### doSuspend() / doResume()：挂起与恢复事务
+
+当嵌套事务使用 `REQUIRES_NEW` 传播行为时，需要挂起当前事务：
+
+```java title="DataSourceTransactionManager.doSuspend() 源码"
+@Override
+protected Object doSuspend(Object transaction) {
+    DataSourceTransactionObject txObject = (DataSourceTransactionObject) transaction;
+
+    // 解除 ThreadLocal 绑定
+    txObject.setConnectionHolder(null);
+
+    // 挂起当前连接
+    Connection suspendedConnection = doSuspend(txObject);
+
+    return suspendedConnection;
+}
+
+@Override
+protected void doResume(@Nullable Object transaction, Object suspendedResources) {
+    // 恢复挂起的连接
+    Connection suspendedConnection = (Connection) suspendedResources;
+    // 重新绑定到 ThreadLocal
+    TransactionSynchronizationManager.bindResource(
+        obtainDataSource(),
+        new ConnectionHolder(suspendedConnection)
+    );
+}
+```
+
+### doCommit()：提交事务
+
+```java title="DataSourceTransactionManager.doCommit() 源码"
+@Override
+protected void doCommit(DefaultTransactionStatus status) {
+    DataSourceTransactionObject txObject = (DataSourceTransactionObject) status.getTransaction();
+    Connection con = txObject.getConnectionHolder().getConnection();
+
+    try {
+        con.commit();
+    } catch (SQLException ex) {
+        throw new TransactionSystemException("Could not commit JDBC transaction", ex);
+    } finally {
+        // 清理连接
+    }
+}
+```
+
+### doRollback()：回滚事务
+
+```java title="DataSourceTransactionManager.doRollback() 源码"
+@Override
+protected void doRollback(DefaultTransactionStatus status) {
+    DataSourceTransactionObject txObject = (DataSourceTransactionObject) status.getTransaction();
+    Connection con = txObject.getConnectionHolder().getConnection();
+
+    try {
+        con.rollback();
+    } catch (SQLException ex) {
+        throw new TransactionSystemException("Could not roll back JDBC transaction", ex);
+    } finally {
+        // 清理连接
+    }
+}
+```
+
+## TransactionSynchronizationManager：事务同步管理器
+
+`TransactionSynchronizationManager` 是 Spring 事务管理的核心工具类，它使用 `ThreadLocal` 来管理事务上下文：
+
+```java title="TransactionSynchronizationManager 核心方法"
+public abstract class TransactionSynchronizationManager {
+
+    // 资源（DataSource -> ConnectionHolder）
+    private static final ThreadLocal<Map<Object, Object>> resources =
+        new NamedThreadLocal<>("Transactional resources");
+
+    // 事务同步器
+    private static final ThreadLocal<Set<TransactionSynchronization>> synchronizations =
+        new NamedThreadLocal<>("Transaction synchronizations");
+
+    // 当前事务名称
+    private static final ThreadLocal<String> currentTransactionName =
+        new NamedThreadLocal<>("Current transaction name");
+
+    // 当前事务是否只读
+    private static final ThreadLocal<Boolean> currentTransactionReadOnly =
+        new NamedThreadLocal<>("Current transaction read-only status");
+
+    // 当前事务传播行为
+    private static final ThreadLocal<Integer> currentTransactionIsolationLevel =
+        new NamedThreadLocal<>("Current transaction isolation level");
+
+    // 绑定资源到当前线程
+    public static void bindResource(Object key, Object value) {
+        Map<Object, Object> map = resources.get();
+        if (map == null) {
+            map = new HashMap<>();
+            resources.set(map);
+        }
+        map.put(key, value);
+    }
+
+    // 从当前线程获取资源
+    @Nullable
+    public static Object unbindResource(Object key) {
+        Map<Object, Object> map = resources.get();
+        if (map == null) {
+            return null;
+        }
+        Object value = map.remove(key);
+        if (map.isEmpty()) {
+            resources.remove();
+        }
+        return value;
+    }
+}
+```
+
+## 事务执行完整流程
+
+```
+方法调用
+        │
+        ▼
+TransactionInterceptor.invoke()
+        │
+        ▼
+invokeWithinTransaction()
+        │
+        ├─→ 1. 获取 @Transactional 属性
+        │
+        ├─→ 2. 获取 PlatformTransactionManager
+        │
+        ├─→ 3. createTransactionIfNecessary()
+        │       │
+        │       ├─→ tm.getTransaction()
+        │       │       │
+        │       │       ├─→ doGetTransaction()
+        │       │       │       └─→ 从 ThreadLocal 获取 Connection
+        │       │       │
+        │       │       ├─→ 判断是否已有事务
+        │       │       │
+        │       │       └─→ doBegin() / doSuspend()
+        │       │               └─→ con.setAutoCommit(false)
+        │       │
+        │       └─→ 返回 TransactionInfo
+        │
+        ├─→ 4. 执行目标方法
+        │       └─→ invocation.proceed()
+        │               └─→ method.invoke(target, args)
+        │
+        ├─→ 5. 异常处理
+        │       └─→ completeTransactionAfterThrowing()
+        │               │
+        │               ├─→ 判断是否需要回滚
+        │               │       └─→ txInfo.rollbackOn(ex)
+        │               │
+        │               └─→ doRollback()
+        │                       └─→ con.rollback()
+        │
+        └─→ 6. 正常结束
+                └─→ commitTransactionAfterReturning()
+                        │
+                        └─→ doCommit()
+                                └─→ con.commit()
+```
+
+## @Transactional 属性详解
+
+```java
+@Transactional(
+    propagation = Propagation.REQUIRED,    // 传播行为
+    isolation = Isolation.DEFAULT,         // 隔离级别
+    timeout = -1,                         // 超时时间
+    readOnly = false,                      // 是否只读
+    rollbackFor = Exception.class,         // 回滚的异常类型
+    noRollbackFor = RuntimeException.class // 不回滚的异常类型
+)
+```
+
+### rollbackFor 和 noRollbackFor
+
+```java
+// 默认只回滚 RuntimeException 和 Error
+// 所以下面这个不会回滚
+@Transactional
+public void saveUser(User user) {
+    throw new Exception("保存失败");  // 不会回滚！
+}
+
+// 应该这样配置
+@Transactional(rollbackFor = Exception.class)
+public void saveUser(User user) throws Exception {
+    throw new Exception("保存失败");  // 会回滚
+}
+```
+
+## 面试追问方向
+
+- `TransactionInterceptor` 的 `invoke()` 方法是如何工作的？
+- `PlatformTransactionManager` 有哪些实现？各自适合什么场景？
+- `TransactionSynchronizationManager` 的 `ThreadLocal` 是如何管理事务上下文的？
+- `DataSourceTransactionManager.doBegin()` 中做了哪些操作？
+- 什么是事务的传播行为？`REQUIRED` 和 `REQUIRES_NEW` 有什么区别？
+- `@Transactional` 的 `rollbackFor` 属性默认只回滚哪些异常？
+
+---
+
+Spring 事务管理的原理就分析到这里。但还有一个重要的问题：事务的传播行为。`REQUIRED`、`REQUIRES_NEW`、`NESTED`……这些传播行为到底有什么区别？

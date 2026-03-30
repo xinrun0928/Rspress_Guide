@@ -1,0 +1,538 @@
+import { Badge } from '@rspress/core/theme';
+
+# JWT 无状态认证：OncePerRequestFilter 的实现
+
+无状态的 JWT，怎么让 Spring Security 知道当前用户是谁？
+
+答案是：过滤器。每次请求都经过一个 JWT 过滤器，从请求头中提取 Token，验证后设置 SecurityContext。
+
+---
+
+## 整体架构
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│              JWT 无状态认证架构                                │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  请求 → JwtAuthenticationFilter → FilterSecurityInterceptor   │
+│                    ↓                                         │
+│            提取 Authorization 头                             │
+│                    ↓                                         │
+│            解析 JWT Token                                     │
+│                    ↓                                         │
+│            验证 Token 签名和有效期                            │
+│                    ↓                                         │
+│            加载用户信息                                      │
+│                    ↓                                         │
+│            设置 SecurityContext                               │
+│                    ↓                                         │
+│            继续过滤器链                                      │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## JwtAuthenticationFilter 实现
+
+### 继承 OncePerRequestFilter
+
+`OncePerRequestFilter` 保证每个请求只执行一次过滤：
+
+```java
+public class JwtAuthenticationFilter extends OncePerRequestFilter {
+
+    @Autowired
+    private JwtTokenProvider jwtTokenProvider;
+
+    @Autowired
+    private UserDetailsService userDetailsService;
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request,
+                                   HttpServletResponse response,
+                                   FilterChain filterChain)
+            throws ServletException, IOException {
+
+        try {
+            // 1. 从请求中提取 JWT Token
+            String jwt = getJwtFromRequest(request);
+
+            // 2. 验证 Token 并获取用户信息
+            if (StringUtils.hasText(jwt) && jwtTokenProvider.validateToken(jwt)) {
+                String username = jwtTokenProvider.getUsernameFromToken(jwt);
+
+                // 3. 加载用户详情
+                UserDetails userDetails =
+                    userDetailsService.loadUserByUsername(username);
+
+                // 4. 创建 Authentication 并设置到 SecurityContext
+                UsernamePasswordAuthenticationToken authentication =
+                    new UsernamePasswordAuthenticationToken(
+                        userDetails,
+                        null,
+                        userDetails.getAuthorities()
+                    );
+
+                authentication.setDetails(
+                    new WebAuthenticationDetailsSource()
+                        .buildDetails(request)
+                );
+
+                SecurityContextHolder.getContext().setAuthentication(authentication);
+            }
+        } catch (Exception ex) {
+            logger.error("无法设置用户认证信息", ex);
+        }
+
+        // 5. 继续执行过滤器链
+        filterChain.doFilter(request, response);
+    }
+}
+```
+
+---
+
+## JwtTokenProvider
+
+### Token 生成和验证
+
+```java
+@Component
+public class JwtTokenProvider {
+
+    private final SecretKey secretKey;
+    private final JwtParser jwtParser;
+
+    public JwtTokenProvider() {
+        // 生成密钥（生产环境应从配置或密钥服务获取）
+        this.secretKey = Keys.secretKeyFor(SignatureAlgorithm.HS256);
+        this.jwtParser = Jwts.parser()
+            .verifyWith(secretKey)
+            .build();
+    }
+
+    /**
+     * 生成 Token
+     */
+    public String generateToken(Long userId, String username, List<String> roles) {
+        Date now = new Date();
+        Date expiryDate = new Date(now.getTime() + jwtExpirationMs);
+
+        return Jwts.builder()
+            .subject(String.valueOf(userId))
+            .claim("username", username)
+            .claim("roles", roles)
+            .issuedAt(now)
+            .expiration(expiryDate)
+            .signWith(secretKey)
+            .compact();
+    }
+
+    /**
+     * 从 Token 获取用户名
+     */
+    public String getUsernameFromToken(String token) {
+        Claims claims = jwtParser
+            .parseSignedClaims(token)
+            .getPayload();
+        return claims.get("username", String.class);
+    }
+
+    /**
+     * 从 Token 获取用户 ID
+     */
+    public Long getUserIdFromToken(String token) {
+        Claims claims = jwtParser
+            .parseSignedClaims(token)
+            .getPayload();
+        return Long.parseLong(claims.getSubject());
+    }
+
+    /**
+     * 验证 Token
+     */
+    public boolean validateToken(String token) {
+        try {
+            jwtParser.parseSignedClaims(token);
+            return true;
+        } catch (MalformedJwtException ex) {
+            logger.error("无效的 JWT Token");
+        } catch (ExpiredJwtException ex) {
+            logger.error("已过期的 JWT Token");
+        } catch (UnsupportedJwtException ex) {
+            logger.error("不支持的 JWT Token");
+        } catch (IllegalArgumentException ex) {
+            logger.error("JWT Claims 字符串为空");
+        }
+        return false;
+    }
+}
+```
+
+### 从请求中提取 Token
+
+```java
+/**
+ * 从 Authorization 头中提取 JWT Token
+ * 格式：Authorization: Bearer <token>
+ */
+private String getJwtFromRequest(HttpServletRequest request) {
+    String bearerToken = request.getHeader("Authorization");
+
+    if (StringUtils.hasText(bearerToken) && bearerToken.startsWith("Bearer ")) {
+        return bearerToken.substring(7);  // 去掉 "Bearer " 前缀
+    }
+
+    return null;
+}
+```
+
+---
+
+## Security 配置
+
+### 注册过滤器
+
+```java
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig {
+
+    @Autowired
+    private JwtAuthenticationFilter jwtAuthenticationFilter;
+
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http
+            // 关闭 CSRF（因为使用 JWT）
+            .csrf(csrf -> csrf.disable())
+
+            // 关闭 Session（无状态）
+            .sessionManagement(session ->
+                session.sessionCreationPolicy(SessionCreationPolicy.STATELESS)
+            )
+
+            // 配置权限
+            .authorizeHttpRequests(auth -> auth
+                // 公开接口
+                .requestMatchers("/auth/login", "/auth/register").permitAll()
+                .requestMatchers("/error").permitAll()
+                // 其他接口需要认证
+                .anyRequest().authenticated()
+            )
+
+            // 添加 JWT 过滤器（在 UsernamePasswordAuthenticationFilter 之前）
+            .addFilterBefore(jwtAuthenticationFilter,
+                UsernamePasswordAuthenticationFilter.class);
+
+        return http.build();
+    }
+}
+```
+
+### 过滤器的执行顺序
+
+Spring Security 过滤器的执行顺序很重要：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                  过滤器执行顺序                                │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  1. ChannelProcessingFilter         （HTTP/HTTPS 切换）      │
+│  2. SecurityContextPersistenceFilter （STATELESS 时不执行）   │
+│  3. CorsFilter                     （跨域处理）              │
+│  4. JwtAuthenticationFilter        （JWT 认证）← 我们添加的    │
+│  5. UsernamePasswordAuthenticationFilter （表单登录）         │
+│  6. ...                                                    │
+│  7. FilterSecurityInterceptor       （权限决策）             │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 为什么要放在 UsernamePasswordAuthenticationFilter 之前？
+
+因为 `/auth/login` 是登录接口，不需要 JWT。其他接口需要 JWT。如果 JWT 过滤器放在后面，可能导致一些不需要 JWT 的请求也被拦截。
+
+---
+
+## 登录接口实现
+
+### 登录成功后生成 Token
+
+```java
+@RestController
+@RequestMapping("/auth")
+public class AuthController {
+
+    @Autowired
+    private AuthenticationManager authenticationManager;
+
+    @Autowired
+    private JwtTokenProvider tokenProvider;
+
+    @Autowired
+    private UserDetailsService userDetailsService;
+
+    @PostMapping("/login")
+    public ResponseEntity<?> login(@RequestBody LoginRequest request) {
+        // 1. 验证用户名密码
+        Authentication authentication = authenticationManager.authenticate(
+            new UsernamePasswordAuthenticationToken(
+                request.getUsername(),
+                request.getPassword()
+            )
+        );
+
+        // 2. 生成 JWT Token
+        UserDetails userDetails =
+            userDetailsService.loadUserByUsername(request.getUsername());
+
+        List<String> roles = userDetails.getAuthorities().stream()
+            .map(GrantedAuthority::getAuthority)
+            .collect(Collectors.toList());
+
+        String token = tokenProvider.generateToken(
+            ((CustomUserDetails) userDetails).getUserId(),
+            userDetails.getUsername(),
+            roles
+        );
+
+        // 3. 返回 Token
+        return ResponseEntity.ok(
+            new JwtResponse(token, "Bearer", 86400)
+        );
+    }
+}
+```
+
+### 请求类
+
+```java
+@Data
+public class LoginRequest {
+    private String username;
+    private String password;
+}
+```
+
+### 响应类
+
+```java
+@Data
+@AllArgsConstructor
+public class JwtResponse {
+    private String accessToken;
+    private String tokenType = "Bearer";
+    private Long expiresIn;
+}
+```
+
+---
+
+## 认证失败的统一处理
+
+### AuthenticationEntryPoint
+
+当用户未认证就访问受保护资源时，返回 401：
+
+```java
+@Component
+public class JwtAuthenticationEntryPoint implements AuthenticationEntryPoint {
+
+    @Override
+    public void commence(HttpServletRequest request,
+                        HttpServletResponse response,
+                        AuthenticationException authException)
+            throws IOException, ServletException {
+
+        response.setContentType("application/json");
+        response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
+        response.getWriter().write(
+            "{\"message\": \"未认证，请先登录\", \"code\": 401}"
+        );
+    }
+}
+```
+
+### AccessDeniedHandler
+
+当用户权限不足时，返回 403：
+
+```java
+@Component
+public class JwtAccessDeniedHandler implements AccessDeniedHandler {
+
+    @Override
+    public void handle(HttpServletRequest request,
+                      HttpServletResponse response,
+                      AccessDeniedException accessDeniedException)
+            throws IOException, ServletException {
+
+        response.setContentType("application/json");
+        response.setStatus(HttpServletResponse.SC_FORBIDDEN);
+        response.getWriter().write(
+            "{\"message\": \"权限不足\", \"code\": 403}"
+        );
+    }
+}
+```
+
+### 配置
+
+```java
+http
+    .exceptionHandling(ex -> ex
+        .authenticationEntryPoint(jwtAuthenticationEntryPoint)
+        .accessDeniedHandler(jwtAccessDeniedHandler)
+    )
+```
+
+---
+
+## 获取当前用户信息
+
+### 在 Controller 中获取
+
+```java
+@GetMapping("/user/profile")
+public UserProfile getProfile(
+        @AuthenticationPrincipal UserDetails userDetails) {
+    // 获取当前登录用户
+    return userService.getProfile(userDetails.getUsername());
+}
+```
+
+### 在 Service 中获取
+
+```java
+@Service
+public class UserService {
+
+    public User getCurrentUser() {
+        Authentication authentication =
+            SecurityContextHolder.getContext().getAuthentication();
+
+        if (authentication != null &&
+            authentication.getPrincipal() instanceof UserDetails) {
+            String username =
+                ((UserDetails) authentication.getPrincipal()).getUsername();
+            return userRepository.findByUsername(username);
+        }
+
+        throw new RuntimeException("用户未登录");
+    }
+}
+```
+
+---
+
+## 多种 Token 格式的兼容
+
+### 同时支持 JWT 和 API Key
+
+```java
+public class MultiAuthenticationFilter extends OncePerRequestFilter {
+
+    @Autowired
+    private JwtTokenProvider jwtTokenProvider;
+
+    @Autowired
+    private ApiKeyService apiKeyService;
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request,
+                                   HttpServletResponse response,
+                                   FilterChain filterChain)
+            throws ServletException, IOException {
+
+        // 尝试 JWT 认证
+        String jwt = extractJwt(request);
+        if (jwt != null && jwtTokenProvider.validateToken(jwt)) {
+            // JWT 认证逻辑
+            setAuthenticationFromJwt(jwt);
+            filterChain.doFilter(request, response);
+            return;
+        }
+
+        // 尝试 API Key 认证
+        String apiKey = extractApiKey(request);
+        if (apiKey != null) {
+            // API Key 认证逻辑
+            setAuthenticationFromApiKey(apiKey);
+            filterChain.doFilter(request, response);
+            return;
+        }
+
+        // 都失败，继续执行（可能是不需要认证的接口）
+        filterChain.doFilter(request, response);
+    }
+
+    private String extractJwt(HttpServletRequest request) {
+        String bearerToken = request.getHeader("Authorization");
+        if (StringUtils.hasText(bearerToken) && bearerToken.startsWith("Bearer ")) {
+            return bearerToken.substring(7);
+        }
+        return null;
+    }
+
+    private String extractApiKey(HttpServletRequest request) {
+        String apiKey = request.getHeader("X-API-Key");
+        if (StringUtils.hasText(apiKey)) {
+            return apiKey;
+        }
+        return request.getParameter("api_key");
+    }
+}
+```
+
+---
+
+## 常见问题与解决方案
+
+### 问题一：Token 过期后用户被迫登出
+
+**解决**：使用 Refresh Token 机制
+
+### 问题二：多个微服务都需要验证 Token
+
+**解决**：每个微服务都配置相同的 JWT 密钥，或者使用非对称加密。
+
+### 问题三：Token 被盗用
+
+**解决**：
+- 使用 HTTPS
+- 设置短期 Token
+- 加入设备指纹验证
+- 使用 Refresh Token + 黑名单
+
+---
+
+## 面试追问预判
+
+### Q1：JWT 过滤器为什么要继承 OncePerRequestFilter？
+
+保证每个请求只执行一次过滤，避免重复认证逻辑。
+
+### Q2：JWT 过滤器为什么放在 UsernamePasswordAuthenticationFilter 之前？
+
+因为 `/login` 接口是公开的，不需要 JWT 认证。如果 JWT 过滤器放在表单登录过滤器之后，可能导致登录接口也被 JWT 过滤器拦截。
+
+### Q3：如何实现 Token 的续期？
+
+Token 过期前，如果用户仍在使用，可以自动颁发新 Token。可以在过滤器中检测 Token 即将过期时，颁发新 Token 并返回给前端。
+
+---
+
+## 总结
+
+JWT 无状态认证的实现：
+
+1. **JwtAuthenticationFilter**：拦截请求，提取 Token，验证，设置 SecurityContext
+2. **JwtTokenProvider**：Token 生成和验证的核心类
+3. **OncePerRequestFilter**：保证每个请求只执行一次
+4. **Security 配置**：注册过滤器，关闭 Session
+
+理解了 JWT 过滤器，下一节我们来看 [JWT 刷新机制](/framework/springsecurity/jwt/jwt-refresh)——双 Token 方案与黑名单设计。
