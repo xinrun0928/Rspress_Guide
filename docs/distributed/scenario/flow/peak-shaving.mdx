@@ -1,0 +1,362 @@
+# 接口流量削峰
+
+双十一零点，10 万用户同时下单。如果系统按峰值设计，成本太高；如果按均值设计，扛不住峰值。
+
+这就是**削峰填谷**的问题。今天我们看如何用消息队列、线程池、限流等方式，让峰值流量平滑处理。
+
+## 一、削峰的核心思路
+
+### 1.1 削峰策略对比
+
+| 策略 | 原理 | 优点 | 缺点 |
+|---|---|---|---|
+| 消息队列 | 异步处理，削峰填谷 | 解耦、可靠 | 延迟增加 |
+| 线程池 | 并发处理，批量执行 | 简单 | 资源有限 |
+| 限流 | 控制进入速率 | 保护系统 | 用户等待 |
+| 缓存 | 预扣库存，异步确认 | 性能高 | 数据一致性 |
+
+### 1.2 削峰场景
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        削峰场景                                        │
+│                                                                         │
+│   1. 秒杀下单：                                                       │
+│   用户下单 ──▶ 预扣库存 ──▶ 返回成功 ──▶ 异步发货                       │
+│                                                                         │
+│   2. 评论发帖：                                                       │
+│   用户发帖 ──▶ 入队 ──▶ 返回成功 ──▶ 异步审核                       │
+│                                                                         │
+│   3. 数据导入：                                                       │
+│   用户上传 ──▶ 入队 ──▶ 返回任务ID ──▶ 异步处理                       │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+## 二、消息队列削峰
+
+### 2.1 订单削峰实现
+
+```java title="订单削峰服务")
+@Service
+@Slf4j
+public class OrderPeakShavingService {
+    @Autowired
+    private RabbitTemplate rabbitTemplate;
+
+    private static final String ORDER_QUEUE = "order.create.queue";
+    private static final String ORDER_EXCHANGE = "order.exchange";
+    private static final String ORDER_ROUTING_KEY = "order.create";
+
+    /**
+     * 订单削峰入口
+     */
+    public String submitOrder(OrderDTO orderDTO) {
+        // 1. 生成订单号
+        String orderNo = generateOrderNo();
+
+        // 2. 发送消息到队列
+        OrderMessage message = OrderMessage.builder()
+                .orderNo(orderNo)
+                .userId(orderDTO.getUserId())
+                .items(orderDTO.getItems())
+                .totalAmount(orderDTO.getTotalAmount())
+                .submitTime(LocalDateTime.now())
+                .build();
+
+        rabbitTemplate.convertAndSend(
+                ORDER_EXCHANGE,
+                ORDER_ROUTING_KEY,
+                message
+        );
+
+        log.info("订单已提交: orderNo={}", orderNo);
+
+        // 3. 返回订单号（用户可查询）
+        return orderNo;
+    }
+}
+```
+
+### 2.2 消费者处理
+
+```java title="订单消费者")
+@Component
+@Slf4j
+public class OrderConsumer {
+    @Autowired
+    private OrderService orderService;
+
+    @RabbitListener(queues = ORDER_QUEUE, concurrency = "5-10")
+    public void handleOrder(OrderMessage message) {
+        try {
+            log.info("开始处理订单: orderNo={}", message.getOrderNo());
+
+            // 处理订单
+            Order order = orderService.processOrder(message);
+
+            log.info("订单处理完成: orderNo={}, status={}",
+                    order.getOrderNo(), order.getStatus());
+
+        } catch (Exception e) {
+            log.error("订单处理失败: orderNo={}", message.getOrderNo(), e);
+            // 死信队列处理
+            throw e;
+        }
+    }
+}
+```
+
+### 2.3 流量控制
+
+```java title="消费限流")
+@Configuration
+public class ConsumerConfig {
+    @Bean
+    public SimpleRabbitListenerContainerFactory rabbitListenerContainerFactory(
+            ConnectionFactory connectionFactory) {
+        SimpleRabbitListenerContainerFactory factory = new SimpleRabbitListenerContainerFactory();
+        factory.setConnectionFactory(connectionFactory);
+        factory.setConcurrentConsumers(5);  // 最小并发
+        factory.setMaxConcurrentConsumers(10); // 最大并发
+        factory.setPrefetchCount(10);        // 预取数量
+        factory.setAcknowledgeMode(AcknowledgeMode.AUTO);
+        return factory;
+    }
+}
+```
+
+## 三、线程池削峰
+
+### 3.1 线程池配置
+
+```java title="削峰线程池")
+@Configuration
+public class PeakShavingConfig {
+    @Bean("orderExecutor")
+    public ThreadPoolTaskExecutor orderExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(10);
+        executor.setMaxPoolSize(50);
+        executor.setQueueCapacity(1000);
+        executor.setKeepAliveSeconds(60);
+        executor.setThreadNamePrefix("order-");
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+        executor.initialize();
+        return executor;
+    }
+}
+```
+
+### 3.2 异步任务处理
+
+```java title="异步任务削峰")
+@Service
+@Slf4j
+public class AsyncTaskService {
+    @Autowired
+    @Qualifier("orderExecutor")
+    private TaskExecutor orderExecutor;
+
+    /**
+     * 异步处理任务
+     */
+    public CompletableFuture<Result> submitTask(TaskDTO task) {
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                return processTask(task);
+            } catch (Exception e) {
+                log.error("任务处理失败", e);
+                return Result.fail(e.getMessage());
+            }
+        }, orderExecutor);
+    }
+
+    /**
+     * 批量任务
+     */
+    public CompletableFuture<List<Result>> submitBatchTask(List<TaskDTO> tasks) {
+        List<CompletableFuture<Result>> futures = tasks.stream()
+                .map(this::submitTask)
+                .collect(Collectors.toList());
+
+        return CompletableFuture.allOf(
+                futures.toArray(new CompletableFuture[0])
+        ).thenApply(v ->
+                futures.stream()
+                        .map(CompletableFuture::join)
+                        .collect(Collectors.toList())
+        );
+    }
+}
+```
+
+## 四、本地削峰
+
+### 4.1 令牌桶实现
+
+```java title="令牌桶限流")
+@Service
+public class TokenBucketRateLimiter {
+    private final AtomicInteger tokens;
+    private final int maxTokens;
+    private final int refillRate; // 每秒补充令牌数
+    private final AtomicLong lastRefillTime;
+
+    public TokenBucketRateLimiter(int maxTokens, int refillRate) {
+        this.maxTokens = maxTokens;
+        this.refillRate = refillRate;
+        this.tokens = new AtomicInteger(maxTokens);
+        this.lastRefillTime = new AtomicLong(System.currentTimeMillis());
+    }
+
+    /**
+     * 获取令牌
+     */
+    public boolean tryAcquire() {
+        refill();
+
+        while (true) {
+            int current = tokens.get();
+            if (current <= 0) {
+                return false;
+            }
+
+            if (tokens.compareAndSet(current, current - 1)) {
+                return true;
+            }
+        }
+    }
+
+    /**
+     * 补充令牌
+     */
+    private void refill() {
+        long now = System.currentTimeMillis();
+        long elapsed = now - lastRefillTime.get();
+
+        if (elapsed >= 1000) {
+            int tokensToAdd = (int) (elapsed / 1000 * refillRate);
+            tokens.updateAndGet(current ->
+                    Math.min(maxTokens, current + tokensToAdd)
+            );
+            lastRefillTime.set(now);
+        }
+    }
+}
+```
+
+### 4.2 滑动窗口
+
+```java title="滑动窗口限流")
+@Service
+public class SlidingWindowRateLimiter {
+    private final int windowSize; // 窗口大小（秒）
+    private final int maxRequests; // 窗口内最大请求数
+    private final AtomicInteger[] counters;
+    private final AtomicInteger index;
+    private volatile long windowStart;
+
+    public SlidingWindowRateLimiter(int windowSize, int maxRequests) {
+        this.windowSize = windowSize;
+        this.maxRequests = maxRequests;
+        this.counters = new AtomicInteger[windowSize];
+        for (int i = 0; i < windowSize; i++) {
+            counters[i] = new AtomicInteger(0);
+        }
+        this.index = new AtomicInteger(0);
+        this.windowStart = System.currentTimeMillis();
+    }
+
+    public boolean tryAcquire() {
+        long now = System.currentTimeMillis();
+        long elapsed = now - windowStart;
+
+        // 滑动窗口
+        if (elapsed >= 1000) {
+            int oldIndex = index.get();
+            int newIndex = (oldIndex + 1) % windowSize;
+            counters[newIndex].set(0);
+            index.set(newIndex);
+            windowStart = now;
+        }
+
+        // 统计窗口内请求数
+        int total = 0;
+        for (AtomicInteger counter : counters) {
+            total += counter.get();
+        }
+
+        if (total >= maxRequests) {
+            return false;
+        }
+
+        counters[index.get()].incrementAndGet();
+        return true;
+    }
+}
+```
+
+## 五、削峰策略选择
+
+### 5.1 场景对比
+
+| 场景 | 推荐策略 | 理由 |
+|---|---|---|
+| 秒杀下单 | 消息队列 + 本地限流 | 高并发、异步处理 |
+| 数据导入 | 消息队列 + 线程池 | 批量处理、异步确认 |
+| 实时计算 | 线程池 | 低延迟、实时响应 |
+| 定时任务 | 线程池 | 批量执行 |
+
+### 5.2 组合策略
+
+```java title="组合削峰")
+@Service
+@Slf4j
+public class CombinedPeakShavingService {
+    @Autowired
+    private TokenBucketRateLimiter tokenBucketLimiter;
+    @Autowired
+    private RabbitTemplate rabbitTemplate;
+
+    /**
+     * 削峰入口
+     */
+    public Result submitWithShaving(TaskDTO task) {
+        // 1. 本地限流
+        if (!tokenBucketLimiter.tryAcquire()) {
+            return Result.fail("系统繁忙，请稍后重试");
+        }
+
+        // 2. 发送消息削峰
+        rabbitTemplate.convertAndSend("task.queue", task);
+
+        return Result.success("任务已提交");
+    }
+}
+```
+
+## 六、总结
+
+| 削峰策略 | 适用场景 | 延迟 | 复杂度 |
+|---|---|---|---|
+| 消息队列 | 秒杀、下单 | 中等 | 中 |
+| 线程池 | 批量任务 | 低 | 低 |
+| 令牌桶 | 接口限流 | 低 | 低 |
+| 滑动窗口 | 精确限流 | 低 | 中 |
+
+:::tip 实战建议
+1. **消息队列是削峰主力**：异步处理，解耦系统
+2. **本地限流是兜底**：防止消息队列也扛不住
+3. **线程池是补充**：适合批量任务
+:::
+
+## 结尾
+
+削峰是让系统在峰值时依然稳定的关键。记住三个要点：
+
+1. **异步是关键**：不要让用户等待
+2. **队列是缓冲**：消息队列是最好的削峰工具
+3. **限流是兜底**：万无一失
+
+下一节，我们来看服务弹性降级——当系统扛不住时，如何优雅地降级。

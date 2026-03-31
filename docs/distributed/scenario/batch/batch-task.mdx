@@ -1,0 +1,315 @@
+# 分布式批量任务框架设计：分片任务与结果聚合
+
+当单机处理能力不够时，批量任务需要分布式化——把一个大任务拆成 N 个子任务，分发到多台机器上并行处理，最后聚合结果。这就是分布式批量任务框架要解决的问题。
+
+## 分布式批处理的核心问题
+
+单机批处理很简单：读文件 → 处理 → 写结果。但分布式批处理面临四大核心问题：
+
+1. **任务如何分片**：大任务拆成多少个？怎么拆？
+2. **如何分发任务**：子任务如何路由到执行节点？
+3. **结果如何聚合**：N 个执行节点的结果如何汇总？
+4. **失败如何处理**：某个节点失败了怎么办？
+
+## 分片策略：从"一刀切"到"智能分片"
+
+### 一、按数据量分片
+
+最简单的分片策略：把数据按固定数量分片。
+
+```java
+public class DataShardingByCount {
+    
+    // 将数据按固定数量分片
+    public List<Task> shardByCount(List<Record> allData, int shardCount) {
+        int dataSize = allData.size();
+        int shardSize = (int) Math.ceil((double) dataSize / shardCount);
+        
+        List<Task> tasks = new ArrayList<>();
+        for (int i = 0; i < shardCount; i++) {
+            int fromIndex = i * shardSize;
+            int toIndex = Math.min(fromIndex + shardSize, dataSize);
+            
+            if (fromIndex >= dataSize) break;
+            
+            List<Record> shardData = allData.subList(fromIndex, toIndex);
+            tasks.add(new Task(i, shardData));
+        }
+        return tasks;
+    }
+}
+```
+
+优点：简单均匀。缺点：每个分片的数据特征不同，处理时间可能差很远（"数据倾斜"问题）。
+
+### 二、按业务维度分片
+
+更好的分片策略：按业务维度分片，保证每个分片的数据特征一致。
+
+```java
+// 按用户 ID 范围分片（适合用户维度的处理）
+public class DataShardingByUserId {
+    
+    public List<Task> shardByUserIdRange(List<User> users, int shardCount) {
+        // 按用户 ID 的哈希值取模
+        Map<Integer, List<User>> buckets = new HashMap<>();
+        for (int i = 0; i < shardCount; i++) {
+            buckets.put(i, new ArrayList<>());
+        }
+        
+        for (User user : users) {
+            int bucket = (int) (user.getId() % shardCount);
+            buckets.get(bucket).add(user);
+        }
+        
+        return buckets.entrySet().stream()
+            .filter(e -> !e.getValue().isEmpty())
+            .map(e -> new Task(e.getKey(), e.getValue()))
+            .collect(Collectors.toList());
+    }
+}
+
+// 按日期分片（适合日志、交易等时间序列数据）
+public class DataShardingByDate {
+    
+    public List<Task> shardByDate(List<Transaction> transactions) {
+        // 按月份分组
+        return transactions.stream()
+            .collect(Collectors.groupingBy(
+                t -> t.getCreateTime().format(DateTimeFormatter.ofPattern("yyyy-MM"))
+            ))
+            .entrySet().stream()
+            .map(e -> new Task(e.getKey(), e.getValue()))
+            .collect(Collectors.toList());
+    }
+}
+```
+
+### 三、动态分片：MapReduce 思想
+
+Hadoop MapReduce 的分片策略：Map 阶段并行处理，Reduce 阶段聚合。
+
+```java
+// Map 阶段：每个节点处理一部分数据
+public class MapStage {
+    
+    public void map(List<Record> records, OutputCollector<String, Integer> output) {
+        for (Record record : records) {
+            // 提取 key（如用户 ID）
+            String key = record.getUserId();
+            // 处理逻辑
+            int processed = process(record);
+            // 输出 <key, value>
+            output.collect(key, processed);
+        }
+    }
+}
+
+// Reduce 阶段：按 key 聚合
+public class ReduceStage {
+    
+    public void reduce(String key, List<Integer> values, OutputCollector<String, Integer> output) {
+        // 同一 key 的所有结果聚合
+        int sum = values.stream().mapToInt(Integer::intValue).sum();
+        output.collect(key, sum);
+    }
+}
+```
+
+## 任务分发与执行
+
+### 方案一：消息队列广播模式
+
+```java
+// 生产者：生成任务分片，发送到消息队列
+public class BatchTaskProducer {
+    
+    @Autowired
+    private RocketMQTemplate mqTemplate;
+    
+    public void submitBatchTask(List<Record> allData, int workerCount) {
+        List<List<Record>> shards = splitIntoShards(allData, workerCount);
+        
+        for (int i = 0; i < shards.size(); i++) {
+            BatchTask task = new BatchTask();
+            task.setTaskId(generateTaskId());
+            task.setShardId(i);
+            task.setData(shards.get(i));
+            task.setTotalShards(shards.size());
+            
+            mqTemplate.asyncSend("batch-task-topic", task, new SendCallback() {
+                @Override
+                public void onSuccess(SendResult result) {
+                    log.info("任务分片 {} 发送成功", i);
+                }
+                
+                @Override
+                public void onException(Throwable e) {
+                    log.error("任务分片 {} 发送失败", i, e);
+                }
+            });
+        }
+    }
+}
+
+// 消费者：每个 worker 消费一部分分片
+@RocketMQMessageListener(
+    consumerGroup = "batch-worker-group",
+    topic = "batch-task-topic",
+    consumeThreadMin = 5,
+    consumeThreadMax = 20,
+    maxReconsumeTimes = 3  // 重试 3 次
+)
+public class BatchTaskConsumer implements RocketMQListener<BatchTask> {
+    
+    @Override
+    public void onMessage(BatchTask task) {
+        try {
+            // 处理分片数据
+            List<ProcessResult> results = processShard(task.getData());
+            
+            // 上报结果到聚合服务
+            reportResults(task.getTaskId(), task.getShardId(), results);
+        } catch (Exception e) {
+            log.error("分片 {} 处理失败", task.getShardId(), e);
+            throw new RuntimeException(e);  // 触发重试
+        }
+    }
+}
+```
+
+### 方案二：分片任务调度框架
+
+开源分布式任务调度框架推荐：**XXL-Job** 和 **ElasticJob**。
+
+```java
+// 使用 XXL-Job 定义分片任务
+@XxlJob("dataSyncJob")
+public ReturnT<String> execute() {
+    // 获取分片参数
+    ShardingUtil.ShardingVO shardingVO = ShardingUtil.getSharding();
+    int shardingIndex = shardingVO.getIndex();    // 当前分片序号
+    int shardingTotal = shardingVO.getTotal();   // 总分片数
+    
+    // 查询本分片负责的数据
+    List<Record> records = queryRecords(shardingIndex, shardingTotal);
+    
+    // 处理数据
+    for (Record record : records) {
+        process(record);
+    }
+    
+    return SUCCESS;
+}
+```
+
+```yaml
+# XXL-Job 任务配置
+xxl:
+  job:
+    handler: dataSyncJob
+    cron: "0 0 2 * * ?"      # 每天凌晨 2 点执行
+    shardingTotal: 10          # 分成 10 个分片
+    routeStrategy: SHARDING_AVERAGE  # 平均分片策略
+    blockStrategy: DISCARD_LATER    # 分片路由不到时丢弃
+    timeout: 3600                   # 超时时间 1 小时
+```
+
+## 结果聚合与汇总
+
+分片任务执行完成后，需要聚合结果。常见策略：
+
+```java
+// 方案一：定时轮询聚合
+public class ResultAggregator {
+    
+    private final Map<String, List<ShardResult>> results = new ConcurrentHashMap<>();
+    
+    public void reportResult(String taskId, int shardId, List<ProcessResult> shardResults) {
+        results.computeIfAbsent(taskId, k -> new ArrayList<>())
+              .add(new ShardResult(shardId, shardResults));
+        
+        // 检查是否所有分片都完成
+        TaskMeta meta = getTaskMeta(taskId);
+        if (results.get(taskId).size() >= meta.getTotalShards()) {
+            aggregateAndNotify(taskId);
+        }
+    }
+    
+    private void aggregateAndNotify(String taskId) {
+        List<ShardResult> allShards = results.get(taskId);
+        
+        // 聚合逻辑
+        int totalSuccess = allShards.stream()
+            .flatMap(s -> s.getResults().stream())
+            .filter(r -> r.isSuccess())
+            .mapToInt(r -> 1)
+            .sum();
+        
+        // 发送完成通知
+        notifyTaskComplete(taskId, totalSuccess);
+        
+        // 清理
+        results.remove(taskId);
+    }
+}
+
+// 方案二：回调模式
+public interface TaskCallback {
+    void onComplete(String taskId, AggregatedResult result);
+    void onFail(String taskId, String reason);
+}
+```
+
+## 失败处理与重试
+
+```java
+// 失败重试策略
+public class RetryStrategy {
+    
+    // 分片级失败：只重试失败的分片
+    public void retryFailedShard(String taskId, int shardId) {
+        // 获取失败原因
+        ShardError error = getShardError(taskId, shardId);
+        
+        // 根据错误类型决定重试策略
+        if (error.isRetryable()) {
+            int retryCount = error.getRetryCount();
+            if (retryCount < 3) {
+                // 指数退避重试
+                long delay = (long) Math.pow(2, retryCount) * 1000;
+                scheduleRetry(taskId, shardId, delay);
+            } else {
+                // 超过重试次数，告警 + 人工处理
+                alertAndEscalate(taskId, shardId, error);
+            }
+        } else {
+            // 不可重试的错误，记录后跳过
+            skipShard(taskId, shardId, error);
+        }
+    }
+    
+    // 整任务失败：检查点（Checkpoint）恢复
+    public void recoverFromCheckpoint(String taskId) {
+        Checkpoint checkpoint = loadCheckpoint(taskId);
+        if (checkpoint != null) {
+            // 从检查点恢复，跳过已完成的数据
+            resumeFrom(checkpoint.getShardId(), checkpoint.getProcessedId());
+        }
+    }
+}
+```
+
+## 总结
+
+分布式批处理框架的核心设计：
+
+1. **分片策略**：根据数据特征选择合适分片方式，避免数据倾斜
+2. **任务分发**：MQ 广播适合简单场景，调度框架适合复杂场景
+3. **结果聚合**：轮询聚合简单可靠，回调模式更实时
+4. **失败处理**：分片级重试 + 整任务检查点恢复
+
+选型建议：
+- 小规模数据（`≤` 1000 万）：单机多线程 + 分片处理即可
+- 中等规模：XXL-Job + 分片广播
+- 大规模数据：ElasticJob + 自研聚合层

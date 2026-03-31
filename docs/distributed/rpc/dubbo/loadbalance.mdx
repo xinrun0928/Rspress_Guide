@@ -1,0 +1,495 @@
+# Dubbo 负载均衡策略
+
+你有 10 台服务器，其中两台是高配（16 核 32G），八台是低配（4 核 8G）。如果用简单的轮询，高配服务器很快就会被压垮。
+
+Dubbo 内置了多种负载均衡策略，可以根据实际场景灵活选择。
+
+## Dubbo 负载均衡概述
+
+Dubbo 的负载均衡发生在 Cluster 层，当 Consumer 调用 Provider 时，会通过负载均衡算法选择一个具体的 Provider 实例。
+
+```yaml
+# 负载均衡在 Dubbo 调用链中的位置
+┌─────────────────────────────────────────────────────────────┐
+│                  Dubbo 负载均衡调用链                       │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  Consumer                                                   │
+│     │                                                      │
+│     ▼                                                      │
+│  ┌──────────────────────────────────────────────┐          │
+│  │ 1. Cluster Invoker                          │          │
+│  │    - 获取 Directory 中所有 Invoker          │          │
+│  │    - 交给 LoadBalance 选择                   │          │
+│  └─────────────────────┬────────────────────────┘          │
+│                        │                                     │
+│                        ▼                                     │
+│  ┌──────────────────────────────────────────────┐          │
+│  │ 2. LoadBalance                              │          │
+│  │    - 根据负载均衡策略选择一个 Invoker        │          │
+│  └─────────────────────┬────────────────────────┘          │
+│                        │                                     │
+│                        ▼                                     │
+│  ┌──────────────────────────────────────────────┐          │
+│  │ 3. Invoker.invoke()                         │          │
+│  │    - 执行 RPC 调用                           │          │
+│  └──────────────────────────────────────────────┘          │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Dubbo 内置负载均衡策略
+
+Dubbo 内置了四种负载均衡策略：
+
+```yaml
+# Dubbo 四种负载均衡策略
+策略                  类名                      特点
+─────────────────────────────────────────────────────────────────
+加权随机              RandomLoadBalance        最常用，性能高
+加权轮询              RoundRobinLoadBalance    负载分配均匀
+最少活跃数            LeastActiveLoadBalance   动态感知实例负载
+一致性哈希            ConsistentHashLoadBalance 相同参数打到相同实例
+```
+
+### 1. 加权随机（Random LoadBalance）
+
+最常用的负载均衡策略，根据权重随机选择。
+
+```java
+// 加权随机实现
+public class RandomLoadBalance extends AbstractLoadBalance {
+
+    @Override
+    protected <T> Invoker<T> doSelect(List<Invoker<T>> invokers, URL url, Invocation invocation) {
+        int length = invokers.size();
+        boolean sameWeight = true;
+        int[] weights = new int[length];
+
+        // 计算总权重
+        int totalWeight = 0;
+        for (int i = 0; i < length; i++) {
+            int weight = getWeight(invokers.get(i), invocation);
+            totalWeight += weight;
+            weights[i] = totalWeight;
+
+            // 检查权重是否相同
+            if (sameWeight && i > 0 && weight != weights[i - 1]) {
+                sameWeight = false;
+            }
+        }
+
+        // 权重相同，直接随机
+        if (totalWeight > 0 && !sameWeight) {
+            int offset = ThreadLocalRandom.current().nextInt(totalWeight);
+
+            // 找到对应的 Invoker
+            for (int i = 0; i < length; i++) {
+                if (offset < weights[i]) {
+                    return invokers.get(i);
+                }
+            }
+        }
+
+        // 默认轮询
+        return invokers.get(ThreadLocalRandom.current().nextInt(length));
+    }
+}
+```
+
+**特点**：
+
+- 权重越大的节点，被选中的概率越高
+- 实现简单，性能高
+- 适合权重配置明确的场景
+
+**配置**：
+
+```java
+@Reference(loadbalance = "random")
+private UserService userService;
+```
+
+### 2. 加权轮询（RoundRobin LoadBalance）
+
+根据权重，轮询选择实例。
+
+```java
+// 加权轮询实现（简化版）
+public class RoundRobinLoadBalance extends AbstractLoadBalance {
+
+    private ConcurrentHashMap<String, AtomicPositiveInteger> sequences = new ConcurrentHashMap<>();
+
+    @Override
+    protected <T> Invoker<T> doSelect(List<Invoker<T>> invokers, URL url, Invocation invocation) {
+        String key = invokers.get(0).getUrl().getServiceKey();
+        int length = invokers.size();
+        int maxWeight = 0;
+        int[] weights = new int[length];
+
+        // 计算权重
+        for (int i = 0; i < length; i++) {
+            int weight = getWeight(invokers.get(i), invocation);
+            maxWeight = Math.max(maxWeight, weight);
+            weights[i] = weight;
+        }
+
+        // 获取当前序列号
+        AtomicPositiveInteger sequence = sequences.computeIfAbsent(
+            key, k -> new AtomicPositiveInteger());
+        int currentSequence = sequence.getAndIncrement();
+
+        // 计算当前序列对应的 Invoker
+        int selectedIndex = currentSequence % maxWeight;
+        int weightSum = 0;
+
+        for (int i = 0; i < length; i++) {
+            weightSum += weights[i];
+            if (selectedIndex < weightSum) {
+                return invokers.get(i);
+            }
+        }
+
+        return invokers.get(ThreadLocalRandom.current().nextInt(length));
+    }
+}
+```
+
+**特点**：
+
+- 负载分配更均匀
+- 适合权重配置且需要均匀调度的场景
+- 注意：Dubbo 2.6.x 之前的轮询实现有 bug，2.7.x 已修复
+
+**配置**：
+
+```java
+@Reference(loadbalance = "roundrobin")
+private UserService userService;
+```
+
+### 3. 最少活跃数（LeastActive LoadBalance）
+
+选择当前活跃请求数最少的实例。
+
+```java
+// 最少活跃数实现
+public class LeastActiveLoadBalance extends AbstractLoadBalance {
+
+    @Override
+    protected <T> Invoker<T> doSelect(List<Invoker<T>> invokers, URL url, Invocation invocation) {
+        int length = invokers.size();
+
+        // 记录最小活跃数
+        int leastActive = -1;
+        int leastCount = 0;
+        int[] leastIndexes = new int[length];
+
+        // 记录总权重
+        int totalWeight = 0;
+        int firstWeight = 0;
+        boolean sameWeight = true;
+
+        for (int i = 0; i < length; i++) {
+            Invoker<T> invoker = invokers.get(i);
+
+            // 获取活跃数
+            int active = RpcStatus.getStatus(invoker.getUrl(), invocation.getMethodName())
+                    .getActive();
+
+            // 获取权重
+            int weight = getWeight(invoker, invocation);
+
+            if (leastActive == -1 || active < leastActive) {
+                // 发现更小的活跃数，重置
+                leastActive = active;
+                leastCount = 1;
+                leastIndexes[0] = i;
+                totalWeight = weight;
+                firstWeight = weight;
+                sameWeight = true;
+            } else if (active == leastActive) {
+                // 活跃数相同
+                leastIndexes[leastCount++] = i;
+                totalWeight += weight;
+                if (weight != firstWeight) {
+                    sameWeight = false;
+                }
+            }
+        }
+
+        // 在最少活跃的实例中加权随机
+        if (leastCount == 1 && sameWeight) {
+            return invokers.get(leastIndexes[0]);
+        }
+
+        if (totalWeight > 0 && !sameWeight) {
+            int offset = ThreadLocalRandom.current().nextInt(totalWeight);
+            for (int i = 0; i < leastCount; i++) {
+                offset -= getWeight(invokers.get(leastIndexes[i]), invocation);
+                if (offset < 0) {
+                    return invokers.get(leastIndexes[i]);
+                }
+            }
+        }
+
+        // 权重相同或总权重为 0，随机选择
+        return invokers.get(leastIndexes[ThreadLocalRandom.current().nextInt(leastCount)]);
+    }
+}
+```
+
+**特点**：
+
+- 动态感知实例的实际负载
+- 适合耗时差异大的服务
+- 配合 RpcStatus 统计活跃请求数
+
+**配置**：
+
+```java
+@Reference(loadbalance = "leastactive")
+private UserService userService;
+```
+
+### 4. 一致性哈希（ConsistentHash LoadBalance）
+
+相同参数的请求打到同一个实例。
+
+```java
+// 一致性哈希实现（简化版）
+public class ConsistentHashLoadBalance extends AbstractLoadBalance {
+
+    private final ConcurrentMap<String, ConsistentHashSelector<?>> selectors =
+            new ConcurrentHashMap<>();
+
+    @Override
+    protected <T> Invoker<T> doSelect(List<Invoker<T>> invokers, URL url, Invocation invocation) {
+        String methodName = invocation.getMethodName();
+        String key = invokers.get(0).getUrl().getServiceKey() + "." + methodName;
+
+        // 获取一致性哈希选择器
+        ConsistentHashSelector<T> selector = (ConsistentHashSelector<T>) selectors.get(key);
+        if (selector == null || selector.getInvokers().size() != invokers.size()) {
+            selector = new ConsistentHashSelector<>(invokers, methodName, 160);
+            selectors.put(key, selector);
+        } else {
+            selector.rebuild(invokers);
+        }
+
+        // 根据参数选择 Invoker
+        return selector.select(invocation);
+    }
+
+    private static class ConsistentHashSelector<T> {
+        private final TreeMap<Long, Invoker<T>> virtualInvokers = new TreeMap<>();
+        private final int replicaNumber;
+
+        public ConsistentHashSelector(List<Invoker<T>> invokers, String methodName, int replicaNumber) {
+            this.replicaNumber = replicaNumber;
+
+            for (Invoker<T> invoker : invokers) {
+                String address = invoker.getUrl().getAddress();
+
+                // 每个物理节点对应 160 个虚拟节点
+                for (int i = 0; i < replicaNumber / 4; i++) {
+                    long hash = md5(address + ":" + i);
+                    virtualInvokers.put(hash, invoker);
+                }
+            }
+        }
+
+        public Invoker<T> select(Invocation invocation) {
+            // 根据方法参数计算 hash
+            String key = toKey(invocation.getArguments());
+            long hash = md5(key);
+
+            // 找到大于等于 hash 的第一个节点
+            Map.Entry<Long, Invoker<T>> entry = virtualInvokers.ceilingEntry(hash);
+
+            // 循环回到第一个
+            if (entry == null) {
+                entry = virtualInvokers.firstEntry();
+            }
+
+            return entry.getValue();
+        }
+
+        private String toKey(Object[] args) {
+            StringBuilder sb = new StringBuilder();
+            for (Object arg : args) {
+                sb.append(arg.toString());
+                sb.append(":");
+            }
+            return sb.toString();
+        }
+
+        private long md5(String key) {
+            MessageDigest md = MessageDigest.getInstance("MD5");
+            byte[] digest = md.digest(key.getBytes());
+            return ((long) (digest[3] & 0xFF) << 24)
+                    | ((long) (digest[2] & 0xFF) << 16)
+                    | ((long) (digest[1] & 0xFF) << 8)
+                    | (long) (digest[0] & 0xFF);
+        }
+    }
+}
+```
+
+**特点**：
+
+- 相同参数总是打到同一个实例
+- 适合需要本地缓存的场景
+- 虚拟节点保证负载均衡
+
+**配置**：
+
+```java
+@Reference(loadbalance = "consistenthash")
+private UserService userService;
+
+// 自定义参数
+@Reference(loadbalance = "consistenthash", parameters = {
+    "hash.arguments", "0,1",  // 根据第 0、1 个参数计算 hash
+    "hash.nodes", "320"        // 虚拟节点数
+})
+private UserService userService;
+```
+
+## 负载均衡配置
+
+### 服务端权重配置
+
+```yaml
+# 服务端配置权重
+@Service(weight = 100)
+public class UserServiceImpl implements UserService {
+    // weight = 100 表示权重为 100
+}
+```
+
+### 客户端负载均衡配置
+
+```java
+// 注解方式配置负载均衡
+@Reference(loadbalance = "random")
+private UserService userService;
+
+// 随机加权
+@Reference(loadbalance = "random")
+private UserService userService;
+
+// 轮询
+@Reference(loadbalance = "roundrobin")
+private UserService userService;
+
+// 最少活跃
+@Reference(loadbalance = "leastactive")
+private UserService userService;
+
+// 一致性哈希
+@Reference(loadbalance = "consistenthash")
+private UserService userService;
+```
+
+### 全局默认配置
+
+```yaml
+# application.yml
+dubbo:
+  consumer:
+    loadbalance: random    # 全局默认负载均衡策略
+```
+
+## 自定义负载均衡
+
+Dubbo 支持 SPI 扩展，可以自定义负载均衡策略：
+
+```java
+// 1. 实现 LoadBalance 接口
+public class CustomLoadBalance<T> implements LoadBalance<T> {
+
+    @Override
+    public <T> Invoker<T> select(List<Invoker<T>> invokers, URL url, Invocation invocation) {
+        // 自定义选择逻辑
+        // 例如：区域感知负载均衡
+        String region = RpcContext.getContext().getAttachment("region");
+        return selectByRegion(invokers, region);
+    }
+
+    private <T> Invoker<T> selectByRegion(List<Invoker<T>> invokers, String region) {
+        // 优先选择同区域的实例
+        for (Invoker<T> invoker : invokers) {
+            if (region.equals(invoker.getUrl().getParameter("region"))) {
+                return invoker;
+            }
+        }
+        return invokers.get(0);
+    }
+}
+```
+
+```java
+// 2. 添加 SPI 配置
+// 在 resources/META-INF/services/ 目录下创建文件
+// com.alibaba.dubbo.rpc.cluster.LoadBalance
+// 内容：custom=com.example.CustomLoadBalance
+```
+
+```java
+// 3. 使用自定义负载均衡
+@Reference(loadbalance = "custom")
+private UserService userService;
+```
+
+## 负载均衡最佳实践
+
+### 实践一：权重配置要合理
+
+```yaml
+# 根据服务器性能配置权重
+服务器          CPU/内存       建议权重
+─────────────────────────────────────────────────────────────
+高配服务器        16C/32G       100
+中配服务器        8C/16G        50
+低配服务器        4C/8G         25
+```
+
+### 实践二：结合健康检查
+
+```yaml
+# 负载均衡配合健康检查
+dubbo:
+  provider:
+    # 权重会自动根据健康状态调整
+    weight: 100
+    healthy: true
+```
+
+### 实践三：跨机房场景使用区域感知
+
+```java
+// 区域感知负载均衡
+@Reference(loadbalance = "custom", parameters = {
+    "region-aware", "true"
+})
+private UserService userService;
+```
+
+## 总结
+
+Dubbo 提供了四种内置负载均衡策略，选择合适策略可以显著提升系统性能和稳定性。
+
+**核心要点回顾：**
+
+- 加权随机：最常用，根据权重随机选择
+- 加权轮询：负载均匀分配
+- 最少活跃数：动态感知实例负载
+- 一致性哈希：相同参数打到同一实例，适合缓存场景
+- 支持 SPI 扩展自定义负载均衡策略
+
+---
+
+**下一章预告：**
+
+除了负载均衡，Dubbo 还支持路由机制，可以根据条件将请求路由到特定的实例。比如灰度发布时，如何只让部分流量打到新版本？下一章，我们将探讨 Dubbo 的路由机制。

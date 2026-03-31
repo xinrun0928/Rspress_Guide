@@ -1,0 +1,420 @@
+# 系统自适应限流
+
+固定阈值的限流太死板：白天流量低，阈值浪费；晚上流量高，阈值不够。
+
+有没有更智能的限流？**自适应限流**根据系统实时负载动态调整阈值，让限流更精准。
+
+## 一、自适应限流原理
+
+### 1.1 核心思想
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        自适应限流                                    │
+│                                                                         │
+│   监控指标：                                                           │
+│   - CPU 使用率                                                         │
+│   - 内存使用率                                                         │
+│   - 响应时间                                                           │
+│   - 队列长度                                                           │
+│   - 活跃线程数                                                         │
+│                                                                         │
+│   动态调整：                                                           │
+│   当 CPU > 80% ──▶ 降低限流阈值                                        │
+│   当 CPU < 50% ──▶ 提高限流阈值                                        │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 1.2 指标选择
+
+| 指标 | 优点 | 缺点 |
+|---|---|---|
+| CPU | 直观反映负载 | 瞬时波动大 |
+| 响应时间 | 反映用户体验 | 受网络影响 |
+| 队列长度 | 反映积压 | 需要接入 APM |
+| 错误率 | 反映系统健康 | 滞后性 |
+
+## 二、基于响应时间的自适应限流
+
+### 2.1 滑动窗口统计
+
+```java title="响应时间统计")
+@Service
+@Slf4j
+public class ResponseTimeStats {
+    private final int windowSize = 60; // 60 秒窗口
+    private final AtomicInteger[] latencies;
+    private final AtomicInteger index = new AtomicInteger(0);
+    private volatile long windowStart = System.currentTimeMillis();
+
+    public ResponseTimeStats() {
+        this.latencies = new AtomicInteger[windowSize];
+        for (int i = 0; i < windowSize; i++) {
+            latencies[i] = new AtomicInteger(0);
+        }
+    }
+
+    /**
+     * 记录响应时间
+     */
+    public void record(long latencyMs) {
+        slideWindow();
+        latencies[index.get()].incrementAndGet();
+    }
+
+    /**
+     * 获取平均响应时间
+     */
+    public double getAverageLatency() {
+        slideWindow();
+
+        int total = 0;
+        int count = 0;
+        for (int i = 0; i < windowSize; i++) {
+            total += latencies[i].get();
+            count++;
+        }
+
+        return count > 0 ? (double) total / count : 0;
+    }
+
+    /**
+     * 获取 P99 响应时间
+     */
+    public long getP99Latency() {
+        // 简化实现：取最大值
+        slideWindow();
+
+        long max = 0;
+        for (int i = 0; i < windowSize; i++) {
+            max = Math.max(max, latencies[i].get());
+        }
+
+        return max;
+    }
+
+    private void slideWindow() {
+        long now = System.currentTimeMillis();
+        if (now - windowStart >= 1000) {
+            int oldIndex = index.get();
+            int newIndex = (oldIndex + 1) % windowSize;
+            latencies[newIndex].set(0);
+            index.set(newIndex);
+            windowStart = now;
+        }
+    }
+}
+```
+
+### 2.2 自适应限流器
+
+```java title="自适应限流器")
+@Service
+@Slf4j
+public class AdaptiveRateLimiter {
+    // 基础阈值
+    private volatile int baseLimit = 1000;
+    // 当前阈值
+    private volatile int currentLimit = 1000;
+    // 最小阈值
+    private static final int MIN_LIMIT = 100;
+    // 最大阈值
+    private static final int MAX_LIMIT = 10000;
+
+    private final ResponseTimeStats stats = new ResponseTimeStats();
+    private final AtomicInteger currentCount = new AtomicInteger(0);
+
+    private static final long STAT_INTERVAL_MS = 1000;
+
+    @Scheduled(fixedRate = STAT_INTERVAL_MS)
+    public void adjustLimit() {
+        // 获取响应时间
+        double avgLatency = stats.getAverageLatency();
+
+        // 根据响应时间调整阈值
+        if (avgLatency > 1000) {
+            // 响应时间过高，降低阈值
+            int newLimit = Math.max(MIN_LIMIT, currentLimit / 2);
+            if (newLimit != currentLimit) {
+                log.info("响应时间过高: {}ms，降低阈值: {} -> {}",
+                        avgLatency, currentLimit, newLimit);
+                currentLimit = newLimit;
+            }
+        } else if (avgLatency > 500) {
+            // 响应时间偏高，适度降低
+            int newLimit = Math.max(MIN_LIMIT, (int) (currentLimit * 0.8));
+            if (newLimit != currentLimit) {
+                log.info("响应时间偏高: {}ms，降低阈值: {} -> {}",
+                        avgLatency, currentLimit, newLimit);
+                currentLimit = newLimit;
+            }
+        } else if (avgLatency < 200) {
+            // 响应时间良好，适度提高
+            int newLimit = Math.min(MAX_LIMIT, (int) (currentLimit * 1.2));
+            if (newLimit != currentLimit) {
+                log.info("系统负载低，提高阈值: {} -> {}", currentLimit, newLimit);
+                currentLimit = newLimit;
+            }
+        }
+    }
+
+    /**
+     * 限流检查
+     */
+    public boolean tryAcquire() {
+        stats.record(1);
+
+        int count = currentCount.incrementAndGet();
+        if (count > currentLimit) {
+            currentCount.decrementAndGet();
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * 释放
+     */
+    public void release() {
+        currentCount.decrementAndGet();
+    }
+}
+```
+
+## 三、基于 CPU 的自适应限流
+
+### 3.1 CPU 监控
+
+```java title="CPU 监控")
+@Service
+@Slf4j
+public class CpuMonitor {
+    private final AtomicReference<Double> cpuUsage = new AtomicReference<>(0.0);
+
+    @Scheduled(fixedRate = 1000)
+    public void updateCpuUsage() {
+        try {
+            MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
+            ObjectName name = ObjectName.valueOf("java.lang:type=OperatingSystem");
+            AttributeList list = mbs.getAttributes(name,
+                    new String[]{"SystemCpuLoad"});
+
+            if (!list.isEmpty()) {
+                Attribute attr = (Attribute) list.get(0);
+                Double value = (Double) attr.getValue();
+                cpuUsage.set(value);
+            }
+        } catch (Exception e) {
+            log.warn("获取 CPU 使用率失败", e);
+        }
+    }
+
+    public double getCpuUsage() {
+        return cpuUsage.get();
+    }
+}
+```
+
+### 3.2 CPU 自适应限流
+
+```java title="CPU 自适应限流")
+@Service
+@Slf4j
+public class CpuAdaptiveLimiter {
+    @Autowired
+    private CpuMonitor cpuMonitor;
+
+    private volatile int currentLimit = 1000;
+    private static final int BASE_LIMIT = 1000;
+    private static final int MIN_LIMIT = 100;
+    private static final int MAX_LIMIT = 10000;
+
+    @Scheduled(fixedRate = 1000)
+    public void adjustByCpu() {
+        double cpu = cpuMonitor.getCpuUsage();
+
+        // CPU > 80%，大幅限流
+        if (cpu > 0.8) {
+            int newLimit = Math.max(MIN_LIMIT, (int) (BASE_LIMIT * 0.2));
+            log.warn("CPU 使用率过高: {}%，限流到: {}", cpu * 100, newLimit);
+            currentLimit = newLimit;
+        }
+        // CPU > 60%，适度限流
+        else if (cpu > 0.6) {
+            int newLimit = Math.max(MIN_LIMIT, (int) (BASE_LIMIT * 0.5));
+            log.info("CPU 使用率偏高: {}%，限流到: {}", cpu * 100, newLimit);
+            currentLimit = newLimit;
+        }
+        // CPU < 40%，放宽限制
+        else if (cpu < 0.4) {
+            int newLimit = Math.min(MAX_LIMIT, (int) (BASE_LIMIT * 1.5));
+            log.info("CPU 使用率正常: {}%，放宽到: {}", cpu * 100, newLimit);
+            currentLimit = newLimit;
+        }
+    }
+
+    public boolean tryAcquire() {
+        // 使用令牌桶实现
+        return tokenBucket.tryAcquire();
+    }
+
+    private final TokenBucket tokenBucket = new TokenBucket(1000);
+
+    // 简化令牌桶
+    private static class TokenBucket {
+        private final AtomicInteger tokens;
+        private volatile long lastRefill;
+        private final int rate;
+
+        public TokenBucket(int rate) {
+            this.tokens = new AtomicInteger(rate);
+            this.rate = rate;
+            this.lastRefill = System.currentTimeMillis();
+        }
+
+        public synchronized boolean tryAcquire() {
+            refill();
+            return tokens.decrementAndGet() >= 0;
+        }
+
+        private void refill() {
+            long now = System.currentTimeMillis();
+            long elapsed = now - lastRefill;
+            if (elapsed >= 1000) {
+                tokens.set(rate);
+                lastRefill = now;
+            }
+        }
+    }
+}
+```
+
+## 四、综合自适应限流
+
+### 4.1 多指标综合评估
+
+```java title="综合评估")
+@Service
+@Slf4j
+public class ComprehensiveAdaptiveLimiter {
+    @Autowired
+    private CpuMonitor cpuMonitor;
+    @Autowired
+    private MemoryMonitor memoryMonitor;
+    @Autowired
+    private ResponseTimeMonitor responseTimeMonitor;
+
+    private volatile int currentLimit = 1000;
+
+    @Scheduled(fixedRate = 1000)
+    public void adjustLimit() {
+        // 计算综合负载
+        double cpuLoad = cpuMonitor.getCpuUsage();
+        double memoryLoad = memoryMonitor.getUsage();
+        double rtLoad = responseTimeMonitor.getNormalizedLoad();
+
+        // 权重
+        double cpuWeight = 0.4;
+        double memoryWeight = 0.2;
+        double rtWeight = 0.4;
+
+        double totalLoad = cpuLoad * cpuWeight
+                + memoryLoad * memoryWeight
+                + rtLoad * rtWeight;
+
+        // 根据综合负载计算阈值
+        int newLimit = calculateLimit(totalLoad);
+
+        if (newLimit != currentLimit) {
+            log.info("系统负载: {:.2f}，调整限流阈值: {} -> {}",
+                    totalLoad, currentLimit, newLimit);
+            currentLimit = newLimit;
+        }
+    }
+
+    private int calculateLimit(double load) {
+        if (load > 0.8) {
+            return 100;  // 极高负载
+        } else if (load > 0.6) {
+            return 500;   // 高负载
+        } else if (load > 0.4) {
+            return 1000;  // 正常负载
+        } else if (load > 0.2) {
+            return 2000;  // 低负载
+        } else {
+            return 5000;  // 极低负载
+        }
+    }
+}
+```
+
+### 4.2 PID 控制算法
+
+```java title="PID 控制器")
+@Service
+@Slf4j
+public class PidAdaptiveLimiter {
+    // PID 参数
+    private double kp = 0.5;  // 比例系数
+    private double ki = 0.1;  // 积分系数
+    private double kd = 0.2;  // 微分系数
+
+    private volatile double setpoint = 0.7;  // 目标 CPU 使用率 70%
+    private double integral = 0;
+    private double lastError = 0;
+
+    public int calculateLimit(int currentLimit, double currentCpu) {
+        // 计算误差
+        double error = setpoint - currentCpu;
+
+        // 比例项
+        double p = kp * error;
+
+        // 积分项
+        integral += error;
+        double i = ki * integral;
+
+        // 微分项
+        double d = kd * (error - lastError);
+        lastError = error;
+
+        // PID 输出
+        double output = p + i + d;
+
+        // 计算新阈值
+        int newLimit = (int) (currentLimit * (1 + output));
+
+        // 限制范围
+        newLimit = Math.max(100, Math.min(10000, newLimit));
+
+        return newLimit;
+    }
+}
+```
+
+## 五、总结
+
+| 自适应策略 | 优点 | 缺点 |
+|---|---|---|
+| 基于响应时间 | 反映用户体验 | 受网络影响 |
+| 基于 CPU | 反映系统负载 | 瞬时波动 |
+| 基于队列 | 反映积压 | 需要 APM |
+| PID 控制 | 精确调控 | 参数调优难 |
+
+:::tip 实战建议
+1. **多指标结合**：单一指标不准确
+2. **平滑调整**：避免阈值剧烈波动
+3. **有上下限**：防止过严或过松
+:::
+
+## 结尾
+
+自适应限流让限流更智能。记住三个要点：
+
+1. **指标要选对**：CPU + RT 是经典组合
+2. **调整要平滑**：避免震荡
+3. **有降级预案**：自适应失效时用固定限流
+
+流量控制专题到此结束。下一节，我们来看数据处理与批任务专题。

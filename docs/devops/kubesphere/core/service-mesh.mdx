@@ -1,0 +1,433 @@
+# KubeSphere 服务网格
+
+在微服务架构中，服务间的通信变得越来越复杂。如何追踪服务间的调用？如何实现灰度发布？如何做熔断限流？
+
+KubeSphere 的服务网格功能，基于 Istio，让你轻松实现这些能力。
+
+## 服务网格概述
+
+### 什么是服务网格
+
+服务网格（Service Mesh）是基础设施层，负责处理服务间通信。它通常由数据平面和控制平面组成：
+
+```
+┌─────────────────────────────────────────────────┐
+│                 控制平面                          │
+│  ┌─────────────┐  ┌─────────────┐  ┌───────────┐ │
+│  │   Pilot     │  │   Citadel   │  │ Galley    │ │
+│  │  (配置)     │  │  (安全)     │  │ (验证)    │ │
+│  └─────────────┘  └─────────────┘  └───────────┘ │
+└─────────────────────────────────────────────────┘
+                      │
+                      │ 配置下发
+                      ▼
+┌─────────────────────────────────────────────────┐
+│                 数据平面                          │
+│                                                 │
+│  ┌───────┐   ─── Envoy ───   ┌───────┐        │
+│  │ Pod A │◀───────────────▶  │ Pod B │        │
+│  └───────┘                  └───────┘        │
+│     │                             │            │
+│  ┌───────────────────────────────┐            │
+│  │        Envoy Sidecar          │            │
+│  │  • 流量管理                    │            │
+│  │  • 可观测性                    │            │
+│  │  • 安全通信                    │            │
+│  └───────────────────────────────┘            │
+└─────────────────────────────────────────────────┘
+```
+
+### KubeSphere 中的服务网格
+
+```
+┌─────────────────────────────────────────┐
+│           KubeSphere Console             │
+├─────────────────────────────────────────┤
+│  • 灰度发布                              │
+│  • 流量治理                              │
+│  • 可观测性                              │
+│  • 证书管理                              │
+└─────────────────────────────────────────┘
+                      │
+                      ▼
+┌─────────────────────────────────────────┐
+│           Istio 控制平面                 │
+│  • Kiali（可视化）                        │
+│  • Prometheus（指标）                     │
+│  • Jaeger（追踪）                        │
+└─────────────────────────────────────────┘
+```
+
+## 流量管理
+
+### 流量分割
+
+```yaml title="virtual-service.yaml"
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: order-service
+  namespace: production
+spec:
+  hosts:
+  - order-service
+  
+  http:
+  # 90% 流量到 v1
+  - route:
+    - destination:
+        host: order-service-v1
+        subset: v1
+      weight: 90
+    # 10% 流量到 v2
+    - destination:
+        host: order-service-v2
+        subset: v2
+      weight: 10
+```
+
+### 基于 Header 的路由
+
+```yaml title="header-routing.yaml"
+spec:
+  http:
+  # Header 匹配路由
+  - match:
+    - headers:
+        x-canary:
+          exact: "true"
+    route:
+    - destination:
+        host: order-service-v2
+        subset: v2
+  
+  # 默认路由
+  - route:
+    - destination:
+        host: order-service-v1
+        subset: v1
+```
+
+### 超时与重试
+
+```yaml title="timeout-retry.yaml"
+spec:
+  http:
+  - route:
+    - destination:
+        host: payment-service
+    # 超时配置
+    timeout: 5s
+    
+    # 重试配置
+    retries:
+      attempts: 3
+      perTryTimeout: 2s
+      retryOn: 5xx,reset,connect-failure
+```
+
+## 金丝雀发布
+
+### 创建 DestinationRule
+
+```yaml title="destination-rule.yaml"
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: order-service
+  namespace: production
+spec:
+  host: order-service
+  
+  # 子集定义（版本）
+  subsets:
+  - name: v1
+    labels:
+      version: v1
+  - name: v2
+    labels:
+      version: v2
+  
+  # 流量策略
+  trafficPolicy:
+    connectionPool:
+      tcp:
+        maxConnections: 100
+      http:
+        h2UpgradePolicy: UPGRADE
+```
+
+### 金丝雀部署流程
+
+```bash
+# 1. 部署 v1 版本
+kubectl apply -f order-v1.yaml
+
+# 2. 创建 DestinationRule
+kubectl apply -f destination-rule.yaml
+
+# 3. 创建 VirtualService（100% 流量到 v1）
+kubectl apply -f virtual-service-v1.yaml
+
+# 4. 部署 v2 版本（金丝雀）
+kubectl apply -f order-v2.yaml
+
+# 5. 逐步增加 v2 流量
+kubectl apply -f virtual-service-canary.yaml
+# 流量配置：v1 90%, v2 10%
+
+# 6. 验证通过后，切换全部流量到 v2
+kubectl apply -f virtual-service-v2.yaml
+
+# 7. 下线 v1
+kubectl delete deployment order-v1
+```
+
+### 自动金丝雀（Flagger）
+
+```yaml title="flagger-canary.yaml"
+apiVersion: flagger.app/v1beta1
+kind: Canary
+metadata:
+  name: order-service
+  namespace: production
+spec:
+  # 指向主服务
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: order-service
+  
+  # 分析策略
+  analysis:
+    interval: 1m
+    maxWeight: 50
+    stepWeight: 10
+    
+    # 自动回滚条件
+    metrics:
+    - name: request-success-rate
+      thresholdRange:
+        min: 99
+    - name: request-duration
+      thresholdRange:
+        max: 500
+    - name: pod-memory-utilization
+      thresholdRange:
+        max: 90
+```
+
+## 熔断与限流
+
+### 熔断配置
+
+```yaml title="circuit-breaker.yaml"
+spec:
+  host: order-service
+  trafficPolicy:
+    connectionPool:
+      tcp:
+        maxConnections: 100
+      http:
+        h2UpgradePolicy: UPGRADE
+        http1MaxPendingRequests: 10
+        http2MaxRequests: 100
+    
+    # 熔断配置
+    outlierDetection:
+      consecutiveGatewayErrors: 5
+      interval: 30s
+      baseEjectionTime: 30s
+      maxEjectionPercent: 50
+```
+
+### 限流配置
+
+```yaml title="rate-limit.yaml"
+apiVersion: networking.istio.io/v1beta1
+kind: EnvoyFilter
+metadata:
+  name: global-rate-limit
+  namespace: production
+spec:
+  workloadSelector:
+    labels:
+      app: order-service
+  
+  configPatches:
+  - applyTo: HTTP_FILTER
+    match:
+      context: SIDECAR_INBOUND
+      listener:
+        filterChain:
+          filter:
+            name: envoy.filters.network.http_connection_manager
+    patch:
+      operation: INSERT_BEFORE
+      value:
+        name: envoy.filters.http.local_ratelimit
+        typed_config:
+          "@type": type.googleapis.com/udpa.type.v1.TypedStruct
+          type_url: type.googleapis.com/envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit
+          value:
+            stat_prefix: http_local_rate_limiter
+            token_bucket:
+              max_tokens: 1000
+              tokens_per_fill: 100
+              fill_interval: 1s
+```
+
+## 可观测性
+
+### Kiali 服务拓扑
+
+```yaml title="kiali-config.yaml"
+apiVersion: kiali.io/v1alpha1
+kind: Kiali
+metadata:
+  name: kiali
+  namespace: istio-system
+spec:
+  auth:
+    strategy: anonymous
+  
+  server:
+    web_root: /kiali
+    metrics_port: 9090
+  
+  external_services:
+    prometheus:
+      url: http://prometheus:9090/
+    
+    tracing:
+      in_cluster_url: http://jaeger-collector:14268
+      url: https://tracing.example.com
+```
+
+### 流量指标
+
+| 指标 | 说明 |
+|---|---|
+| **istio_requests_total** | 请求总数 |
+| **istio_request_duration_seconds** | 请求延迟 |
+| **istio_requests_total** | 按响应码统计 |
+| **istio_tcp_connections_closed_total** | TCP 连接关闭数 |
+
+### 链路追踪
+
+```yaml title="jaeger-config.yaml"
+apiVersion: jaegertracing.io/v1
+kind: Jaeger
+metadata:
+  name: jaeger
+  namespace: istio-system
+spec:
+  strategy: production
+  
+  collector:
+    replicas: 2
+    maxReplicas: 5
+  
+  query:
+    replicas: 1
+  
+  storage:
+    type: elasticsearch
+    elasticsearch:
+      nodeCount: 3
+```
+
+## mTLS 配置
+
+### 强制 mTLS
+
+```yaml title="mtls-strict.yaml"
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: production
+spec:
+  mtls:
+    mode: STRICT
+```
+
+### 命名空间级别 mTLS
+
+```yaml title="mtls-permissive.yaml"
+spec:
+  mtls:
+    mode: PERMISSIVE  # 允许明文
+```
+
+### Service 级别 mTLS
+
+```yaml title="mtls-service.yaml"
+spec:
+  selector:
+    app: payment-service
+  mtls:
+    mode: STRICT
+```
+
+## 故障注入
+
+### 延迟注入
+
+```yaml title="delay-injection.yaml"
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: order-service
+spec:
+  hosts:
+  - order-service
+  
+  http:
+  - route:
+    - destination:
+        host: inventory-service
+    # 注入 2 秒延迟
+    fault:
+      delay:
+        percentage:
+          value: 10
+        fixedDelay: 2s
+```
+
+### 错误注入
+
+```yaml title="error-injection.yaml"
+spec:
+  http:
+  - route:
+    - destination:
+        host: payment-service
+    # 注入 500 错误
+    fault:
+      abort:
+        percentage:
+          value: 5
+        httpStatus: 500
+```
+
+## 总结
+
+KubeSphere 服务网格的核心能力：
+
+| 能力 | 说明 |
+|---|---|
+| **流量管理** | 路由分割、超时重试、负载均衡 |
+| **灰度发布** | 金丝雀发布、渐进式切换 |
+| **熔断限流** | 保护服务，提高稳定性 |
+| **可观测性** | 拓扑图、指标、链路追踪 |
+| **安全通信** | mTLS 加密服务间通信 |
+| **故障注入** | 测试服务韧性 |
+
+最佳实践：
+
+1. **渐进式部署**：使用金丝雀降低风险
+2. **配置超时重试**：避免请求无限等待
+3. **启用 mTLS**：保护服务间通信
+4. **监控分析**：及时发现异常
+5. **故障演练**：定期进行混沌测试

@@ -1,0 +1,289 @@
+# StatefulSet 网络与存储深度解析
+
+StatefulSet 的精髓在于「稳定」二字。但这种稳定性是如何实现的？Pod 如何获得固定的网络标识？PVC 如何与 Pod 建立一一对应关系？Pod 被重建后如何找到原来的数据？
+
+这一节我们将深入 StatefulSet 的内部机制，理解它是如何为有状态工作负载提供可靠的运行环境。
+
+## Headless Service 的作用
+
+StatefulSet 通常搭配一个 `clusterIP: None` 的 Headless Service 使用：
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: zookeeper
+spec:
+  ports:
+  - port: 2181
+    name: client
+  - port: 2888
+    name: leader-election
+  - port: 3888
+    name: heartbeat
+  clusterIP: None  # 关键：Headless Service
+  selector:
+    app: zookeeper
+```
+
+Headless Service 不会分配 ClusterIP，CoreDNS 会为它创建一条 A 记录，直接解析到 Pod 的 IP 地址：
+
+```bash
+# 解析 Headless Service
+nslookup zookeeper.default.svc.cluster.local
+```
+
+```
+Name:	zookeeper.default.svc.cluster.local
+Address: 10.244.1.5  # zookeeper-0 的 IP
+Name:	zookeeper.default.svc.cluster.local
+Address: 10.244.2.8  # zookeeper-1 的 IP
+Name:	zookeeper.default.svc.cluster.local
+Address: 10.244.3.2  # zookeeper-2 的 IP
+```
+
+:::tip 为什么需要 Headless Service
+普通 Service 通过负载均衡将请求分发到多个 Pod。但对于有状态应用，客户端可能需要直接连接到特定的 Pod（比如 MySQL 主库），而不是通过负载均衡。Headless Service 让客户端可以通过 Pod 的域名直接访问每个实例。
+:::
+
+## 稳定的网络标识
+
+StatefulSet 为每个 Pod 创建的标识由以下几部分组成：
+
+```
+$(podname).$(headless service name).$(namespace).svc.cluster.local
+```
+
+对于 zookeeper StatefulSet 的第一个 Pod：
+
+```
+zookeeper-0.zookeeper.default.svc.cluster.local
+```
+
+这个域名由 CoreDNS 解析，始终指向同一个 IP（除非 Pod 被重建到其他节点）。
+
+### Pod 序号的稳定性
+
+Pod 序号是 StatefulSet 的核心概念：
+
+| 序号 | Pod 名称 | 角色 | 典型用途 |
+|---|---|---|---|
+| 0 | web-0 | Primary | 主节点，写入 |
+| 1 | web-1 | Replica | 从节点，读取 |
+| 2 | web-2 | Replica | 从节点，读取 |
+
+序号 0 通常被用作主节点或有特殊职责的节点。应用程序可以通过检查 Pod 序号来区分不同的角色：
+
+```bash
+# 在容器内获取自身序号
+hostname | grep -oP '(?<=-)\d+$'
+```
+
+### 初始化顺序
+
+StatefulSet 创建 Pod 时遵循严格的顺序：
+
+```
+创建 zookeeper-0，等待 Running + Ready
+创建 zookeeper-1，等待 Running + Ready
+创建 zookeeper-2，等待 Running + Ready
+```
+
+这种顺序对于需要 quorum 的分布式系统至关重要。比如 ZooKeeper 需要至少 3 个节点才能形成多数派（2/3 + 1），如果允许并行启动，可能在集群稳定前就出现脑裂问题。
+
+## VolumeClaimTemplate 的工作原理
+
+VolumeClaimTemplate 是 StatefulSet 的存储抽象，它为每个 Pod 创建独立且绑定的 PVC：
+
+```yaml
+spec:
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 10Gi
+      storageClassName: "fast-storage"
+```
+
+### PVC 命名规则
+
+创建的 PVC 名称遵循：`$(volumeClaimTemplate.name)-$(statefulset.name)-$(ordinal)`
+
+对于 `volumeClaimTemplates[0].name=data` 的 mysql StatefulSet：
+
+```
+data-mysql-0   # 绑定 mysql-0
+data-mysql-1   # 绑定 mysql-1
+data-mysql-2   # 绑定 mysql-2
+```
+
+### Pod 与 PVC 的绑定
+
+Pod 和 PVC 的绑定关系是 **一一对应且固定** 的：
+
+- Pod 被删除重建后，它仍然会使用相同序号的 PVC
+- 即使 Pod 被调度到不同的节点，PVC 也会跟着迁移（通过存储层的机制）
+- PVC 不会被其他 Pod 使用
+
+:::warning 绑定的代价
+这种绑定关系意味着 Pod 的调度可能受到存储位置的限制。比如 mysql-0 的 PVC 在 node-A 上的 PV 中，mysql-0 重建时如果 node-A 不可用，可能会卡在 Pending 状态。这是有状态工作负载调度复杂性的根源。
+:::
+
+## PVC 保留策略
+
+默认情况下，当 StatefulSet 被删除时，PVC 不会被自动删除。这是为了保护数据，防止误操作导致数据丢失。
+
+但你可以通过 `persistentVolumeClaimRetentionPolicy` 精细控制这个行为：
+
+```yaml
+spec:
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain    # StatefulSet 删除时
+    whenScaled: Delete      # 缩容时
+```
+
+| 策略 | whenDeleted | whenScaled |
+|---|---|---|
+| `Retain` | PVC 保留 | PVC 保留 |
+| `Delete` | 删除 PVC 和 PV | 删除 PVC 和 PV |
+
+```yaml
+# 示例：删除时保留，缩容时删除
+spec:
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Delete
+```
+
+:::tip 推荐配置
+对于测试环境，可以用 `whenScaled: Delete` 自动清理缩容时释放的存储。对于生产环境，建议使用 `Retain` 以保留数据，防止误操作。
+:::
+
+## Pod 管理策略
+
+### OrderedReady（默认）
+
+`OrderedReady` 是默认的 Pod 管理策略，它强制 Pod 的创建和终止按序号顺序进行：
+
+```yaml
+spec:
+  podManagementPolicy: OrderedReady
+```
+
+这确保了有依赖关系的 Pod 按照正确的顺序启动。
+
+### Parallel
+
+`Parallel` 允许所有 Pod 同时创建和终止，不再等待前一个 Pod Ready：
+
+```yaml
+spec:
+  podManagementPolicy: Parallel
+```
+
+这个模式适用于：
+
+- 应用自身能处理并发初始化
+- 不关心启动顺序
+- 希望加快启动速度
+
+:::warning 使用 Parallel 的风险
+如果你不确定应用是否能处理并发启动，**不要使用 Parallel 模式**。许多分布式系统（如 ZooKeeper、Kafka）需要明确的 quorum 过程，并发启动可能导致集群无法形成。
+:::
+
+## 数据迁移场景
+
+### Pod 重建与数据持久性
+
+StatefulSet 的一个核心承诺是：**Pod 重建不会丢失数据**。
+
+```bash
+# 模拟 Pod 故障
+kubectl delete pod mysql-0
+
+# 查看 Pod 重建过程
+kubectl get pods -w -l app=mysql
+```
+
+```
+NAME      READY   STATUS        RESTARTS   AGE
+mysql-0   1/1     Terminating   0          10d
+mysql-0   0/1     Terminating   0          10d
+mysql-0   0/1     Terminating   0          10d
+mysql-0   0/1     Pending       0          0s
+mysql-0   0/1     ContainerCreating   0    0s
+mysql-0   1/1     Running       0          2s
+```
+
+注意：Pod 名称保持为 `mysql-0`，绑定的 PVC `data-mysql-0` 不变，数据得以保留。
+
+### 存储扩缩容
+
+如果需要扩大存储容量，可以直接编辑 PVC：
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: data-mysql-0
+spec:
+  resources:
+    requests:
+      storage: 20Gi  # 从 10Gi 扩大到 20Gi
+```
+
+:::warning 在线扩容支持
+在线扩容需要存储类和底层存储都支持 `ExpandInUsePersistentVolumes` 特性。不支持的存储类会在 Pod 运行时拒绝扩容请求，Pod 需要重启才能生效。
+:::
+
+## DNS 记录解析详解
+
+### Service A 记录
+
+Headless Service 会为每个 Pod 创建独立的 A 记录：
+
+```
+# 解析 Service，会返回所有 Pod IP
+zookeeper.default.svc.cluster.local -> [10.244.1.5, 10.244.2.8, 10.244.3.2]
+
+# 解析单个 Pod，返回固定 IP
+zookeeper-0.zookeeper.default.svc.cluster.local -> 10.244.1.5
+zookeeper-1.zookeeper.default.svc.cluster.local -> 10.244.2.8
+zookeeper-2.zookeeper.default.svc.cluster.local -> 10.244.3.2
+```
+
+### 客户端连接示例
+
+```java
+// Java 客户端连接 ZooKeeper 集群
+String connectionString = "zookeeper-0.zookeeper:2181," +
+                          "zookeeper-1.zookeeper:2181," +
+                          "zookeeper-2.zookeeper:2181";
+
+ZooKeeper zk = new ZooKeeper(connectionString, 3000, watcher);
+```
+
+应用程序通常配置所有 Pod 的地址，让客户端库自己处理连接和故障转移。
+
+## 总结
+
+StatefulSet 的稳定性是通过多个组件协同实现的：
+
+- **Headless Service**：提供稳定的 DNS 入口
+- **Pod 序号**：每个 Pod 有固定的身份
+- **VolumeClaimTemplate**：提供绑定的持久存储
+- **有序管理**：确保启动和终止的顺序
+- **PVC 保留策略**：控制存储的生命周期
+
+理解这些机制，才能在生产环境中正确使用 StatefulSet，避免数据丢失或服务中断。
+
+**面试追问方向：**
+
+- 为什么 StatefulSet 不能使用 `emptyDir` 作为持久存储？
+- 如果 StorageClass 不支持动态扩容，如何扩大 StatefulSet 的存储？
+- StatefulSet 的滚动更新和 Deployment 有什么不同？
+- 如何实现 StatefulSet 的原地更新（不重建 Pod）？
+- Pod Disruption Budget 如何与 StatefulSet 配合使用？

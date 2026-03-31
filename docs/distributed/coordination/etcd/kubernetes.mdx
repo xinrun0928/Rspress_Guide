@@ -1,0 +1,416 @@
+import { Badge } from '@rspress/core/theme';
+
+# etcd 在 Kubernetes 中的应用
+
+当你执行 `kubectl get pods` 时，数据从哪里来？当你创建一个 Deployment 时，请求是如何到达 etcd 的？etcd 在 Kubernetes 中扮演着什么角色？
+
+本节将深入剖析 etcd 与 Kubernetes 的关系。
+
+## Kubernetes 架构回顾
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                 Kubernetes 架构                              │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │                      Control Plane                     │  │
+│  │                                                           │  │
+│  │  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐  │  │
+│  │  │API Server│  │Scheduler│  │Controller│  │ Cloud    │  │  │
+│  │  │ (etcd)   │  │ Manager │  │ Manager  │  │ Manager  │  │  │
+│  │  └────┬────┘  └─────────┘  └─────────┘  └─────────┘  │  │
+│  │       │                                                   │  │
+│  │       │ 读写数据                                           │  │
+│  │       ▼                                                   │  │
+│  │  ┌─────────┐                                            │  │
+│  │  │  etcd   │ ◀── 所有集群状态存储在这里                    │  │
+│  │  └─────────┘                                            │  │
+│  │                                                           │  │
+│  └───────────────────────────────────────────────────────┘  │
+│                          │                                   │
+│              ┌───────────┼───────────┐                       │
+│              ▼           ▼           ▼                       │
+│  ┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐│
+│  │    Node 1       │ │    Node 2       │ │    Node 3       ││
+│  │ ┌─────────────┐ │ │ ┌─────────────┐ │ │ ┌─────────────┐ ││
+│  │ │   kubelet   │ │ │ │   kubelet   │ │ │ │   kubelet   │ ││
+│  │ │ kube-proxy  │ │ │ │ kube-proxy  │ │ │ │ kube-proxy  │ ││
+│  │ │ containerd  │ │ │ │ containerd  │ │ │ │ containerd  │ ││
+│  │ └─────────────┘ │ │ └─────────────┘ │ │ └─────────────┘ ││
+│  └─────────────────┘ └─────────────────┘ └─────────────────┘│
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## etcd 在 K8s 中的角色
+
+### 唯一数据源
+
+Kubernetes 采用 **声明式 API**，所有集群状态都存储在 etcd 中：
+
+| 数据类型 | 存储路径 | 说明 |
+|---|---|---|
+| Pod | `/registry/pods/` | Pod 规格和状态 |
+| Service | `/registry/services/` | 服务定义 |
+| ConfigMap | `/registry/configmaps/` | 配置数据 |
+| Secret | `/registry/secrets/` | 敏感信息 |
+| Deployment | `/registry/deployments/` | 部署状态 |
+| Node | `/registry/minions/` | 节点信息 |
+
+### 数据示例
+
+```bash
+# 查看 etcd 中的数据
+etcdctl --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+        --cert=/etc/kubernetes/pki/etcd/server.crt \
+        --key=/etc/kubernetes/pki/etcd/server.key \
+        get /registry/pods/default --prefix
+
+# 输出示例
+/registry/pods/default/nginx-deployment-7fb96c846b-abcde
+{"kind":"Pod","apiVersion":"v1","metadata":
+  {"name":"nginx-deployment-7fb96c846b-abcde",
+   "namespace":"default",
+   "uid":"12345678-1234-1234-1234-123456789abc",
+   ...
+  },
+  "spec":{
+    "containers":[{
+      "name":"nginx",
+      "image":"nginx:latest"
+    }]
+  },
+  "status":{
+    "phase":"Running",
+    ...
+  }}
+```
+
+## API Server 与 etcd 的交互
+
+### 写入流程
+
+```
+kubectl apply -f deployment.yaml
+         │
+         ▼
+┌─────────────────┐
+│  API Server     │
+│                 │
+│ 1. 认证/授权    │
+│ 2. 验证资源      │
+│ 3. 转换资源版本  │
+│ 4. 写入 etcd    │
+└────────┬────────┘
+         │
+         │  gRPC / Protocol Buffers
+         ▼
+┌─────────────────┐
+│     etcd        │
+│                 │
+│ 1. Raft 复制    │
+│ 2. WAL 写入     │
+│ 3. BoltDB 持久化│
+└─────────────────┘
+```
+
+### API Server 源码解析
+
+```go
+// API Server 中的 etcd 存储层
+// k8s.io/apiserver/pkg/storage/etcd3/store.go
+
+type Store struct {
+    client        *clientv3.Client
+    codec         runtime.Codec
+    versioner     storage.Versioner
+    transformer   value.Transformer
+}
+
+// 创建资源
+func (s *Store) Create(ctx context.Context, key string, obj, out runtime.Object, ttl uint64) error {
+    // 1. 编码对象
+    data, err := s.codec.Encode(obj)
+    if err != nil {
+        return err
+    }
+
+    // 2. 添加元数据（创建时间、UID 等）
+    meta, err := s.objectMeta(obj)
+    if err != nil {
+        return err
+    }
+
+    // 3. 写入 etcd
+    txnResp, err := s.client.Txn(ctx).
+        If(s.createObjNotFoundErr(key)).
+        Then(clientv3.OpPut(key, data, options...))
+
+    return err
+}
+
+// 读取资源
+func (s *Store) Get(ctx context.Context, key string, objPtr runtime.Object) error {
+    // 1. 从 etcd 读取
+    getResp, err := s.client.Get(ctx, key)
+
+    // 2. 解码对象
+    return s.codec.Decode(getResp.Kvs[0].Value, objPtr)
+}
+```
+
+## Watch 机制在 K8s 中的应用
+
+### Informer 机制
+
+Kubernetes 使用 Informer 机制来同步 etcd 数据到各个组件：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Informer 机制                            │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│                    API Server                               │
+│                        │                                     │
+│                        │ gRPC Watch                          │
+│                        ▼                                     │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │                   ListWatch                            │  │
+│  │                                                         │  │
+│  │  List ───────────────────────────────────────────────▶│  │
+│  │  Watch ◀──────────────────────────────────────────────│  │
+│  │       (持续接收变化事件)                               │  │
+│  └───────────────────────────────────────────────────────┘  │
+│                        │                                     │
+│                        ▼                                     │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │                   Reflector                            │  │
+│  │                                                         │  │
+│  │  - 调用 ListWatch 获取初始数据                         │  │
+│  │  - 将数据放入 DeltaFIFO 队列                           │  │
+│  └───────────────────────────────────────────────────────┘  │
+│                        │                                     │
+│                        ▼                                     │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │                 DeltaFIFO Queue                        │  │
+│  │                                                         │  │
+│  │  [Pod-ADD] [Pod-UPDATE] [Pod-DELETE] ...              │  │
+│  └───────────────────────────────────────────────────────┘  │
+│                        │                                     │
+│                        ▼                                     │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │                   Indexer                             │  │
+│  │                                                         │  │
+│  │  本地缓存 + 索引查找                                   │  │
+│  └───────────────────────────────────────────────────────┘  │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 控制器如何使用 Informer
+
+```go
+// Kubernetes 控制器使用 Informer
+// 例如：Deployment Controller
+
+type DeploymentController struct {
+    // Informer
+    deploymentInformer cache.SharedIndexInformer
+    rsInformer        cache.SharedIndexInformer
+    podInformer       cache.SharedIndexInformer
+
+    // Workqueue
+    queue workqueue.RateLimitingInterface
+}
+
+func (dc *DeploymentController) Run(threadiness int, stopCh <-chan struct{}) {
+    // 启动 Informer
+    go dc.deploymentInformer.Run(stopCh)
+    go dc.rsInformer.Run(stopCh)
+    go dc.podInformer.Run(stopCh)
+
+    // 启动 Worker 处理变化
+    for i := 0; i < threadiness; i++ {
+        go wait.Until(dc.worker, time.Second, stopCh)
+    }
+}
+
+func (dc *DeploymentController) enqueueDeployment(obj interface{}) {
+    // 将变化放入队列
+    key, err := controller.KeyFunc(obj)
+    dc.queue.Add(key)
+}
+
+func (dc *DeploymentController) worker() {
+    // 处理队列中的任务
+    for {
+        key, shutdown := dc.queue.Get()
+        if shutdown {
+            return
+        }
+
+        defer dc.queue.Done(key)
+
+        // 调谐：确保实际状态匹配期望状态
+        err := dc.syncDeployment(key.(string))
+        if err != nil {
+            dc.queue.AddRateLimited(key)
+        }
+    }
+}
+```
+
+## 集群高可用
+
+### K8s 高可用 etcd 部署
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    K8s 高可用架构                            │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐                   │
+│  │ Control  │ │ Control  │ │ Control  │                   │
+│  │ Plane 1  │ │ Plane 2  │ │ Plane 3  │                   │
+│  │          │ │          │ │          │                   │
+│  │ kube-    │ │ kube-    │ │ kube-    │                   │
+│  │ apiserver│ │ apiserver│ │ apiserver│                   │
+│  └────┬─────┘ └────┬─────┘ └────┬─────┘                   │
+│       │            │            │                          │
+│       └────────────┼────────────┘                          │
+│                    │                                        │
+│                    ▼                                        │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │              etcd 集群 (stacked etcd)                │    │
+│  │                                                       │    │
+│  │   ┌─────────┐  ┌─────────┐  ┌─────────┐             │    │
+│  │   │  etcd 1 │◀─│  etcd 2 │─▶│  etcd 3 │             │    │
+│  │   │(CP-1)   │  │(CP-2)   │  │(CP-3)   │             │    │
+│  │   └─────────┘  └────┬────┘  └─────────┘             │    │
+│  │                    │                               │    │
+│  │            Raft 复制                                 │    │
+│  └─────────────────────────────────────────────────────┘    │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### etcd 备份与恢复
+
+```bash
+# 1. 备份
+etcdctl snapshot save /backup/etcd-snapshot.db \
+    --endpoints=https://127.0.0.1:2379 \
+    --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+    --cert=/etc/kubernetes/pki/etcd/server.crt \
+    --key=/etc/kubernetes/pki/etcd/server.key
+
+# 2. 检查备份
+etcdctl snapshot status /backup/etcd-snapshot.db
+
+# 3. 恢复（需要停止 kube-apiserver）
+etcdctl snapshot restore /backup/etcd-snapshot.db \
+    --data-dir=/var/lib/etcd-restore \
+    --name=etcd-1 \
+    --initial-cluster=etcd-1=https://192.168.1.1:2380,etcd-2=...
+
+# 4. 重启 etcd 和 kube-apiserver
+systemctl restart etcd
+systemctl restart kube-apiserver
+```
+
+## 性能调优
+
+### 常见问题
+
+| 问题 | 症状 | 解决方案 |
+|---|---|---|
+| etcd 延迟高 | API Server 超时 | 使用 SSD、增强硬件 |
+| 选举超时 | 集群频繁重新选主 | 增大 heartbeat-interval |
+| 存储空间不足 | etcd 启动失败 | 配置配额、压缩旧数据 |
+| Watch 阻塞 | 控制器不工作 | 增加 API Server 副本 |
+
+### 监控指标
+
+```yaml
+# Prometheus 抓取 etcd 指标
+- job_name: 'etcd'
+  static_configs:
+    - targets: ['localhost:2379']
+  metrics_path: '/metrics'
+  scheme: https
+  tls_config:
+    ca_file: /etc/kubernetes/pki/etcd/ca.crt
+    cert_file: /etc/kubernetes/pki/etcd/healthcheck-client.crt
+    key_file: /etc/kubernetes/pki/etcd/healthcheck-client.key
+```
+
+关键指标：
+
+| 指标 | 说明 | 告警阈值 |
+|---|---|---|
+| `etcd_server_leader_changes_total` | Leader 变更次数 | > 5/10min |
+| `etcd_mvcc_db_total_size_in_bytes` | 数据库大小 | > 8GB |
+| `etcd_disk_wal_fsync_duration_seconds` | WAL 写入延迟 | P99 > 0.5s |
+| `etcd_network_peer_round_trip_time_seconds` | 节点间延迟 | P99 > 0.1s |
+
+## 常见运维场景
+
+### 场景一：增加 etcd 节点
+
+```bash
+# 1. 添加新节点到集群
+etcdctl member add etcd-4 \
+    --peer-urls=https://192.168.1.4:2380
+
+# 2. 在新节点上启动 etcd
+etcd --name=etcd-4 \
+    --initial-cluster=etcd-1=... \
+    --initial-cluster-state=existing \
+    --peer-urls=https://192.168.1.4:2380
+```
+
+### 场景二：清理过期数据
+
+```bash
+# 1. 检查存储使用
+etcdctl endpoint status
+
+# 2. 执行 defragmentation（释放未使用的空间）
+etcdctl defrag --endpoints=https://127.0.0.1:2379
+
+# 3. 清理历史版本（需要 API Server v1.11+）
+kubectl exec -it -n kube-system etcd-<pod-name> -- \
+    etcdctl compact 100000
+```
+
+### 场景三：灾难恢复
+
+```bash
+# 1. 在所有节点上停止 etcd
+systemctl stop etcd
+
+# 2. 在一个节点上恢复快照
+etcdctl snapshot restore /backup/etcd-snapshot.db \
+    --data-dir=/var/lib/etcd \
+    --name=etcd-1
+
+# 3. 重启所有 etcd 节点
+systemctl restart etcd
+
+# 4. 验证集群健康
+etcdctl --endpoints=https://127.0.0.1:2379 endpoint health
+```
+
+## 总结
+
+etcd 在 Kubernetes 中扮演着**数据中枢**的角色：
+
+1. **唯一数据源**：所有集群状态都存储在 etcd 中
+2. **API Server 依赖**：K8s 组件通过 API Server 与 etcd 交互
+3. **高可用设计**：通过 Raft 协议保证数据强一致
+4. **Informer 机制**：K8s 控制器通过 Watch 同步集群状态
+
+理解 etcd 的工作原理，对于运维 Kubernetes 集群至关重要。
+
+下一节，我们将进入 **Nacos 专题**，介绍阿里巴巴开源的服务发现与配置管理平台。

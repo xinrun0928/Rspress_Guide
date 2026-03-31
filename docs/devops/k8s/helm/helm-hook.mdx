@@ -1,0 +1,406 @@
+# Helm Hook：管理应用生命周期事件
+
+部署一个应用，不仅仅是创建 K8s 资源。有些操作需要在资源创建之前执行，有些需要在升级之前备份数据，有些需要在删除之后清理资源。这就是 Helm Hook 存在的意义——**它在应用生命周期的关键节点插入自定义逻辑**。
+
+## Hook 是什么
+
+Helm Hook 是在 Release 生命周期的特定时刻自动执行的 Job 或 Pod。通过 Hook，你可以：
+
+- 在安装前准备数据库
+- 在升级前备份数据
+- 在删除后清理资源
+- 在安装/升级后运行测试
+
+## Hook 类型
+
+| Hook | 时机 | 常用场景 |
+|---|---|---|
+| `pre-install` | 模板渲染后，资源创建前 | 创建 PVC、初始化数据库 |
+| `post-install` | 资源创建完成后 | 初始化配置、发送通知 |
+| `pre-upgrade` | 模板渲染后，资源更新前 | 备份数据、迁移 |
+| `post-upgrade` | 资源更新完成后 | 验证升级、清理缓存 |
+| `pre-delete` | 删除资源前 | 备份数据、导出日志 |
+| `post-delete` | 资源删除后 | 清理存储、发送通知 |
+| `pre-rollback` | 回滚前 | 准备回滚环境 |
+| `post-rollback` | 回滚后 | 验证回滚 |
+| `test` | Helm test 命令执行时 | 健康检查、集成测试 |
+
+## Hook 资源
+
+### 基本 Hook 配置
+
+```yaml title="templates/backup-job.yaml"
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "myapp.fullname" . }}-backup
+  labels:
+    {{- include "myapp.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-upgrade
+    "helm.sh/hook-weight": "-1"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+      - name: backup
+        image: postgres-client:15
+        command:
+        - /bin/bash
+        - -c
+        - |
+          pg_dump -h $DB_HOST -U $DB_USER $DB_NAME > /backups/pre-upgrade-$(date +%Y%m%d).sql
+        env:
+        - name: DB_HOST
+          value: {{ include "myapp.fullname" . }}-postgresql
+        - name: DB_USER
+          value: {{ .Values.postgresql.auth.username }}
+        - name: DB_NAME
+          value: {{ .Values.postgresql.auth.database }}
+```
+
+### 关键注解
+
+| 注解 | 说明 |
+|---|---|
+| `helm.sh/hook` | Hook 类型，多个用逗号分隔 |
+| `helm.sh/hook-weight` | 执行权重（数字越小越先执行） |
+| `helm.sh/hook-delete-policy` | 删除策略 |
+
+### Hook 权重
+
+Hook 按权重排序执行：
+
+```yaml
+# 权重为负数，先执行
+annotations:
+  "helm.sh/hook": pre-upgrade
+  "helm.sh/hook-weight": "-2"
+
+---
+# 权重为正数，后执行
+annotations:
+  "helm.sh/hook": pre-upgrade
+  "helm.sh/hook-weight": "1"
+```
+
+:::tip 执行顺序
+1. 按权重升序排序
+2. 权重相同时按名称字母序
+3. 同类型的 Hook 可并行执行
+:::
+
+## Hook 删除策略
+
+### `before-hook-creation`
+
+在创建新 Hook 前删除旧资源：
+
+```yaml
+annotations:
+  "helm.sh/hook": pre-upgrade
+  "helm.sh/hook-delete-policy": before-hook-creation
+```
+
+### `hook-succeeded`
+
+Hook 成功后删除：
+
+```yaml
+annotations:
+  "helm.sh/hook": post-install
+  "helm.sh/hook-delete-policy": hook-succeeded
+```
+
+### `hook-failed`
+
+Hook 失败后删除：
+
+```yaml
+annotations:
+  "helm.sh/hook": post-install
+  "helm.sh/hook-delete-policy": hook-failed
+```
+
+### 组合策略
+
+```yaml
+annotations:
+  "helm.sh/hook": post-upgrade
+  "helm.sh/hook-delete-policy": hook-succeeded,hook-failed
+```
+
+## 常用 Hook 场景
+
+### 场景一：数据库迁移
+
+```yaml title="templates/db-migration-job.yaml"
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "myapp.fullname" . }}-migration
+  labels:
+    {{- include "myapp.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-upgrade,pre-rollback
+    "helm.sh/hook-weight": "-1"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: {{ include "myapp.fullname" . }}-migration
+      containers:
+      - name: migration
+        image: {{ .Values.migration.image }}:{{ .Values.migration.tag }}
+        command: ["python", "manage.py", "migrate", "--noinput"]
+        env:
+        {{- range $key, $value := .Values.migration.env }}
+        - name: {{ $key }}
+          value: {{ $value | quote }}
+        {{- end }}
+```
+
+### 场景二：配置初始化
+
+```yaml title="templates/config-init-job.yaml"
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "myapp.fullname" . }}-config-init
+  labels:
+    {{- include "myapp.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "1"
+    "helm.sh/hook-delete-policy": hook-succeeded
+spec:
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+      - name: init
+        image: curlimages/curl:latest
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          # 初始化配置
+          curl -X POST http://{{ include "myapp.fullname" . }}/admin/init \
+            -H "Authorization: Bearer {{ .Values.init.token }}" \
+            -d '{"environment": "{{ .Release.Namespace }}"}'
+```
+
+### 场景三：健康检查测试
+
+```yaml title="templates/test-job.yaml"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "myapp.fullname" . }}-test
+  labels:
+    {{- include "myapp.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-delete-policy": hook-succeeded,hook-failed
+spec:
+  restartPolicy: Never
+  containers:
+  - name: test
+    image: curlimages/curl:latest
+    command: ["/bin/sh", "-c"]
+    args:
+    - |
+      echo "Testing application endpoints..."
+      # 测试健康检查
+      CODE=$(curl -s -o /dev/null -w "%{http_code}" http://{{ include "myapp.fullname" . }}:{{ .Values.service.port }}/health)
+      if [ $CODE -ne 200 ]; then
+        echo "Health check failed with code: $CODE"
+        exit 1
+      fi
+      echo "Health check passed!"
+      # 测试 API
+      curl -s http://{{ include "myapp.fullname" . }}:{{ .Values.service.port }}/api/v1/status
+```
+
+### 场景四：清理资源
+
+```yaml title="templates/cleanup-job.yaml"
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "myapp.fullname" . }}-cleanup
+  labels:
+    {{- include "myapp.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-delete
+    "helm.sh/hook-weight": "1"
+    "helm.sh/hook-delete-policy": hook-succeeded
+spec:
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+      - name: cleanup
+        image: bitnami/kubectl:latest
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          # 清理 PVC（可选，谨慎使用）
+          {{- if .Values.cleanup.pvc }}
+          kubectl delete pvc -l "app.kubernetes.io/instance={{ .Release.Name }}" -n {{ .Release.Namespace }}
+          {{- end }}
+          # 清理残留资源
+          kubectl delete configmap {{ include "myapp.fullname" . }}-temp -n {{ .Release.Namespace }} --ignore-not-found=true
+```
+
+## Hook RBAC 配置
+
+Hook 需要对应的 RBAC 权限：
+
+```yaml title="templates/migration-rbac.yaml"
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "myapp.fullname" . }}-migration
+  labels:
+    {{- include "myapp.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-upgrade,pre-rollback
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "myapp.fullname" . }}-migration
+  labels:
+    {{- include "myapp.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-upgrade,pre-rollback
+rules:
+- apiGroups: ["batch"]
+  resources: ["jobs"]
+  verbs: ["get", "list", "create", "delete"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "myapp.fullname" . }}-migration
+  labels:
+    {{- include "myapp.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-upgrade,pre-rollback
+roleRef:
+  kind: Role
+  name: {{ include "myapp.fullname" . }}-migration
+subjects:
+- kind: ServiceAccount
+  name: {{ include "myapp.fullname" . }}-migration
+  namespace: {{ .Release.Namespace }}
+```
+
+## Hook 调试
+
+### 查看 Hook 状态
+
+```bash
+# 查看 Hook 资源
+kubectl get jobs -n production
+kubectl get pods -n production | grep migration
+
+# 查看 Hook 日志
+kubectl logs job/myapp-migration -n production
+
+# 查看 Helm 注释
+kubectl get job myapp-migration -n production -o yaml | grep -A5 annotations
+```
+
+### 手动执行 Hook
+
+```bash
+# Helm 不会手动触发 Hook，但可以手动运行 Job
+kubectl apply -f templates/migration-job.yaml
+
+# 完成后手动清理
+kubectl delete job myapp-migration -n production
+```
+
+### 常见问题
+
+```bash
+# 问题：Hook Job 一直处于 Pending
+# 可能原因：缺少 ServiceAccount 权限
+# 解决：检查 RBAC 配置
+
+# 问题：Hook 重复执行
+# 可能原因：缺少 hook-delete-policy
+# 解决：添加 "helm.sh/hook-delete-policy": before-hook-creation
+
+# 问题：Hook 执行失败导致 Release 失败
+# 可能原因：Hook 没有设置正确的退出码
+# 解决：确保 Job restartPolicy 和退出码正确
+```
+
+## Hook 与 Ci/Cd
+
+### 在 CI 中跳过 Hook
+
+```bash
+# 安装时跳过 Hook
+helm install my-app ./chart --no-hooks
+
+# 升级时跳过 Hook
+helm upgrade my-app ./chart --no-hooks
+```
+
+### 选择性执行 Hook
+
+```bash
+# 只执行特定类型的 Hook
+helm upgrade my-app ./chart --hooks
+
+# 查看 Hook 计划但不执行
+helm upgrade my-app ./chart --dry-run --debug
+```
+
+## 面试追问方向
+
+1. **Hook 和普通 Job 的区别？**
+   - Hook 由 Helm 生命周期触发
+   - Hook 支持权重和删除策略
+   - Hook 失败可以阻止 Release 操作
+
+2. **Hook 失败会影响 Release 吗？**
+   - 默认不会
+   - 可以通过 `--timeout` 控制等待时间
+   - Job 失败不会阻止后续操作（除非配置不当）
+
+3. **如何确保 Hook 幂等性？**
+   - 使用 `before-hook-creation` 删除旧资源
+   - 在 Hook 内部检查资源是否存在
+   - 使用 ConfigMap/Secret 记录状态
+
+4. **Hook 的执行顺序？**
+   - 按权重升序执行
+   - 负权重先执行，正权重后执行
+   - 同权重可并行
+
+## 总结
+
+Helm Hook 是管理应用生命周期的关键机制：
+
+- **多类型**：支持安装、升级、删除、回滚等多种 Hook
+- **权重控制**：通过 hook-weight 控制执行顺序
+- **删除策略**：管理 Hook 资源生命周期
+- **RBAC**：确保 Hook 有足够权限执行
+
+合理使用 Hook，可以让应用的部署、升级、清理过程更加自动化和可靠。
+
+**面试追问方向**：
+- Hook 和 Init Container 的区别？
+- 如何测试 Hook？
+- Hook 的常见陷阱？

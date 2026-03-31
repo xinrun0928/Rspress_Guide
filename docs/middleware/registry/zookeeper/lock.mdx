@@ -1,0 +1,353 @@
+import { Badge } from '@rspress/core/theme';
+
+# ZooKeeper 分布式锁实现
+
+分布式锁是 ZooKeeper 最经典的应用场景之一。与本地锁（synchronized、ReentrantLock）不同，分布式锁需要在多个 JVM 进程之间生效，解决的是跨进程的互斥问题。
+
+一个分布式锁需要满足以下特性：
+- **互斥性**：同一时刻只能有一个客户端持有锁
+- **可重入性**：同一个客户端可以多次获取锁而不被阻塞
+- **不会死锁**：即使锁持有者崩溃，锁也能被正确释放
+- **不会误删**：只能删除自己持有的锁，不能删除他人的锁
+- **公平性**（可选）：按请求顺序获取锁，先到先得
+
+ZooKeeper 基于**临时顺序节点**实现分布式锁，可以满足上述所有需求。
+
+## 分布式锁的核心原理
+
+### 为什么选择临时顺序节点
+
+在 ZooKeeper 中实现分布式锁，通常采用**临时顺序节点**而非普通节点，原因是：
+
+| 节点类型 | 优势 | 劣势 |
+|---|---|---|
+| 持久节点 | 永久存在，不会因会话断开而删除 | 锁持有者崩溃后需要人工介入清理 |
+| 临时节点 | 会话断开后自动删除，无需人工清理 | 无法保证锁的公平性 |
+| 临时顺序节点 | 自动删除 + 按序号排序，天然支持公平锁 | 实现复杂度稍高 |
+
+临时顺序节点的**序号递增特性**是实现公平锁的关键。每个节点创建时，ZooKeeper 会自动为其追加一个单调递增的数字后缀，例如 `/lock/lock-000000001`、`/lock/lock-000000002`。
+
+## 加锁流程：最小节点即锁
+
+分布式锁的核心思想是：**判断自己是否是最小的节点**。
+
+如果当前创建的节点在所有节点中序号最小，就意味着当前客户端是最早请求锁的，因此它获得了锁。其他客户端只需监听比自己序号小的那个节点，等待它被删除。
+
+```bash
+# 假设有三个客户端同时创建临时顺序节点
+create -s -e /locks/order-service-lock ""
+
+# ZooKeeper 自动分配递增序号
+# /locks/order-service-lock/lock-000000001  (客户端 A)
+# /locks/order-service-lock/lock-000000002  (客户端 B)
+# /locks/order-service-lock/lock-000000003  (客户端 C)
+```
+
+**判断逻辑**：
+- 客户端 A：`/lock/lock-000000001` 是最小节点，获取锁成功
+- 客户端 B：`/lock/lock-000000002` 不是最小节点，等待监听 `/lock/lock-000000001`
+- 客户端 C：`/lock/lock-000000003` 不是最小节点，等待监听 `/lock/lock-000000002`
+
+### 完整的加锁流程
+
+```java
+public class ZooKeeperDistributedLock {
+    private final ZooKeeper zk;
+    private final String lockPath;
+    private final String currentNodePath;
+
+    public boolean acquire() throws Exception {
+        // Step 1: 创建临时顺序节点
+        // 节点名以 "lock-" 为前缀，便于识别和排序
+        currentNodePath = zk.create(
+            lockPath + "/lock-",      // 节点名前缀
+            null,                      // 数据
+            ZooDefs.Ids.OPEN_ACL_UNSAFE,
+            CreateMode.EPHEMERAL_SEQUENTIAL  // 临时顺序节点
+        );
+
+        // Step 2: 获取锁路径下所有子节点
+        List<String> children = zk.getChildren(lockPath, false);
+
+        // 按节点名排序（节点名包含递增序号）
+        Collections.sort(children);
+
+        String myNodeName = new PathUtils().getNodeName(currentNodePath);
+        int myIndex = children.indexOf(myNodeName);
+
+        // Step 3: 判断是否为最小节点
+        if (myIndex == 0) {
+            // 我是最小节点，获取锁成功
+            return true;
+        } else {
+            // 我不是最小节点，监听前一个节点
+            String previousNode = children.get(myIndex - 1);
+            String previousNodePath = lockPath + "/" + previousNode;
+
+            // 注册 Watch，等待前一个节点删除
+            zk.exists(previousNodePath, event -> {
+                // 前一个节点被删除了，重新尝试获取锁
+                if (event.getType() == EventType.NodeDeleted) {
+                    // 收到通知后，重新执行获取锁的逻辑
+                    acquire();
+                }
+            });
+
+            return false; // 获取锁失败
+        }
+    }
+
+    public void release() throws Exception {
+        // 删除当前节点，释放锁
+        zk.delete(currentNodePath, -1);
+    }
+}
+```
+
+### 解锁流程
+
+解锁的核心是**删除自己创建的节点**。由于节点是临时的，客户端正常断开连接时节点也会自动删除，但主动删除更为优雅：
+
+```java
+public void release() throws Exception {
+    try {
+        // 删除当前节点
+        zk.delete(currentNodePath, -1);
+    } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+    } catch (KeeperException e) {
+        // 节点可能已经不存在了（会话超时），忽略
+        if (e.code() != KeeperException.NoNodeException) {
+            throw e;
+        }
+    }
+}
+```
+
+## 羊群效应与优化
+
+### 什么是羊群效应
+
+上述实现存在一个性能问题：**所有等待锁的客户端都监听同一个节点**。
+
+当锁被释放时，所有等待的客户端都会收到通知，但只有一个客户端能成功获取锁（序号最小的那个）。这意味着：
+
+- 锁释放时，所有客户端都被唤醒
+- 大多数客户端发现自己仍然不是最小节点，再次进入等待
+- **大量无效的竞争和唤醒，造成性能浪费**
+
+这就是分布式锁中的**羊群效应（Herd Effect）**——大量客户端同时竞争同一把锁，但实际上只有少数客户端需要参与竞争。
+
+### 优化方案：监听前一个节点
+
+解决羊群效应的方法是**只监听前一个节点，而不是最小节点**：
+
+```
+场景：
+- 锁被客户端 A 持有（序号 001）
+- 客户端 B、C、D 依次排队等待
+
+优化前：
+- B、C、D 都监听 A
+- A 释放锁时，B、C、D 同时被唤醒
+- B 发现自己是 002，最小，获得锁
+- C、D 被唤醒后再次等待（浪费）
+
+优化后：
+- B 监听 A（序号 001）
+- C 监听 B（序号 002）
+- D 监听 C（序号 003）
+- A 释放锁时，只有 B 被唤醒
+- B 发现自己是最小，获得锁
+- C 被 B 的存在唤醒，发现不是最小，等待
+- D 继续监听 C
+```
+
+这种优化将锁竞争的粒度从「所有等待者竞争最小节点」降低到「相邻两个节点之间」，大幅减少了无效唤醒。
+
+### 优化后的代码
+
+```java
+public class OptimizedDistributedLock {
+    private final ZooKeeper zk;
+    private final String lockPath;
+    private String currentNodePath;
+
+    public boolean acquire() throws Exception {
+        currentNodePath = zk.create(
+            lockPath + "/lock-",
+            null,
+            ZooDefs.Ids.OPEN_ACL_UNSAFE,
+            CreateMode.EPHEMERAL_SEQUENTIAL
+        );
+
+        return waitForLock();
+    }
+
+    private boolean waitForLock() throws Exception {
+        List<String> children = zk.getChildren(lockPath, false);
+        Collections.sort(children);
+
+        String myNodeName = new PathUtils().getNodeName(currentNodePath);
+        int myIndex = children.indexOf(myNodeName);
+
+        if (myIndex == 0) {
+            return true; // 获取锁成功
+        }
+
+        // 只监听前一个节点，而非最小节点
+        String previousNode = children.get(myIndex - 1);
+        String previousNodePath = lockPath + "/" + previousNode;
+
+        // 使用 CountDownLatch 阻塞当前线程
+        CountDownLatch latch = new CountDownLatch(1);
+
+        // 注册 Watch
+        Stat stat = zk.exists(previousNodePath, event -> {
+            if (event.getType() == EventType.NodeDeleted) {
+                latch.countDown(); // 收到通知，解除阻塞
+            }
+        });
+
+        // 再次确认前一个节点是否还存在（可能在注册 Watch 的间隙被删除）
+        if (stat == null) {
+            latch.countDown(); // 节点已不存在，直接尝试获取锁
+        }
+
+        latch.await(); // 阻塞等待
+
+        // 被唤醒后，递归重新检查
+        return waitForLock();
+    }
+}
+```
+
+### 羊群效应优化效果
+
+| 场景 | 未优化 | 优化后 |
+|---|---|---|
+| 100 个客户端等待同一把锁 | 每次释放唤醒 99 个 | 每次释放只唤醒 1 个 |
+| 释放锁到再次获取锁的延迟 | 所有等待者竞争，延迟高 | 无效唤醒减少，延迟稳定 |
+| CPU 消耗 | 高（大量线程被唤醒又阻塞） | 低（按需唤醒） |
+
+## 可重入锁实现
+
+ZooKeeper 的临时节点本身不存储客户端信息，无法直接支持可重入。但可以通过改造实现可重入：基于 `clientId + threadId + 重入次数` 在节点数据中记录重入状态。
+
+```java
+public class ReentrantZooKeeperLock {
+    private final ZooKeeper zk;
+    private final String lockPath;
+    private final String clientId;
+    private ThreadLocal<Integer> localCount = ThreadLocal.withInitial(() -> 0);
+
+    public boolean acquire() throws Exception {
+        int count = localCount.get();
+
+        if (count > 0) {
+            // 可重入：当前线程已持有锁
+            localCount.set(count + 1);
+            return true;
+        }
+
+        // 创建临时顺序节点
+        currentNodePath = zk.create(
+            lockPath + "/lock-",
+            clientId.getBytes(),
+            ZooDefs.Ids.OPEN_ACL_UNSAFE,
+            CreateMode.EPHEMERAL_SEQUENTIAL
+        );
+
+        if (tryAcquire()) {
+            localCount.set(1);
+            return true;
+        }
+
+        return false;
+    }
+
+    public void release() throws Exception {
+        int count = localCount.get();
+        if (count > 1) {
+            localCount.set(count - 1);
+            return;
+        }
+
+        localCount.set(0);
+        zk.delete(currentNodePath, -1);
+    }
+}
+```
+
+:::warning
+可重入锁的实现依赖节点数据存储客户端标识，这会引入额外的复杂度。在生产环境中，建议直接使用 Curator 框架提供的 `InterProcessMutex`，它是经过充分测试的可重入分布式锁实现。
+:::
+
+## Curator 框架：开箱即用的分布式锁
+
+Apache Curator 是 ZooKeeper 官方推荐的客户端封装库，提供了丰富的recipes（分布式锁、Master选举、Barrier等）。使用 Curator 实现分布式锁非常简单：
+
+```xml
+<dependency>
+    <groupId>org.apache.curator</groupId>
+    <artifactId>curator-recipes</artifactId>
+    <version>5.5.0</version>
+</dependency>
+```
+
+```java
+import org.apache.curator.framework.CuratorFramework;
+import org.apache.curator.framework.CuratorFrameworkFactory;
+import org.apache.curator.framework.recipes.locks.InterProcessMutex;
+import org.apache.curator.retry.ExponentialBackoffRetry;
+
+public class CuratorDistributedLock {
+    private final InterProcessMutex lock;
+
+    public CuratorDistributedLock(String zkAddress, String lockPath) {
+        CuratorFramework client = CuratorFrameworkFactory.newClient(
+            zkAddress,
+            new ExponentialBackoffRetry(1000, 3)
+        );
+        client.start();
+
+        lock = new InterProcessMutex(client, lockPath);
+    }
+
+    public void executeWithLock(Runnable task) throws Exception {
+        // 获取锁（可重入）
+        lock.acquire();
+
+        try {
+            task.run();
+        } finally {
+            // 释放锁
+            lock.release();
+        }
+    }
+}
+```
+
+Curator 还提供了多种分布式锁变体：
+- `InterProcessReadWriteLock`：读写锁
+- `InterProcessSemaphoreMutex`：不可重入的互斥锁
+- `InterProcessMultiLock`：锁组合
+
+## 总结
+
+ZooKeeper 分布式锁的实现原理：
+
+| 步骤 | 说明 |
+|---|---|
+| **创建节点** | 创建临时顺序节点 |
+| **获取序号** | 获取锁路径下所有子节点并排序 |
+| **判断位置** | 判断自己是否为序号最小的节点 |
+| **监听前一个** | 若不是最小节点，只监听前一个节点 |
+| **收到通知** | 前一个节点删除后，重新判断 |
+| **删除节点** | 释放锁时删除自己创建的节点 |
+
+关键优化是**避免羊群效应**：只监听前一个节点而非最小节点，将 O(n) 的竞争降低到 O(1)。
+
+<Badge text="临时顺序节点" type="tip" /> 分布式锁的核心数据结构
+<Badge text="羊群效应" type="warning" /> 需要优化，只监听前一个节点
+<Badge text="Curator" type="tip" /> 生产环境推荐使用 Curator 框架

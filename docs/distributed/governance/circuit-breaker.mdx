@@ -1,0 +1,474 @@
+# 服务熔断
+
+你可能遇到过这种情况：支付服务突然卡住了，所有调用它的订单服务开始堆积请求，线程资源被耗尽。紧接着，物流服务也超时了，因为它也在调用支付服务。最后，整个系统被拖垮，从支付模块的故障演变成了全局性的宕机。
+
+这就是微服务架构中最危险的场景——**级联故障（Cascading Failure）**。问题的根源不在于某个服务的故障，而在于**调用方对故障的服务毫无防备**。
+
+服务熔断（Circuit Breaker）就是为了解决这个问题而生的：它的核心思想是「当某个服务持续失败时，停止向它发送请求，给它喘息的机会」。
+
+## 为什么需要熔断器
+
+假设没有熔断器，请看这个场景：
+
+```yaml
+# 无熔断器的调用链
+请求 A → 订单服务 → 支付服务（故障中，超时 30 秒）
+        ↓
+        请求堆积，线程耗尽
+        ↓
+订单服务不可用 → 影响 → 用户服务（因为用户服务调用订单服务）
+                          ↓
+                     影响 → 积分服务
+                          ↓
+                     影响 → 通知服务
+                          ↓
+                     ... 整个系统崩溃
+```
+
+这就是经典的「级联故障」：一个服务的故障，像多米诺骨牌一样传导到整个系统。
+
+熔断器的作用是：**在故障扩散之前，主动切断传导链**。
+
+## 熔断器的状态机
+
+熔断器的核心是一个状态机，有三种状态：
+
+```yaml
+┌─────────────────────────────────────────────────────────────┐
+│                    熔断器状态机                               │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│                        ┌──────────┐                         │
+│                        │  CLOSED  │                         │
+│                        │ (关闭)   │                         │
+│                        │          │                         │
+│                        │ 正常请求  │                         │
+│                        └────┬─────┘                         │
+│                             │                               │
+│              失败次数超过阈值 │                               │
+│                             ▼                               │
+│                        ┌──────────┐                         │
+│                        │   OPEN   │                         │
+│                        │ (打开)   │                         │
+│                        │          │                         │
+│                        │ 快速失败  │                         │
+│                        │ 返回降级  │                         │
+│                        └────┬─────┘                         │
+│                             │                               │
+│              半开间隔时间到  │                               │
+│                             ▼                               │
+│                        ┌──────────┐                         │
+│                        │ HALF_OPEN │                         │
+│                        │ (半开)   │                         │
+│                        │          │                         │
+│                        │ 尝试恢复  │                         │
+│                        └────┬─────┘                         │
+│                             │                               │
+│              成功 ─────────┴───────── 失败                   │
+│              │                                  │           │
+│              ▼                                  ▼           │
+│         ┌──────────┐                      ┌──────────┐       │
+│         │  CLOSED  │                      │   OPEN   │       │
+│         └──────────┘                      └──────────┘       │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 1. 关闭状态（Closed）
+
+熔断器关闭，正常放行所有请求。失败请求会被记录，当失败次数超过阈值时，熔断器打开。
+
+### 2. 打开状态（Open）
+
+熔断器打开，所有请求直接失败（或返回降级响应），不会发送到目标服务。经过一段时间后，熔断器进入半开状态。
+
+### 3. 半开状态（Half-Open）
+
+熔断器半开，允许少量请求通过以探测服务是否恢复。如果这些请求成功，熔断器关闭；如果失败，熔断器重新打开。
+
+## 熔断器的实现
+
+### 核心指标
+
+熔断器需要追踪几个关键指标：
+
+```java
+// 熔断器核心指标
+public class CircuitBreakerConfig {
+
+    // 滑动窗口：统计最近 N 次请求
+    private final int slidingWindowSize = 100;
+
+    // 失败率阈值：超过此比例则触发熔断
+    private final double failureRateThreshold = 50;  // 50%
+
+    // 慢调用阈值：超过此时间算慢调用
+    private final long slowCallDurationThreshold = 5;  // 5 秒
+
+    // 慢调用比例阈值
+    private final double slowCallRateThreshold = 80;  // 80%
+
+    // 熔断持续时间
+    private final long waitDurationInOpenState = 60;  // 60 秒
+
+    // 半开状态允许的请求数
+    private final int permittedNumberOfCallsInHalfOpenState = 10;
+
+    // 最小请求数：滑动窗口内至少要有这么多请求才计算失败率
+    private final int minimumNumberOfCalls = 20;
+}
+```
+
+### 熔断器核心实现
+
+```java
+// 熔断器核心实现
+public class CircuitBreaker {
+
+    private final AtomicReference<State> state = new AtomicReference<>(State.CLOSED);
+    private final CircuitBreakerConfig config;
+    private final SlidingWindow<CallResult> slidingWindow;
+    private volatile long openedAt;
+
+    public CircuitBreaker(CircuitBreakerConfig config) {
+        this.config = config;
+        this.slidingWindow = new SlidingWindow<>(config.getSlidingWindowSize());
+    }
+
+    public boolean allowRequest() {
+        switch (state.get()) {
+            case CLOSED:
+                return allowInClosedState();
+            case OPEN:
+                return allowInOpenState();
+            case HALF_OPEN:
+                return allowInHalfOpenState();
+            default:
+                return true;
+        }
+    }
+
+    public void recordResult(CallResult result) {
+        slidingWindow.record(result);
+
+        switch (state.get()) {
+            case CLOSED:
+                checkStateForClosing();
+                break;
+            case HALF_OPEN:
+                checkStateForHalfOpen();
+                break;
+        }
+    }
+
+    private void checkStateForClosing() {
+        CallResultStats stats = slidingWindow.getStats();
+
+        // 请求数不足，不做判断
+        if (stats.getTotalCalls() < config.getMinimumNumberOfCalls()) {
+            return;
+        }
+
+        // 检查失败率
+        if (stats.getFailureRate() >= config.getFailureRateThreshold()) {
+            transitionToOpen();
+            return;
+        }
+
+        // 检查慢调用比例
+        if (stats.getSlowCallRate() >= config.getSlowCallRateThreshold()) {
+            transitionToOpen();
+        }
+    }
+
+    private void checkStateForHalfOpen() {
+        CallResultStats stats = slidingWindow.getStats();
+        long successCount = stats.getSuccessCalls();
+        long failureCount = stats.getFailureCalls();
+        long halfOpenCalls = config.getPermittedNumberOfCallsInHalfOpenState();
+
+        if (successCount >= halfOpenCalls / 2) {
+            transitionToClosed();
+        } else if (failureCount >= halfOpenCalls / 2) {
+            transitionToOpen();
+        }
+    }
+
+    private void transitionToOpen() {
+        state.set(State.OPEN);
+        openedAt = System.currentTimeMillis();
+        log.warn("熔断器打开");
+    }
+
+    private void transitionToClosed() {
+        state.set(State.CLOSED);
+        slidingWindow.clear();
+        log.info("熔断器关闭");
+    }
+
+    private void transitionToHalfOpen() {
+        state.set(State.HALF_OPEN);
+        slidingWindow.clear();
+        log.info("熔断器进入半开状态");
+    }
+
+    private boolean allowInOpenState() {
+        long elapsed = System.currentTimeMillis() - openedAt;
+        if (elapsed >= config.getWaitDurationInOpenState()) {
+            transitionToHalfOpen();
+            return true;
+        }
+        return false;
+    }
+}
+
+// 熔断器状态
+public enum State {
+    CLOSED,    // 关闭
+    OPEN,      // 打开
+    HALF_OPEN  // 半开
+}
+```
+
+## 熔断器在框架中的应用
+
+### Resilience4j 熔断器
+
+Resilience4j 是 Java 中最流行的轻量级熔断器库：
+
+```java
+// Resilience4j 配置
+@Configuration
+public class Resilience4jConfig {
+
+    @Bean
+    public CircuitBreakerRegistry circuitBreakerRegistry() {
+        CircuitBreakerConfig config = CircuitBreakerConfig.custom()
+                // 滑动窗口配置
+                .slidingWindowType(SlidingWindowType.COUNT_BASED)
+                .slidingWindowSize(100)
+                .minimumNumberOfCalls(20)
+                // 熔断阈值
+                .failureRateThreshold(50)
+                .slowCallRateThreshold(80)
+                .slowCallDurationThreshold(Duration.ofSeconds(5))
+                // 熔断持续时间
+                .waitDurationInOpenState(Duration.ofSeconds(60))
+                .permittedNumberOfCallsInHalfOpenState(10)
+                .build();
+
+        return CircuitBreakerRegistry.of(config);
+    }
+}
+
+// 使用熔断器
+@Service
+public class PaymentService {
+
+    @Autowired
+    private CircuitBreakerRegistry registry;
+
+    public String processPayment(Long orderId) {
+        CircuitBreaker circuitBreaker = registry.circuitBreaker("payment-service");
+
+        return circuitBreaker.executeSupplier(() -> {
+            return callPaymentApi(orderId);
+        });
+    }
+
+    // 使用注解方式
+    @CircuitBreaker(name = "payment-service", fallbackMethod = "paymentFallback")
+    public String processPaymentWithAnnotation(Long orderId) {
+        return callPaymentApi(orderId);
+    }
+
+    // 降级方法
+    public String paymentFallback(Long orderId, Throwable t) {
+        log.error("支付服务调用失败，降级处理: {}", t.getMessage());
+        return "系统繁忙，请稍后重试";
+    }
+}
+```
+
+### Spring Cloud Hystrix（已停产，仅供学习）
+
+```java
+// Hystrix 熔断器配置
+@Service
+public class OrderServiceHystrix {
+
+    @HystrixCommand(
+        groupKey = "orderGroup",
+        commandKey = "getOrder",
+        fallbackMethod = "getOrderFallback",
+        commandProperties = {
+            // 熔断器配置
+            @HystrixProperty(name = "circuitBreaker.enabled", value = "true"),
+            @HystrixProperty(name = "circuitBreaker.requestVolumeThreshold", value = "20"),
+            @HystrixProperty(name = "circuitBreaker.sleepWindowInMilliseconds", value = "10000"),
+            @HystrixProperty(name = "circuitBreaker.errorThresholdPercentage", value = "50"),
+            // 超时配置
+            @HystrixProperty(name = "execution.isolation.thread.timeoutInMilliseconds", value = "3000")
+        }
+    )
+    public Order getOrder(Long orderId) {
+        return orderApi.getOrder(orderId);
+    }
+
+    public Order getOrderFallback(Long orderId, Throwable t) {
+        log.error("获取订单失败，降级返回: orderId={}, error={}", orderId, t.getMessage());
+        return new Order(orderId, "降级订单", "PENDING");
+    }
+}
+```
+
+### Sentinel 熔断器
+
+Sentinel 是阿里巴巴开源的流量控制和熔断组件：
+
+```java
+// Sentinel 熔断器配置
+@Configuration
+public class SentinelConfig {
+
+    @PostConstruct
+    public void initRules() {
+        List<DegradeRule> rules = new ArrayList<>();
+
+        DegradeRule rule = new DegradeRule("payment-service")
+                .setGrade(CircuitBreakerStrategy.SLOW_REQUEST_RATIO.getType())
+                .setCount(0.5)
+                .setSlowRatioThreshold(3000)
+                .setMinRequestAmount(5)
+                .setStatIntervalMs(10000)
+                .setTimeWindow(10);
+
+        rules.add(rule);
+        DegradeRuleManager.loadRules(rules);
+    }
+}
+
+// 使用 Sentinel
+@RestController
+public class PaymentController {
+
+    @GetMapping("/pay/{orderId}")
+    @SentinelResource(value = "payment",
+                     blockHandler = "paymentBlockHandler",
+                     fallback = "paymentFallback")
+    public String payment(@PathVariable Long orderId) {
+        return paymentService.callPayment(orderId);
+    }
+
+    public String paymentBlockHandler(Long orderId, BlockException ex) {
+        return "系统繁忙，请稍后重试";
+    }
+
+    public String paymentFallback(Long orderId, Throwable t) {
+        return "服务暂时不可用";
+    }
+}
+```
+
+## 熔断器的高级配置
+
+### 慢调用熔断
+
+除了失败率熔断，还可以配置慢调用熔断：
+
+```yaml
+# 慢调用熔断配置
+circuit-breaker:
+  slidingWindow:
+    size: 100
+    type: COUNT
+  slowCall:
+    durationThreshold: 5s
+    rateThreshold: 80%
+  failure:
+    rateThreshold: 50%
+  open:
+    duration: 60s
+    halfOpen:
+      maxCalls: 10
+```
+
+### 异常处理与重试策略
+
+```java
+// 哪些异常应该触发熔断，哪些应该忽略
+@Configuration
+public class CircuitBreakerExceptionConfig {
+
+    @Bean
+    public CircuitBreakerRegistry customRegistry() {
+        CircuitBreakerConfig config = CircuitBreakerConfig.custom()
+                .recordExceptions(IOException.class, TimeoutException.class, CallException.class)
+                .ignoreExceptions(BusinessException.class, ValidationException.class)
+                .build();
+
+        return CircuitBreakerRegistry.of(config);
+    }
+}
+```
+
+## 熔断器与降级的关系
+
+熔断器和降级是配合使用的两把保护伞：
+
+```yaml
+┌─────────────────────────────────────────────────────────────┐
+│              熔断器 + 降级 的配合                             │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│   请求进入                                                    │
+│      │                                                      │
+│      ▼                                                      │
+│   ┌────────────────┐                                       │
+│   │  熔断器检查     │                                       │
+│   └───────┬────────┘                                       │
+│           │                                                │
+│     ┌─────┴─────┐                                           │
+│     │  熔断器   │                                           │
+│     │   打开？  │                                           │
+│     └─────┬─────┘                                           │
+│           │                                                 │
+│     Yes ──┴ ── No                                          │
+│      │              │                                       │
+│      ▼              ▼                                       │
+│   返回降级      执行实际请求                                   │
+│   响应          │                                            │
+│                 │                                            │
+│           ┌─────┴─────┐                                     │
+│           │  返回成功 │                                     │
+│           └───────────┘                                      │
+│                                                             │
+│                 │                                            │
+│           ┌─────┴─────┐                                     │
+│           │  请求失败 │                                     │
+│           └─────┬─────┘                                     │
+│                 │                                            │
+│           ┌─────┴─────┐                                     │
+│           │  记录失败  │ ──── 失败率超阈值 ──→ 熔断器打开     │
+│           │  返回降级  │                                     │
+│           └───────────┘                                      │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## 总结
+
+熔断器是防止级联故障的关键机制，它通过「快速失败」来保护系统不被拖垮。
+
+**核心要点回顾：**
+
+- 熔断器有三种状态：关闭、打开、半开
+- 熔断条件可以是失败率、慢调用比例或混合策略
+- 熔断器需要配合降级使用，快速失败 + 降级响应 = 完整的保护
+- 熔断器不是银弹，配置不当可能导致系统过度保守或过度敏感
+
+---
+
+**下一章预告：**
+
+熔断器打开了，请求不再发送到故障服务。但请求失败后应该返回什么？降级服务怎么设计？降级和熔断有什么区别？下一章，我们将深入探讨服务降级的设计与实现。

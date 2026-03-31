@@ -1,0 +1,393 @@
+# ES 性能优化
+
+Elasticsearch 的性能调优是一个系统工程，涉及写入优化、查询优化、硬件选择、集群架构等多个方面。
+
+很多人遇到性能问题时，第一反应是「加内存」或「加节点」。但很多时候，问题出在配置或查询写法上，不需要花冤枉钱。这篇文章系统讲解 ES 性能优化的方方面面。
+
+## 性能瓶颈定位
+
+### 监控关键指标
+
+```bash
+# 集群健康状态
+GET /_cluster/health?pretty
+
+# 节点状态
+GET /_cat/nodes?v&h=name,heap.current,heap.max,disk.used,disk.total,query.total,fetch.total
+
+# 索引状态
+GET /_cat/indices?v&h=index,health,status,docs.count,store.size,segment.count
+```
+
+关键指标：
+- `heap.current/heap.max`：JVM 堆内存使用率，应该保持在 70% 以下
+- `disk.used/disk.total`：磁盘使用率，不应超过 80%
+- `segment.count`：每个分片的 Segment 数量，过多会影响查询性能
+
+### 使用 Profile API 分析慢查询
+
+```json
+GET /my-index/_search
+{
+  "profile": true,
+  "query": {
+    "match": { "content": "elasticsearch" }
+  }
+}
+```
+
+Profile 返回每个查询阶段的耗时：
+
+```json
+{
+  "profile": {
+    "shards": [
+      {
+        "searches": [
+          {
+            "query": [
+              {
+                "type": "BooleanQuery",
+                "time": "1.245678ms",
+                "breakdown": {
+                  "initialize": 123,
+                  "build_scorer": 456,
+                  "score": 234
+                }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+## 写入性能优化
+
+### 批量写入
+
+单条写入的开销很大，应该使用批量 API：
+
+```java
+BulkRequest bulkRequest = new BulkRequest();
+for (Product product : products) {
+    bulkRequest.add(new IndexRequest("products")
+        .id(product.getId().toString())
+        .source(product.toMap()));
+}
+BulkResponse response = client.bulk(bulkRequest);
+```
+
+批量大小的经验值：
+- 文档数：500-5000
+- 数据量：5MB-50MB
+- 超过这个范围，收益递减
+
+### 调整刷新间隔
+
+写入量大时，可以临时增大刷新间隔：
+
+```json
+PUT /my-index/_settings
+{
+  "index": {
+    "refresh_interval": "5s"
+  }
+}
+```
+
+完成后记得改回来：
+
+```json
+PUT /my-index/_settings
+{
+  "index": {
+    "refresh_interval": "1s"
+  }
+}
+```
+
+### 副本设置
+
+写入高峰期可以临时减少副本数：
+
+```json
+PUT /my-index/_settings
+{
+  "number_of_replicas": 0
+}
+```
+
+等高峰过去再恢复：
+
+```json
+PUT /my-index/_settings
+{
+  "number_of_replicas": 1
+}
+```
+
+### 禁止 refresh 和 flush
+
+大量导入时，可以完全禁止自动刷新：
+
+```json
+PUT /my-index/_settings
+{
+  "index": {
+    "refresh_interval": "-1",
+    "translog.durability": "async"
+  }
+}
+```
+
+导入完成后恢复设置并手动刷新：
+
+```json
+PUT /my-index/_settings
+{
+  "index": {
+    "refresh_interval": "1s",
+    "translog.durability": "request"
+  }
+}
+
+POST /my-index/_refresh
+```
+
+### 合理使用 routing
+
+如果经常按某个字段过滤，可以将该字段作为 routing key，减少搜索的分片数：
+
+```json
+PUT /my-index
+{
+  "settings": {
+    "number_of_shards": 10
+  },
+  "mappings": {
+    "_routing": {
+      "required": true,
+      "paths": ["category"]
+    }
+  }
+}
+```
+
+```json
+GET /my-index/_search?routing=electronics
+{
+  "query": {
+    "term": { "category": "electronics" }
+  }
+}
+```
+
+现在查询 `category=electronics` 的文档只需要搜索 1 个分片，而不是 10 个。
+
+## 查询性能优化
+
+### 避免 wildcards 开头的查询
+
+```json
+// 慢：通配符在开头
+{
+  "query": {
+    "wildcard": { "name": "*phone*" }
+  }
+}
+
+// 快：通配符在结尾
+{
+  "query": {
+    "wildcard": { "name": "phone*" }
+  }
+}
+```
+
+通配符在开头会导致全表扫描。
+
+### 使用 filter 而不是 query
+
+过滤上下文不计算相关性得分，性能更好：
+
+```json
+// 慢
+{
+  "query": {
+    "bool": {
+      "must": [
+        { "term": { "status": "active" } }
+      ]
+    }
+  }
+}
+
+// 快
+{
+  "query": {
+    "bool": {
+      "filter": [
+        { "term": { "status": "active" } }
+      ]
+    }
+  }
+}
+```
+
+### 限制返回字段
+
+只返回必要的字段：
+
+```json
+{
+  "_source": ["title", "author", "published_at"]
+}
+```
+
+避免返回大字段或不需要的嵌套对象。
+
+### 减少分片数
+
+查询多个分片会产生协调开销。如果数据量不大，使用较少的分片：
+
+```json
+{
+  "settings": {
+    "number_of_shards": 1
+  }
+}
+```
+
+### 使用 search_type
+
+```json
+GET /my-index/_search?search_type=query_then_fetch
+```
+
+`query_then_fetch` 是默认类型。对于大多数场景，这是最优选择。
+
+## Segment 优化
+
+### Segment Merging
+
+Segment 合并可以减少分片内的 Segment 数量，提升查询性能：
+
+```json
+POST /my-index/_forcemerge
+{
+  "max_num_segments": 1,
+  "only_expunge_deletes": false
+}
+```
+
+这会将分片合并成单个 Segment。注意：
+- 合并过程会消耗大量 I/O
+- 在业务低峰期执行
+- 只对只读索引执行（不再写入的数据）
+
+### 查看 Segment 信息
+
+```bash
+GET /my-index/_segments?v
+```
+
+显示每个分片的 Segment 数量、占用大小、是否已删除。
+
+## 内存与缓存
+
+### JVM 堆内存
+
+Elasticsearch 建议：
+- 堆内存不要超过 32GB（超过后指针压缩失效）
+- 留一半内存给系统缓存（Lucene 使用）
+- 堆内存使用率保持在 70% 以下
+
+```yaml
+# jvm.options
+-Xms16g
+-Xmx16g
+```
+
+### Query Cache
+
+Query Cache 缓存查询结果，但只对 `filter` 上下文的查询有效：
+
+```json
+GET /my-index/_search?request_cache=true
+{
+  "query": {
+    "bool": {
+      "filter": [...]
+    }
+  }
+}
+```
+
+### Field Data Cache
+
+用于排序和聚合的字段，会被加载到内存：
+
+```json
+PUT /my-index/_settings
+{
+  "indices.fielddata.cache.size": "30%"
+}
+```
+
+对于 cardinality 很高的字段，谨慎使用 `fielddata: true`，可能会导致内存溢出。
+
+## 硬件与架构
+
+### 存储优化
+
+- **SSD 是必须的**：Elasticsearch 对 I/O 要求很高，SSD 显著提升性能
+- **使用本地存储**：网络存储（如 NFS）的延迟会影响性能
+- **独立存储数据**：数据和日志最好在不同磁盘
+
+### 节点角色分离
+
+大型集群建议分离节点角色：
+
+```
+节点类型      数量    职责
+Master        3       集群管理
+Hot          5       接收写入，存储热数据
+Warm         10      存储温数据
+Coordinating 3       接收查询
+```
+
+### 冷热数据架构
+
+```json
+PUT /my-index/_settings
+{
+  "index.routing.allocation.include._tier_preference": "data_hot"
+}
+```
+
+新数据写入热节点，冷却后迁移到温/冷节点。
+
+## 常见问题与解决方案
+
+| 问题 | 原因 | 解决方案 |
+|---|---|---|
+| 查询慢 | 深度分页 | 改用 search_after |
+| 写入慢 | 刷新太频繁 | 增大 refresh_interval |
+| OOM | 大聚合查询 | 限制聚合大小，使用 filter |
+| 分片不均衡 | 写入热点 | 使用 routing 打散 |
+| 副本同步慢 | 网络带宽不足 | 限速 or 增加带宽 |
+
+## 总结
+
+性能优化是一个持续的过程：
+
+1. **先定位瓶颈**：用 Profile API 和监控指标找到问题
+2. **从简单做起**：优化查询写法比加硬件更有效
+3. **写入与查询分离**：高峰期可以牺牲实时性换性能
+4. **定期维护**：Segment 合并、索引优化
+5. **监控预警**：设置性能基线，及时发现异常
+
+记住：**最好的优化是避免做不需要做的事**。不必要的全量扫描、不需要的高精度、不合理的聚合，都是性能杀手。

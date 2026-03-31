@@ -1,0 +1,438 @@
+# Kafka 生产者（Producer）原理
+
+## 场景切入：发送一条消息，Kafka 做了什么？
+
+你调用了 `producer.send(record)`，然后收到了发送成功的响应。但背后发生了什么？消息去了哪个 Partition？如何保证消息不丢失？如何实现幂等发送？
+
+理解生产者的原理，是深入掌握 Kafka 的关键。
+
+## 一、生产者核心架构
+
+### 1.1 整体架构
+
+```
+生产者架构：
+
+┌─────────────────────────────────────────────────────────────┐
+│                        KafkaProducer                          │
+│                                                             │
+│  ┌─────────────┐   ┌─────────────┐   ┌─────────────┐     │
+│  │ Serializer  │   │  Partitioner │   │  RecordAccumulator │     │
+│  │ (序列化器)  │──>│ (分区器)    │──>│ (消息累加器) │     │
+│  └─────────────┘   └─────────────┘   └──────┬──────┘     │
+│                                               │              │
+│  ┌────────────────────────────────────────────┼────────┐   │
+│  │              Sender 线程                       │        │   │
+│  │                                               ▼        │   │
+│  │  ┌─────────────┐   ┌─────────────┐   ┌─────────────┐   │   │
+│  │  │   Client    │   │    Kafka   │   │   Acks      │   │   │
+│  │  │   Request   │──>│   Broker   │<──│   处理      │   │   │
+│  │  └─────────────┘   └─────────────┘   └─────────────┘   │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 1.2 核心组件
+
+| 组件 | 说明 |
+|---|---|
+| **Serializer** | 消息序列化器，将 Key 和 Value 序列化为字节数组 |
+| **Partitioner** | 分区器，决定消息发送到哪个分区 |
+| **RecordAccumulator** | 消息累加器，批量缓存待发送的消息 |
+| **Sender** | 发送线程，负责从累加器取消息并发送 |
+| **ClientRequest** | 客户端请求封装 |
+
+---
+
+## 二、分区选择
+
+### 2.1 分区器接口
+
+```java
+// Partitioner 接口
+public interface Partitioner extends Configurable {
+
+    // 计算分区
+    int partition(String topic, Object key, byte[] keyBytes,
+                  Object value, byte[] valueBytes, Cluster cluster);
+
+    // 关闭时调用
+    void close();
+}
+```
+
+### 2.2 默认分区策略
+
+```java
+// DefaultPartitioner 实现
+public class DefaultPartitioner implements Partitioner {
+
+    public int partition(String topic, Object key, byte[] keyBytes,
+                        Object value, byte[] valueBytes, Cluster cluster) {
+        // 如果没有 Key，使用轮询
+        if (keyBytes == null) {
+            return Utils.toPositive(Utils.murmur2(valueBytes)) % partitions.size();
+        }
+
+        // 如果有 Key，使用 Key 的哈希
+        return Utils.toPositive(Utils.murmur2(keyBytes)) % partitions.size();
+    }
+}
+```
+
+### 2.3 自定义分区器
+
+```java
+// 自定义分区器
+public class OrderPartitioner implements Partitioner {
+
+    @Override
+    public int partition(String topic, Object key, byte[] keyBytes,
+                        Object value, byte[] valueBytes, Cluster cluster) {
+        // 解析 Key
+        String keyStr = key.toString();
+
+        // 按订单 ID 哈希，保证同一订单的消息到同一分区
+        if (keyStr.startsWith("order-")) {
+            String orderId = keyStr.substring(6);
+            return Math.abs(orderId.hashCode()) % cluster.partitionCountForTopic(topic);
+        }
+
+        // 默认哈希
+        return Utils.toPositive(Utils.murmur2(keyBytes)) % cluster.partitionCountForTopic(topic);
+    }
+}
+```
+
+---
+
+## 三、ACK 确认机制
+
+### 3.1 ACKS 配置详解
+
+| acks | 说明 | 可靠性 | 性能 | 适用场景 |
+|---|---|---|---|---|
+| `0` | 不等待任何确认 | 最低 | 最高 | 允许少量丢失，如日志收集 |
+| `1` | 只等 Leader 确认 | 中 | 高 | 普通场景 |
+| `-1` / `all` | 等待 ISR 所有副本确认 | 最高 | 低 | 高可靠场景 |
+
+### 3.2 acks=0
+
+```
+acks=0 流程：
+
+Producer ──发送──> Leader ──> 返回成功（不等确认）
+
+特点：
+- 消息发出后不等待任何响应
+- Leader 宕机可能丢失消息
+- 性能最高
+- 适用于可以容忍少量丢失的场景
+```
+
+```java
+props.put("acks", "0");
+```
+
+### 3.3 acks=1
+
+```
+acks=1 流程：
+
+Producer ──发送──> Leader
+                      │
+                      ├─> 写入本地日志
+                      │
+                      └─> 返回成功（不等 Follower）
+                            │
+                            ▼
+                        Producer 收到确认
+
+特点：
+- 等待 Leader 写入本地日志
+- Follower 未同步时 Leader 宕机，消息丢失
+- 性能中等
+```
+
+```java
+props.put("acks", "1");
+```
+
+### 3.4 acks=all
+
+```
+acks=all 流程：
+
+Producer ──发送──> Leader ──> 同步到 Follower ──> 返回成功
+                                        │
+                            ┌────────────┴────────────┐
+                            ▼                         ▼
+                      ISR 中所有副本             收到所有 ACK
+                      同步完成
+
+特点：
+- 等待 ISR 中所有副本同步完成
+- 最多容忍 ISR-1 个副本丢失
+- 性能最低，可靠性最高
+```
+
+```java
+props.put("acks", "all");
+```
+
+### 3.5 min.insync.replicas
+
+```properties
+# min.insync.replicas 配置
+min.insync.replicas=2
+
+# 配合 acks=all 使用
+# 表示：ISR 中至少 2 个副本确认，才算发送成功
+```
+
+---
+
+## 四、重试机制
+
+### 4.1 重试配置
+
+```java
+// 重试配置
+props.put("retries", 3);                      // 重试次数
+props.put("retry.backoff.ms", 100);           // 重试间隔
+props.put("request.timeout.ms", 30000);       // 请求超时
+```
+
+### 4.2 重试条件
+
+```java
+// 可重试异常
+// - NetworkException：网络异常
+// - LeaderNotAvailableException：Leader 不可用
+// - UnknownTopicOrPartitionException：Topic 或分区不存在
+// - NotEnoughReplicasException：副本数不足
+
+// 不可重试异常
+// - RecordTooLargeException：消息太大
+// - SerializationException：序列化失败
+```
+
+### 4.3 重试与幂等性
+
+```java
+// 开启幂等后，消息有唯一的 PID（Producer ID）
+// 序列号（Sequence Number）保证消息不重复
+props.put("enable.idempotence", true);
+```
+
+---
+
+## 五、幂等性
+
+### 5.1 幂等性原理
+
+幂等性保证消息不会重复发送：
+
+```
+幂等性原理：
+
+每个 Producer 有一个唯一的 PID（Producer ID）
+每个消息有一个递增的 Sequence Number
+
+Broker 记录每个 PID 的最大 Sequence Number
+收到消息时，检查 Sequence Number 是否已处理
+
+情况 1：Sequence Number = max + 1
+  → 正常写入，max = Sequence Number
+
+情况 2：Sequence Number < max + 1
+  → 重复消息，丢弃
+
+情况 3：Sequence Number > max + 1
+  → 消息丢失，拒绝
+```
+
+### 5.2 幂等性配置
+
+```java
+// 开启幂等性
+props.put("enable.idempotence", true);  // 默认 true
+
+// 开启幂等性后，以下配置会自动设置
+// acks = all
+// retries = Integer.MAX_VALUE
+// max.in.flight.requests.per.connection = 5
+```
+
+### 5.3 幂等性限制
+
+```java
+// 幂等性的限制
+// 1. 只能保证单个 Producer 实例的幂等
+// 2. Producer 重启后，PID 变化，幂等性失效
+// 3. 如果需要跨 Producer 实例的幂等，需要业务自己实现
+```
+
+---
+
+## 六、事务
+
+### 6.1 事务的应用场景
+
+事务用于需要原子性保证的场景：
+
+| 场景 | 说明 |
+|---|---|
+| **多 Topic 原子性** | 同时发送多个 Topic 的消息，要么全部成功，要么全部失败 |
+| **Exactly-Once** | 消费-处理-生产链路的 Exactly-Once 语义 |
+| **批量处理** | 批量发送消息的原子性 |
+
+### 6.2 事务配置
+
+```java
+// 事务配置
+props.put("enable.idempotence", true);
+props.put("transactional.id", "order-producer-001");  // 事务 ID
+```
+
+### 6.3 事务代码示例
+
+```java
+// 事务发送示例
+KafkaProducer<String, String> producer = new KafkaProducer<>(props);
+
+// 初始化事务
+producer.initTransactions();
+
+try {
+    // 开始事务
+    producer.beginTransaction();
+
+    // 发送消息
+    producer.send(new ProducerRecord<>("order-topic", "order-1", "order data"));
+    producer.send(new ProducerRecord<>("payment-topic", "order-1", "payment data"));
+    producer.send(new ProducerRecord<>("inventory-topic", "order-1", "inventory data"));
+
+    // 提交事务
+    producer.commitTransaction();
+} catch (Exception e) {
+    // 回滚事务
+    producer.abortTransaction();
+    throw e;
+}
+```
+
+### 6.4 Exactly-Once 语义
+
+Kafka 支持 Exactly-Once 语义：
+
+```java
+// 配置 Exactly-Once
+props.put("enable.idempotence", true);
+props.put("processing.guarantee", "exactly_once_v2");  // 消费端 Exactly-Once
+```
+
+```
+Exactly-Once vs At-Least-Once vs At-Most-Once：
+
+At-Most-Once：
+  消息最多消费一次
+  → 可能丢失消息
+
+At-Least-Once：
+  消息至少消费一次
+  → 可能重复消费
+
+Exactly-Once：
+  消息恰好消费一次
+  → 需要业务配合实现幂等
+```
+
+---
+
+## 七、完整配置示例
+
+### 7.1 高可靠生产者配置
+
+```java
+// 高可靠配置
+Properties props = new Properties();
+props.put("bootstrap.servers", "localhost:9092");
+
+// 基本配置
+props.put("key.serializer", "org.apache.kafka.common.serialization.StringSerializer");
+props.put("value.serializer", "org.apache.kafka.common.serialization.StringSerializer");
+
+// 可靠性配置
+props.put("acks", "all");                      // 等待所有副本确认
+props.put("retries", 3);                       // 重试 3 次
+props.put("retry.backoff.ms", 1000);          // 重试间隔 1 秒
+
+// 幂等性
+props.put("enable.idempotence", true);         // 开启幂等
+
+// 批次配置
+props.put("batch.size", 16384);               // 批次大小 16KB
+props.put("linger.ms", 10);                   // 等待时间 10ms
+
+// 超时配置
+props.put("request.timeout.ms", 30000);        // 请求超时 30 秒
+props.put("delivery.timeout.ms", 120000);     // 交付超时 2 分钟
+
+KafkaProducer<String, String> producer = new KafkaProducer<>(props);
+```
+
+### 7.2 高吞吐配置
+
+```java
+// 高吞吐配置
+Properties props = new Properties();
+props.put("bootstrap.servers", "localhost:9092");
+
+// 基本配置
+props.put("key.serializer", "org.apache.kafka.common.serialization.StringSerializer");
+props.put("value.serializer", "org.apache.kafka.common.serialization.StringSerializer");
+
+// 高吞吐配置
+props.put("acks", "1");                        // 只等 Leader 确认
+props.put("batch.size", 65536);               // 批次大小 64KB
+props.put("linger.ms", 20);                  // 等待时间 20ms
+props.put("buffer.memory", 67108864);         // 缓冲区 64MB
+props.put("compression.type", "lz4");         // 压缩算法
+props.put("max.in.flight.requests.per.connection", 5);
+```
+
+---
+
+## 八、面试追问预判
+
+### 追问一：acks=all 一定不会丢消息吗？
+
+不是。极端情况下，如 ISR 全部宕机，即使 `acks=all` 也可能丢失消息。但这种概率极低。
+
+### 追问二：幂等性和事务有什么区别？
+
+| 概念 | 说明 |
+|---|---|
+| **幂等性** | 防止消息重复发送 |
+| **事务** | 保证多个操作的原子性 |
+
+幂等性是事务的基础，事务包含幂等性。
+
+### 追问三：如何选择 acks 配置？
+
+| 场景 | acks 推荐 |
+|---|---|
+| 日志收集 | `0` |
+| 普通消息 | `1` |
+| 金融交易 | `all` |
+
+### 追问四：batch.size 和 linger.ms 有什么区别？
+
+| 参数 | 说明 |
+|---|---|
+| `batch.size` | 批次大小阈值，达到后立即发送 |
+| `linger.ms` | 等待时间阈值，达到后即使批次未满也发送 |
+
+两者配合使用，既保证批次大小，又保证延迟。

@@ -1,0 +1,377 @@
+# Etcd 备份与恢复：守护集群核心数据
+
+凌晨四点，你接到告警：生产 K8s 集群的 Etcd 数据损坏。应用还在运行，但集群状态已经无法修改——无法创建新资源、无法更新配置、无法扩缩容。
+
+你该怎么办？
+
+这不是危言耸听。Etcd 存储了整个 K8s 集群的状态，一旦数据损坏或丢失，集群将陷入不可用状态。**没有备份的 Etcd，就是一颗随时可能爆炸的炸弹**。
+
+## Etcd 数据结构
+
+### 数据存储位置
+
+```bash
+# 默认数据目录
+--data-dir=/var/lib/etcd
+
+# 查看数据目录结构
+ls -la /var/lib/etcd/
+```
+
+```
+/var/lib/etcd/
+├── member/
+│   ├── snap/           # 快照目录
+│   │   └── db
+│   ├── wal/            # Write-Ahead Log
+│   └── etcd
+```
+
+### 数据内容
+
+Etcd 存储的 K8s 数据包括：
+
+| 数据类型 | 说明 |
+|---|---|
+| Pods | 所有 Pod 配置和状态 |
+| Services | Service、Endpoints |
+| ConfigMaps | 非敏感配置 |
+| Secrets | 加密或未加密的密钥 |
+| Deployments | 部署配置 |
+| PV/PVC | 持久化存储 |
+| RBAC | 角色和绑定 |
+
+:::tip 关键认知
+Etcd 存储的是期望状态（Spec），不是实际状态。Pod 崩溃后的重新调度记录在 Etcd 中，但 Pod 的实际进程状态在 Kubelet 内存里。
+:::
+
+## 快照备份
+
+### 使用 etcdctl 备份
+
+```bash
+# 设置环境变量
+export ETCDCTL_API=3
+export ETCDCTL_CACERT=/etc/kubernetes/pki/etcd/ca.crt
+export ETCDCTL_CERT=/etc/kubernetes/pki/etcd/server.crt
+export ETCDCTL_KEY=/etc/kubernetes/pki/etcd/server.key
+
+# 查看端点
+ENDPOINTS=$(kubectl get pods -n kube-system -l component=etcd -o jsonpath='{.items[*].status.podIP}')":2379"
+echo $ENDPOINTS
+
+# 创建快照
+etcdctl --endpoints=$ENDPOINTS \
+  snapshot save /backup/etcd-snapshot-$(date +%Y%m%d-%H%M%S).db
+```
+
+### 自动化备份脚本
+
+```bash title="/usr/local/bin/etcd-backup.sh"
+#!/bin/bash
+set -euo pipefail
+
+# 配置
+ENDPOINTS="https://127.0.0.1:2379"
+BACKUP_DIR="/backup/etcd"
+RETENTION_DAYS=7
+CACERT="/etc/kubernetes/pki/etcd/ca.crt"
+CERT="/etc/kubernetes/pki/etcd/server.crt"
+KEY="/etc/kubernetes/pki/etcd/server.key"
+
+# 创建备份目录
+mkdir -p ${BACKUP_DIR}
+
+# 快照名称
+SNAPSHOT_NAME="etcd-snapshot-$(date +%Y%m%d-%H%M%S).db"
+
+# 执行备份
+etcdctl --endpoints=${ENDPOINTS} \
+  --cacert=${CACERT} \
+  --cert=${CERT} \
+  --key=${KEY} \
+  snapshot save ${BACKUP_DIR}/${SNAPSHOT_NAME}
+
+# 验证备份
+etcdctl --endpoints=${ENDPOINTS} \
+  --cacert=${CACERT} \
+  --cert=${CERT} \
+  --key=${KEY} \
+  snapshot status ${BACKUP_DIR}/${SNAPSHOT_NAME}
+
+# 清理过期备份
+find ${BACKUP_DIR} -name "etcd-snapshot-*.db" -mtime +${RETENTION_DAYS} -delete
+
+echo "Backup completed: ${SNAPSHOT_NAME}"
+```
+
+### Cron 定时任务
+
+```bash
+# 编辑 crontab
+crontab -e
+
+# 每天凌晨 3 点执行备份
+0 3 * * * /usr/local/bin/etcd-backup.sh >> /var/log/etcd-backup.log 2>&1
+
+# 每小时执行一次（生产环境推荐）
+0 */1 * * * /usr/local/bin/etcd-backup.sh >> /var/log/etcd-backup.log 2>&1
+```
+
+## S3 云存储备份
+
+### 备份到对象存储
+
+```bash title="s3-etcd-backup.sh"
+#!/bin/bash
+set -euo pipefail
+
+# S3 配置
+S3_BUCKET="my-etcd-backups"
+S3_PREFIX="production"
+AWS_REGION="us-east-1"
+
+# 创建快照
+SNAPSHOT_NAME="/tmp/etcd-snapshot-$(date +%Y%m%d-%H%M%S).db"
+
+etcdctl --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  snapshot save ${SNAPSHOT_NAME}
+
+# 上传到 S3
+aws s3 cp ${SNAPSHOT_NAME} s3://${S3_BUCKET}/${S3_PREFIX}/$(basename ${SNAPSHOT_NAME})
+
+# 清理本地文件
+rm -f ${SNAPSHOT_NAME}
+
+echo "Backup uploaded to S3"
+```
+
+### Velero 集成备份
+
+Velero 是 K8s 官方的灾难恢复工具，可以备份整个集群状态到对象存储：
+
+```bash
+# 安装 Velero CLI
+brew install velero
+
+# 安装 Velero Server（带 Restic 插件）
+velero install \
+  --provider aws \
+  --plugins velero/velero-plugin-for-aws:v1.7.0 \
+  --bucket my-velero-backups \
+  --secret-file /path/to/credentials \
+  --backup-location-config region=us-east-1 \
+  --snapshot-location-config region=us-east-1
+
+# 创建备份
+velero backup create daily-backup --ttl 720h
+
+# 定时备份
+velero schedule create daily-backup --schedule="0 3 * * *"
+```
+
+Velero 备份 Etcd 数据：
+
+```bash
+# 查看备份
+velero backup get
+
+# 查看备份详情
+velero backup describe daily-backup
+
+# 恢复到新集群
+velero restore create --from-backup daily-backup
+```
+
+## 数据恢复
+
+### 从本地快照恢复
+
+```bash
+# 1. 停止 Etcd 服务
+systemctl stop etcd
+
+# 2. 备份当前数据
+mv /var/lib/etcd /var/lib/etcd-old
+
+# 3. 执行恢复
+etcdctl snapshot restore /backup/etcd-snapshot-20240115-030000.db \
+  --name=etcd-1 \
+  --initial-cluster=etcd-1=https://192.168.1.1:2380,etcd-2=https://192.168.1.2:2380,etcd-3=https://192.168.1.3:2380 \
+  --initial-cluster-token=etcd-cluster \
+  --initial-advertise-peer-urls=https://192.168.1.1:2380 \
+  --data-dir=/var/lib/etcd
+
+# 4. 修复权限
+chown -R etcd:etcd /var/lib/etcd
+
+# 5. 启动 Etcd
+systemctl start etcd
+```
+
+### 多节点恢复
+
+```bash
+# 在所有节点执行恢复
+# 注意：每个节点需要不同的 --name 和 --initial-advertise-peer-urls
+
+# etcd-1
+etcdctl snapshot restore snapshot.db \
+  --name=etcd-1 \
+  --initial-cluster=etcd-1=https://192.168.1.1:2380,etcd-2=https://192.168.1.2:2380,etcd-3=https://192.168.1.3:2380 \
+  --initial-cluster-token=etcd-cluster \
+  --initial-advertise-peer-urls=https://192.168.1.1:2380 \
+  --data-dir=/var/lib/etcd
+
+# etcd-2
+etcdctl snapshot restore snapshot.db \
+  --name=etcd-2 \
+  --initial-cluster=etcd-1=https://192.168.1.1:2380,etcd-2=https://192.168.1.2:2380,etcd-3=https://192.168.1.3:2380 \
+  --initial-cluster-token=etcd-cluster \
+  --initial-advertise-peer-urls=https://192.168.1.2:2380 \
+  --data-dir=/var/lib/etcd
+
+# etcd-3
+etcdctl snapshot restore snapshot.db \
+  --name=etcd-3 \
+  --initial-cluster=etcd-1=https://192.168.1.1:2380,etcd-2=https://192.168.1.2:2380,etcd-3=https://192.168.1.3:2380 \
+  --initial-cluster-token=etcd-cluster \
+  --initial-advertise-peer-urls=https://192.168.1.3:2380 \
+  --data-dir=/var/lib/etcd
+```
+
+## 备份验证
+
+### 验证快照完整性
+
+```bash
+# 查看快照状态
+etcdctl --endpoints=$ENDPOINTS \
+  snapshot status /backup/etcd-snapshot.db
+
+# 输出示例
++----------+----------+------------+------------+
+|   HASH   | REVISION | TOTAL KEYS |     SIZE   |
++----------+----------+------------+------------+
+| abc123   |  123456  |    15000   |   25.4 MB  |
++----------+----------+------------+------------+
+```
+
+### 恢复验证
+
+```bash
+# 恢复到临时目录验证
+mkdir -p /tmp/etcd-verify
+etcdctl snapshot restore /backup/etcd-snapshot.db \
+  --data-dir=/tmp/etcd-verify
+
+# 启动临时 Etcd 验证
+etcd --data-dir=/tmp/etcd-verify &
+sleep 3
+
+# 验证数据
+etcdctl --endpoints=localhost:2379 get --prefix "" --limit 10
+```
+
+### 定期演练
+
+```bash title="恢复演练脚本"
+#!/bin/bash
+set -euo pipefail
+
+# 从 S3 下载最新备份
+aws s3 cp s3://my-etcd-backups/production/$(aws s3 ls s3://my-etcd-backups/production/ | tail -1 | awk '{print $4}') /tmp/etcd-restore.db
+
+# 恢复到测试环境
+etcdctl snapshot restore /tmp/etcd-restore.db \
+  --name=etcd-test \
+  --initial-cluster=etcd-test=http://localhost:2380 \
+  --data-dir=/tmp/etcd-test
+
+# 启动测试 Etcd
+etcd --data-dir=/tmp/etcd-test --listen-client-urls=http://0.0.0.0:2379 &
+
+# 验证数据
+etcdctl --endpoints=localhost:2379 get --prefix "" --limit 5
+
+# 清理
+pkill etcd
+rm -rf /tmp/etcd-*
+
+echo "Restore verification completed"
+```
+
+## Etcd 维护
+
+### 压缩历史版本
+
+Etcd 会保留数据的历史版本，用于 MVCC。定期压缩可以回收空间：
+
+```bash
+# 查看当前版本
+etcdctl endpoint status
+
+# 执行压缩（保留最近 10000 个历史版本）
+etcdctl compact 123456
+
+# 压缩输出
+# Compacted revision 123456
+```
+
+### 碎片整理
+
+压缩后需要整理碎片回收空间：
+
+```bash
+# 查看磁盘使用
+df -h /var/lib/etcd
+
+# 执行碎片整理
+etcdctl defrag --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key
+
+# 再次查看磁盘使用
+df -h /var/lib/etcd
+```
+
+:::warning 维护时间窗口
+碎片整理期间会短暂影响性能，建议在业务低峰期执行。
+:::
+
+## 面试追问方向
+
+1. **Etcd 快照的原理是什么？**
+   - BoltDB 的 MVCC 快照
+   - Write-Ahead Log（WAL）
+
+2. **为什么需要定期压缩和碎片整理？**
+   - MVCC 保留历史版本，占用空间
+   - 删除数据后空间不会立即释放
+
+3. **Etcd 备份和 Velero 备份有什么区别？**
+   - Etcd 备份整个集群状态
+   - Velero 可以选择性备份特定资源
+
+4. **如何设计跨区域的备份策略？**
+   - 本地快照 + 异地 S3 复制
+   - 定期恢复演练
+
+## 总结
+
+Etcd 备份是 K8s 运维的生命线。核心实践：
+
+- **自动化备份**：定时任务或 Operator
+- **多重备份**：本地 + 云存储
+- **定期验证**：恢复演练确保备份可用
+- **压缩维护**：定期清理历史数据
+
+**面试追问方向**：
+- 如何设计零丢失的备份策略？
+- Etcd 数据损坏的排查思路？
+- 如何在不影响业务的情况下恢复 Etcd？
+- 为什么 Etcd 不建议使用 NFS 存储？

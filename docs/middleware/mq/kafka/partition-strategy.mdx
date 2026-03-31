@@ -1,0 +1,361 @@
+# Kafka 分区策略：轮询、哈希、时间轮
+
+## 场景切入：分区决定命运
+
+消息发送到 Kafka 后，去了哪个 Partition？为什么同一订单的消息可能不在同一个 Partition 里？分区策略选错了，性能和顺序都可能出问题。
+
+分区策略是 Kafka 最核心的知识点之一，它决定了消息的分布和消费顺序。
+
+## 一、分区策略概述
+
+### 1.1 为什么需要分区
+
+分区解决了两个核心问题：
+
+| 问题 | 解决方案 |
+|---|---|
+| **水平扩展** | 分区分布到不同 Broker，支持并行读写 |
+| **顺序保证** | 同一 Partition 内消息有序 |
+| **负载均衡** | 消息均匀分布到各 Partition |
+
+### 1.2 分区策略类型
+
+| 策略 | 说明 | 适用场景 |
+|---|---|---|
+| **轮询策略** | 消息依次发送到各个分区 | 消息无业务关联，追求均衡分布 |
+| **哈希策略** | 根据 Key 的哈希值路由 | 需要同一 Key 的消息有序 |
+| **时间轮策略** | 按时间维度分区 | 定时任务、时间序列数据 |
+| **自定义策略** | 实现 Partitioner 接口 | 特殊业务需求 |
+
+---
+
+## 二、轮询策略（RoundRobin）
+
+### 2.1 原理
+
+轮询策略是最简单的分区策略，消息依次发送到各个分区：
+
+```
+轮询发送示例：
+
+消息 1 ──> Partition 0
+消息 2 ──> Partition 1
+消息 3 ──> Partition 2
+消息 4 ──> Partition 0
+消息 5 ──> Partition 1
+消息 6 ───> Partition 2
+...
+```
+
+### 2.2 实现
+
+当不指定 Key 时，Kafka 使用轮询策略：
+
+```java
+// 不指定 Key，使用轮询策略
+producer.send(new ProducerRecord<>(
+    "order-topic",
+    null,  // Key 为 null
+    "消息内容"
+));
+
+// 内部实现逻辑
+int nextPartition = partitioner.nextPartition(topic, null, value);
+```
+
+### 2.3 特点
+
+| 特点 | 说明 |
+|---|---|
+| **均衡分布** | 消息均匀分布到各分区 |
+| **无序保证** | 不同分区消息无序 |
+| **简单可靠** | 实现简单，无额外开销 |
+
+---
+
+## 三、哈希策略（Hash）
+
+### 3.1 原理
+
+根据消息 Key 的哈希值路由到特定分区：
+
+```
+哈希路由示例：
+
+Key = "order-123"
+Partition = hash("order-123") % 3 = 1  ──> Partition 1
+
+Key = "order-456"
+Partition = hash("order-456") % 3 = 2  ──> Partition 2
+
+Key = "order-123"  ──> 再次发送 ──> Partition 1（同一个分区）
+```
+
+### 3.2 实现
+
+```java
+// 指定 Key，使用哈希策略
+producer.send(new ProducerRecord<>(
+    "order-topic",
+    "order-123",     // Key 决定分区
+    "消息内容"
+));
+```
+
+```java
+// 默认的哈希分区器
+public class DefaultPartitioner implements Partitioner {
+
+    public int partition(String topic, Object key, byte[] keyBytes,
+                        Object value, byte[] valueBytes, Cluster cluster) {
+        // 如果没有 Key，使用轮询
+        if (keyBytes == null) {
+            return nextPartition(topic, key, cluster);
+        }
+
+        // 使用 MurmurHash2 算法计算哈希
+        int partition = Math.abs(Utils.murmur2(keyBytes)) % numPartitions;
+        return partition;
+    }
+}
+```
+
+### 3.3 特点
+
+| 特点 | 说明 |
+|---|---|
+| **有序保证** | 同一 Key 的消息在同一分区有序 |
+| **负载可能不均** | 热点 Key 可能导致数据倾斜 |
+| **Key 敏感** | 相同的 Key 总是路由到同一分区 |
+
+### 3.4 数据倾斜问题
+
+如果业务中某些 Key 的消息量特别大，会导致分区不均衡：
+
+```
+数据倾斜示例：
+
+假设 Key = "hot-product" 的消息占总消息的 50%
+
+Partition 0: [hot-product 消息 x 10000]
+Partition 1: [其他消息 x 1000]
+Partition 2: [其他消息 x 1000]
+
+Partition 0 堆积了大量消息，消费变慢
+```
+
+**解决方案**：使用自定义分区器，将热点 Key 打散：
+
+```java
+// 自定义分区器：热点 Key 打散
+public class HotKeyPartitioner implements Partitioner {
+
+    private static final Set<String> HOT_KEYS = Set.of("hot-product", "flash-sale");
+
+    public int partition(String topic, Object key, byte[] keyBytes,
+                        Object value, byte[] valueBytes, Cluster cluster) {
+        String keyStr = key.toString();
+
+        if (HOT_KEYS.contains(keyStr)) {
+            // 热点 Key：加上随机后缀打散
+            int randomSuffix = ThreadLocalRandom.current().nextInt(10);
+            keyStr = keyStr + "-" + randomSuffix;
+            return Math.abs(Utils.murmur2(keyStr.getBytes())) % numPartitions;
+        }
+
+        // 普通 Key：使用默认哈希
+        return Math.abs(Utils.murmur2(keyBytes)) % numPartitions;
+    }
+}
+```
+
+---
+
+## 四、时间轮策略（TimeWheel）
+
+### 4.1 概念
+
+时间轮策略是按时间维度对消息进行分区，适用于：
+
+- 定时任务
+- 时间序列数据
+- 延迟消息
+
+```
+时间轮分区示例：
+
+时间轮：1 小时为一个分区
+
+时间区间 00:00-01:00 ──> Partition 0
+时间区间 01:00-02:00 ──> Partition 1
+时间区间 02:00-03:00 ──> Partition 2
+...
+
+消费时按时间顺序消费，实现时间有序
+```
+
+### 4.2 实现
+
+```java
+// 时间轮分区器实现
+public class TimeWheelPartitioner implements Partitioner {
+
+    private static final int HOUR_MS = 3600 * 1000;
+
+    public int partition(String topic, Object key, byte[] keyBytes,
+                        Object value, byte[] valueBytes, Cluster cluster) {
+        // 获取当前时间戳
+        long timestamp = extractTimestamp(value);
+
+        // 计算时间分区
+        int timePartition = (int) (timestamp / HOUR_MS) % numPartitions;
+        return timePartition;
+    }
+
+    private long extractTimestamp(Object value) {
+        // 从消息体中提取时间戳
+        if (value instanceof byte[]) {
+            // 解析 JSON 或其他格式
+            return parseTimestamp(new String((byte[]) value));
+        }
+        return System.currentTimeMillis();
+    }
+}
+```
+
+### 4.3 应用场景
+
+| 场景 | 说明 |
+|---|---|
+| **日志收集** | 按日志产生时间分区 |
+| **监控数据** | 按数据采集时间分区 |
+| **事件溯源** | 按事件发生时间分区 |
+
+---
+
+## 五、自定义分区策略
+
+### 5.1 实现 Partitioner 接口
+
+```java
+import org.apache.kafka.clients.producer.Partitioner;
+import org.apache.kafka.common.Cluster;
+import org.apache.kafka.common.utils.Utils;
+
+public class BusinessPartitioner implements Partitioner {
+
+    @Override
+    public int partition(String topic, Object key, byte[] keyBytes,
+                        Object value, byte[] valueBytes, Cluster cluster) {
+        List<PartitionInfo> partitions = cluster.partitionsForTopic(topic);
+        int numPartitions = partitions.size();
+
+        if (keyBytes == null) {
+            throw new IllegalArgumentException("Key 不能为空");
+        }
+
+        String keyStr = new String(keyBytes);
+
+        // 业务逻辑：根据 Key 的前缀决定分区
+        if (keyStr.startsWith("order-")) {
+            // 订单消息：根据用户 ID 哈希
+            String userId = extractUserId(keyStr);
+            return Math.abs(userId.hashCode()) % numPartitions;
+        } else if (keyStr.startsWith("product-")) {
+            // 商品消息：使用固定分区（保证同一商品有序）
+            String productId = extractProductId(keyStr);
+            return Math.abs(productId.hashCode()) % numPartitions;
+        }
+
+        // 默认：使用 Key 哈希
+        return Math.abs(Utils.murmur2(keyBytes)) % numPartitions;
+    }
+
+    @Override
+    public void close() {
+        // 关闭资源
+    }
+
+    @Override
+    public void configure(Map<String, ?> configs) {
+        // 读取配置
+    }
+}
+```
+
+### 5.2 配置使用
+
+```java
+// 配置自定义分区器
+Properties props = new Properties();
+props.put("bootstrap.servers", "localhost:9092");
+props.put("key.serializer", "org.apache.kafka.common.serialization.StringSerializer");
+props.put("value.serializer", "org.apache.kafka.common.serialization.StringSerializer");
+props.put("partitioner.class", "com.example.BusinessPartitioner");
+
+KafkaProducer<String, String> producer = new KafkaProducer<>(props);
+```
+
+---
+
+## 六、分区数规划
+
+### 6.1 规划公式
+
+```java
+// 经验公式
+分区数 = max(消费者数量, 期望吞吐量 / 单分区吞吐)
+```
+
+### 6.2 考虑因素
+
+| 因素 | 说明 |
+|---|---|
+| **消费者数量** | 分区数 >= 消费者数 |
+| **吞吐量需求** | 分区数越多，吞吐越高 |
+| **文件描述符** | 每个分区占用文件描述符 |
+| **元数据压力** | 分区过多增加 Controller 负担 |
+| **副本数量** | 每个分区的副本都要同步 |
+
+### 6.3 分区数调整
+
+```bash
+# 查看当前分区数
+kafka-topics.sh --describe --topic order-topic --bootstrap-server localhost:9092
+
+# 增加分区数
+kafka-topics.sh --alter --topic order-topic \
+  --partitions 6 \
+  --bootstrap-server localhost:9092
+```
+
+:::warning 注意
+分区数只能增加，不能减少。
+:::
+
+---
+
+## 七、面试追问预判
+
+### 追问一：为什么不指定 Key 时用轮询？
+
+因为轮询可以保证消息均匀分布。如果使用哈希，不指定 Key 时会抛出异常或使用默认分区。
+
+### 追问二：如何保证同一订单的消息到同一分区？
+
+使用订单 ID 作为消息 Key：
+
+```java
+producer.send(new ProducerRecord<>(
+    "order-topic",
+    order.getId(),  // 订单 ID 作为 Key
+    order.toString()
+));
+```
+
+### 追问三：分区数过多有什么问题？
+
+1. **文件描述符耗尽**：每个分区占用文件描述符
+2. **元数据压力**：Controller 需要管理更多分区
+3. **故障恢复慢**：Broker 宕机后需要恢复更多分区
+4. **客户端压力**：Consumer 需要管理更多分区连接

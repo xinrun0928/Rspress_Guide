@@ -1,0 +1,181 @@
+# 全局递增 ID 在分库分表中的实现
+
+分库分表后，最大的挑战之一就是 ID 生成。
+
+单机 MySQL 的自增主键，用不了了——多库并发插入，ID 必然重复。UUID？太长了，32 位字符串，索引效率差，UUID 本身还无序。你需要一种能在分布式环境下生成**全局唯一、趋势递增**的 ID。
+
+## 分库分表 ID 方案全景图
+
+| 方案 | 唯一性 | 趋势递增 | 性能 | 可用性 | 适用场景 |
+|---|---|---|---|---|---|
+| UUID | ✅ | ❌ | 高 | 依赖本地 | 不关心 ID 顺序的日志表 |
+| 数据库自增 | ✅ | ✅ | 中 | 依赖单库 | 单机分表 `≤` 10 张 |
+| 批量号段 | ✅ | ✅ | 高 | 高 | 通用场景 |
+| 雪花算法 | ✅ | ✅ | 高 | 高 | 互联网高并发场景 |
+| 滴滴/美团等变种 | ✅ | ✅ | 高 | 高 | 时钟回拨风险环境 |
+
+## 雪花算法（Snowflake）：最通用的方案
+
+Twitter 开源的 Snowflake，是目前最广泛使用的分布式 ID 生成方案。它将 64 位的 ID 分为四部分：
+
+```
+64 位整数结构：
+
+| 符号位 |        时间戳 (41位)        |   机器ID (10位)    |  序列号 (12位)  |
+|   1位  |  (当前时间 - 2016-01-01) / 4ms |  dataCenterId+workerId | 每ms内的递增计数 |
+    0           2^41 / 4ms ≈ 69年         2^10 = 1024          2^12 = 4096/ms
+```
+
+```java
+public class SnowflakeIdGenerator {
+    
+    // 起始时间戳：2024-01-01
+    private final long epoch = 1704067200000L;
+    
+    // 各部分位数
+    private final long workerIdBits = 10L;
+    private final long sequenceBits = 12L;
+    
+    // 各部分位移
+    private final long workerIdShift = sequenceBits;
+    private final long timestampLeftShift = sequenceBits + workerIdBits;
+    
+    // 最大值
+    private final long maxWorkerId = ~(-1L << workerIdBits);
+    
+    private long workerId;
+    private long sequence = 0L;
+    private long lastTimestamp = -1L;
+    
+    public SnowflakeIdGenerator(long workerId) {
+        if (workerId > maxWorkerId || workerId < 0) {
+            throw new IllegalArgumentException("workerId 超出范围");
+        }
+        this.workerId = workerId;
+    }
+    
+    public synchronized long nextId() {
+        long timestamp = timeGen();
+        
+        // 时钟回拨：等待回拨恢复
+        if (timestamp < lastTimestamp) {
+            timestamp = waitForNextMillis(lastTimestamp);
+        }
+        
+        // 同一毫秒内，序列号递增
+        if (timestamp == lastTimestamp) {
+            sequence = (sequence + 1) & ((1L << sequenceBits) - 1);
+            if (sequence == 0) {
+                timestamp = waitForNextMillis(lastTimestamp);
+            }
+        } else {
+            sequence = 0L;
+        }
+        
+        lastTimestamp = timestamp;
+        
+        return (timestamp - epoch) << timestampLeftShift
+            | workerId << workerIdShift
+            | sequence;
+    }
+    
+    private long waitForNextMillis(long lastTimestamp) {
+        long timestamp = timeGen();
+        while (timestamp <= lastTimestamp) {
+            timestamp = timeGen();
+        }
+        return timestamp;
+    }
+    
+    private long timeGen() {
+        return System.currentTimeMillis();
+    }
+}
+```
+
+### 雪花算法的问题与解决方案
+
+**问题一：机器 ID 需要手动分配**
+
+在容器化（Kubernetes）环境中，容器 IP 不固定，机器 ID 无法预先分配。解决方案：
+
+```yaml
+# Kubernetes 中使用 Pod UID 作为 workerId 的来源
+# 可以用 downwardAPI 将 pod-name 和 namespace 编码为固定的 workerId
+apiVersion: v1
+kind: Pod
+metadata:
+  annotations:
+    pod.beta.kubernetes.io/container-names: app
+    pod.beta.kubernetes.io/container-ids: "1"  # Pod 启动序号
+spec:
+  containers:
+  - name: app
+    env:
+    - name: WORKER_ID
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.annotations['pod.beta.kubernetes.io/container-ids']
+```
+
+**问题二：时钟回拨**
+
+服务器时钟可能被 NTP 同步或者人为调整，导致时钟回拨。Snowflake 的应对策略是：等待时钟恢复。但这会导致短暂的 ID 生成阻塞。
+
+美团的 Leaf、百度的 UidGenerator 都针对时钟回拨做了优化：
+- Leaf：使用 Snowflake + ZooKeeper 或 etcd 统一分配 workerId，并使用"双 buffer + RingBuffer"预生成 ID
+- UidGenerator：基于百度内部 Snowflake 变种，使用"抢占式" workerId 分配
+
+## 批量号段方案：最高可用性
+
+批量号段方案的核心思想：**不每次都去获取 ID，而是每次从数据库批量获取一段 ID，用完再拿。**
+
+```sql
+-- 号段表
+CREATE TABLE sequence (
+    biz_tag VARCHAR(64) PRIMARY KEY,  -- 业务标识，如 order, user
+    max_id BIGINT NOT NULL,            -- 当前号段最大值
+    step INT NOT NULL DEFAULT 1000    -- 步长（每次获取的 ID 数量）
+);
+
+-- 每次获取一段 ID
+UPDATE sequence SET max_id = max_id + step WHERE biz_tag = 'order';
+SELECT max_id FROM sequence WHERE biz_tag = 'order';
+```
+
+```java
+public class BatchIdGenerator {
+    private volatile long currentId = 0;
+    private volatile long maxId = 0;
+    private final int step = 1000;
+    
+    public synchronized long nextId() {
+        if (currentId >= maxId) {
+            // 刷新号段
+            currentId = getNextBatchFromDB();
+            maxId = currentId + step;
+        }
+        return currentId++;
+    }
+}
+```
+
+:::tip 推荐
+号段方案的优势：
+1. **性能极高**：本地内存操作，不需要网络请求（大多数请求）
+2. **可用性极高**：号段用尽前刷新，即使数据库短暂不可用也不影响
+3. **实现简单**：不需要依赖 ZooKeeper 或雪花算法
+
+缺点：ID 不是严格连续递增的（跳号）。
+
+号段方案是大多数互联网公司推荐的分库分表 ID 方案。
+:::
+
+## 总结
+
+分库分表场景下的 ID 生成选型建议：
+
+- `≤` 10 张分表：直接用数据库自增 ID，简单够用
+- 高并发分库分表：雪花算法（Leaf 或自研变种）
+- 对 ID 连续性有要求（如订单号需要可读）：批量号段 + 时间前缀
+- 超大规模（每秒千万级 ID）：多 Worker 组合 + 号段池化

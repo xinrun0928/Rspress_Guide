@@ -1,0 +1,692 @@
+# 无状态 JWT 方案设计与实践
+
+你有没有想过，为什么很多大厂的系统登录后即使用户不操作，也能保持登录状态一整天甚至一周？这背后是 Token 在起作用。
+
+但 JWT（JSON Web Token）江湖口碑两极分化：有人说它性能无敌、水平扩展；有人说它无法主动失效、安全隐患大。**谁对？都对，也都不对。** JWT 是个好工具，关键看你会不会用。
+
+今天我们深入聊一聊 JWT 的设计、实战技巧，以及那些「坑」如何避开。
+
+## 一、从一个登录流程说起
+
+### 1.1 传统 Session vs JWT
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        传统 Session 流程                                │
+│                                                                         │
+│   用户 ──▶ 服务端 ──▶ 创建 Session ──▶ 返回 SessionID                  │
+│                        │                                                 │
+│                   存储在内存/Redis                                       │
+│                                                                         │
+│   下次请求：Cookie 带 SessionID ──▶ 服务端查询 Session ──▶ 获取用户信息 │
+│                                                                         │
+│   问题：每个服务都要能访问 Session 存储                                  │
+└─────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         JWT 流程                                         │
+│                                                                         │
+│   用户 ──▶ 服务端 ──▶ 签名生成 JWT ──▶ 返回 JWT                         │
+│                        │                                                 │
+│                   只需保存签名密钥（不存 Token）                          │
+│                                                                         │
+│   下次请求：Header 带 JWT ──▶ 验签 ──▶ 直接获取用户信息（无需存储）     │
+│                                                                         │
+│   优点：任何服务只要知道密钥，都能验证 Token                              │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 1.2 JWT 长什么样
+
+```
+eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.
+eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.
+SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c
+```
+
+```
+┌──────────────────┬──────────────────┬──────────────────┐
+│      Header       │      Payload     │     Signature    │
+│   (eyJhbGciOi... ) │   (eyJzdWIiOi... ) │   (SflKxwRJS... ) │
+├──────────────────┼──────────────────┼──────────────────┤
+│  {               │  {               │  HMACSHA256(    │
+│    "alg": "HS256"│    "sub": "123", │    base64Url(    │
+│    "typ": "JWT"  │    "name": "John",│      header) +   │
+│  }               │    "iat": 1516239022│    "." +        │
+│                  │  }               │    base64Url(    │
+│                  │                  │      payload),  │
+│                  │                  │    secret)       │
+│                  │                  │  )               │
+└──────────────────┴──────────────────┴──────────────────┘
+```
+
+## 二、JWT 详解
+
+### 2.1 标准 Claims
+
+| Claim | 说明 | 示例 |
+|---|---|---|
+| `iss` | 签发者 | `"https://auth.example.com"` |
+| `sub` | 主题（用户ID） | `"user_123456"` |
+| `aud` | 受众（哪个服务可用） | `["order-service"]` |
+| `exp` | 过期时间 | `1699999999` |
+| `nbf` | 生效时间 | `1699999000` |
+| `iat` | 签发时间 | `1699999000` |
+| `jti` | JWT 唯一ID（防重放） | `"token_abc123"` |
+
+### 2.2 自定义 Claims
+
+```java title="Token 载荷设计"
+public class TokenClaims {
+    private String userId;
+    private String username;
+    private String email;
+    private List<String> roles;
+    private Set<String> permissions;
+    private String deviceId;        // 登录设备
+    private String ipAddress;       // 登录 IP
+    private String loginTime;       // 登录时间
+}
+```
+
+```java title="生成 Token"
+@Service
+public class JwtTokenService {
+    private static final String SECRET = "your-256-bit-secret-key-here-must-be-long";
+    private static final long ACCESS_TOKEN_EXPIRY = 3600;       // 1小时
+    private static final long REFRESH_TOKEN_EXPIRY = 604800;   // 7天
+
+    public String generateAccessToken(UserPrincipal user) {
+        Date now = new Date();
+        Date expiry = new Date(now.getTime() + ACCESS_TOKEN_EXPIRY * 1000);
+
+        Map<String, Object> claims = new HashMap<>();
+        claims.put("userId", user.getId());
+        claims.put("username", user.getUsername());
+        claims.put("email", user.getEmail());
+        claims.put("roles", user.getRoles());
+        claims.put("permissions", user.getPermissions());
+        claims.put("deviceId", user.getCurrentDeviceId());
+        claims.put("jti", UUID.randomUUID().toString());
+
+        return Jwts.builder()
+                .setClaims(claims)
+                .setSubject(user.getId().toString())
+                .setIssuedAt(now)
+                .setExpiration(expiry)
+                .setIssuer("https://auth.example.com")
+                .setAudience(Collections.singletonList("api"))
+                .signWith(Keys.hmacShaKeyFor(SECRET.getBytes()), SignatureAlgorithm.HS256)
+                .compact();
+    }
+
+    public String generateRefreshToken(UserPrincipal user) {
+        Map<String, Object> claims = new HashMap<>();
+        claims.put("userId", user.getId());
+        claims.put("type", "refresh");
+        claims.put("jti", UUID.randomUUID().toString());
+
+        Date now = new Date();
+        Date expiry = new Date(now.getTime() + REFRESH_TOKEN_EXPIRY * 1000);
+
+        return Jwts.builder()
+                .setClaims(claims)
+                .setSubject(user.getId().toString())
+                .setIssuedAt(now)
+                .setExpiration(expiry)
+                .signWith(Keys.hmacShaKeyFor(SECRET.getBytes()), SignatureAlgorithm.HS256)
+                .compact();
+    }
+}
+```
+
+## 三、Token 验证与解析
+
+### 3.1 网关层统一验证
+
+```java title="网关 Token 验证"
+@Component
+public class JwtAuthFilter implements GlobalFilter {
+    @Autowired
+    private JwtTokenService jwtTokenService;
+
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        String path = exchange.getRequest().getURI().getPath();
+
+        // 白名单直接放行
+        if (isWhiteListed(path)) {
+            return chain.filter(exchange);
+        }
+
+        String token = extractToken(exchange.getRequest());
+        if (token == null) {
+            return unauthorized(exchange, "Missing authentication token");
+        }
+
+        try {
+            Claims claims = jwtTokenService.parseToken(token);
+
+            // 基础校验
+            validateClaims(claims);
+
+            // 检查 Token 类型
+            String type = claims.get("type", String.class);
+            if (type != null && type.equals("refresh")) {
+                return unauthorized(exchange, "Invalid token type: expected access token");
+            }
+
+            // 检查黑名单（主动失效）
+            if (jwtTokenService.isTokenBlacklisted(claims.getId())) {
+                return unauthorized(exchange, "Token has been revoked");
+            }
+
+            // 权限校验
+            if (!hasRequiredPermission(path, claims)) {
+                return forbidden(exchange, "Insufficient permissions");
+            }
+
+            // 透传用户信息给下游服务
+            ServerWebExchange mutatedExchange = addAuthHeaders(exchange, claims);
+            return chain.filter(mutatedExchange);
+
+        } catch (ExpiredJwtException e) {
+            return unauthorized(exchange, "Token expired");
+        } catch (JwtException e) {
+            return unauthorized(exchange, "Invalid token: " + e.getMessage());
+        }
+    }
+}
+```
+
+### 3.2 下游服务获取用户信息
+
+```java title="用户信息获取工具类"
+@Component
+public class AuthContextHolder {
+    private static final ThreadLocal<Claims> claimsHolder = new ThreadLocal<>();
+
+    public static void setClaims(Claims claims) {
+        claimsHolder.set(claims);
+    }
+
+    public static Claims getClaims() {
+        return claimsHolder.get();
+    }
+
+    public static String getUserId() {
+        Claims claims = getClaims();
+        return claims != null ? claims.getSubject() : null;
+    }
+
+    public static String getUsername() {
+        Claims claims = getClaims();
+        return claims != null ? claims.get("username", String.class) : null;
+    }
+
+    public static List<String> getRoles() {
+        Claims claims = getClaims();
+        return claims != null ? claims.get("roles", List.class) : null;
+    }
+
+    public static void clear() {
+        claimsHolder.remove();
+    }
+}
+
+@RestController
+public class UserController {
+    @GetMapping("/api/user/me")
+    public Result getCurrentUser() {
+        String userId = AuthContextHolder.getUserId();
+        return Result.success(userService.getUserById(userId));
+    }
+}
+```
+
+## 四、JWT 的致命弱点：主动失效
+
+这是 JWT 被诟病最多的地方：**Token 一旦签发，服务端无法控制它。**
+
+### 4.1 为什么说「无法失效」
+
+```
+用户登录 → 签发 Token（有效期 7 天）→ Token 存储在用户浏览器
+
+问题来了：
+- 用户被管理员封禁 → Token 依然有效！
+- 用户在异地登录（被盗号）→ 旧 Token 依然有效！
+- Token 被泄露 → 攻击者可以用 7 天！
+```
+
+### 4.2 解决方案：黑名单 + 白名单
+
+**方案一：黑名单（适合短期 Token）**
+
+```java title="Token 黑名单服务"
+@Service
+public class TokenBlacklistService {
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+
+    private static final String BLACKLIST_PREFIX = "jwt:blacklist:";
+
+    /**
+     * 将 Token 加入黑名单
+     */
+    public void blacklistToken(String jti, long expireInSeconds) {
+        String key = BLACKLIST_PREFIX + jti;
+        redisTemplate.opsForValue().set(key, "1", expireInSeconds, TimeUnit.SECONDS);
+    }
+
+    /**
+     * 检查 Token 是否在黑名单
+     */
+    public boolean isBlacklisted(String jti) {
+        String key = BLACKLIST_PREFIX + jti;
+        return Boolean.TRUE.equals(redisTemplate.hasKey(key));
+    }
+
+    /**
+     * 用户主动注销：黑名单其所有 Token
+     */
+    public void blacklistUserTokens(String userId, List<String> jtiList) {
+        for (String jti : jtiList) {
+            blacklistToken(jti, 7 * 24 * 3600); // 黑名单保留 7 天
+        }
+    }
+}
+```
+
+**方案二：白名单（适合长期 Token）
+
+```java title="Token 白名单服务"
+@Service
+public class TokenWhitelistService {
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+
+    private static final String WHITELIST_PREFIX = "jwt:whitelist:";
+
+    /**
+     * 登录时：将 Token 加入白名单
+     */
+    public void addToWhitelist(String jti, String userId, long ttlSeconds) {
+        String key = WHITELIST_PREFIX + jti;
+        Map<String, String> value = new HashMap<>();
+        value.put("userId", userId);
+        value.put("createdAt", String.valueOf(System.currentTimeMillis()));
+        redisTemplate.opsForHash().putAll(key, value);
+        redisTemplate.expire(key, ttlSeconds, TimeUnit.SECONDS);
+    }
+
+    /**
+     * 验证 Token：必须存在于白名单
+     */
+    public boolean isInWhitelist(String jti) {
+        String key = WHITELIST_PREFIX + jti;
+        return Boolean.TRUE.equals(redisTemplate.hasKey(key));
+    }
+
+    /**
+     * 注销：删除白名单中的 Token
+     */
+    public void removeFromWhitelist(String jti) {
+        redisTemplate.delete(WHITELIST_PREFIX + jti);
+    }
+
+    /**
+     * 用户下线：删除该用户所有 Token
+     */
+    public void removeAllUserTokens(String userId) {
+        // 需要维护 userId -> [jti1, jti2, ...] 的映射
+        Set<String> jtiSet = getUserTokenSet(userId);
+        for (String jti : jtiSet) {
+            removeFromWhitelist(jti);
+        }
+    }
+}
+```
+
+:::tip 选型建议
+- Token 有效期 `<=` 1 小时 → 黑名单方案，开销小
+- Token 有效期 `>` 1 小时 → 白名单方案，更精确
+- 金融/安全敏感系统 → 白名单 + 黑名单结合
+:::
+
+## 五、双 Token 机制
+
+### 5.1 为什么需要两个 Token
+
+```
+Access Token：短期（15分钟 - 1小时），用户操作时携带
+Refresh Token：长期（7天），Access Token 过期时换新
+
+好处：
+1. Access Token 泄露，攻击窗口短
+2. Refresh Token 泄露，可以快速吊销
+3. 用户修改密码后，只需吊销 Refresh Token
+```
+
+### 5.2 完整刷新流程
+
+```java title="Token 刷新服务"
+@Service
+public class TokenRefreshService {
+    @Autowired
+    private JwtTokenService jwtTokenService;
+    @Autowired
+    private TokenBlacklistService blacklistService;
+    @Autowired
+    private UserService userService;
+
+    private static final String REFRESH_TOKEN_PREFIX = "refresh:token:";
+    private static final String TOKEN_FAMILY_PREFIX = "refresh:family:";
+
+    public TokenPair refreshToken(String refreshToken) {
+        // 1. 验证 Refresh Token
+        Claims claims = jwtTokenService.parseToken(refreshToken);
+        String type = claims.get("type", String.class);
+        if (!"refresh".equals(type)) {
+            throw new InvalidTokenException("Not a refresh token");
+        }
+
+        String userId = claims.getSubject();
+        String jti = claims.getId();
+
+        // 2. 检查 Token 家族（防止 Refresh Token 被重复使用）
+        String familyId = getTokenFamilyId(userId);
+        String storedFamilyId = claims.get("family", String.class);
+
+        if (storedFamilyId != null && familyId != null && !storedFamilyId.equals(familyId)) {
+            // 家族 ID 不匹配，说明之前刷新时用了这个 Token
+            // 可能的攻击：Refresh Token 被重复使用
+            // 防御措施：吊销整个 Token 家族
+            revokeTokenFamily(userId, familyId);
+            throw new SecurityException("Refresh token reuse detected, all tokens revoked");
+        }
+
+        // 3. 检查是否已使用（一次性）
+        String usedKey = REFRESH_TOKEN_PREFIX + "used:" + jti;
+        if (Boolean.TRUE.equals(redisTemplate.hasKey(usedKey))) {
+            // 重复使用，触发安全响应
+            revokeAllUserTokens(userId);
+            throw new SecurityException("Refresh token reuse detected");
+        }
+
+        // 4. 标记为已使用
+        long ttl = calculateRemainingTtl(claims.getExpiration());
+        redisTemplate.opsForValue().set(usedKey, "1", ttl, TimeUnit.SECONDS);
+
+        // 5. 生成新的 Token 对
+        UserPrincipal user = userService.getUserById(userId);
+        String newAccessToken = jwtTokenService.generateAccessToken(user);
+        String newRefreshToken = jwtTokenService.generateRefreshToken(user, familyId);
+
+        // 6. 存储新 Refresh Token
+        storeRefreshToken(newRefreshToken, userId);
+
+        return new TokenPair(newAccessToken, newRefreshToken);
+    }
+}
+```
+
+:::warning 重要：Refresh Token 一次性使用
+这是防止 Refresh Token 重放攻击的关键机制。每次刷新后，旧 Refresh Token 必须失效。即使攻击者截获了 Refresh Token，只要用户用了一次，攻击者的 Token 就无效了。
+:::
+
+## 六、JWT 安全最佳实践
+
+### 6.1 密钥管理
+
+```java title="密钥生成与验证"
+public class KeyManagement {
+    // 密钥必须 256 位以上
+    private static final String SECRET = System.getenv("JWT_SECRET");
+    // 生产环境：使用配置中心或 KMS
+    // 绝对不能硬编码在代码中
+
+    public static Key getSigningKey() {
+        return Keys.hmacShaKeyFor(SECRET.getBytes(StandardCharsets.UTF_8));
+    }
+}
+```
+
+### 6.2 HTTPS 传输
+
+```java title="Token 传输安全配置"
+@RestController
+public class AuthController {
+
+    @PostMapping("/login")
+    public ResponseEntity<TokenResponse> login(LoginRequest request, HttpServletResponse response) {
+        // 验证用户...
+
+        String accessToken = jwtTokenService.generateAccessToken(user);
+        String refreshToken = jwtTokenService.generateRefreshToken(user);
+
+        // 设置 HttpOnly Cookie（防止 XSS 攻击）
+        Cookie accessCookie = new Cookie("access_token", accessToken);
+        accessCookie.setHttpOnly(true);
+        accessCookie.setSecure(true); // HTTPS Only
+        accessCookie.setPath("/");
+        accessCookie.setMaxAge(3600);
+        response.addCookie(accessCookie);
+
+        // Refresh Token 也设为 HttpOnly
+        Cookie refreshCookie = new Cookie("refresh_token", refreshToken);
+        refreshCookie.setHttpOnly(true);
+        refreshCookie.setSecure(true);
+        refreshCookie.setPath("/api/auth/refresh"); // 只在刷新接口发送
+        refreshCookie.setMaxAge(604800);
+        response.addCookie(refreshCookie);
+
+        return ResponseEntity.ok(TokenResponse.builder()
+                .accessToken(accessToken)
+                .refreshToken(refreshToken)
+                .tokenType("Bearer")
+                .expiresIn(3600)
+                .build());
+    }
+}
+```
+
+### 6.3 攻击检测与响应
+
+```java title="异常登录检测")
+@Service
+public class LoginSecurityService {
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    private static final String LOGIN_IP_PREFIX = "login:ip:";
+    private static final String LOGIN_USER_AGENT_PREFIX = "login:ua:";
+
+    /**
+     * 检测异常登录
+     */
+    public LoginAlert detectAnomaly(String userId, String ip, String userAgent, String token) {
+        LoginAlert alert = new LoginAlert();
+
+        // 1. 异地登录检测
+        String lastLoginIp = (String) redisTemplate.opsForValue().get("user:lastlogin:ip:" + userId);
+        if (lastLoginIp != null && !lastLoginIp.equals(ip)) {
+            String lastLocation = ip2Location(lastLoginIp);
+            String currentLocation = ip2Location(ip);
+            if (!lastLocation.equals(currentLocation)) {
+                alert.setLevel(AlertLevel.HIGH);
+                alert.setReason("异地登录");
+                alert.setLastLocation(lastLocation);
+                alert.setCurrentLocation(currentLocation);
+            }
+        }
+
+        // 2. 短时间内大量登录检测
+        String ipCountKey = LOGIN_IP_PREFIX + ip;
+        Long count = redisTemplate.opsForValue().increment(ipCountKey, 1);
+        if (count != null && count == 1) {
+            redisTemplate.expire(ipCountKey, 3600, TimeUnit.SECONDS);
+        }
+        if (count != null && count > 10) {
+            alert.setLevel(AlertLevel.MEDIUM);
+            alert.setReason("短时间大量登录请求");
+        }
+
+        // 3. 新设备检测
+        String uaKey = LOGIN_USER_AGENT_PREFIX + userId + ":" + hashUserAgent(userAgent);
+        if (Boolean.FALSE.equals(redisTemplate.hasKey(uaKey))) {
+            alert.setLevel(AlertLevel.LOW);
+            alert.setReason("新设备登录");
+        }
+
+        // 记录登录信息
+        redisTemplate.opsForValue().set("user:lastlogin:ip:" + userId, ip);
+        redisTemplate.opsForValue().set("user:lastlogin:ua:" + userId, hashUserAgent(userAgent));
+
+        return alert;
+    }
+
+    /**
+     * 响应异常
+     */
+    public void respondToAnomaly(String userId, LoginAlert alert) {
+        switch (alert.getLevel()) {
+            case HIGH:
+                // 高风险：吊销所有 Token，发送告警
+                tokenService.revokeAllUserTokens(userId);
+                alertService.sendSms(userId, "检测到异地登录，请确认是否本人操作");
+                break;
+            case MEDIUM:
+                // 中风险：标记，延迟生效
+                alertService.sendEmail(userId, "检测到异常登录");
+                break;
+            case LOW:
+                // 低风险：记录即可
+                log.info("New device login for user: {}", userId);
+                break;
+        }
+    }
+}
+```
+
+## 七、性能优化
+
+### 7.1 Token 本地缓存
+
+```java title="本地缓存验证结果"
+@Service
+public class CachedJwtValidator {
+    @Autowired
+    private JwtTokenService jwtTokenService;
+    @Autowired
+    private TokenBlacklistService blacklistService;
+
+    // 本地缓存：避免频繁查询 Redis
+    private LoadingCache<String, Optional<Boolean>> blacklistCache;
+
+    public CachedJwtValidator() {
+        blacklistCache = Caffeine.newBuilder()
+                .maximumSize(10000)
+                .expireAfterWrite(60, TimeUnit.SECONDS) // 1 分钟过期
+                .build(key -> {
+                    return Optional.of(blacklistService.isBlacklisted(key));
+                });
+    }
+
+    public Claims validate(String token) {
+        Claims claims = jwtTokenService.parseToken(token);
+
+        // 先查本地缓存
+        Optional<Boolean> cached = blacklistCache.getIfPresent(claims.getId());
+        if (cached != null && cached.get()) {
+            throw new TokenRevokedException("Token has been revoked");
+        }
+
+        // 缓存未命中，查询 Redis
+        if (!blacklistService.isBlacklisted(claims.getId())) {
+            // 写入本地缓存
+            blacklistCache.put(claims.getId(), Optional.of(false));
+        }
+
+        return claims;
+    }
+}
+```
+
+### 7.2 公私钥方案（RS256）
+
+对于多服务场景，可以使用非对称加密，各服务只需公钥验证。
+
+```java title="RSA 密钥对生成与使用"
+@Service
+public class RsaJwtTokenService {
+    // 生成密钥对（生产环境只需保存私钥，公钥可公开）
+    @PostConstruct
+    public void init() {
+        if (!Files.exists(Paths.get("jwt-private.key"))) {
+            KeyPairGenerator generator = KeyPairGenerator.getInstance("RSA");
+            generator.initialize(2048);
+            KeyPair pair = generator.generateKeyPair();
+
+            try (FileOutputStream fos = new FileOutputStream("jwt-private.key")) {
+                fos.write(pair.getPrivate().getEncoded());
+            }
+            try (FileOutputStream fos = new FileOutputStream("jwt-public.key")) {
+                fos.write(pair.getPublic().getEncoded());
+            }
+        }
+    }
+
+    // 签发 Token（Auth Service 做）
+    public String generateToken(String userId) {
+        PrivateKey privateKey = loadPrivateKey();
+        return Jwts.builder()
+                .setSubject(userId)
+                .setIssuedAt(new Date())
+                .setExpiration(new Date(System.currentTimeMillis() + 3600000))
+                .signWith(privateKey, SignatureAlgorithm.RS256)
+                .compact();
+    }
+
+    // 验证 Token（任何 Service 只需公钥）
+    public Claims validate(String token) {
+        PublicKey publicKey = loadPublicKey();
+        return Jwts.parserBuilder()
+                .setSigningKey(publicKey)
+                .build()
+                .parseClaimsJws(token)
+                .getBody();
+    }
+}
+```
+
+## 八、总结对比
+
+| 维度 | JWT 无状态 | JWT + Redis 黑名单 | Session |
+|---|---|---|---|
+| 服务端存储 | 无 | Token ID | 完整 Session |
+| 扩展性 | 最好 | 好 | 一般 |
+| 主动失效 | 不支持 | 支持 | 支持 |
+| 实现复杂度 | 最低 | 中等 | 中等 |
+| Token 泄露风险 | 高（无法控制） | 低 | 低 |
+| 适用场景 | 微服务间通信 | 用户认证 | 复杂状态 |
+
+:::tip 最佳实践
+对于大多数 Web 应用，**推荐「JWT + Redis 黑名单」方案**：
+- Access Token 有效期 1 小时（短期）
+- Refresh Token 有效期 7 天
+- Refresh Token 一次性使用
+- 登录、注销、修改密码时主动操作黑名单
+
+这样既享受了 JWT 的高性能和无状态特性，又解决了主动失效的难题。
+:::
+
+## 结尾
+
+JWT 不是银弹，它解决的是「认证」问题，而不是「授权管理」问题。记住三个核心原则：
+
+1. **短期 Token**：Access Token 越短越好，泄露了攻击窗口也短
+2. **主动失效**：结合 Redis 黑名单或白名单，需要失效时一定要能控制
+3. **传输安全**：始终使用 HTTPS，敏感 Token 放在 HttpOnly Cookie
+
+下一节，我们回到缓存专题，看一看多级缓存架构如何设计，这是分布式系统性能优化的核心战场。

@@ -1,0 +1,426 @@
+# 缓存雪崩
+
+双十一零点，数据库突然告警：每秒 10 万次查询。再一看时间点——**恰好有一批缓存同时过期**。
+
+这不是巧合，这是**缓存雪崩**。一个热点 key 过期是击穿，一万个热点 key 同时过期，就是雪崩。
+
+今天我们深入剖析这个缓存系统的「灭霸级」灾难，以及如何用事前、事中、事后三道防线来防御。
+
+## 一、什么是缓存雪崩
+
+### 1.1 问题描述
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        缓存雪崩示意图                                    │
+│                                                                         │
+│   正常情况：                                                            │
+│   ┌──────────┐ ┌──────────┐ ┌──────────┐                              │
+│   │ Cache A │ │ Cache B │ │ Cache C │ ───▶ 少量请求打 DB              │
+│   └──────────┘ └──────────┘ └──────────┘                              │
+│                                                                         │
+│   雪崩情况：                                                            │
+│   ┌──────────┐ ┌──────────┐ ┌──────────┐                              │
+│   │ Cache A  │ │ Cache B  │ │ Cache C  │  ← 同时过期！                   │
+│   └──────────┘ └──────────┘ └──────────┘                              │
+│        ↓            ↓            ↓                                    │
+│   所有请求 ──▶ ──▶ ──▶ ──▶  数据库 ◀───▶ 被打爆！                      │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 1.2 雪崩的分类
+
+| 类型 | 原因 | 特点 |
+|---|---|---|
+| **Key 集中过期** | 大量 key 设置了相同的过期时间 | 有明显的时间点 |
+| **Redis 宕机** | Redis 服务不可用 | 影响整个系统 |
+| **热点数据集体失效** | 秒杀/大促导致 | 流量突增 + 失效双重打击 |
+
+### 1.3 与击穿的区别
+
+| 维度 | 缓存击穿 | 缓存雪崩 |
+|---|---|---|
+| 涉及 Key | 单个热点 Key | 大量 Key |
+| 发生场景 | 热点 Key 过期 | 大量 Key 同时过期 |
+| 影响范围 | 局部 | 全局 |
+
+### 1.4 危害
+
+- **数据库被打爆**：瞬间 N 倍正常流量
+- **服务不可用**：响应超时、连接池耗尽
+- **引发连锁反应**：其他服务也扛不住
+- **业务完全中断**：用户看到 502/503
+
+## 二、原因一：Key 集中过期
+
+### 2.1 过期时间随机化
+
+```java title="过期时间随机化")
+@Service
+public class GoodCacheService {
+    private static final long BASE_EXPIRE_SECONDS = 3600;
+    private static final long RANDOM_RANGE = 600;
+
+    private long randomExpire() {
+        return BASE_EXPIRE_SECONDS + ThreadLocalRandom.current().nextInt(RANDOM_RANGE);
+    }
+
+    public void cacheProduct(Long id, Product product) {
+        String key = "product:" + id;
+        long expire = randomExpire();
+        redisTemplate.opsForValue().set(key, product, expire, TimeUnit.SECONDS);
+    }
+}
+```
+
+### 2.2 过期时间递进式
+
+```java title="递进式过期")
+@Configuration
+public class ProgressiveExpireConfig {
+    public static long getExpireSeconds(String category) {
+        switch (category) {
+            case "hot":
+                return 7200; // 2 小时
+            case "normal":
+                return 3600; // 1 小时
+            case "cold":
+                return 1800; // 30 分钟
+            default:
+                return 3600;
+        }
+    }
+}
+```
+
+## 三、原因二：Redis 宕机
+
+### 3.1 架构加固
+
+```
+                        ┌─────────────┐
+                        │  Sentinel   │
+                        │  (哨兵集群)  │
+                        └──────┬──────┘
+                               │
+         ┌─────────────────────┼─────────────────────┐
+         │                     │                     │
+         ▼                     ▼                     ▼
+   ┌─────────┐           ┌─────────┐           ┌─────────┐
+   │ Master  │◀──────────│ Slave 1 │◀──────────│ Slave 2 │
+   └────┬────┘           └─────────┘           └─────────┘
+```
+
+### 3.2 多级缓存兜底
+
+```java title="多级缓存降级")
+@Service
+@Slf4j
+public class MultiLevelCacheService {
+    private volatile boolean redisAvailable = true;
+
+    @Scheduled(fixedRate = 5000)
+    public void checkRedisHealth() {
+        try {
+            redisTemplate.opsForValue().get("health:check");
+            redisAvailable = true;
+        } catch (Exception e) {
+            redisAvailable = false;
+            log.warn("Redis 不可用，切换到本地缓存模式");
+        }
+    }
+
+    public Product getProduct(Long id) {
+        String key = "product:" + id;
+
+        // 1. 先查本地缓存
+        Product local = localCache.getIfPresent(key);
+        if (local != null) {
+            return local;
+        }
+
+        // 2. Redis 可用，查 Redis
+        if (redisAvailable) {
+            try {
+                Product cached = redisTemplate.opsForValue().get(key);
+                if (cached != null) {
+                    localCache.put(key, cached);
+                    return cached;
+                }
+            } catch (Exception e) {
+                redisAvailable = false;
+            }
+        }
+
+        // 3. Redis 不可用，查数据库
+        Product product = productMapper.selectById(id);
+        if (product != null) {
+            localCache.put(key, product);
+        }
+        return product;
+    }
+}
+```
+
+### 3.3 熔断降级
+
+```java title="熔断降级")
+@Service
+@Slf4j
+public class CircuitBreakerService {
+    private volatile boolean open = false;
+    private int failureCount = 0;
+    private static final int FAILURE_THRESHOLD = 5;
+
+    public Product getProductWithCircuitBreaker(Long id) {
+        if (open) {
+            return getDefaultProduct(id);
+        }
+        try {
+            Product product = getProductFromCache(id);
+            return product;
+        } catch (Exception e) {
+            failureCount++;
+            if (failureCount >= FAILURE_THRESHOLD) {
+                open = true;
+                log.error("熔断器打开！");
+            }
+            return getDefaultProduct(id);
+        }
+    }
+
+    private Product getDefaultProduct(Long id) {
+        log.warn("服务熔断，返回默认值");
+        return defaultProductService.getDefault(id);
+    }
+}
+```
+
+## 四、解决方案：事前预防
+
+### 4.1 缓存预热
+
+```java title="缓存预热")
+@Service
+@Slf4l
+public class CachePreheatService {
+    @Autowired
+    private RedisTemplate<String, Product> redisTemplate;
+    @Autowired
+    private ProductMapper productMapper;
+
+    @Scheduled(cron = "0 55 * * * ?")
+    public void preheatHotProducts() {
+        List<Long> hotProductIds = hotProductService.getHotProductIds();
+        for (Long id : hotProductIds) {
+            try {
+                Product product = productMapper.selectById(id);
+                if (product != null) {
+                    long expireSeconds = 3600 + ThreadLocalRandom.current().nextInt(600);
+                    redisTemplate.opsForValue().set("product:" + id, product, expireSeconds, TimeUnit.SECONDS);
+                }
+            } catch (Exception e) {
+                log.error("预热失败: {}", id, e);
+            }
+        }
+    }
+
+    @PostConstruct
+    public void preheatOnStartup() {
+        CompletableFuture.runAsync(this::preheatHotProducts);
+    }
+}
+```
+
+### 4.2 热点数据永不过期
+
+```java title="热点数据永不过期")
+@Service
+public class HotDataNeverExpireService {
+    private Set<String> neverExpireKeys = ConcurrentHashMap.newKeySet();
+
+    public void markNeverExpire(String key) {
+        neverExpireKeys.add(key);
+        redisTemplate.persist(key);
+    }
+
+    public void getProduct(Long id) {
+        String key = "product:" + id;
+        if (neverExpireKeys.contains(key)) {
+            return redisTemplate.opsForValue().get(key);
+        }
+        if (hotKeyMonitor.isHotKey(key)) {
+            markNeverExpire(key);
+        }
+        return redisTemplate.opsForValue().get(key);
+    }
+}
+```
+
+## 五、解决方案：事中控制
+
+### 5.1 请求限流
+
+```java title="Redis 限流")
+@Service
+@Slf4j
+public class RedisRateLimiter {
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    public boolean isAllowed(String key, int maxRequests, int windowSeconds) {
+        String windowKey = "rate:" + key;
+        long now = System.currentTimeMillis();
+        long windowStart = now - windowSeconds * 1000L;
+
+        RedisCallback<Boolean> callback = connection -> {
+            connection.zSetCommands().zRemRangeByScore(windowKey.getBytes(), 0, windowStart);
+            Long count = connection.zSetCommands().zCard(windowKey.getBytes());
+            if (count != null && count >= maxRequests) {
+                return false;
+            }
+            connection.zSetCommands().zAdd(windowKey.getBytes(), now, String.valueOf(now));
+            connection.keyCommands().expire(windowKey.getBytes(), windowSeconds);
+            return true;
+        };
+        return Boolean.TRUE.equals(redisTemplate.execute(callback));
+    }
+
+    public Product getProductWithLimit(Long id) {
+        String limitKey = "limit:db:" + id;
+        if (!isAllowed(limitKey, 100, 1)) {
+            throw new ServiceUnavailableException("系统繁忙，请稍后重试");
+        }
+        return getProductFromDb(id);
+    }
+}
+```
+
+### 5.2 请求合并
+
+```java title="请求合并")
+@Service
+@Slf4jl
+public class RequestMergeService {
+    private ConcurrentHashMap<Long, CompletableFuture<Product>> waitingRequests = new ConcurrentHashMap<>();
+
+    public Product getProduct(Long id) {
+        CompletableFuture<Product> existingFuture = waitingRequests.get(id);
+        if (existingFuture != null) {
+            return existingFuture.join();
+        }
+
+        Product cached = redisTemplate.opsForValue().get("product:" + id);
+        if (cached != null) {
+            return cached;
+        }
+
+        CompletableFuture<Product> future = new CompletableFuture<>();
+        try {
+            waitingRequests.put(id, future);
+            Thread.sleep(10);
+            Product product = productMapper.selectById(id);
+            future.complete(product);
+        } catch (Exception e) {
+            future.completeExceptionally(e);
+        } finally {
+            waitingRequests.remove(id);
+        }
+        return future.join();
+    }
+}
+```
+
+## 六、解决方案：事后恢复
+
+### 6.1 快速恢复机制
+
+```java title="快速恢复)")
+@Service
+@Slf4jl
+public class FastRecoveryService {
+    public void fastRecovery(List<Long> hotIds) {
+        ExecutorService executor = Executors.newFixedThreadPool(10);
+        CountDownLatch latch = new CountDownLatch(hotIds.size());
+
+        for (Long id : hotIds) {
+            executor.submit(() -> {
+                try {
+                    Product product = productMapper.selectById(id);
+                    if (product != null) {
+                        redisTemplate.opsForValue().set("product:" + id, product, 2, TimeUnit.HOURS);
+                    }
+                } finally {
+                    latch.countDown();
+                }
+            });
+        }
+
+        try {
+            latch.await(60, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } finally {
+            executor.shutdown();
+        }
+    }
+}
+```
+
+## 七、综合防护体系
+
+### 7.1 三道防线
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        缓存雪崩防护体系                                  │
+│                                                                         │
+│   第一道防线：事前预防                                                   │
+│   - 过期时间随机化                                                      │
+│   - 缓存预热                                                            │
+│   - 热点数据永不过期                                                    │
+│   - Redis 高可用架构                                                    │
+│                                                                         │
+│   第二道防线：事中控制                                                   │
+│   - 限流                                                                │
+│   - 熔断降级                                                            │
+│   - 请求合并                                                            │
+│   - 多级缓存降级                                                        │
+│                                                                         │
+│   第三道防线：事后恢复                                                   │
+│   - 数据库保护                                                          │
+│   - 快速恢复                                                            │
+│   - 告警通知                                                            │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+## 八、总结
+
+| 防线 | 措施 | 作用 |
+|---|---|---|
+| **事前** | 过期时间随机化 | 避免集中过期 |
+| **事前** | 缓存预热 | 避免冷启动 |
+| **事前** | 热点永不过期 | 保护热点数据 |
+| **事前** | Redis 高可用 | 避免 Redis 宕机 |
+| **事中** | 限流 | 控制请求量 |
+| **事中** | 熔断降级 | 保护数据库 |
+| **事中** | 多级缓存 | 降级兜底 |
+| **事后** | 快速恢复 | 快速恢复服务 |
+
+:::tip 核心原则
+缓存雪崩的核心是**「量变引起质变」**。单个热点 key 击穿是小事，大量 key 同时失效就是灾难。
+
+记住三个要点：
+
+1. **分散过期时间**，让 key 不要一起过期
+2. **保护好 Redis**，不让它成为单点故障
+3. **准备降级方案**，万无一失
+:::
+
+## 结尾
+
+缓存雪崩是缓存系统最严重的灾难之一。但只要做好**事前预防、事中控制、事后恢复**三道防线，就能有效应对。
+
+下一节，我们来看最后一个缓存专题——热点数据探测，如何在海量数据中精准识别热点。

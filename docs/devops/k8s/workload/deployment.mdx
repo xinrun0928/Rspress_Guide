@@ -1,0 +1,332 @@
+# Deployment 控制器
+
+凌晨 3 点，你正在处理一个紧急需求：需要将生产环境的订单服务从 v1.2.0 升级到 v1.3.0。这个服务承载着每秒上千笔交易，不能中断。
+
+你怎么做？手动一台一台更新？先在测试环境验证再上生产？还是直接 kubectl apply 等它自己搞定？
+
+Deployment 控制器正是为解决这些问题而生的。它让你以一种声明式的、可控的方式管理应用的更新过程，支持灰度发布、自动回滚、滚动更新等一系列高级特性。
+
+## 核心概念
+
+Deployment 是 Kubernetes 中用于管理无状态应用的资源对象。它在 ReplicaSet 之上封装了一层编排逻辑，让应用的部署和更新变得简单而可靠。
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service
+  namespace: production
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: order-service
+  template:
+    metadata:
+      labels:
+        app: order-service
+    spec:
+      containers:
+      - name: order-service
+        image: registry.example.com/order-service:v1.3.0
+        ports:
+        - containerPort: 8080
+```
+
+当你创建一个 Deployment 时，Kubernetes 会自动创建一个 ReplicaSet，ReplicaSet 再根据 spec 创建 Pod。这种层级关系为滚动更新和回滚提供了基础。
+
+## 滚动更新策略
+
+滚动更新是 Deployment 的默认更新策略，它的特点是在更新过程中始终保持一定数量的可用 Pod，确保服务不中断。
+
+### 关键参数
+
+滚动更新有两个核心参数控制更新节奏：
+
+| 参数 | 说明 | 典型值 |
+|---|---|---|
+| `maxSurge` | 更新过程中允许超过期望副本数的最大数量 | 25% 或 1-2 个 |
+| `maxUnavailable` | 更新过程中允许不可用的最大 Pod 数量 | 25% 或 0-1 个 |
+
+```yaml
+spec:
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1        # 最多同时运行 4 个 Pod
+      maxUnavailable: 0 # 不允许 Pod 不可用
+```
+
+这个配置的含义是：更新时先创建一个新 Pod，等新 Pod Ready 后再删除一个旧 Pod，始终保持 3 个可用副本。
+
+### 策略选择
+
+不同的业务场景需要不同的更新策略：
+
+```yaml
+# 保守策略：优先保证可用性，更新速度慢
+spec:
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+
+# 激进策略：快速更新，但短暂超出期望副本数
+spec:
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 50%
+      maxUnavailable: 25%
+```
+
+:::warning 注意事项
+`maxUnavailable: 0` 和 `maxSurge: 1` 的组合意味着更新期间副本数会短暂变成 4 个。如果你的集群资源紧张，需要考虑这个额外的资源需求。
+:::
+
+## Recreate 策略
+
+对于有状态应用或数据库类服务，更新过程中同时存在多个版本可能导致数据不一致。这时可以使用 Recreate 策略：
+
+```yaml
+spec:
+  strategy:
+    type: Recreate
+```
+
+Recreate 策略会先删除所有旧 Pod，等 Pod 全部终止后，再创建新 Pod。这种方式会导致服务短暂不可用（约等于 Pod 启动时间），适用于：
+
+- 数据库主从切换场景
+- 需要执行数据迁移的版本
+- 不支持多版本同时运行的应用
+- 有状态存储依赖初始化顺序的场景
+
+## 版本回滚
+
+应用上线后难免会遇到问题，Deployment 提供了内置的回滚能力。
+
+### 查看历史版本
+
+```bash
+kubectl rollout history deployment/order-service
+```
+
+```
+deployment.apps/order-service
+REVISION  CHANGE-CAUSE
+1         kubectl create --filename=deployment.yaml
+2         kubectl set image deployment/order-service order-service=v1.2.0
+3         kubectl set image deployment/order-service order-service=v1.3.0
+```
+
+### 回滚到上一版本
+
+```bash
+kubectl rollout undo deployment/order-service
+```
+
+### 回滚到指定版本
+
+```bash
+kubectl rollout undo deployment/order-service --to-revision=1
+```
+
+Deployment 会保留最近 10 个版本的 ReplicaSet 历史（可通过 `spec.revisionHistoryLimit` 修改）。超过这个数量的旧版本会被清理。
+
+:::tip 保存配置
+如果想让回滚记录更清晰，建议在 apply 时添加注释：
+
+```bash
+kubectl apply --filename=deployment.yaml --record
+```
+
+这样 revision history 会记录每次变更的命令。
+:::
+
+## 金丝雀发布
+
+金丝雀发布是一种风险可控的发布策略：新版本先以小比例流量进入生产环境，验证稳定后再逐步扩大。
+
+### 基于副本数的简单实现
+
+```yaml
+# 旧版本：3 个副本
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service-stable
+spec:
+  replicas: 3
+  ...
+
+# 新版本：1 个副本（金丝雀）
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service-canary
+spec:
+  replicas: 1
+  ...
+```
+
+配合 Service selector 可以实现流量分配：
+
+```yaml
+# 只将金丝雀 Pod 加入 Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: order-service
+spec:
+  selector:
+    app: order-service
+    version: stable  # 只选中 stable 版本
+```
+
+### 结合 HPA 实现自适应灰度
+
+更高级的玩法是结合 HorizontalPodAutoscaler，根据金丝雀的错误率自动扩缩容：
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: order-service-canary-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: order-service-canary
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 50
+  minReplicas: 1
+  maxReplicas: 10
+```
+
+## 蓝绿部署
+
+蓝绿部署需要两套完整的环境，通过切换流量来实现无缝切换。
+
+```yaml
+# Blue 环境 (v1)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service-blue
+  labels:
+    app: order-service
+    slot: blue
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: order-service
+      slot: blue
+  template:
+    metadata:
+      labels:
+        app: order-service
+        slot: blue
+    spec:
+      containers:
+      - name: order-service
+        image: order-service:v1
+---
+# Service 指向 blue
+apiVersion: v1
+kind: Service
+metadata:
+  name: order-service
+spec:
+  selector:
+    slot: blue
+  ports:
+  - port: 80
+    targetPort: 8080
+```
+
+```yaml
+# Green 环境 (v2) - 先部署不暴露
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service-green
+  labels:
+    app: order-service
+    slot: green
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: order-service
+      slot: green
+  ...
+```
+
+切换时只需修改 Service selector：
+
+```bash
+kubectl patch service order-service -p '{"spec":{"selector":{"slot":"green"}}}'
+```
+
+:::tip 蓝绿优势
+蓝绿部署可以实现秒级回滚：出现问题时，把 Service selector 改回 blue 即可。而且在切换前可以对新版本进行完整验证。
+:::
+
+但蓝绿部署的缺点也很明显：**需要双倍资源**。如果你的集群资源紧张，这可能不是最优选择。
+
+## Deployment 状态
+
+Deployment 有一个 `.status` 字段，记录了当前的发布状态：
+
+```yaml
+status:
+  observedGeneration: 3
+  replicas: 3
+  updatedReplicas: 3
+  availableReplicas: 3
+  readyReplicas: 3
+  conditions:
+  - type: Available
+    status: "True"
+    reason: MinimumReplicasAvailable
+  - type: Progressing
+    status: "True"
+    reason: NewReplicaSetAvailable
+```
+
+当 `Progressing` 状态为 `True` 时，表示 Deployment 正在推进中或已完成更新。如果状态变为 `False`，需要检查 `reason` 字段来定位问题。
+
+## 暂停与恢复
+
+对于需要分阶段更新的场景，可以使用 pause 和 resume：
+
+```bash
+# 暂停更新
+kubectl rollout pause deployment/order-service
+
+# 修改镜像
+kubectl set image deployment/order-service order-service=v1.4.0
+
+# 继续更新
+kubectl rollout resume deployment/order-service
+```
+
+暂停期间的所有变更会合并为一次滚动更新，而不是多次独立的更新。这在需要验证中间状态的场景下很有用。
+
+## 总结
+
+Deployment 是 Kubernetes 中最常用的工作负载控制器，掌握它的各种特性对于日常运维至关重要。
+
+**面试追问方向：**
+
+- Deployment 和 ReplicaSet 的关系是什么？为什么需要这一层抽象？
+- 滚动更新过程中，如果新 Pod 启动失败会怎样？
+- 如何实现 zero-downtime 部署？需要满足什么条件？
+- `maxSurge` 和 `maxUnavailable` 能同时为 0 吗？为什么？

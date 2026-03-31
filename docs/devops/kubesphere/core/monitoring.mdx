@@ -1,0 +1,435 @@
+# KubeSphere 监控系统
+
+凌晨 3 点，你的服务开始变慢。用户开始投诉，但你还在睡觉。早上醒来，你发现原来是凌晨 1 点有流量突增，但已经来不及处理了。
+
+KubeSphere 的监控系统就是为了解决这个问题——让你在问题发生前就能预警。
+
+## 监控系统架构
+
+### 核心组件
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     采集层                                   │
+│  ┌────────────┐  ┌────────────┐  ┌───────────────────────┐ │
+│  │ kube-state-metrics │ │ node-exporter │ │ 应用指标 (自定义) │ │
+│  └────────────┘  └────────────┘  └───────────────────────┘ │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                     存储层                                   │
+│                 Prometheus + Thanos                          │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                     展示层                                   │
+│           KubeSphere Web UI + Grafana                       │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 指标类型
+
+| 类型 | 说明 | 示例 |
+|---|---|---|
+| **基础设施指标** | 节点、CPU、内存、网络 | node_cpu_usage |
+| **Kubernetes 指标** | Pod、Deployment、Service | pod_status_phase |
+| **应用指标** | 业务埋点 | order_count, api_latency |
+
+## 监控目标
+
+### 集群级监控
+
+```yaml title="cluster-monitor.yaml"
+apiVersion: monitoring.kubesphere.io/v1alpha1
+kind: ClusterMonitoring
+metadata:
+  name: cluster-monitoring
+spec:
+  retention: 30d
+  
+  # 采集间隔
+  interval: 15s
+  
+  # 告警配置
+  alerting:
+    enabled: true
+    alertmanagers:
+    - http://alertmanager-main.monitoring.svc:9093
+```
+
+### 节点监控
+
+监控所有节点的资源使用：
+
+```yaml title="node-exporter.yaml"
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-exporter
+  namespace: monitoring
+spec:
+  selector:
+    matchLabels:
+      app: node-exporter
+  template:
+    spec:
+      containers:
+      - name: node-exporter
+        image: prom/node-exporter:v1.6.1
+        ports:
+        - containerPort: 9100
+        resources:
+          limits:
+            cpu: 250m
+            memory: 180Mi
+```
+
+### Pod 监控
+
+```yaml title="pod-monitor.yaml"
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: order-service
+  namespace: production
+spec:
+  selector:
+    matchLabels:
+      app: order-service
+  
+  endpoints:
+  - port: metrics
+    interval: 15s
+    path: /metrics
+  
+  namespaceSelector:
+    matchNames:
+    - production
+```
+
+## 应用监控
+
+### Spring Boot 监控
+
+```xml title="pom.xml"
+<dependencies>
+    <!-- Actuator -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-actuator</artifactId>
+    </dependency>
+    
+    <!-- Micrometer -->
+    <dependency>
+        <groupId>io.micrometer</groupId>
+        <artifactId>micrometer-registry-prometheus</artifactId>
+    </dependency>
+</dependencies>
+```
+
+```yaml title="application.yml"
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+    tags:
+      application: order-service
+```
+
+### 自定义指标
+
+```java title="OrderMetrics.java"
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.Timer;
+
+@Service
+public class OrderMetrics {
+    private final Counter orderCreatedCounter;
+    private final Counter orderFailedCounter;
+    private final Timer orderProcessingTimer;
+    
+    public OrderMetrics(MeterRegistry registry) {
+        this.orderCreatedCounter = Counter.builder("order_created_total")
+            .description("Total orders created")
+            .tag("service", "order")
+            .register(registry);
+        
+        this.orderFailedCounter = Counter.builder("order_failed_total")
+            .description("Total orders failed")
+            .tag("service", "order")
+            .register(registry);
+        
+        this.orderProcessingTimer = Timer.builder("order_processing_duration")
+            .description("Order processing duration")
+            .tag("service", "order")
+            .register(registry);
+    }
+    
+    public void recordOrderCreated() {
+        orderCreatedCounter.increment();
+    }
+    
+    public void recordOrderFailed(String reason) {
+        Counter.builder("order_failed_total")
+            .tag("reason", reason)
+            .register(orderCreatedCounter.getId().getMeterRegistry())
+            .increment();
+    }
+    
+    public Timer.Sample startTimer() {
+        return Timer.start();
+    }
+    
+    public void recordDuration(Timer.Sample sample) {
+        sample.stop(orderProcessingTimer);
+    }
+}
+```
+
+### Python 应用监控
+
+```python title="app_metrics.py"
+from prometheus_client import Counter, Histogram, Gauge, start_http_server
+
+# 定义指标
+REQUEST_COUNT = Counter(
+    'http_requests_total',
+    'Total HTTP requests',
+    ['method', 'endpoint', 'status']
+)
+
+REQUEST_LATENCY = Histogram(
+    'http_request_duration_seconds',
+    'HTTP request latency',
+    ['method', 'endpoint']
+)
+
+ACTIVE_USERS = Gauge(
+    'active_users',
+    'Number of active users'
+)
+
+@app.middleware
+async def metrics_middleware(request, call_next):
+    start = time.time()
+    
+    response = await call_next(request)
+    
+    REQUEST_COUNT.labels(
+        method=request.method,
+        endpoint=request.url.path,
+        status=response.status_code
+    ).inc()
+    
+    REQUEST_LATENCY.labels(
+        method=request.method,
+        endpoint=request.url.path
+    ).observe(time.time() - start)
+    
+    return response
+```
+
+## 告警规则
+
+### 节点告警
+
+```yaml title="node-alert.yaml"
+apiVersion: monitoring.kubesphere.io/v1alpha2
+kind: AlertRule
+metadata:
+  name: node-high-cpu
+  namespace: kubesphere-monitoring-system
+spec:
+  # 告警条件
+  expr: |
+    (
+      1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)
+    ) * 100 > 85
+  
+  for: 5m
+  severity: warning
+  
+  labels:
+    type: node
+    severity: warning
+  
+  annotations:
+    summary: "Node memory usage is high"
+    description: "Node {{ $labels.node }} memory usage is {{ $value | printf \"%.2f\" }}%"
+```
+
+### 应用告警
+
+```yaml title="app-alert.yaml"
+apiVersion: monitoring.kubesphere.io/v1alpha2
+kind: AlertRule
+metadata:
+  name: api-high-latency
+  namespace: production
+spec:
+  expr: |
+    histogram_quantile(0.99,
+      sum(rate(http_request_duration_seconds_bucket[5m])) by (le)
+    ) > 1
+  
+  for: 3m
+  severity: critical
+  
+  annotations:
+    summary: "API P99 latency is high"
+    description: "API P99 latency is {{ $value }}s, threshold is 1s"
+```
+
+### 告警级别
+
+| 级别 | 说明 | 响应时间 | 通知频率 |
+|---|---|---|---|
+| **Critical** | 服务不可用 | 立即 | 每 5 分钟 |
+| **Warning** | 性能下降 | 30 分钟 | 每 15 分钟 |
+| **Info** | 潜在问题 | 4 小时 | 一次 |
+
+## 可视化大盘
+
+### 集群总览大盘
+
+```yaml title="cluster-dashboard.yaml"
+apiVersion: monitoring.kubesphere.io/v1alpha1
+kind: Dashboard
+metadata:
+  name: cluster-overview
+  namespace: kubesphere-monitoring-system
+spec:
+  title: "集群总览"
+  
+  panels:
+  - title: "CPU 使用率"
+    type: graph
+    datasource: prometheus
+    targets:
+    - expr: sum(rate(container_cpu_usage_seconds_total[5m])) by (pod) / sum(container_spec_cpu_quota / container_spec_cpu_period_millisec) by (pod)
+  
+  - title: "内存使用率"
+    type: graph
+    targets:
+    - expr: |
+        (
+          sum(container_memory_working_set_bytes) by (pod) /
+          sum(container_spec_memory_limit_bytes > 0) by (pod)
+        ) * 100
+  
+  - title: "Pod 数量"
+    type: stat
+    targets:
+    - expr: count(kube_pod_info) by (namespace)
+```
+
+### 应用监控大盘
+
+```yaml title="app-dashboard.yaml"
+spec:
+  title: "Order Service 监控"
+  
+  variables:
+  - name: namespace
+    type: constant
+    value: production
+  - name: service
+    type: constant
+    value: order-service
+  
+  panels:
+  - title: "QPS"
+    type: graph
+    targets:
+    - expr: |
+        sum(rate(http_requests_total{service="$service", namespace="$namespace"}[5m])) by (service)
+  
+  - title: "P99 延迟"
+    type: graph
+    targets:
+    - expr: |
+        histogram_quantile(0.99,
+          sum(rate(http_request_duration_seconds_bucket{service="$service"}[5m])) by (le)
+        )
+  
+  - title: "错误率"
+    type: graph
+    targets:
+    - expr: |
+        sum(rate(http_requests_total{service="$service", status=~"5.."}[5m])) /
+        sum(rate(http_requests_total{service="$service"}[5m])) * 100
+```
+
+## 服务发现
+
+### 自动发现
+
+KubeSphere 自动发现 Kubernetes 中的服务：
+
+```yaml title="service-monitor.yaml"
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: auto-discover
+  labels:
+    release: kube-prometheus-stack
+spec:
+  # 自动匹配所有服务
+  selector:
+    matchExpressions:
+    - key: app
+      operator: Exists
+```
+
+### 服务级别 SLO
+
+```yaml title="slo-config.yaml"
+apiVersion: monitoring.kubesphere.io/v1alpha1
+kind: ServiceLevelObjective
+metadata:
+  name: order-service-availability
+  namespace: production
+spec:
+  target:
+    service: order-service
+    namespace: production
+  
+  objectives:
+  - name: availability
+    goal: 99.9
+    sli:
+      total:
+        query: |
+          sum(http_requests_total{service="order-service"})
+      success:
+        query: |
+          sum(http_requests_total{service="order-service", status=~"2.."})
+```
+
+## 总结
+
+KubeSphere 监控系统的核心能力：
+
+| 能力 | 说明 |
+|---|---|
+| **多层次监控** | 集群、节点、Pod、应用 |
+| **实时指标** | Prometheus 高效采集 |
+| **告警管理** | 多级别告警规则 |
+| **可视化** | 丰富的 Grafana 大盘 |
+| **SLO 管理** | 服务级别目标跟踪 |
+
+最佳实践：
+
+1. **应用埋点**：关键业务指标必须上报
+2. **合理告警阈值**：避免告警疲劳
+3. **SLO 监控**：关注核心业务指标
+4. **定期 Review**：持续优化监控覆盖
+5. **告警响应**：有告警必须有人响应

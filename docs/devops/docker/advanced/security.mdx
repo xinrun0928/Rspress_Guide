@@ -1,0 +1,404 @@
+# 容器安全
+
+容器共享宿主机的内核，这意味着如果容器内的进程提权成功，理论上可能影响宿主机甚至其他容器。
+
+理解容器的安全机制，是构建安全容器化基础设施的基础。
+
+## 容器安全的核心威胁
+
+| 威胁类型 | 说明 | 风险等级 |
+|---|---|---|
+| 特权容器 | 拥有几乎所有宿主机权限 | 极高 |
+| 敏感目录挂载 | 挂载 `/var/run/docker.sock` 等 | 高 |
+| 内核漏洞 | 利用内核漏洞提权或逃逸 | 高 |
+| 镜像漏洞 | 镜像包含已知 CVE | 中 |
+| 密钥泄露 | 密钥在镜像或环境变量中暴露 | 高 |
+| 资源耗尽 | 恶意容器耗尽宿主机资源 | 中 |
+
+## 用户命名空间映射
+
+### 用户命名空间简介
+
+用户命名空间（User Namespace）将容器内的用户 ID 映射到宿主机上不同的用户 ID，实现容器与宿主机用户的隔离。
+
+```bash
+# 未映射：容器 root (UID 0) = 宿主机 root (UID 0)
+docker run -it --rm alpine id
+# uid=0(root) gid=0(root)
+
+# 使用 userns-remap：容器 root (UID 0) = 宿主机 nobody (UID 65534)
+```
+
+### 启用用户命名空间映射
+
+```bash
+# /etc/docker/daemon.json
+{
+  "userns-remap": "default"
+}
+```
+
+```bash
+# 或者指定用户
+# /etc/docker/daemon.json
+{
+  "userns-remap": "myuser"
+}
+```
+
+```bash
+# 创建用户映射
+useradd -M -u 100000 -U myuser
+# 在 /etc/subuid 和 /etc/subgid 中配置映射
+echo "myuser:100000:65536" >> /etc/subuid
+echo "myuser:100000:65536" >> /etc/subgid
+
+# 重启 Docker
+sudo systemctl restart docker
+```
+
+:::warning 限制
+启用用户命名空间后，某些操作可能受限：
+- 无法使用特权容器
+- 无法直接挂载某些设备
+- `--privileged` 参数被禁用
+:::
+
+## Linux Capabilities
+
+Linux 权限模型将 root 的特权拆分为多个 **Capabilities**。
+
+### 查看默认 capabilities
+
+```bash
+# 查看容器的 capabilities
+docker inspect --format '{{.HostConfig.CapAdd}}' container-name
+
+# 查看有效 capabilities
+docker run --rm alpine capsh --print
+```
+
+### 默认 drop 的 capabilities
+
+Docker 默认禁用以下危险 capabilities：
+
+| Capability | 说明 | 默认 |
+|---|---|---|
+| `CAP_SYS_ADMIN` | 系统管理（挂载等） | drop |
+| `CAP_NET_ADMIN` | 网络管理 | drop |
+| `CAP_SYS_MODULE` | 加载内核模块 | drop |
+| `CAP_SYS_RAWIO` | 原始 I/O | drop |
+| `CAP_SYS_PTRACE` | 调试追踪 | drop |
+| `CAP_SYS_TIME` | 修改系统时间 | drop |
+
+### 自定义 capabilities
+
+```bash
+# 添加 capability（谨慎使用）
+docker run -d --cap-add=NET_ADMIN --name app nginx:alpine
+
+# 添加所有 capabilities
+docker run -d --privileged --name app nginx:alpine
+
+# 移除 capability
+docker run -d --cap-drop=SYS_ADMIN --name app nginx:alpine
+
+# 移除所有，添加特定
+docker run -d --cap-drop=ALL --cap-add=NET_BIND_SERVICE --name app nginx:alpine
+```
+
+:::danger --privileged 的风险
+`--privileged` 给予容器几乎所有 capabilities，等同于完全信任容器内进程。**绝不**在生产环境对不可信容器使用。
+:::
+
+## seccomp
+
+seccomp（Secure Computing Mode）限制容器可以调用的系统调用。
+
+### 默认 seccomp 配置
+
+Docker 默认启用 seccomp，阻止约 44 个系统调用：
+
+```bash
+# 查看默认 seccomp 配置
+cat /etc/docker/seccomp.json
+
+# 或者导出默认配置
+docker run --rm \
+  alpine \
+  cat /proc/self/status | grep Seccomp
+# Seccomp: 2（seccomp 过滤模式）
+```
+
+### 自定义 seccomp 配置
+
+```bash
+# 创建自定义 seccomp 配置
+cat > /etc/docker/seccomp-custom.json << 'EOF'
+{
+  "defaultAction": "SCMP_ACT_ERRNO",
+  "architectures": [
+    "SCMP_ARCH_X86_64",
+    "SCMP_ARCH_AARCH64"
+  ],
+  "syscalls": [
+    {
+      "names": ["write", "read", "open", "close"],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "names": ["mount", "umount2"],
+      "action": "SCMP_ACT_ERRNO"
+    }
+  ]
+}
+EOF
+```
+
+```bash
+# 使用自定义 seccomp
+docker run --security-opt seccomp=/etc/docker/seccomp-custom.json --rm alpine sh
+```
+
+### 禁用 seccomp
+
+```bash
+# 禁用 seccomp（不推荐）
+docker run --security-opt seccomp=unconfined --rm alpine sh
+```
+
+## AppArmor
+
+AppArmor 是 Ubuntu/Debian 上的强制访问控制（MAC）系统。
+
+### 查看 AppArmor 状态
+
+```bash
+# 检查 AppArmor 是否启用
+aa-status
+# 或
+cat /sys/kernel/security/apparmor/profiles
+```
+
+### 自定义 AppArmor 配置
+
+```bash
+# 创建 AppArmor 配置文件
+cat > /etc/apparmor.d/docker-myapp << 'EOF'
+#include <tunables/global>
+
+profile docker-myapp flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+
+  # 允许读写 /opt/app
+  /opt/app/** rwk,
+
+  # 允许读写特定目录
+  /var/log/myapp/** rw,
+
+  # 允许执行特定二进制
+  /usr/bin/python3 mr,
+
+  # 拒绝其他所有写操作
+  deny /proc/** w,
+}
+EOF
+```
+
+```bash
+# 加载配置
+sudo apparmor_parser -r /etc/apparmor.d/docker-myapp
+
+# 使用自定义 AppArmor
+docker run --security-opt apparmor=docker-myapp --rm -it alpine sh
+```
+
+## SELinux
+
+SELinux 是 RHEL/CentOS/Fedora 上的 MAC 系统。
+
+### SELinux 标签
+
+```bash
+# 使用 SELinux 标签
+docker run -d \
+  --security-opt label=type:container_t \
+  --security-opt label=level:s0:c100,c200 \
+  --name app \
+  nginx:alpine
+```
+
+### 禁用 SELinux
+
+:::warning 安全风险
+禁用 SELinux 会降低容器安全性。仅在测试环境中使用。
+:::
+
+```bash
+docker run --security-opt label=disable --rm alpine sh
+```
+
+## 运行时安全最佳实践
+
+### 1. 非 root 用户运行
+
+```dockerfile title="Dockerfile"
+FROM alpine:3.18
+
+# 创建应用用户
+RUN addgroup -g 1001 -S app && \
+    adduser -S app -u 1001 -G app
+
+# 复制文件并设置所有者
+COPY --chown=app:app . /opt/app
+
+# 切换用户
+USER app
+
+CMD ["node", "app.js"]
+```
+
+### 2. 最小化 capabilities
+
+```bash
+# 移除所有 capabilities，只保留必要的
+docker run -d \
+  --cap-drop=ALL \
+  --cap-add=NET_BIND_SERVICE \
+  --name app \
+  myapp:latest
+```
+
+### 3. 只读文件系统
+
+```bash
+# 容器文件系统只读（需要写入的目录用 tmpfs）
+docker run -d --read-only --name app nginx:alpine
+
+# 允许特定目录可写
+docker run -d \
+  --read-only \
+  --tmpfs /tmp \
+  --tmpfs /run \
+  -v /var/log:/var/log \
+  --name app \
+  nginx:alpine
+```
+
+### 4. 禁止特权操作
+
+```bash
+# 禁止新增设备
+docker run -d --device-read-bps /dev/null:0 --name app nginx:alpine
+
+# 禁止 sys_admin
+docker run -d --cap-drop=SYS_ADMIN --name app nginx:alpine
+```
+
+### 5. 资源限制
+
+```bash
+# 限制内存和 CPU
+docker run -d \
+  -m="256m" \
+  --cpus="0.5" \
+  --pids-limit=100 \
+  --name app \
+  nginx:alpine
+```
+
+### 6. 完整的安全配置示例
+
+```bash
+docker run -d \
+  --name secure-app \
+  --restart unless-stopped \
+  \
+  # 用户和权限
+  --user 1001:1001 \
+  --cap-drop=ALL \
+  --cap-add=NET_BIND_SERVICE \
+  \
+  # 文件系统
+  --read-only \
+  --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+  --tmpfs /run:rw,noexec,nosuid,size=32m \
+  \
+  # seccomp
+  --security-opt seccomp=/etc/docker/seccomp-custom.json \
+  \
+  # 资源限制
+  -m="512m" \
+  --cpus="1" \
+  --pids-limit=200 \
+  \
+  # 网络
+  --network none \
+  \
+  nginx:alpine
+```
+
+## 镜像安全
+
+### 使用可信基础镜像
+
+```dockerfile title="Dockerfile"
+# 使用官方镜像，明确版本
+FROM node:18.17.0-alpine
+
+# 不要使用 latest
+# FROM node:latest  ← 不好
+```
+
+### 多阶段构建减少攻击面
+
+```dockerfile title="Dockerfile"
+# 构建阶段
+FROM golang:1.21 AS builder
+WORKDIR /app
+COPY . .
+RUN CGO_ENABLED=0 go build -ldflags="-w -s" -o myapp .
+
+# 运行阶段
+FROM scratch
+COPY --from=builder /app/myapp /myapp
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+USER 1000
+ENTRYPOINT ["/myapp"]
+```
+
+### 定期更新基础镜像
+
+```bash
+# 定期检查漏洞
+docker scout cves myregistry/myapp:v1.0.0
+
+# 使用自动更新工具
+# 如 Renovate、Dependabot 自动创建 PR 更新镜像
+```
+
+## 安全扫描
+
+```bash
+# 使用 Trivy 扫描镜像
+docker run --rm \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  aquasec/trivy image nginx:alpine
+
+# Docker Scout
+docker scout cves myregistry/myapp:v1.0.0
+```
+
+## 总结
+
+容器安全需要多层防护：
+
+| 层次 | 措施 |
+|---|---|
+| 镜像层 | 可信镜像、多阶段构建、定期扫描 |
+| 运行时 | 非 root、cap-drop、seccomp |
+| 资源 | 内存限制、CPU 限制、PID 限制 |
+| 网络 | 网络隔离、最小端口暴露 |
+| 存储 | 只读文件系统、敏感目录排除 |
+
+理解并正确配置这些安全机制，才能真正发挥容器的隔离优势。

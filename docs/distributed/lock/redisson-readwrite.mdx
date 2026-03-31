@@ -1,0 +1,461 @@
+# Redisson 读写锁实现
+
+读写锁是并发优化的利器——多线程读同一份数据，完全可以并行；只有写的时候才需要互斥。
+
+在分布式环境中，读写锁同样重要。比如缓存系统：多个线程可以同时读取缓存，但写入缓存时需要独占访问。
+
+Redisson 提供了分布式的 `ReadWriteLock` 实现，让你可以在 Redis 基础上使用读写锁。
+
+## 一、读写锁的概念
+
+### 1.1 为什么需要读写锁
+
+在没有读写锁的情况下：
+
+```java
+// 普通锁：读和写都互斥
+Lock lock = new ReentrantLock();
+
+public void read() {
+    lock.lock();
+    try {
+        // 读数据
+        return data;
+    } finally {
+        lock.unlock();
+    }
+}
+
+public void write() {
+    lock.lock();
+    try {
+        // 写数据
+        data = newValue;
+    } finally {
+        lock.unlock();
+    }
+}
+```
+
+问题：读和写之间互斥，导致读操作无法并行，降低性能。
+
+### 1.2 读写锁的规则
+
+| 操作 | 其他读锁 | 其他写锁 |
+|---|---|---|
+| 获取读锁 | ✓ 可以 | ✗ 阻塞 |
+| 获取写锁 | ✗ 阻塞 | ✗ 阻塞 |
+
+读写锁的核心规则：
+- **读锁共享**：多个线程可以同时持有读锁
+- **写锁互斥**：写锁独占，同时不允许任何读锁
+- **读写互斥**：读锁和写锁不能同时存在
+
+### 1.3 读写锁的优势
+
+```
+普通锁：
+线程 A [读] ────────────────────── [完成]
+线程 B [读] ────────────────────── [完成]  // 等待 A 完成
+线程 C [写] ────────────────────── [完成]  // 等待 B 完成
+
+读写锁：
+线程 A [读] ────────── [完成]
+线程 B [读] ────────── [完成]  // 和 A 并行读
+线程 C [写] ────────────────────── [完成]  // 等待 A、B 完成
+```
+
+## 二、Redisson ReadWriteLock
+
+### 2.1 接口定义
+
+Redisson 实现了 `ReadWriteLock` 接口：
+
+```java
+public interface ReadWriteLock {
+    /**
+     * 获取读锁
+     */
+    Lock readLock();
+
+    /**
+     * 获取写锁
+     */
+    Lock writeLock();
+}
+```
+
+### 2.2 获取锁
+
+```java
+// 获取读写锁
+ReadWriteLock rwLock = redissonClient.getReadWriteLock("my-rw-lock");
+
+// 获取读锁
+RLock readLock = rwLock.readLock();
+
+// 获取写锁
+RLock writeLock = rwLock.writeLock();
+```
+
+## 三、Redis 中的实现
+
+### 3.1 存储结构
+
+Redisson 读写锁使用 Hash 结构：
+
+```
+锁 key: my-rw-lock
+    │
+    └── Hash 结构
+          │
+          ├── "read:thread-uuid-1:thread-id-1" -> 1  (读锁计数)
+          ├── "read:thread-uuid-2:thread-id-2" -> 2  (另一个线程持有 2 次读锁)
+          └── "write:thread-uuid-3:thread-id-3" -> 1  (写锁计数)
+```
+
+关键设计：
+- 读锁和写锁分开存储
+- 使用前缀区分：`read:` 和 `write:`
+- 计数器记录重入次数
+
+### 3.2 读锁获取 Lua 脚本
+
+```lua
+-- 获取读锁
+-- KEYS[1] = 锁 key
+-- ARGV[1] = 读锁标识前缀
+-- ARGV[2] = 线程标识
+-- ARGV[3] = 过期时间
+
+-- 1. 检查是否有写锁
+if (redis.call('exists', KEYS[1]) == 1) then
+    -- 锁存在，检查是否有写锁
+    local writeKey = redis.call('keys', 'write:*')[1];
+    if (writeKey) then
+        -- 有写锁，不能获取读锁
+        return 0;
+    end;
+end;
+
+-- 2. 没有写锁，可以获取读锁
+local lockKey = ARGV[1] .. ARGV[2];
+if (redis.call('hexists', KEYS[1], lockKey) == 1) then
+    -- 同一线程重入读锁，计数 +1
+    redis.call('hincrby', KEYS[1], lockKey, 1);
+    redis.call('pexpire', KEYS[1], ARGV[3]);
+    return 1;
+end;
+
+-- 3. 首次获取读锁
+redis.call('hset', KEYS[1], lockKey, 1);
+redis.call('pexpire', KEYS[1], ARGV[3]);
+return 1;
+```
+
+### 3.3 写锁获取 Lua 脚本
+
+```lua
+-- 获取写锁
+-- KEYS[1] = 锁 key
+-- ARGV[1] = 写锁标识前缀
+-- ARGV[2] = 线程标识
+-- ARGV[3] = 过期时间
+
+-- 1. 检查是否有读锁（使用 keys 命令）
+local readKeys = redis.call('keys', 'read:*');
+
+if (#readKeys > 0) then
+    -- 有读锁，不能获取写锁
+    return 0;
+end;
+
+-- 2. 没有读锁，检查写锁
+local lockKey = ARGV[1] .. ARGV[2];
+
+if (redis.call('hexists', KEYS[1], lockKey) == 1) then
+    -- 同一线程重入写锁，计数 +1
+    redis.call('hincrby', KEYS[1], lockKey, 1);
+    redis.call('pexpire', KEYS[1], ARGV[3]);
+    return 1;
+end;
+
+-- 3. 首次获取写锁
+redis.call('hset', KEYS[1], lockKey, 1);
+redis.call('pexpire', KEYS[1], ARGV[3]);
+return 1;
+```
+
+### 3.4 锁释放 Lua 脚本
+
+```lua
+-- 释放读锁/写锁
+-- KEYS[1] = 锁 key
+-- ARGV[1] = 锁标识（前缀 + 线程标识）
+-- ARGV[2] = 过期时间
+
+if (redis.call('hexists', KEYS[1], ARGV[1]) == 0) then
+    return nil;
+end;
+
+-- 计数器 -1
+local counter = redis.call('hincrby', KEYS[1], ARGV[1], -1);
+
+if (counter > 0) then
+    -- 还有计数，重置过期时间
+    redis.call('pexpire', KEYS[1], ARGV[2]);
+    return 0;
+else
+    -- 计数为 0，删除该锁
+    redis.call('hdel', KEYS[1], ARGV[1]);
+    return 1;
+end;
+```
+
+## 四、使用示例
+
+### 4.1 缓存读写分离
+
+```java
+@Service
+public class CacheService {
+
+    private final RedissonClient redissonClient;
+    private final StringRedisTemplate redisTemplate;
+
+    public CacheService(RedissonClient redissonClient,
+                        StringRedisTemplate redisTemplate) {
+        this.redissonClient = redissonClient;
+        this.redisTemplate = redisTemplate;
+    }
+
+    /**
+     * 读取缓存（读锁）
+     */
+    public String get(String key) {
+        ReadWriteLock rwLock = redissonClient.getReadWriteLock(key);
+        RLock readLock = rwLock.readLock();
+
+        try {
+            readLock.lock();
+            String value = redisTemplate.opsForValue().get(key);
+            if (value != null) {
+                return value;
+            }
+
+            // 缓存未命中，从数据库读取
+            value = loadFromDatabase(key);
+
+            // 写入缓存（需要写锁）
+            writeLock.lock();
+            try {
+                redisTemplate.opsForValue().set(key, value, 1, TimeUnit.HOURS);
+            } finally {
+                writeLock.unlock();
+            }
+
+            return value;
+        } finally {
+            readLock.unlock();
+        }
+    }
+
+    /**
+     * 更新缓存（写锁）
+     */
+    public void update(String key, String value) {
+        ReadWriteLock rwLock = redissonClient.getReadWriteLock(key);
+        RLock writeLock = rwLock.writeLock();
+
+        try {
+            writeLock.lock();
+            redisTemplate.opsForValue().set(key, value, 1, TimeUnit.HOURS);
+        } finally {
+            writeLock.unlock();
+        }
+    }
+
+    private String loadFromDatabase(String key) {
+        // 模拟从数据库加载
+        return "data-for-" + key;
+    }
+}
+```
+
+### 4.2 配置读写分离
+
+```java
+@Service
+public class ConfigService {
+
+    private final RedissonClient redissonClient;
+    private final Map<String, String> localCache = new ConcurrentHashMap<>();
+
+    /**
+     * 读取配置（高并发读取）
+     */
+    public String getConfig(String configKey) {
+        // 1. 先读本地缓存
+        String localValue = localCache.get(configKey);
+        if (localValue != null) {
+            return localValue;
+        }
+
+        // 2. 本地缓存未命中，读分布式缓存
+        ReadWriteLock rwLock = redissonClient.getReadWriteLock(
+            "config:cache:" + configKey
+        );
+        RLock readLock = rwLock.readLock();
+
+        try {
+            readLock.lock();
+            // 双重检查
+            String value = localCache.get(configKey);
+            if (value != null) {
+                return value;
+            }
+
+            // 从 Redis 读取
+            value = loadFromRedis(configKey);
+            if (value != null) {
+                localCache.put(configKey, value);
+            }
+            return value;
+        } finally {
+            readLock.unlock();
+        }
+    }
+
+    /**
+     * 更新配置（低频写入）
+     */
+    public void updateConfig(String configKey, String value) {
+        ReadWriteLock rwLock = redissonClient.getReadWriteLock(
+            "config:cache:" + configKey
+        );
+        RLock writeLock = rwLock.writeLock();
+
+        try {
+            writeLock.lock();
+
+            // 更新 Redis
+            saveToRedis(configKey, value);
+
+            // 更新本地缓存
+            localCache.put(configKey, value);
+        } finally {
+            writeLock.unlock();
+        }
+    }
+}
+```
+
+### 4.3 写锁降级
+
+在某些场景下，持有写锁时可以获取读锁（锁降级）：
+
+```java
+public class ReadWriteLockExample {
+
+    private final RedissonClient redissonClient;
+
+    public void lockDowngrade() {
+        ReadWriteLock rwLock = redissonClient.getReadWriteLock("resource");
+        RLock writeLock = rwLock.writeLock();
+
+        try {
+            writeLock.lock();
+
+            // 持有写锁，可以安全读取
+            String data = readData();
+
+            // 执行业务逻辑
+            String processed = process(data);
+
+            // 仍然持有写锁，可以安全写入
+            writeData(processed);
+
+        } finally {
+            writeLock.unlock();
+        }
+    }
+}
+```
+
+## 五、注意事项
+
+### 5.1 读锁不支持条件等待
+
+与 ReentrantReadWriteLock 不同，Redisson 读写锁不支持：
+- `readLock().tryLock(long time, TimeUnit unit)` 带条件的等待
+- 读写锁之间的条件等待
+
+### 5.2 WatchDog 生效条件
+
+```java
+// 以下情况 WatchDog 生效
+readLock.lock();
+readLock.tryLock(0, TimeUnit.SECONDS);
+
+// 以下情况 WatchDog 不生效
+readLock.tryLock(5, TimeUnit.SECONDS);  // 指定了等待时间
+```
+
+### 5.3 避免死锁
+
+```java
+// 错误：读写锁嵌套导致死锁
+readLock.lock();
+writeLock.lock();  // 可能导致死锁！
+writeLock.unlock();
+readLock.unlock();
+
+// 正确：按固定顺序获取
+writeLock.lock();
+readLock.lock();  // 持有写锁后可以获取读锁（降级）
+readLock.unlock();
+writeLock.unlock();
+```
+
+## 六、与本地读写锁的区别
+
+| 维度 | ReentrantReadWriteLock | Redisson ReadWriteLock |
+|---|---|---|
+| **作用域** | 单 JVM | 分布式 |
+| **实现** | AQS | Redis |
+| **公平性** | 可配置公平/非公平 | 默认非公平 |
+| **可重入** | 支持 | 支持 |
+| **读并发** | 支持多读 | 支持多读 |
+
+## 七、面试高频问题
+
+**Q：读写锁的规则是什么？**
+
+A：读锁共享，多个线程可以同时持有读锁；写锁独占，同时排斥所有读锁和写锁；读锁和写锁互斥。
+
+**Q：Redisson 读写锁如何实现？**
+
+A：使用 Redis Hash 结构存储，读锁和写锁分开存储在不同 field 中。读锁用 `read:` 前缀，写锁用 `write:` 前缀。获取读锁时检查无写锁，获取写锁时检查无读锁。
+
+**Q：什么场景适合使用读写锁？**
+
+A：读多写少的场景，如缓存系统、配置中心、数据查询等。多个线程可以并行读取，提高并发性能。
+
+**Q：读写锁可以降级吗？**
+
+A：可以。持有写锁时可以获取读锁（锁降级），但不能从读锁升级为写锁（可能死锁）。
+
+## 总结
+
+Redisson ReadWriteLock 为分布式环境提供了高效的读写锁实现：
+
+1. **读锁共享**：多个线程可同时读取，提高并发性能
+2. **写锁独占**：写入时独占，保证数据一致性
+3. **基于 Redis**：使用 Hash 结构实现，天然支持分布式
+4. **可重入**：支持同一线程多次获取
+
+适用场景是读多写少的缓存系统、配置管理等。在这些场景中，读写锁能显著提升系统吞吐量。
+
+> 下一步探索：
+> - 想了解更多并发原语？阅读《Redisson 信号量与 CountDownLatch》
+> - 想了解更复杂的锁？阅读《Redisson 联锁与红锁》

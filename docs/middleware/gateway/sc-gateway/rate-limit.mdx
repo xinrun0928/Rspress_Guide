@@ -1,0 +1,376 @@
+# Spring Cloud Gateway 限流
+
+当你的系统遭遇突发流量——可能是促销活动，也可能是恶意攻击——没有限流的网关会在压力下崩溃，进而影响整个系统。
+
+Spring Cloud Gateway 的 `RequestRateLimiter` 提供了完善的限流能力，基于 Redis 实现高性能的分布式限流。
+
+## RequestRateLimiter 过滤器
+
+### 工作原理
+
+`RequestRateLimiter` 使用 **令牌桶算法**（Token Bucket）实现限流。每个路由可以配置独立的限流规则。
+
+```yaml
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: limited-route
+          uri: lb://backend-service
+          predicates:
+            - Path=/api/**
+          filters:
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 100      # 每秒补充的令牌数
+                redis-rate-limiter.burstCapacity: 200      # 令牌桶容量
+                redis-rate-limiter.requestedTokens: 1       # 每个请求消耗的令牌数
+```
+
+| 参数 | 说明 | 默认值 |
+|---|---|---|
+| `replenishRate` | 每秒补充的令牌数 | 10 |
+| `burstCapacity` | 令牌桶最大容量 | 100 |
+| `requestedTokens` | 每个请求消耗的令牌数 | 1 |
+
+### 限流粒度
+
+`RequestRateLimiter` 支持多种限流粒度，通过 `key-resolver` 指定：
+
+```yaml
+filters:
+  - name: RequestRateLimiter
+    args:
+      key-resolver: "#{@pathKeyResolver}"   # Bean 名称引用
+      redis-rate-limiter.replenishRate: 100
+      redis-rate-limiter.burstCapacity: 200
+```
+
+## 限流 Key 解析器
+
+### 基于路径的限流
+
+同一路径的所有请求共享令牌桶：
+
+```java
+@Component
+public class PathKeyResolver implements KeyResolver {
+
+    @Override
+    public Mono<String> resolve(ServerWebExchange exchange) {
+        return Mono.just(exchange.getRequest().getPath().value());
+    }
+}
+```
+
+### 基于用户 ID 的限流
+
+每个用户有独立的令牌桶：
+
+```java
+@Component
+public class UserKeyResolver implements KeyResolver {
+
+    @Override
+    public Mono<String> resolve(ServerWebExchange exchange) {
+        String authHeader = exchange.getRequest().getHeaders().getFirst("Authorization");
+
+        if (StringUtils.hasText(authHeader) && authHeader.startsWith("Bearer ")) {
+            String token = authHeader.substring(7);
+            // 从 Token 中解析用户 ID
+            return Mono.just(extractUserId(token));
+        }
+
+        // 无 Token 则按 IP 限流
+        return Mono.just(getClientIp(exchange));
+    }
+
+    private String getClientIp(ServerWebExchange exchange) {
+        String xForwardedFor = exchange.getRequest()
+            .getHeaders().getFirst("X-Forwarded-For");
+        if (StringUtils.hasText(xForwardedFor)) {
+            return xForwardedFor.split(",")[0].trim();
+        }
+        return exchange.getRequest().getRemoteAddress() != null
+            ? exchange.getRequest().getRemoteAddress().getAddress().getHostAddress()
+            : "unknown";
+    }
+}
+```
+
+### 基于 IP 的限流
+
+每个 IP 地址有独立的令牌桶：
+
+```java
+@Component
+public class IpKeyResolver implements KeyResolver {
+
+    @Override
+    public Mono<String> resolve(ServerWebExchange exchange) {
+        String ip = getClientIp(exchange);
+        return Mono.just(ip);
+    }
+
+    private String getClientIp(ServerWebExchange exchange) {
+        String xForwardedFor = exchange.getRequest()
+            .getHeaders().getFirst("X-Forwarded-For");
+        if (StringUtils.hasText(xForwardedFor)) {
+            return xForwardedFor.split(",")[0].trim();
+        }
+        if (exchange.getRequest().getRemoteAddress() != null) {
+            return exchange.getRequest().getRemoteAddress()
+                .getAddress().getHostAddress();
+        }
+        return "unknown";
+    }
+}
+```
+
+### 组合限流
+
+可以同时按用户和接口限流：
+
+```java
+@Component
+public class CompositeKeyResolver implements KeyResolver {
+
+    private final UserKeyResolver userKeyResolver = new UserKeyResolver();
+
+    @Override
+    public Mono<String> resolve(ServerWebExchange exchange) {
+        return userKeyResolver.resolve(exchange)
+            .map(userId -> userId + "_" + exchange.getRequest().getPath().value());
+    }
+}
+```
+
+## 令牌桶算法详解
+
+### 算法原理
+
+令牌桶以固定速率向桶中添加令牌，桶满时新令牌被丢弃。每个请求从桶中取走一个令牌，桶空时请求被拒绝。
+
+```
+补充速率: 10 令牌/秒
+桶容量: 50 令牌
+
+时间轴:
+0s   ─▶ 桶: 50 (已满)
+1s   ─▶ 桶: 60 (补充了 10 个，上限 50，实际还是 50)
+2s   ─▶ 桶: 50
+...
+10s  ─▶ 桶: 50 (持续以最大容量运行)
+
+请求:
+时刻 1.1s ─▶ 请求到达，桶有 50 令牌，取走 1，剩 49，允许通过
+时刻 1.2s ─▶ 请求到达，桶有 49 令牌，取走 1，剩 48，允许通过
+...
+时刻 1.9s ─▶ 请求到达，桶有 41 令牌，取走 1，剩 40，允许通过
+时刻 2.0s ─▶ 补充 10 令牌，桶从 40 变成 50
+```
+
+### 与滑动窗口的区别
+
+| 维度 | 令牌桶 | 滑动窗口 |
+|---|---|---|
+| 突发处理 | 支持，可消耗积累的令牌 | 不支持，严格按时间窗口 |
+| 实现复杂度 | 中等 | 较高 |
+| 精度 | 高 | 依赖窗口大小 |
+| Redis 支持 | Lua 脚本 | 需多个 key |
+
+:::tip 选择建议
+
+对于大多数 API 限流场景，**令牌桶**是更好的选择：
+
+- 允许合理突发（如用户快速点击按钮）
+- Redis 支持好，性能高
+- 配置简单，易于理解
+
+如果需要严格控制任意时间窗口内的请求数（如金融交易），可以考虑**滑动窗口**算法。
+:::
+
+## 滑动窗口算法
+
+如果需要更精确的限流控制，可以实现滑动窗口算法：
+
+```java
+@Component
+public class SlidingWindowRateLimiter {
+
+    private final RedisTemplate<String, String> redisTemplate;
+    private final StringRedisTemplate stringRedisTemplate;
+
+    public SlidingWindowRateLimiter(RedisTemplate<String, String> redisTemplate,
+                                   StringRedisTemplate stringRedisTemplate) {
+        this.redisTemplate = redisTemplate;
+        this.stringRedisTemplate = stringRedisTemplate;
+    }
+
+    /**
+     * 滑动窗口限流
+     * @param key 限流 key
+     * @param windowSizeSeconds 窗口大小（秒）
+     * @param maxRequests 窗口内最大请求数
+     * @return 是否允许通过
+     */
+    public boolean isAllowed(String key, int windowSizeSeconds, int maxRequests) {
+        long now = System.currentTimeMillis();
+        long windowStart = now - windowSizeSeconds * 1000L;
+
+        String redisKey = "rate_limit:" + key;
+
+        // Lua 脚本保证原子性
+        String script = """
+            redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, ARGV[1])
+            local count = redis.call('ZCARD', KEYS[1])
+            if count < tonumber(ARGV[3]) then
+                redis.call('ZADD', KEYS[1], ARGV[2], ARGV[2])
+                redis.call('EXPIRE', KEYS[1], ARGV[4])
+                return 1
+            else
+                return 0
+            end
+            """;
+
+        Long result = stringRedisTemplate.execute(
+            new DefaultRedisScript<>(script, Long.class),
+            List.of(redisKey),
+            String.valueOf(windowStart),
+            String.valueOf(now),
+            String.valueOf(maxRequests),
+            String.valueOf(windowSizeSeconds)
+        );
+
+        return result != null && result == 1;
+    }
+}
+```
+
+## 自定义限流响应
+
+当请求被限流时，默认返回 `429 Too Many Requests`。可以自定义限流响应：
+
+```java
+@Component
+public class CustomRateLimiterErrorHandler implements ErrorExceptionHandler {
+
+    @Override
+    public Mono<Void> handle(ServerWebExchange exchange, Throwable ex) {
+        if (ex instanceof RequestNotPermitted) {
+            ServerHttpResponse response = exchange.getResponse();
+            response.setStatusCode(HttpStatus.TOO_MANY_REQUESTS);
+            response.getHeaders().add("Content-Type", "application/json");
+
+            String body = """
+                {
+                    "code": 429,
+                    "message": "请求过于频繁，请稍后再试",
+                    "timestamp": %d
+                }
+                """.formatted(System.currentTimeMillis());
+
+            DataBuffer buffer = response.bufferFactory().wrap(body.getBytes());
+            return response.writeWith(Mono.just(buffer));
+        }
+        return Mono.error(ex);
+    }
+}
+```
+
+## 配置示例
+
+### 全局限流配置
+
+```yaml
+spring:
+  cloud:
+    gateway:
+      default-filters:
+        - name: RequestRateLimiter
+          args:
+            redis-rate-limiter.replenishRate: 1000
+            redis-rate-limiter.burstCapacity: 2000
+            key-resolver: "#{@ipKeyResolver}"
+```
+
+### 分路由限流配置
+
+```yaml
+spring:
+  cloud:
+    gateway:
+      routes:
+        # 高频接口（公开数据），限制较宽松
+        - id: public-api
+          uri: lb://public-service
+          predicates:
+            - Path=/api/public/**
+          filters:
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 500
+                redis-rate-limiter.burstCapacity: 1000
+                key-resolver: "#{@ipKeyResolver}"
+
+        # 敏感接口（用户数据），限制严格
+        - id: user-api
+          uri: lb://user-service
+          predicates:
+            - Path=/api/user/**
+          filters:
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 100
+                redis-rate-limiter.burstCapacity: 200
+                key-resolver: "#{@userKeyResolver}"
+
+        # 管理接口，极低限制
+        - id: admin-api
+          uri: lb://admin-service
+          predicates:
+            - Path=/api/admin/**
+          filters:
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 10
+                redis-rate-limiter.burstCapacity: 20
+                key-resolver: "#{@userKeyResolver}"
+```
+
+## Redis 配置
+
+限流依赖 Redis，需要确保 Redis 可用：
+
+```yaml
+spring:
+  redis:
+    host: 127.0.0.1
+    port: 6379
+    password: ${REDIS_PASSWORD:}
+    lettuce:
+      pool:
+        max-active: 10
+        max-idle: 5
+        min-idle: 2
+```
+
+## 总结
+
+| 组件 | 作用 |
+|---|---|
+| `RequestRateLimiter` | 限流过滤器 |
+| `KeyResolver` | 限流 key 解析器，决定限流粒度 |
+| `Redis` | 存储令牌桶状态，支持分布式限流 |
+
+| 算法 | 特点 | 适用场景 |
+|---|---|---|
+| 令牌桶 | 支持突发，Redis 原生支持 | 大多数 API 限流 |
+| 滑动窗口 | 精确控制，无突发 | 金融交易、严格限流 |
+
+限流配置的关键点：
+
+1. **合理设置 `replenishRate`**：根据后端服务的实际处理能力设置
+2. **设置合适的 `burstCapacity`**：允许合理突发，提升用户体验
+3. **选择正确的限流粒度**：按用户 > 按 IP > 按接口
+4. **监控限流触发率**：如果频繁触发，考虑扩容或优化后端

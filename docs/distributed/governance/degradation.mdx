@@ -1,0 +1,358 @@
+# 服务降级
+
+熔断器打开了，请求不再发送到故障服务。但问题是：**调用方该怎么响应？**
+
+返回一个 500 错误？前端页面直接挂掉？用户看到一堆报错信息？
+
+不，我们需要一个更好的方案——**降级**。
+
+服务降级（Degradation）的核心思想是：当服务不可用时，不是简单报错，而是**返回一个「勉强能用」的结果**，让系统在「残血」状态下继续运行。
+
+## 降级 vs 熔断：傻傻分不清？
+
+很多人容易把熔断和降级搞混，让我用一句话说清楚它们的区别：
+
+> **熔断是「不调用」，降级是「调用别的」。**
+
+```yaml
+# 熔断 vs 降级
+熔断：          支付服务挂了 → 不调用 → 直接返回「系统繁忙」
+降级：          支付服务挂了 → 改用本地模拟服务 → 返回「订单已创建，支付稍后处理」
+```
+
+熔断解决的是「要不要调用」的问题，降级解决的是「调用失败后怎么办」的问题。两者配合使用，才能构建完整的保护机制。
+
+## 为什么要降级
+
+### 场景一：页面降级——核心功能优先
+
+```yaml
+# 电商详情页降级示例
+# 正常情况：返回完整信息
+{
+  "product": {...},
+  "price": {...},
+  "inventory": {...},
+  "recommendation": [...],
+  "reviews": [...]
+}
+
+# 降级情况：只返回核心信息
+{
+  "product": {...},
+  "price": {...},
+  "inventory": {...},
+  "recommendation": [],     # 推荐模块降级
+  "reviews": []            # 评价模块降级
+}
+# 用户感知：页面能打开，能下单，只是推荐和评价没有了
+```
+
+### 场景二：功能降级——非核心功能暂时关闭
+
+```yaml
+# 双十一零点峰值期间
+降级前：
+- 实时推荐服务：在线
+- 用户画像服务：在线
+- 行为分析服务：在线
+- 营销活动服务：在线
+- 商品评价服务：在线
+
+降级后：
+- 实时推荐服务：降级 → 返回热门榜单缓存
+- 用户画像服务：降级 → 返回默认画像
+- 行为分析服务：降级 → 关闭上报，先缓存
+- 营销活动服务：在线
+- 商品评价服务：降级 → 返回固定文案「评价稍后更新」
+```
+
+### 场景三：数据降级——返回缓存或默认值
+
+```java
+// 价格服务降级示例
+@Service
+public class PriceService {
+
+    @CircuitBreaker(name = "price-service", fallbackMethod = "getPriceFallback")
+    public BigDecimal getPrice(Long productId) {
+        return priceApi.getPrice(productId);
+    }
+
+    public BigDecimal getPriceFallback(Long productId, Throwable t) {
+        log.warn("价格服务调用失败，降级处理: productId={}", productId);
+
+        // Step 1: 尝试从 Redis 缓存获取
+        String cachedPrice = redisTemplate.opsForValue().get("price:" + productId);
+        if (cachedPrice != null) {
+            return new BigDecimal(cachedPrice);
+        }
+
+        // Step 2: 缓存也没有，返回默认价格
+        return BigDecimal.ZERO;
+    }
+}
+```
+
+## 降级的实现策略
+
+### 策略一：返回默认值
+
+最简单粗暴的降级策略。
+
+```java
+// 返回默认值的降级方法
+public User getUserFallback(Long userId, Throwable t) {
+    return User.builder()
+            .id(userId)
+            .name("未知用户")
+            .level(0)
+            .status("UNKNOWN")
+            .build();
+}
+
+public List<Order> getOrdersFallback(Long userId, Throwable t) {
+    return Collections.emptyList();
+}
+
+public String getNicknameFallback(Long userId, Throwable t) {
+    return "";
+}
+```
+
+### 策略二：返回缓存数据
+
+```java
+// 缓存降级
+@Service
+public class ProductService {
+
+    private final Cache<Long, Product> localCache = Caffeine.newBuilder()
+            .maximumSize(1000)
+            .expireAfterWrite(10, TimeUnit.MINUTES)
+            .build();
+
+    public Product getProduct(Long productId) {
+        // Step 1: 查本地缓存
+        Product local = localCache.getIfPresent(productId);
+        if (local != null) {
+            return local;
+        }
+
+        // Step 2: 查远程服务
+        try {
+            Product product = productApi.getProduct(productId);
+            localCache.put(productId, product);
+            return product;
+        } catch (Exception e) {
+            return getProductFallback(productId, e);
+        }
+    }
+
+    public Product getProductFallback(Long productId, Throwable t) {
+        log.warn("商品服务调用失败，降级返回缓存: productId={}", productId);
+        return localCache.getIfPresent(productId);
+    }
+}
+```
+
+### 策略三：调用备用服务
+
+```java
+// 备用服务降级
+@Service
+public class RecommendationService {
+
+    @Autowired
+    private AiRecommendationService aiService;
+
+    @Autowired
+    private RuleBasedRecommendationService ruleService;
+
+    public List<Product> recommend(Long userId, int limit) {
+        try {
+            return aiService.recommend(userId, limit);
+        } catch (Exception e) {
+            log.warn("AI 推荐服务不可用，降级到规则推荐", e);
+            return ruleService.recommend(userId, limit);
+        }
+    }
+}
+```
+
+### 策略四：返回静态数据或固定文案
+
+```java
+// 返回静态数据
+@Service
+public class BannerService {
+
+    @CircuitBreaker(name = "banner-api", fallbackMethod = "getBannersFallback")
+    public List<Banner> getBanners() {
+        return bannerApi.getActiveBanners();
+    }
+
+    public List<Banner> getBannersFallback(Throwable t) {
+        return Arrays.asList(
+            Banner.builder().id(1L).title("欢迎光临").imageUrl("/static/default1.jpg").build(),
+            Banner.builder().id(2L).title("全场五折").imageUrl("/static/default2.jpg").build(),
+            Banner.builder().id(3L).title("新人专享").imageUrl("/static/default3.jpg").build()
+        );
+    }
+}
+```
+
+### 策略五：延迟执行（队列缓冲）
+
+```java
+// 延迟执行降级
+@Service
+public class OrderService {
+
+    @Autowired
+    private KafkaTemplate<String, OrderMessage> kafkaTemplate;
+
+    public String createOrder(OrderCreateRequest request) {
+        try {
+            return createOrderDirectly(request);
+        } catch (Exception e) {
+            log.warn("订单创建服务降级，消息进入缓冲队列", e);
+            kafkaTemplate.send("order-buffer", request.getUserId().toString(),
+                    new OrderMessage(request));
+            return "订单已提交，系统繁忙，稍后确认";
+        }
+    }
+}
+```
+
+## 多级降级策略
+
+实际生产中，通常会设计多级降级，根据故障严重程度逐步降级：
+
+```java
+// 多级降级策略
+@Service
+public class ProductDetailService {
+
+    public ProductDetail getProductDetailFallback(Long productId, Throwable t) {
+        log.warn("一级降级：返回缓存数据");
+        ProductDetail cached = cache.get(productId);
+        if (cached != null) {
+            cached.setFromCache(true);
+            return cached;
+        }
+        return getProductDetailFallbackLevel2(productId);
+    }
+
+    private ProductDetail getProductDetailFallbackLevel2(Long productId) {
+        log.warn("二级降级：返回核心字段");
+        return ProductDetail.builder()
+                .id(productId)
+                .name("商品")
+                .status("UNAVAILABLE")
+                .message("商品详情暂时不可用")
+                .build();
+    }
+}
+```
+
+## 降级与前端的配合
+
+后端降级需要前端配合，才能给用户良好的体验：
+
+```java
+// 降级响应标记
+@RestController
+public class ProductController {
+
+    @GetMapping("/product/{id}")
+    public ResponseEntity<ProductDetail> getProduct(@PathVariable Long id) {
+        try {
+            ProductDetail detail = productService.getProductDetail(id);
+            return ResponseEntity.ok(detail);
+        } catch (Exception e) {
+            log.error("获取商品详情失败，降级返回", e);
+            ProductDetail fallback = productService.getProductDetailFallback(id, e);
+            fallback.setDegraded(true);
+            fallback.setDegradedMessage("部分数据暂时不可用");
+            return ResponseEntity.ok(fallback);
+        }
+    }
+}
+```
+
+```javascript
+// 前端处理降级响应
+async function loadProductDetail(productId) {
+    const response = await fetch(`/api/product/${productId}`);
+    if (response.ok) {
+        const product = await response.json();
+        if (product.degraded) {
+            showToast(product.degradedMessage || '部分功能暂时不可用');
+            hideComponent('.recommendation-section');
+        }
+        renderProduct(product);
+    }
+}
+```
+
+## 降级的最佳实践
+
+### 最佳实践一：降级要有日志
+
+```java
+public BigDecimal getPriceFallback(Long productId, Throwable t) {
+    log.warn("触发降级 - service=price, productId={}, error={}",
+            productId, t.getMessage());
+    metricsService.increment("degradation.price.fallback.count");
+    return getDefaultPrice();
+}
+```
+
+### 最佳实践二：降级数据要有标记
+
+```java
+public class ProductDetail {
+    private boolean degraded = false;
+    private String degradedMessage;
+    private LocalDateTime degradedAt;
+
+    public void markDegraded(String message) {
+        this.degraded = true;
+        this.degradedMessage = message;
+        this.degradedAt = LocalDateTime.now();
+    }
+}
+```
+
+### 最佳实践三：降级后要有告警
+
+```java
+public void handleDegradation(String serviceName, Throwable cause) {
+    Alert alert = Alert.builder()
+            .type(Alert.Type.WARNING)
+            .service(serviceName)
+            .message("服务降级已触发")
+            .cause(cause.getMessage())
+            .build();
+    alertService.send(alert);
+}
+```
+
+## 总结
+
+服务降级是保障系统可用性的重要手段，它通过「牺牲一致性换取可用性」，让系统在部分功能受损的情况下依然能提供服务。
+
+**核心要点回顾：**
+
+- 降级是「调用失败后怎么办」，熔断是「要不要调用」
+- 降级策略包括：返回默认值、返回缓存、调用备用服务、返回静态数据、延迟执行
+- 多级降级可以根据故障严重程度逐步降级
+- 降级数据要有标记，方便前端区分正常和降级状态
+- 降级后要有日志和告警，方便运维监控
+
+---
+
+**下一章预告：**
+
+熔断和降级保护的是「单个服务」或「调用链路」。但当整体流量超过系统处理能力时，需要从全局角度进行流量控制——这就是服务限流要解决的问题。下一章，我们将深入探讨服务限流的原理与实现。

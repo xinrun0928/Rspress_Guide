@@ -1,0 +1,503 @@
+# 热点数据探测
+
+秒杀系统上线，Redis 被打满。一查监控才发现：80% 的流量都集中在一个商品上。这就是**热点数据问题**——你的缓存系统为「万分之一」的热点数据付出了「百分之百」的性能代价。
+
+问题是：**你不知道哪个是热点。**
+
+今天我们来看如何用滑动窗口、LFU、实时计算三种方案，精准探测热点数据，让缓存资源用在刀刃上。
+
+## 一、为什么需要热点探测
+
+### 1.1 热点数据的特征
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        热点数据分布                                      │
+│                                                                         │
+│   访问量                                                                │
+│     ▲                                                                   │
+│ 1000│                                            ●●●●●●●●●            │
+│     │                                      ●●●●●●●●●●●●●●●●●●          │
+│  500│                               ●●●●●●●●●●●●●●●●●●●●●●●●●●●         │
+│     │                         ●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●           │
+│  100│              ●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●            │
+│     │        ●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●          │
+│    1│●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●           │
+│     └────────────────────────────────────────────────────────────────►  │
+│         1%        10%        50%        80%       99%       100%       │
+│                                                                         │
+│   二八定律：20% 的数据承担 80% 的访问量                                   │
+│   极端场景：0.1% 的数据承担 99% 的访问量                                 │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 1.2 热点数据的分类
+
+| 类型 | 示例 | 影响 |
+|---|---|---|
+| **绝对热点** | 秒杀商品、明星、热播剧 | 确定性的高流量 |
+| **相对热点** | 突发新闻、临时活动 | 不可预测 |
+| **恶意热点** | 爬虫、攻击 | 非正常流量 |
+
+### 1.3 不探测热点的问题
+
+- **Redis 被打满**：所有流量都打到 Redis
+- **带宽成为瓶颈**：单 key QPS 超过网卡限制
+- **请求排队**：热点 key 成为性能瓶颈
+- **系统雪崩**：热点 key 过期引发雪崩
+
+## 二、方案一：滑动窗口计数
+
+### 2.1 核心思想
+
+「用滑动窗口统计每个 key 在一段时间内的访问次数。」
+
+```
+时间轴：|---5s---|---5s---|---5s---|---5s---|---5s---|
+
+Key "product:100" 的访问记录：
+Window 1: ████ (4 次)
+Window 2: ██████ (6 次)
+Window 3: ██████████ (10 次)
+Window 4: ████████████████ (15 次) ← 热点！
+Window 5: ██████████████████ (18 次)
+
+最近 25 秒总访问：4 + 6 + 10 + 15 = 35 次
+平均 QPS：35 / 25 = 1.4
+```
+
+### 2.2 Redis ZSet 实现
+
+```java title="滑动窗口实现"
+@Service
+@Slf4j
+public class SlidingWindowHotKeyDetector {
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    private static final String HOT_KEY_PREFIX = "hotkey:";
+    private static final int WINDOW_SIZE_SECONDS = 30;
+    private static final int HOT_KEY_THRESHOLD = 1000;
+
+    public void recordAccess(String key) {
+        String hotKey = HOT_KEY_PREFIX + key;
+        long now = System.currentTimeMillis();
+        long windowStart = now - WINDOW_SIZE_SECONDS * 1000L;
+
+        RedisCallback<Void> callback = connection -> {
+            connection.zSetCommands().zAdd(hotKey.getBytes(), now, String.valueOf(now));
+            connection.zSetCommands().zRemRangeByScore(hotKey.getBytes(), 0, windowStart);
+            connection.keyCommands().expire(hotKey.getBytes(), WINDOW_SIZE_SECONDS + 10);
+            return null;
+        };
+        redisTemplate.execute(callback);
+    }
+
+    public long getQps(String key) {
+        String hotKey = HOT_KEY_PREFIX + key;
+        long now = System.currentTimeMillis();
+        long windowStart = now - WINDOW_SIZE_SECONDS * 1000L;
+        Long count = redisTemplate.opsForZSet().count(hotKey, windowStart, now);
+        return count != null ? count / WINDOW_SIZE_SECONDS : 0;
+    }
+
+    public boolean isHotKey(String key) {
+        return getQps(key) > HOT_KEY_THRESHOLD;
+    }
+}
+```
+
+### 2.3 并发优化
+
+```java title="滑动窗口并发优化")
+@Service
+@Slf4jl
+public class OptimizedSlidingWindowService {
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    private BlockingQueue<HotKeyEvent> eventQueue = new LinkedBlockingQueue<>(10000);
+
+    @PostConstruct
+    public void init() {
+        Executors.newSingleThreadExecutor().submit(this::consumeQueue);
+    }
+
+    public void recordAccessAsync(String key) {
+        eventQueue.offer(new HotKeyEvent(key, System.currentTimeMillis()));
+    }
+
+    private void consumeQueue() {
+        List<HotKeyEvent> batch = new ArrayList<>(100);
+        while (true) {
+            try {
+                HotKeyEvent event = eventQueue.poll(100, TimeUnit.MILLISECONDS);
+                if (event != null) {
+                    batch.add(event);
+                }
+                if (batch.size() >= 100 || (batch.isEmpty() && event == null)) {
+                    if (!batch.isEmpty()) {
+                        flushBatch(batch);
+                        batch.clear();
+                    }
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+    }
+
+    private void flushBatch(List<HotKeyEvent> batch) {
+        redisTemplate.executePipelined((RedisCallback<Object>) connection -> {
+            long now = System.currentTimeMillis();
+            for (HotKeyEvent event : batch) {
+                String hotKey = HOT_KEY_PREFIX + event.getKey();
+                connection.zSetCommands().zAdd(hotKey.getBytes(), event.getTimestamp(), String.valueOf(event.getTimestamp()));
+            }
+            return null;
+        });
+    }
+}
+```
+
+## 三、方案二：LFU 淘汰策略
+
+### 3.1 什么是 LFU
+
+LFU（Least Frequently Used）是最不经常使用淘汰策略，优先淘汰访问频率最低的数据。
+
+```java title="Caffeine LFU 配置")
+@Configuration
+public class LfuCacheConfig {
+    @Bean
+    public Cache<String, Product> lfuCache() {
+        return Caffeine.newBuilder()
+                .maximumSize(10000)
+                .weigher((String key, Product product) -> estimateSize(product))
+                .recordStats()
+                .build();
+    }
+
+    private int estimateSize(Product product) {
+        // 估算内存占用
+        return 1024; // 假设每个商品占 1KB
+    }
+}
+```
+
+### 3.2 热点数据自动识别
+
+```java title="热点数据自动识别")
+@Service
+@Slf4jl
+public class HotDataAutoIdentifier {
+    @Autowired
+    private Cache<String, Product> lfuCache;
+
+    private Map<String, Long> accessCount = new ConcurrentHashMap<>();
+
+    public Product getProduct(String key) {
+        Product product = lfuCache.getIfPresent(key);
+        if (product != null) {
+            accessCount.merge(key, 1L, Long::sum);
+            return product;
+        }
+        return null;
+    }
+
+    @Scheduled(fixedRate = 60000)
+    public void identifyHotData() {
+        accessCount.entrySet().stream()
+                .sorted((a, b) -> Long.compare(b.getValue(), a.getValue()))
+                .limit(100)
+                .forEach(entry -> {
+                    String key = entry.getKey();
+                    if (entry.getValue() > HOT_THRESHOLD) {
+                        hotKeySet.add(key);
+                        log.info("识别为热点数据: {}, 访问次数: {}", key, entry.getValue());
+                    }
+                });
+    }
+}
+```
+
+## 四、方案三：实时计算热点
+
+### 4.1 Flink 实时计算
+
+```java title="Flink 热点计算")
+public class HotKeyFlinkJob {
+    public static void main(String[] args) throws Exception {
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+        DataStream<String> kafkaStream = env.addSource(
+                new FlinkKafkaConsumer<>("access-log", new SimpleStringSchema(), props)
+        );
+
+        kafkaStream
+                .filter(log -> log.contains("product:"))
+                .map(log -> {
+                    String[] parts = log.split(" ");
+                    return new Tuple2<>(parts[1], 1L);
+                })
+                .keyBy(0)
+                .timeWindow(Time.seconds(30))
+                .sum(1)
+                .filter(tuple -> tuple.f1 > 1000)
+                .addSink(new HotKeySink());
+
+        env.execute("Hot Key Detection");
+    }
+}
+```
+
+### 4.2 FlinkKafka 热 key 上报
+
+```java title="热 key 上报 Sink")
+public class HotKeySink implements SinkFunction<Tuple2<String, Long>> {
+    @Override
+    public void invoke(Tuple2<String, Long> value, Context context) {
+        String hotKey = value.f0;
+        long qps = value.f1;
+
+        // 1. 上报到配置中心
+        configService.updateHotKey(hotKey, qps);
+
+        // 2. 下发到各应用节点
+        notifyAllNodes(hotKey);
+
+        // 3. 本地缓存预热
+        localCacheService.preload(hotKey);
+    }
+}
+```
+
+## 五、生产级热点探测架构
+
+### 5.1 整体架构
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        热点探测架构                                     │
+│                                                                         │
+│   应用节点                                                              │
+│   ┌─────────────────────────────────────────────────────────────────┐  │
+│   │  1. 拦截器记录访问（异步队列）                                     │  │
+│   │  2. 本地热点窗口                                                  │  │
+│   │  3. 本地缓存预热                                                  │  │
+│   └─────────────────────────────────────────────────────────────────┘  │
+│                              │                                          │
+│                              ▼                                          │
+│   ┌─────────────────────────────────────────────────────────────────┐  │
+│   │  计算集群（Flink/Spark）                                         │  │
+│   │  - 滑动窗口统计                                                  │  │
+│   │  - TopN 热点排名                                                  │  │
+│   │  - 异常检测                                                        │  │
+│   └─────────────────────────────────────────────────────────────────┘  │
+│                              │                                          │
+│                              ▼                                          │
+│   ┌─────────────────────────────────────────────────────────────────┐  │
+│   │  配置中心（Nacos/Apollo）                                        │  │
+│   │  - 热 key 下发                                                  │  │
+│   │  - 动态路由配置                                                  │  │
+│   └─────────────────────────────────────────────────────────────────┘  │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 5.2 完整实现
+
+```java title="热点探测完整实现")
+@Service
+@Slf4jl
+public class HotKeyService {
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+    @Autowired
+    private LocalCacheService localCacheService;
+
+    private Set<String> hotKeySet = ConcurrentHashMap.newKeySet();
+    private Map<String, Long> hotKeyQps = new ConcurrentHashMap<>();
+
+    private static final long HOT_KEY_THRESHOLD = 1000; // QPS 阈值
+    private static final long HOT_KEY_COOL_DOWN = 60000; // 冷却时间 1 分钟
+
+    /**
+     * 记录 key 访问
+     */
+    public void recordAccess(String key) {
+        String counterKey = "hot:counter:" + key;
+        redisTemplate.opsForValue().increment(counterKey);
+        redisTemplate.expire(counterKey, 60, TimeUnit.SECONDS);
+    }
+
+    /**
+     * 定时检测热点
+     */
+    @Scheduled(fixedRate = 5000)
+    public void detectHotKeys() {
+        Set<String> counterKeys = redisTemplate.keys("hot:counter:*");
+        if (counterKeys == null) return;
+
+        for (String counterKey : counterKeys) {
+            String key = counterKey.replace("hot:counter:", "");
+            Long count = (Long) redisTemplate.opsForValue().get(counterKey);
+            if (count == null) continue;
+
+            long qps = count / 5; // 5 秒窗口
+
+            if (qps > HOT_KEY_THRESHOLD) {
+                if (!hotKeySet.contains(key)) {
+                    log.warn("检测到热点 key: {}, QPS: {}", key, qps);
+                    hotKeySet.add(key);
+                    hotKeyQps.put(key, qps);
+
+                    // 触发预热
+                    localCacheService.preloadHotKey(key);
+                }
+            } else {
+                if (hotKeySet.contains(key)) {
+                    long lastQps = hotKeyQps.getOrDefault(key, 0L);
+                    if (qps < HOT_KEY_THRESHOLD / 2) {
+                        hotKeySet.remove(key);
+                        hotKeyQps.remove(key);
+                        log.info("热点 key 冷却: {}", key);
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * 判断是否是热点 key
+     */
+    public boolean isHotKey(String key) {
+        return hotKeySet.contains(key);
+    }
+
+    /**
+     * 获取热点 key 列表
+     */
+    public Map<String, Long> getHotKeys() {
+        return new HashMap<>(hotKeyQps);
+    }
+}
+```
+
+## 六、热点数据处理策略
+
+### 6.1 本地缓存降级
+
+```java title="本地缓存降级")
+@Service
+@Slf4jl
+public class HotKeyLocalCacheService {
+    @Autowired
+    private Cache<String, Object> localCache;
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    private static final long LOCAL_CACHE_TTL = 60; // 本地缓存 1 分钟
+
+    public Object getHotData(String key) {
+        // 1. 查本地缓存
+        Object local = localCache.getIfPresent(key);
+        if (local != null) {
+            return local;
+        }
+
+        // 2. 查 Redis
+        Object cached = redisTemplate.opsForValue().get(key);
+        if (cached != null) {
+            localCache.put(key, cached);
+            return cached;
+        }
+
+        return null;
+    }
+
+    public void preloadHotKey(String key) {
+        Object value = redisTemplate.opsForValue().get(key);
+        if (value != null) {
+            localCache.put(key, value);
+            log.info("预热热点数据: {}", key);
+        }
+    }
+}
+```
+
+### 6.2 热点 key 分散
+
+```java title="热点 key 分散")
+@Service
+public class HotKeyScatterService {
+    private static final int SHARD_COUNT = 16;
+
+    public String getScatteredKey(String originalKey) {
+        int shard = Math.abs(originalKey.hashCode() % SHARD_COUNT);
+        return originalKey + ":shard:" + shard;
+    }
+
+    public void cacheHotData(String key, Object value) {
+        int shard = Math.abs(key.hashCode() % SHARD_COUNT);
+        for (int i = 0; i < SHARD_COUNT; i++) {
+            String shardKey = key + ":shard:" + i;
+            redisTemplate.opsForValue().set(shardKey, value);
+        }
+    }
+}
+```
+
+## 七、监控与告警
+
+```java title="热点监控")
+@Service
+@Slf4jl
+public class HotKeyMonitor {
+    @Autowired
+    private MeterRegistry meterRegistry;
+
+    @Scheduled(fixedRate = 10000)
+    public void reportHotKeys() {
+        Map<String, Long> hotKeys = hotKeyService.getHotKeys();
+        hotKeys.forEach((key, qps) -> {
+            Gauge.builder("hotkey.qps", () -> qps)
+                    .tag("key", key)
+                    .register(meterRegistry);
+        });
+
+        if (!hotKeys.isEmpty()) {
+            log.info("当前热点数据: {} 个, QPS 详情: {}", hotKeys.size(), hotKeys);
+        }
+    }
+}
+```
+
+## 八、总结
+
+| 方案 | 原理 | 优点 | 缺点 |
+|---|---|---|---|
+| 滑动窗口 | 统计时间窗口内的访问量 | 实现简单，实时性好 | 内存占用大 |
+| LFU | 按访问频率淘汰 | 自动识别热点 | 需要预热 |
+| Flink 实时计算 | 流处理实时统计 | 精确，可处理海量数据 | 架构复杂 |
+
+:::tip 实战建议
+**生产环境推荐滑动窗口 + 本地缓存组合**：
+
+1. **滑动窗口**：实时检测热点 key
+2. **本地缓存**：热点数据本地缓存，减轻 Redis 压力
+3. **预热机制**：热点 key 自动预热到本地
+4. **分散策略**：热点 key 分散到多个分片
+:::
+
+## 结尾
+
+热点探测是缓存系统的「眼睛」，没有它，你就是在黑暗中摸索。记住三个要点：
+
+1. **滑动窗口是最实用的方案**，实现简单，效果好
+2. **本地缓存是热点数据的最终归宿**，Redis 再快也比不上本地内存
+3. **预热机制是关键**，与其被动探测，不如主动预热
+
+缓存系列到此结束。下一节，我们来看分布式文件存储方案。

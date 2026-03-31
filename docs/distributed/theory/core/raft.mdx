@@ -1,0 +1,508 @@
+import { Badge } from '@rspress/core/theme';
+
+# Raft 算法
+
+<Badge text="分布式系统" type="tip" /> <Badge text="共识算法" type="warning" /> <Badge text="原理篇" type="info" />
+
+2014 年 Diego Ongaro 和 John Ousterhout 发表了一篇论文，标题就叫《In Search of an Understandable Consensus Algorithm》。
+
+这篇论文的诞生背景很有意思：当时 Paxos 几乎是共识算法的代名词，但它的复杂性让无数工程师望而却步。Ongaro 在研究 Paxos 时发现，「Paxos 太难了，我的学生都无法理解它，更别说实现它了。」
+
+于是他决定设计一个更容易理解的共识算法，这就是 Raft。
+
+**Raft 的设计目标**：比 Paxos 更易理解，同时提供相同的功能和性能。
+
+## Raft 的核心思想
+
+Raft 通过两种方式达到这个目标：
+
+1. **问题分解**：将共识问题分解为三个相对独立的子问题
+2. **状态简化**：减少需要考虑的状态数量
+
+```java
+/**
+ * Raft 将共识问题分解为三个子问题
+ */
+
+// 1. 领导者选举（Leader Election）
+// - 如何从集群中选出一个领导者？
+// - 领导者崩溃后如何重新选举？
+
+// 2. 日志复制（Log Replication）
+// - 如何将日志复制到所有节点？
+// - 如何保证日志的一致性？
+
+// 3. 安全性（Safety）
+// - 如何保证每次选举都能选出包含所有已提交日志的领导者？
+// - 如何保证已提交的日志不会丢失？
+```
+
+## Raft 的角色
+
+Raft 集群中的每个节点有三种角色之一：
+
+```java
+/**
+ * Raft 的三种角色
+ */
+public enum Role {
+    /**
+     * Follower（跟随者）
+     * - 被动角色，不主动发起请求
+     * - 响应来自 Candidate 和 Leader 的请求
+     * - 如果超时未收到心跳，成为 Candidate
+     */
+    FOLLOWER,
+    
+    /**
+     * Candidate（候选者）
+     * - 正在竞选领导者
+     * - 向所有节点发送投票请求
+     * - 获得多数派投票后成为 Leader
+     */
+    CANDIDATE,
+    
+    /**
+     * Leader（领导者）
+     * - 主动发起所有写操作
+     * - 管理日志复制
+     * - 向 Follower 发送心跳维持权威
+     */
+    LEADER
+}
+
+/**
+ * 节点状态
+ */
+public class RaftNode {
+    private Role role = Role.FOLLOWER;
+    private long currentTerm = 0;      // 当前任期
+    private Integer votedFor = null;   // 当前任期投票给谁
+    private List<LogEntry> log = new ArrayList<>();  // 日志
+    
+    // volatile 状态（不需要持久化）
+    private volatile long commitIndex = 0;  // 已提交的日志索引
+    private volatile long lastApplied = 0; // 已应用的日志索引
+}
+```
+
+## 领导者选举
+
+Raft 使用随机超时机制来触发领导者选举：
+
+```java
+/**
+ * Raft 领导者选举
+ */
+public class RaftLeaderElection {
+    
+    // 选举超时配置
+    private static final long ELECTION_TIMEOUT_MIN = 150;  // ms
+    private static final long ELECTION_TIMEOUT_MAX = 300;  // ms
+    
+    private Random random = new Random();
+    private volatile long lastHeartbeat = 0;
+    private volatile long electionTimeout;
+    
+    /**
+     * 初始化选举超时
+     */
+    public void resetElectionTimeout() {
+        electionTimeout = ELECTION_TIMEOUT_MIN 
+            + random.nextInt(ELECTION_TIMEOUT_MAX - ELECTION_TIMEOUT_MIN);
+    }
+    
+    /**
+     * 检查是否需要发起选举
+     */
+    public void checkElectionTimeout() {
+        if (System.currentTimeMillis() - lastHeartbeat > electionTimeout) {
+            startElection();
+        }
+    }
+    
+    /**
+     * 发起选举
+     */
+    public void startElection() {
+        role = Role.CANDIDATE;
+        currentTerm++;  // 任期号递增
+        votedFor = nodeId;  // 给自己投票
+        lastHeartbeat = System.currentTimeMillis();
+        
+        int votesReceived = 1;  // 已有 1 票（自己）
+        
+        // 向所有其他节点发送投票请求
+        for (Integer peerId : peers) {
+            RequestVoteRequest request = new RequestVoteRequest(
+                currentTerm, nodeId,
+                log.size() - 1, getLastLogTerm()
+            );
+            
+            RequestVoteResponse response = sendRequestVote(peerId, request);
+            
+            if (response.term > currentTerm) {
+                // 发现更大的任期，转为 Follower
+                becomeFollower(response.term);
+                return;
+            }
+            
+            if (response.voteGranted) {
+                votesReceived++;
+            }
+        }
+        
+        // 获得多数派票数，成为 Leader
+        if (votesReceived > peers.size() / 2) {
+            becomeLeader();
+        }
+    }
+    
+    /**
+     * 处理投票请求
+     */
+    public RequestVoteResponse onRequestVote(RequestVoteRequest request) {
+        // 1. 如果请求任期更小，拒绝
+        if (request.term < currentTerm) {
+            return new RequestVoteResponse(currentTerm, false);
+        }
+        
+        // 2. 如果请求任期更大，更新自己的任期
+        if (request.term > currentTerm) {
+            becomeFollower(request.term);
+        }
+        
+        // 3. 检查是否可以投票
+        if (votedFor == null || votedFor == request.candidateId) {
+            // 检查候选者的日志是否比自己新
+            if (isLogUpToDate(request.lastLogIndex, request.lastLogTerm)) {
+                votedFor = request.candidateId;
+                resetElectionTimeout();  // 重置选举超时
+                return new RequestVoteResponse(currentTerm, true);
+            }
+        }
+        
+        return new RequestVoteResponse(currentTerm, false);
+    }
+    
+    /**
+     * 判断候选者的日志是否比自己更新
+     */
+    private boolean isLogUpToDate(long lastLogIndex, long lastLogTerm) {
+        long myLastLogIndex = log.size() - 1;
+        long myLastLogTerm = log.isEmpty() ? 0 : log.get(myLastLogIndex).term;
+        
+        // 如果最后一条日志的任期不同，任期更大的更新
+        // 如果任期相同，索引更大的更新
+        return lastLogTerm > myLastLogTerm 
+            || (lastLogTerm == myLastLogTerm && lastLogIndex >= myLastLogIndex);
+    }
+}
+```
+
+### 随机超时的重要性
+
+```java
+/**
+ * 随机超时避免同时选举
+ */
+
+// 问题：如果所有节点同时超时，会产生多个 Candidate
+// 导致投票分散，谁都无法获得多数派
+
+// 解决方案：随机化超时时间
+// T1 = 150 + random(150) = 180ms
+// T2 = 150 + random(150) = 220ms
+// T3 = 150 + random(150) = 260ms
+
+// T1 首先超时，发起选举
+// 此时 T2 和 T3 还是 Follower，会投票给 T1
+// T1 获得多数派，成为 Leader
+```
+
+## 日志复制
+
+领导者接收客户端请求，将操作追加到日志，然后复制到 Follower：
+
+```java
+/**
+ * Raft 日志复制
+ */
+public class RaftLogReplication {
+    
+    // 持久化状态
+    private List<LogEntry> log = new ArrayList<>();
+    
+    // volatile 状态
+    private volatile long commitIndex = 0;
+    private volatile long lastSnapshotIndex = 0;
+    
+    /**
+     * 日志条目结构
+     */
+    public static class LogEntry {
+        long term;           // 任期号
+        long index;          // 日志索引
+        Object command;      // 操作命令
+        long timestamp;      // 时间戳（用于压缩）
+    }
+    
+    /**
+     * 客户端请求处理（领导者）
+     */
+    public AppendEntriesResponse onClientRequest(Object command) {
+        if (role != Role.LEADER) {
+            return new AppendEntriesResponse(currentTerm, false, -1);
+        }
+        
+        // 1. 创建新日志条目
+        LogEntry entry = new LogEntry();
+        entry.term = currentTerm;
+        entry.index = log.size();
+        entry.command = command;
+        entry.timestamp = System.currentTimeMillis();
+        
+        // 2. 追加到本地日志
+        log.add(entry);
+        
+        // 3. 复制到所有 Follower
+        replicateToFollowers();
+        
+        return new AppendEntriesResponse(currentTerm, true, entry.index);
+    }
+    
+    /**
+     * 复制日志到所有 Follower
+     */
+    private void replicateToFollowers() {
+        for (Integer followerId : peers) {
+            // 发送 AppendEntries RPC
+            long prevLogIndex = getPrevLogIndex(followerId);
+            long prevLogTerm = getPrevLogTerm(prevLogIndex);
+            List<LogEntry> entries = getEntriesSince(followerId);
+            
+            AppendEntriesRequest request = new AppendEntriesRequest(
+                currentTerm, nodeId,
+                prevLogIndex, prevLogTerm,
+                entries,
+                commitIndex
+            );
+            
+            AppendEntriesResponse response = sendAppendEntries(followerId, request);
+            
+            if (response.success) {
+                // 更新 matchIndex
+                updateMatchIndex(followerId, response.matchIndex);
+            } else {
+                // 失败，可能是因为日志不一致
+                // 后退一步重试
+                decrementNextIndex(followerId);
+            }
+        }
+        
+        // 4. 如果多数派复制成功，提交日志
+        if (isCommitted(log.size() - 1)) {
+            commitIndex = log.size() - 1;
+            applyToStateMachine();
+        }
+    }
+    
+    /**
+     * 判断日志是否可以被提交
+     * 日志必须被复制到多数派才能提交
+     */
+    private boolean isCommitted(long index) {
+        int replication = 1;  // 领导者自己
+        
+        for (Integer followerId : peers) {
+            if (matchIndex.getOrDefault(followerId, 0) >= index) {
+                replication++;
+            }
+        }
+        
+        // 必须是当前任期的日志才能提交
+        LogEntry entry = log.get((int) index);
+        return replication > peers.size() / 2 && entry.term == currentTerm;
+    }
+    
+    /**
+     * 处理 Follower 的 AppendEntries 响应
+     */
+    public void onAppendEntriesResponse(Integer followerId, 
+                                         AppendEntriesResponse response) {
+        if (response.term > currentTerm) {
+            becomeFollower(response.term);
+            return;
+        }
+        
+        if (response.success) {
+            // 更新 matchIndex 和 nextIndex
+            matchIndex.put(followerId, response.matchIndex);
+            nextIndex.put(followerId, response.matchIndex + 1);
+        } else {
+            // 日志不一致，后退
+            nextIndex.put(followerId, 
+                Math.max(1, nextIndex.get(followerId) - 1));
+        }
+    }
+}
+```
+
+### 日志不一致的修复
+
+```java
+/**
+ * Follower 处理 AppendEntries
+ */
+public AppendEntriesResponse onAppendEntries(AppendEntriesRequest request) {
+    
+    // 1. 如果任期过期，拒绝
+    if (request.term < currentTerm) {
+        return new AppendEntriesResponse(currentTerm, false, -1);
+    }
+    
+    // 2. 如果日志中找不到 prevLogIndex，跳过
+    if (request.prevLogIndex > 0 
+        && (log.size() < request.prevLogIndex 
+            || log.get((int) request.prevLogIndex).term != request.prevLogTerm)) {
+        return new AppendEntriesResponse(currentTerm, false, log.size());
+    }
+    
+    // 3. 找到第一个不一致的位置，删除后面的日志
+    for (int i = 0; i < request.entries.size(); i++) {
+        long index = request.prevLogIndex + 1 + i;
+        if (index < log.size()) {
+            if (log.get((int) index).term != request.entries.get(i).term) {
+                // 删除不一致的日志
+                log.subList((int) index, log.size()).clear();
+                break;
+            }
+        }
+    }
+    
+    // 4. 追加新条目
+    for (LogEntry entry : request.entries) {
+        if (entry.index >= log.size()) {
+            log.add(entry);
+        }
+    }
+    
+    // 5. 更新提交索引
+    if (request.leaderCommit > commitIndex) {
+        commitIndex = Math.min(request.leaderCommit, log.size() - 1);
+    }
+    
+    return new AppendEntriesResponse(currentTerm, true, log.size() - 1);
+}
+```
+
+## 安全性保证
+
+Raft 通过以下机制保证安全性：
+
+```java
+/**
+ * Raft 安全性保证
+ */
+
+// 选举限制（Election Restriction）
+// 只有包含所有已提交日志的候选者才能成为领导者
+
+// 证明：
+// 假设日志 (n, v) 已被多数派接受并提交
+// 那么任何多数派 S 必须至少包含一个已接受 (n, v) 的节点
+// 新候选者必须获得 S 中多数派的投票
+// 因此新领导者必须包含 (n, v)
+
+/**
+ * 投票条件
+ */
+public boolean canVoteFor(Candidate candidate) {
+    // 1. 还没有投票，或者投给了这个候选者
+    if (votedFor != null && votedFor != candidate.nodeId) {
+        return false;
+    }
+    
+    // 2. 候选者的日志至少和自己一样新
+    return isLogUpToDate(candidate.lastLogIndex, candidate.lastLogTerm);
+}
+```
+
+## 日志压缩与快照
+
+日志会不断增长，需要压缩：
+
+```java
+/**
+ * 日志压缩
+ */
+public class RaftSnapshot {
+    
+    /**
+     * 快照内容
+     */
+    public static class Snapshot {
+        long lastIncludedIndex;  // 快照包含的最后日志索引
+        long lastIncludedTerm;   // 快照包含的最后日志任期
+        byte[] state;            // 状态机状态
+    }
+    
+    private Snapshot snapshot;
+    
+    /**
+     * 创建快照
+     */
+    public void createSnapshot(long lastIncludedIndex, byte[] state) {
+        snapshot = new Snapshot();
+        snapshot.lastIncludedIndex = lastIncludedIndex;
+        snapshot.lastIncludedTerm = log.get((int) lastIncludedIndex).term;
+        snapshot.state = state;
+        
+        // 删除快照之前的日志
+        log.subList(0, (int) lastIncludedIndex + 1).clear();
+    }
+    
+    /**
+     * 安装快照
+     */
+    public void installSnapshot(Snapshot snapshot) {
+        if (snapshot.lastIncludedIndex > commitIndex) {
+            // 快照比本地日志更新
+            log.clear();
+            log.add(new LogEntry(snapshot.lastIncludedTerm, 
+                snapshot.lastIncludedIndex, null));
+            
+            this.snapshot = snapshot;
+            commitIndex = lastIncludedIndex;
+            lastApplied = lastIncludedIndex;
+            
+            // 恢复状态机
+            restoreStateMachine(snapshot.state);
+        }
+    }
+}
+```
+
+## Raft vs Paxos
+
+| 维度 | Raft | Paxos |
+|---|---|---|
+| 角色划分 | Leader/Follower/Candidate | Proposer/Acceptor/Learner |
+| 日志 | 必须是连续的 | 允许空洞 |
+| 领导者 | 强领导者 | 弱领导者 |
+| 领导者选举 | 随机超时 | 提案号竞争 |
+| 成员变更 | 联合共识 | 需要额外机制 |
+| 可理解性 | 较易 | 难 |
+
+## 总结
+
+Raft 算法是 Paxos 的工程化实现，它通过以下方式达到易理解的目标：
+
+1. **强领导者**：所有写操作经过领导者，简化了流程
+2. **领导者选举**：随机超时机制，简洁有效
+3. **日志连续**：简化了一致性保证
+4. **问题分解**：将复杂问题分解为三个子问题
+
+理解 Raft 对于理解分布式一致性至关重要。它的设计思想——「分解问题、简化状态」——也是解决其他复杂系统问题的重要方法论。
+
+> 理解了 Raft，下一章让我们看看 [ZAB 协议](/distributed/theory/core/zab)，Zookeeper 是如何实现自己的共识算法的。

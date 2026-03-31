@@ -1,0 +1,381 @@
+import { Badge } from '@rspress/core/theme';
+
+# Kubernetes 架构设计
+
+<Badge text="Principle" type="warning" /> <Badge text="Control Plane" type="tip" />
+
+凌晨 2 点，你的告警系统响了：Control Plane 的一台 Master 节点宕机了。群里炸开了锅——"集群还能用吗？""Pod 会自动恢复吗？""要不要手动干预？"
+
+大多数人对 Kubernetes 的第一印象是"Master-Slave 架构"，Master 挂了集群就完了。但事实真的是这样吗？
+
+在深入讨论之前，我们需要先理解 Kubernetes 的架构设计。这不仅能帮助你回答上面的问题，更能让你在遇到复杂的调度问题、存储问题、网络问题时，从根源上理解为什么会这样。
+
+## 整体架构
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        Control Plane (Master)                    │
+│  ┌──────────┐  ┌──────────┐  ┌──────────────┐  ┌───────────────┐ │
+│  │ etcd     │  │ kube-    │  │ kube-        │  │ kube-         │ │
+│  │          │  │ apiserver│  │ scheduler    │  │ controller-   │ │
+│  │ 存储集群  │  │  API 服务器 │  │ 调度器      │  │ manager      │ │
+│  └──────────┘  └──────────┘  └──────────────┘  └───────────────┘ │
+└─────────────────────────────────────────────────────────────────┘
+                                │
+                                │ API 调用
+                                ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                         Worker Node 1                            │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐        │
+│  │ kubelet  │  │ kube-    │  │container │  │  Pod 1   │        │
+│  │          │  │ proxy    │  │ runtime  │  │  Pod 2   │        │
+│  └──────────┘  └──────────┘  └──────────┘  └──────────┘        │
+└─────────────────────────────────────────────────────────────────┘
+                                │
+┌─────────────────────────────────────────────────────────────────┐
+│                         Worker Node 2                            │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐        │
+│  │ kubelet  │  │ kube-    │  │container │  │  Pod 3   │        │
+│  │          │  │ proxy    │  │ runtime  │  │  Pod 4   │        │
+│  └──────────┘  └──────────┘  └──────────┘  └──────────┘        │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+从架构上看，Kubernetes 分为两个核心部分：**Control Plane（控制平面）** 和 **Worker Node（工作节点）**。
+
+## Control Plane 组件
+
+Control Plane 负责整个集群的管理工作，它维护着集群的期望状态，并协调各种操作使其生效。在生产环境中，Control Plane 通常由多台机器组成以保证高可用。
+
+### kube-apiserver：集群的统一入口
+
+API Server 是 Kubernetes 集群的**前门**——所有组件和用户的请求都经过它。
+
+当你执行 `kubectl get pods` 时，请求的流向是：
+
+```
+kubectl → kube-apiserver → etcd → kube-apiserver → kubectl
+```
+
+但 API Server 不仅仅是转发请求，它还承担着关键的安全职责：
+
+**认证（Authentication）**：API Server 支持多种认证方式，包括：
+
+| 认证方式 | 说明 |
+|---|---|
+| X509 客户端证书 | 最常用，kubelet 默认使用这种方式 |
+| Bearer Token | 静态 Token 或 Bootstrap Token |
+| OIDC | 集成外部身份提供商 |
+| Webhook | 第三方认证服务 |
+
+**授权（Authorization）**：认证之后，API Server 需要判断"这个身份有没有权限做这件事"。RBAC（基于角色的访问控制）是最常用的授权模式：
+
+```yaml title="rbac-example.yaml"
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: default
+  name: pod-reader
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch"]
+```
+
+**准入控制（Admission Control）**：这是 API Server 的一道特殊关卡。它可以在对象被写入 etcd 之前，对其进行修改或验证。常见的准入控制器包括：
+
+- `LimitRanger`：强制执行资源限制
+- `ResourceQuota`：命名空间级别的资源配额
+- `MutatingWebhook`：在对象变更前修改它
+- `ValidatingWebhook`：验证对象是否符合规则
+
+:::tip 扩展点
+准入控制器链是 Kubernetes 最重要的扩展机制之一。很多 Kubernetes 生态工具（如 Istio、Gatekeeper）都通过 Webhook 机制接入准入控制流程。
+:::
+
+### etcd：集群的大脑
+
+etcd 是一个分布式键值存储，使用 [Raft 一致性算法](https://raft.github.io/) 保证数据一致性。在 Kubernetes 中，etcd 是**唯一的状态存储**。
+
+所有 Kubernetes 对象——Pod、Service、Deployment、ConfigMap——都存储在 etcd 中。这意味着 etcd 的重要性怎么强调都不为过。
+
+**为什么 Kubernetes 选择 etcd？**
+
+1. **一致性**：Raft 算法保证了强一致性，集群状态永远不会出现分歧
+2. **高可用**：etcd 本身支持集群部署，少数节点故障不会导致服务中断
+3. **高效**：专为元数据存储设计，读写性能优异
+4. **版本化**：etcd 支持历史版本查询，为 Kubernetes 的 revision 机制提供了基础
+
+**etcd 的数据组织**：
+
+```
+/registry
+├── pods/
+│   └── default/
+│       └── nginx-pod-xxx
+├── services/
+│   └── default/
+│       └── nginx-service
+├── deployments/
+│   └── default/
+│       └── nginx-deployment
+└── configmaps/
+    └── default/
+        └── app-config
+```
+
+:::warning 性能影响
+etcd 的性能直接影响整个集群的响应速度。在大型集群中，etcd 通常需要 SSD 存储，并配置适当的 --snapshot-count 参数。
+:::
+
+### kube-scheduler：Pod 的指挥官
+
+当用户提交一个 Pod 资源时，Scheduler 负责选择一个合适的节点来运行它。这个过程分为两个主要阶段：**Filtering（预选）** 和 **Scoring（优选）**。
+
+**预选阶段（Filtering）**：
+
+Scheduler 会评估所有节点，排除明显不符合条件的。常见的预选条件包括：
+
+```yaml
+# Pod 的资源请求能否被节点满足？
+resources.limits.cpu <= node.allocatable.cpu
+resources.limits.memory <= node.allocatable.memory
+
+# 节点是否有足够的 Pod 数量？
+node.pods.count < node.status.capacity.pods
+
+# 节点是否满足标签选择器？
+node.labels[app] in [web-server]
+
+# 端口是否冲突？
+port not in node.allocatedPorts
+```
+
+**优选阶段（Scoring）**：
+
+通过预选的节点会进入优选阶段，Scheduler 根据多个评分维度计算综合得分：
+
+| 评分维度 | 说明 |
+|---|---|
+| 资源利用率 | 偏好资源使用更均衡的节点 |
+| 亲和性 | 考虑 Pod 亲和性/反亲和性规则 |
+| 数据局部性 | 考虑数据与计算的位置关系 |
+| 拓扑分布 | 考虑拓扑域（如可用区）的分布 |
+| least_requested | 优先调度到资源更空闲的节点 |
+| most_requested | 优先调度到资源使用更多的节点 |
+
+最终，Scheduler 选择得分最高的节点，通过 API Server 将 Pod 绑定到该节点。
+
+```bash
+# 查看 Pod 的调度决策
+kubectl describe pod <pod-name> | grep -A 10 "Events:"
+```
+
+### kube-controller-manager：集群的自动化引擎
+
+Controller Manager 运行着多个控制器，每个控制器都是一个控制循环，持续将当前状态向期望状态推进。
+
+**Node Controller**：
+
+负责监测节点状态，当节点不可达时，触发 Pod 驱逐流程：
+
+```
+节点失联 → 等待 --pod-eviction-timeout（默认 5 分钟）→ 标记 NotReady
+→ 删除节点上的 Pod → ReplicaSet 创建新 Pod 到其他节点
+```
+
+**ReplicaSet Controller**：
+
+确保指定数量的 Pod 副本始终在运行：
+
+```
+期望副本数 = 3
+当前副本数 = 2
+→ 创建 1 个新 Pod
+```
+
+**Endpoints Controller**：
+
+维护 Service 与 Pod 之间的Endpoint。当 Pod 创建或销毁时，自动更新 Endpoint：
+
+```
+Service selector: app=nginx
+匹配的 Pod: pod-1, pod-2, pod-3
+→ 更新 Endpoints: [pod-1:80, pod-2:80, pod-3:80]
+```
+
+**Service Accounts Controller**：
+
+为每个命名空间创建默认 Service Account，并确保 ServiceAccount 对应的 Secret 存在。
+
+**其他内置控制器**：
+
+- Job Controller：管理 Job 资源
+- CronJob Controller：管理定时任务
+- Deployment Controller：管理 Deployment 资源
+- StatefulSet Controller：管理有状态应用
+- PersistentVolume Controller：管理 PV/PVC 绑定
+- Namespace Controller：管理命名空间生命周期
+
+:::tip 设计哲学
+Kubernetes 的核心设计哲学是"声明式 API + 控制循环"。你声明期望状态，控制器持续运作直到状态达成。这与传统命令式编程的思路完全不同。
+:::
+
+### cloud-controller-manager：云厂商适配层
+
+cloud-controller-manager 是 Kubernetes 1.8 引入的组件，负责与底层云平台集成。它将云厂商特定的逻辑从核心代码中分离出来。
+
+```yaml
+# 启动 cloud-controller-manager 时指定云类型
+cloud-controller-manager --cloud-provider=gce
+```
+
+**Node Controller**：从云平台获取节点信息，处理节点生命周期
+
+**Route Controller**：在云平台上配置路由，使跨节点的 Pod 网络成为可能
+
+**Service Controller**：与云平台的负载均衡器集成，创建/更新/删除云负载均衡器
+
+**PersistentVolume Controller**：与云存储 API 集成，实现 PV 的动态供给
+
+## Worker Node 组件
+
+Worker Node 是实际运行 Pod 的地方。每个 Worker Node 上都运行着一组核心组件。
+
+### kubelet：节点的守护进程
+
+kubelet 是运行在每个节点上的**代理**，它负责向 Control Plane 注册节点，并管理节点上的容器。
+
+**kubelet 的职责**：
+
+1. **注册节点**：向 API Server 汇报节点信息，包括 CPU、内存、存储容量
+2. **Pod 管理：从 API Server 获取 Pod 规格，确保容器按规格运行
+3. **健康检查**：定期执行探针，汇报容器健康状态
+4. **资源汇报**：向 Control Plane 汇报节点资源使用情况
+
+**Pod 的创建流程**（kubelet 侧）：
+
+```
+1. kubelet 从 API Server 监听到新的 Pod 分配
+2. 创建一个 Pod 沙箱（Pause 容器）
+3. 拉取容器镜像
+4. 创建并启动容器
+5. 挂载卷
+6. 配置网络
+7. 汇报 Pod 状态到 API Server
+```
+
+**镜像垃圾回收**：
+
+kubelet 会自动清理未使用的镜像：
+
+```yaml
+# kubelet 配置示例
+imageGcHighThreshold: 85   # 磁盘使用 85% 时触发回收
+imageGcLowThreshold: 80   # 回收到 80% 为止
+```
+
+### kube-proxy：服务网络的基础
+
+kube-proxy 运行在每个节点上，负责维护网络规则，使 Service 的负载均衡成为可能。
+
+**kube-proxy 的三种模式**：
+
+| 模式 | 原理 | 优点 | 缺点 |
+|---|---|---|---|
+| userspace | 代理模式，kube-proxy 监听端口转发流量 | 兼容性好 | 性能差，已废弃 |
+| iptables | 使用 iptables 规则转发 | 成熟稳定 | 规则多时性能下降 |
+| IPVS | 使用 IP Virtual Server | O(1) 性能，支持多种调度算法 | 需要内核模块 |
+
+**iptables 模式的工作原理**：
+
+```
+Service: 10.0.0.1:80 → Endpoint: 192.168.1.10:8080
+
+# kube-proxy 创建的 iptables 规则
+-A KUBE-SERVICES -d 10.0.0.1/32 -p tcp --dport 80 -j KUBE-SVC-XXX
+-A KUBE-SVC-XXX -m statistic --mode random --probability 0.33 -j KUBE-SEP-YYY1
+-A KUBE-SVC-XXX -m statistic --mode random --probability 0.50 -j KUBE-SEP-YYY2
+-A KUBE-SVC-XXX -j KUBE-SEP-YYY3
+-A KUBE-SEP-YYY1 -s 192.168.1.10/32 -j ACCEPT
+-A KUBE-SEP-YYY1 -j DNAT --to-destination 192.168.1.10:8080
+```
+
+### container runtime：容器运行时
+
+容器运行时是实际运行容器的软件。Kubernetes 支持多种容器运行时：
+
+| 运行时 | 说明 |
+|---|---|
+| containerd | Docker 的核心组件，CNCF 项目 |
+| cri-o | 轻量级 CRI 实现，专为 Kubernetes 设计 |
+| dockershim | Docker 早期支持的临时方案，K8s 1.24+ 已移除 |
+
+**CRI（Container Runtime Interface）**：
+
+Kubernetes 通过 CRI 与容器运行时交互。CRI 定义了 kubelet 与容器运行时之间的接口：
+
+```
+kubelet ← CRI API → containerd/cri-o
+```
+
+## 回答开头的问题
+
+回到开头的问题：**Master 节点宕了，集群还能运行吗？**
+
+这取决于宕的是哪个组件，以及你的高可用配置：
+
+| 场景 | 影响 |
+|---|---|
+| 单 Master 节点宕机 | 新 Pod 无法调度，现有 Pod 继续运行 |
+| etcd 节点宕机（单节点） | 集群状态丢失，无法执行任何操作 |
+| etcd 多数节点宕机 | 集群不可用 |
+| API Server 宕机 | 无法执行 kubectl 操作，现有 Pod 继续运行 |
+| Scheduler 宕机 | 新 Pod 无法调度，现有 Pod 继续运行 |
+| Controller Manager 宕机 | 自动扩缩容、滚动更新停止 |
+
+**结论**：只要 etcd 和 API Server 还有存活的副本，现有的 Pod 会继续运行。只是无法提交新的资源请求或触发自动恢复。
+
+:::tip 生产环境建议
+- etcd 至少 3 节点，Control Plane 至少 3 节点
+- 使用托管 Kubernetes（如 EKS、GKE、AKS）可以省去高可用配置的复杂性
+- 定期备份 etcd 数据
+:::
+
+## 组件通信总结
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         用户 / kubectl                          │
+└─────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                        kube-apiserver                           │
+│  认证 → 授权 → 准入控制 → 存储到 etcd                           │
+└─────────────────────────────────────────────────────────────────┘
+         │              │              │              │
+         ▼              ▼              ▼              ▼
+┌─────────────┐ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐
+│  Scheduler  │ │ Controller  │ │    kubelet  │ │  kubelet    │
+│             │ │  Manager    │ │   (Node1)   │ │   (Node2)   │
+└─────────────┘ └─────────────┘ └─────────────┘ └─────────────┘
+                                │              │
+                                └──────┬───────┘
+                                       ▼
+                              ┌─────────────────┐
+                              │  kube-proxy     │
+                              │  (每个节点)      │
+                              └─────────────────┘
+```
+
+## 总结
+
+Kubernetes 的架构设计体现了几个核心原则：
+
+1. **声明式 API**：用户描述期望状态，系统负责实现
+2. **中心化控制**：Control Plane 统一管理，Worker 节点执行
+3. **高可用设计**：每个组件都支持多副本部署
+4. **可扩展性**：通过 CRD、Admission Webhook、CSI、CNI 等接口扩展
+
+理解这套架构，是你深入学习 Kubernetes 的基础。后面的章节，我们将基于这些概念，深入探讨 Pod 调度、网络、存储等具体话题。

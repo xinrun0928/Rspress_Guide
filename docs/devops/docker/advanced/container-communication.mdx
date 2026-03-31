@@ -1,0 +1,330 @@
+# 容器间通信原理
+
+两个 Docker 容器之间是如何「对话」的？数据包是如何从容器 A 到达容器 B 的？iptables 规则是如何控制网络流量的？
+
+理解容器网络通信的底层原理，是排查复杂网络问题和设计容器网络架构的基础。
+
+## Linux 网络命名空间
+
+Docker 容器网络隔离的基础是 **Linux Network Namespace**。每个容器都有自己独立的网络命名空间，包含：
+
+- 网络接口（网卡）
+- 路由表
+- iptables 规则
+- 端口绑定
+
+```bash
+# 查看宿主机的网络命名空间
+ip netns list
+
+# 查看某个容器的网络命名空间（通过 PID）
+docker inspect --format '{{.State.Pid}}' container-name
+nsenter -t <PID> -n ip addr
+
+# 或者使用 docker exec
+docker exec container-name ip addr
+```
+
+## veth pair：虚拟网线
+
+容器与宿主机之间的连接通过 **veth pair（虚拟以太网对）** 实现。veth pair 像一根虚拟网线，一端在容器内，一端在宿主机上。
+
+```
+veth pair 结构：
+
+┌─────────────────────────────────────────────────┐
+│                  宿主机                          │
+│                                                 │
+│  docker0 网桥                                   │
+│      │                                          │
+│      ├── veth_abc123 (宿主机端) ──────────────┐ │
+│      │                                 │     │ │
+│      │  ifindex: 5                     │     │ │
+│      │                                 ▼     │ │
+│      └────────────────────────────────────────┘ │
+│                                                 │
+└─────────────────────────────────────────────────┘
+                                          │
+                                          │ eth0（容器端）
+                                          ▼
+                              ┌─────────────────┐
+                              │     容器内        │
+                              │   172.17.0.2     │
+                              │                 │
+                              │ lo (loopback)   │
+                              └─────────────────┘
+```
+
+### 创建容器时的网络设置
+
+当你创建容器时，Docker 会：
+
+1. 创建一对 veth pair
+2. 一端连接到容器的网络命名空间（通常命名为 `eth0`）
+3. 另一端连接到 docker0 网桥（命名为 `veth*`）
+4. 在宿主机端添加到 docker0 的端口
+
+```bash
+# 查看容器使用的 veth pair
+docker exec container-name cat /sys/class/net/eth0/iflink
+# 返回类似 5 的数字
+
+# 在宿主机上找到对应的 veth
+cat /sys/class/net/veth*/ifindex
+# 或使用 ip 命令
+ip link | grep 5
+```
+
+## docker0 网桥
+
+docker0 是 Linux 网桥，充当容器网络的核心交换机：
+
+```bash
+# 查看 docker0 网桥
+ip link show docker0
+
+# 查看网桥详情
+bridge link show
+
+# 查看连接到网桥的设备
+ip link show type bridge
+```
+
+```
+docker0 网桥结构：
+
+eth0 (宿主机物理网卡)
+    │
+    │ NAT
+    ▼
+docker0 (172.17.0.1/16)
+    │
+    ├── veth_abc ─── Container A (172.17.0.2)
+    ├── veth_def ─── Container B (172.17.0.3)
+    └── veth_ghi ─── Container C (172.17.0.4)
+```
+
+### 网桥工作原理
+
+Linux 网桥工作在数据链路层（第二层），根据 MAC 地址转发帧：
+
+1. 容器 A（172.17.0.2）发送数据包到容器 B（172.17.0.3）
+2. 数据包通过 veth pair 到达 docker0
+3. 网桥查看目标 MAC 地址
+4. 找到容器 B 对应的 veth 端口
+5. 将数据包转发到该端口
+
+```bash
+# 查看网桥的 FDB（转发表）
+bridge fdb show
+```
+
+## iptables 规则
+
+Docker 通过 iptables 规则控制容器的网络流量。
+
+### NAT 表：容器访问外部网络
+
+容器访问宿主机外部网络时，需要通过 NAT（网络地址转换）：
+
+```
+容器 A (172.17.0.2) ──▶ docker0 ──▶ NAT ──▶ eth0 ──▶ 外部网络
+```
+
+```bash
+# 查看 Docker 添加的 NAT 规则
+iptables -t nat -L -n -v
+
+# 典型输出：
+# Chain POSTROUTING (1 references)
+# target     prot opt source               destination
+# MASQUERADE  all  --  172.17.0.0/16      !172.17.0.0/16
+# 172.17.0.0/16 访问非 172.17.0.0/16 时，源 IP 伪装为 eth0 IP
+```
+
+```bash
+# 查看 FORWARD 链
+iptables -L FORWARD -n -v
+
+# 典型输出：
+# Chain FORWARD (policy DROP)
+# target     prot opt source               destination
+# ACCEPT     all  --  0.0.0.0/0            172.17.0.0/16   # 来自容器的流量
+# ACCEPT     all  --  172.17.0.0/16        0.0.0.0/0       # 去往容器的流量
+# DOCKER-USER  all  --  0.0.0.0/0            0.0.0.0/0       # 用户自定义规则
+# DOCKER-ISOLATION  all  --  0.0.0.0/0       0.0.0.0/0       # 隔离规则
+```
+
+### NAT 工作流程
+
+当容器访问外部 HTTP 服务时：
+
+```
+1. 容器 A 发送请求到 8.8.8.8:80
+   源 IP: 172.17.0.2:xxxxx
+   目标 IP: 8.8.8.8:80
+
+2. 数据包到达 docker0，通过 NAT 规则
+
+3. NAT 将源 IP 转换为宿主机 IP
+   源 IP: <宿主机IP>:yyyyy
+
+4. 响应包返回时，NAT 再将目标 IP 转换回容器 IP
+```
+
+## 端口映射原理
+
+`-p 8080:80` 是如何让外部流量到达容器的？
+
+```bash
+# 发布端口
+docker run -d -p 8080:80 --name web nginx:alpine
+```
+
+Docker 会在 iptables 的 NAT 表中添加端口映射规则：
+
+```bash
+# 查看 Docker 的端口映射规则
+iptables -t nat -L DOCKER -n -v
+
+# 典型输出：
+# Chain DOCKER (2 references)
+# target     prot opt source               destination
+# RETURN     all  --  anywhere             anywhere
+# DNAT       tcp  --  0.0.0.0/0            0.0.0.0/0            tcp dpt:8080 to:172.17.0.2:80
+# DNAT       tcp  --  0.0.0.0/0            0.0.0.0/0            tcp dpt:8080 to:172.17.0.2:80
+```
+
+### 端口映射流程
+
+```
+外部请求 (client) ──▶ 宿主机 :8080
+                              │
+                              ▼ DNAT (目的地址转换)
+                    172.17.0.2:80 (容器内 nginx)
+                              │
+                              ▼
+                    ──▶ nginx 处理请求
+```
+
+## 容器间通信
+
+### 同一网络内的通信
+
+```bash
+# 两个容器在同一 bridge 网络
+docker run -d --name container-a --network bridge nginx:alpine
+docker run -d --name container-b --network bridge alpine ping container-a
+```
+
+```
+container-a (172.17.0.2) ──▶ container-b (172.17.0.3)
+       │
+       │ 通过 docker0 网桥直接交换
+       ▼
+docker0 网桥直接转发帧
+```
+
+### DNS 解析
+
+Docker 提供了内置 DNS，解析容器名和服务名：
+
+```bash
+# 查看 Docker 的 DNS 配置
+docker exec container-a cat /etc/resolv.conf
+
+# 典型输出：
+# nameserver 127.0.0.11
+# options ndots:0
+# 127.0.0.11 是 Docker 嵌入的 DNS 服务器
+```
+
+```
+容器内 DNS 解析流程：
+
+1. 应用请求解析 nginx.service.local
+2. /etc/resolv.conf 指向 127.0.0.11
+3. Docker 内嵌 DNS 响应：
+   - 检查是否为本地容器名
+   - 检查是否为 Docker Compose 服务名
+   - 转发到宿主机 DNS（/etc/resolv.conf）
+```
+
+## 服务发现
+
+在自定义网络和 Docker Compose 中，Docker 自动提供服务发现：
+
+```bash
+# 创建自定义网络
+docker network create mynet
+
+# 启动服务
+docker run -d --network mynet --network-alias api myapp:latest
+docker run -d --network mynet --network-alias web nginx:alpine
+
+# web 容器可以通过 api 主机名访问 myapp
+docker exec web ping -c 1 api
+```
+
+```
+DNS 记录自动创建：
+
+api         A    172.17.0.2
+api.mynet   A    172.17.0.2
+```
+
+## 网络隔离
+
+Docker 网络之间的隔离通过 iptables 规则实现：
+
+```bash
+# 查看隔离规则
+iptables -L DOCKER-ISOLATION -n -v
+```
+
+```
+网络隔离原理：
+
+bridge 网络之间默认隔离
+container-a (net-a) 无法直接访问 container-b (net-b)
+
+除非：
+1. 通过宿主机 IP 中转（NAT）
+2. 加入同一网络
+3. 配置自定义 iptables 规则
+```
+
+## 查看网络信息
+
+```bash
+# 查看容器网络详情
+docker inspect --format '{{json .NetworkSettings}}' container-name | jq
+
+# 查看容器分配的 IP
+docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' container-name
+
+# 查看端口映射
+docker port container-name
+
+# 查看网络统计
+docker stats --no-stream
+```
+
+## 总结
+
+Docker 容器网络通信的核心机制：
+
+| 组件 | 作用 |
+|---|---|
+| **Network Namespace** | 提供网络隔离 |
+| **veth pair** | 连接容器与宿主机 |
+| **docker0 网桥** | 容器间交换数据 |
+| **iptables NAT** | 容器访问外网、端口映射 |
+| **Docker DNS** | 容器名解析、服务发现 |
+
+理解这些底层原理，有助于：
+
+- 排查网络连接问题
+- 优化容器网络性能
+- 设计多容器网络架构
+- 配置网络安全规则

@@ -1,0 +1,440 @@
+# 缓存击穿
+
+热点商品上架，万人抢购。结果在开抢瞬间，所有请求都打到了数据库——缓存过期了，而大量并发请求正在「同时」涌入。
+
+这就是**缓存击穿**。与穿透不同，击穿是「同一个热点 key 过期瞬间，大量请求同时穿透」。
+
+今天我们来看如何用互斥锁、逻辑过期、永不过期三种方案彻底解决它。
+
+## 一、什么是缓存击穿
+
+### 1.1 问题描述
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        缓存击穿示意图                                    │
+│                                                                         │
+│   T1: 缓存中热点 key 存在，用户请求正常                                  │
+│   T2: 热点 key 过期                                                     │
+│   T3: N 个请求同时到达，全部发现缓存未命中                               │
+│   T4: N 个请求同时查数据库                                               │
+│   T5: 数据库被打爆                                                      │
+│                                                                         │
+│   ┌─────────────────────────────────────────────────────────────────┐   │
+│   │  - 热点 key：访问量极大的数据（爆品、明星、秒杀商品）            │   │
+│   │  - 后果：数据库被瞬间击穿                                         │   │
+│   └─────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 1.2 与穿透的区别
+
+| 维度 | 缓存穿透 | 缓存击穿 |
+|---|---|---|
+| 问题数据 | 不存在的数据 | 存在但过期的热点数据 |
+| 并发量 | 较小 | 巨大 |
+| 数据库数据 | 确实没有 | 实际存在 |
+| 解决方案 | 布隆过滤器 + 空值缓存 | 互斥锁 + 逻辑过期 |
+
+### 1.3 危害
+
+- **数据库瞬间压力巨大**：N 倍并发请求同时打 DB
+- **接口响应超时**：数据库处理不过来
+- **引发雪崩**：击穿 + 高并发 = 系统崩溃
+
+## 二、解决方案一：互斥锁
+
+### 2.1 核心思想
+
+「只让一个人去查数据库，其他人等着拿结果。」
+
+```
+请求A ──▶ 查缓存 ──▶ 未命中 ──▶ 加锁 ──▶ 查数据库 ──▶ 写缓存 ──▶ 解锁
+请求B ──▶ 查缓存 ──▶ 未命中 ──▶ 等锁
+请求C ──▶ 查缓存 ──▶ 未命中 ──▶ 等锁
+
+请求A 完成 ──▶ 写缓存 ──▶ 解锁
+请求B/C ──▶ 抢到锁 ──▶ 查缓存（已命中）──▶ 立即返回
+```
+
+### 2.2 Redis 分布式锁实现
+
+```java title="Redis 分布式锁"
+@Service
+@Slf4j
+public class RedisLockService {
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    private static final String LOCK_PREFIX = "lock:";
+    private static final long DEFAULT_LOCK_TIMEOUT = 10;
+
+    public boolean lock(String key, long timeoutSeconds) {
+        String lockKey = LOCK_PREFIX + key;
+        String value = UUID.randomUUID().toString();
+        Boolean result = redisTemplate.opsForValue().setIfAbsent(
+                lockKey, value, timeoutSeconds, TimeUnit.SECONDS);
+        return Boolean.TRUE.equals(result);
+    }
+
+    public void unlock(String key, String value) {
+        String lockKey = LOCK_PREFIX + key;
+        String script = "if redis.call('get', KEYS[1]) == ARGV[1] then " +
+                "return redis.call('del', KEYS[1]) else return 0 end";
+        redisTemplate.execute(
+                new DefaultRedisScript<>(script, Long.class),
+                Collections.singletonList(lockKey), value
+        );
+    }
+
+    public String tryLock(String key) {
+        String lockKey = LOCK_PREFIX + key;
+        String value = UUID.randomUUID().toString();
+        long startTime = System.currentTimeMillis();
+
+        while (System.currentTimeMillis() - startTime < 3000) {
+            Boolean result = redisTemplate.opsForValue().setIfAbsent(
+                    lockKey, value, DEFAULT_LOCK_TIMEOUT, TimeUnit.SECONDS);
+            if (Boolean.TRUE.equals(result)) {
+                return value;
+            }
+            try {
+                Thread.sleep(50);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return null;
+            }
+        }
+        return null;
+    }
+}
+```
+
+### 2.3 互斥锁查询实现
+
+```java title="互斥锁方案实现"
+@Service
+@Slf4j
+public class MutexCacheService {
+    @Autowired
+    private RedisTemplate<String, Product> redisTemplate;
+    @Autowired
+    private RedisLockService lockService;
+    @Autowired
+    private ProductMapper productMapper;
+
+    public Product getProduct(Long id) {
+        String key = "product:" + id;
+        Product cached = redisTemplate.opsForValue().get(key);
+        if (cached != null) {
+            return cached;
+        }
+
+        String lockValue = lockService.tryLock(key);
+        try {
+            if (lockValue != null) {
+                cached = redisTemplate.opsForValue().get(key);
+                if (cached != null) {
+                    return cached;
+                }
+                Product product = productMapper.selectById(id);
+                if (product != null) {
+                    redisTemplate.opsForValue().set(key, product, 1, TimeUnit.HOURS);
+                }
+                return product;
+            } else {
+                Thread.sleep(50);
+                return redisTemplate.opsForValue().get(key);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return redisTemplate.opsForValue().get(key);
+        } finally {
+            if (lockValue != null) {
+                lockService.unlock(key, lockValue);
+            }
+        }
+    }
+}
+```
+
+### 2.4 优缺点
+
+| 优点 | 缺点 |
+|---|---|
+| 简单可靠 | 所有线程都要等锁 |
+| 保证数据一致性 | 并发度降低 |
+
+## 三、解决方案二：逻辑过期
+
+### 3.1 核心思想
+
+「永不过期，但过期时间存在数据里。过期了就后台异步更新。」
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  数据结构：CacheData<T> { T data; long expireTime; }                   │
+│                                                                         │
+│  请求 ──▶ 查缓存 ──▶ 命中                                               │
+│              │         │                                               │
+│              │      逻辑过期？                                           │
+│              │         │                                               │
+│              │       否 ──▶ 返回数据                                     │
+│              │         │                                               │
+│              │       是 ──▶ 返回旧数据 + 异步更新                        │
+│              │                                                             │
+│              └─▶ 未命中 ──▶ 加锁 ──▶ 查数据库 ──▶ 写缓存 ──▶ 解锁      │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 3.2 数据结构设计
+
+```java title="逻辑过期数据封装"
+@Data
+public class CacheData<T> implements Serializable {
+    private T data;
+    private long expireTime;
+
+    public boolean isLogicalExpire() {
+        return System.currentTimeMillis() > expireTime;
+    }
+
+    public static <T> CacheData<T> of(T data, long logicalExpireSeconds) {
+        CacheData<T> cacheData = new CacheData<>();
+        cacheData.data = data;
+        cacheData.expireTime = System.currentTimeMillis() + logicalExpireSeconds * 1000;
+        return cacheData;
+    }
+}
+```
+
+### 3.3 逻辑过期实现
+
+```java title="逻辑过期方案实现"
+@Service
+@Slf4j
+public class LogicalExpireCacheService {
+    @Autowired
+    private RedisTemplate<String, CacheData<Product>> redisTemplate;
+    @Autowired
+    private RedisLockService lockService;
+    @Autowired
+    private ProductMapper productMapper;
+    @Autowired
+    private ThreadPoolExecutor executor;
+
+    private static final long LOGICAL_EXPIRE = 3600;
+
+    public Product getProduct(Long id) {
+        String key = "product:" + id;
+        CacheData<Product> cached = redisTemplate.opsForValue().get(key);
+
+        if (cached == null) {
+            String lockValue = lockService.tryLock(key);
+            try {
+                if (lockValue != null) {
+                    cached = redisTemplate.opsForValue().get(key);
+                    if (cached != null) {
+                        return cached.getData();
+                    }
+                    Product product = productMapper.selectById(id);
+                    if (product != null) {
+                        CacheData<Product> cacheData = CacheData.of(product, LOGICAL_EXPIRE);
+                        redisTemplate.opsForValue().set(key, cacheData);
+                    }
+                    return product;
+                }
+            } finally {
+                if (lockValue != null) {
+                    lockService.unlock(key, lockValue);
+                }
+            }
+        }
+
+        if (cached.isLogicalExpire()) {
+            executor.submit(() -> refreshCache(id));
+            return cached.getData();
+        }
+        return cached.getData();
+    }
+
+    private void refreshCache(Long id) {
+        String key = "product:" + id;
+        String lockValue = lockService.tryLock(key);
+        try {
+            if (lockValue != null) {
+                Product product = productMapper.selectById(id);
+                if (product != null) {
+                    CacheData<Product> newCache = CacheData.of(product, LOGICAL_EXPIRE);
+                    redisTemplate.opsForValue().set(key, newCache);
+                }
+            }
+        } finally {
+            if (lockValue != null) {
+                lockService.unlock(key, lockValue);
+            }
+        }
+    }
+}
+```
+
+## 四、解决方案三：永不过期
+
+### 4.1 核心思想
+
+「不给 key 设置过期时间，后台定时刷新。」
+
+```java title="永不过期方案实现")
+@Service
+@Slf4j
+public class NeverExpireCacheService {
+    @Autowired
+    private RedisTemplate<String, Product> redisTemplate;
+    @Autowired
+    private ProductMapper productMapper;
+
+    private Set<String> hotKeys = ConcurrentHashMap.newKeySet();
+
+    public Product getProduct(Long id) {
+        String key = "product:" + id;
+        Product cached = redisTemplate.opsForValue().get(key);
+        if (cached != null) {
+            hotKeys.add(key);
+            return cached;
+        }
+        Product product = productMapper.selectById(id);
+        if (product != null) {
+            redisTemplate.opsForValue().set(key, product);
+            hotKeys.add(key);
+        }
+        return product;
+    }
+
+    @Scheduled(fixedRate = 60000)
+    public void scheduledRefresh() {
+        for (String key : hotKeys) {
+            Long id = extractId(key);
+            if (id != null) {
+                Product product = productMapper.selectById(id);
+                if (product != null) {
+                    redisTemplate.opsForValue().set(key, product);
+                }
+            }
+        }
+    }
+}
+```
+
+## 五、方案对比与选型
+
+### 5.1 横向对比
+
+| 方案 | 并发性能 | 数据一致性 | 实现复杂度 |
+|---|---|---|---|
+| 互斥锁 | 低（有等待） | 高 | 低 |
+| 逻辑过期 | 高（无等待） | 中 | 中 |
+| 永不过期 | 高 | 低 | 低 |
+
+### 5.2 选型建议
+
+```
+数据一致性要求高？ ──▶ 是 ──▶ 互斥锁
+        │
+        否
+        │
+数据更新频率低？ ──▶ 是 ──▶ 逻辑过期
+        │
+        否
+        │
+永不过期
+```
+
+### 5.3 混合方案（推荐）
+
+```java title="混合方案实现")
+@Service
+public class HybridCacheService {
+    public Product getProduct(Long id) {
+        String key = "product:" + id;
+        CacheData<Product> cached = redisTemplate.opsForValue().get(key);
+
+        if (cached == null) {
+            return getProductWithMutex(id);
+        }
+
+        if (cached.isLogicalExpire()) {
+            String lockValue = lockService.tryLock(key);
+            if (lockValue != null) {
+                executor.submit(() -> refreshCache(id));
+                lockService.unlock(key, lockValue);
+            }
+            return cached.getData();
+        }
+        return cached.getData();
+    }
+}
+```
+
+## 六、实战要点
+
+### 6.1 热点 key 识别
+
+```java title="热点 key 识别")
+@Service
+public class HotKeyDetector {
+    private ConcurrentHashMap<String, LongAdder> counters = new ConcurrentHashMap<>();
+    private static final long HOT_KEY_THRESHOLD = 1000;
+
+    @Scheduled(fixedRate = 1000)
+    public void detectHotKeys() {
+        counters.forEach((key, counter) -> {
+            long qps = counter.sumThenReset();
+            if (qps > HOT_KEY_THRESHOLD) {
+                hotKeySet.add(key);
+            }
+        });
+    }
+
+    public void recordAccess(String key) {
+        counters.computeIfAbsent(key, k -> new LongAdder()).increment();
+    }
+}
+```
+
+### 6.2 锁粒度控制
+
+```java title="锁粒度优化")
+// 按商品 ID 级别加锁，互不影响
+public String lockProduct(Long productId) {
+    return lockService.lock("product:lock:" + productId, 10);
+}
+```
+
+## 七、总结
+
+| 方案 | 核心思想 | 优点 | 缺点 |
+|---|---|---|---|
+| 互斥锁 | 只让一个人查 DB | 简单可靠 | 性能降低 |
+| 逻辑过期 | 过期了返回旧数据 + 异步更新 | 性能高 | 实现复杂 |
+| 永不过期 | 不设过期，后台刷新 | 最简单 | 一致性差 |
+
+:::tip 实战建议
+**生产环境推荐逻辑过期 + 互斥锁混合**：
+
+1. 正常情况下用逻辑过期，保证性能
+2. 极端情况下用互斥锁兜底
+3. 保证数据最终一致，用户体验良好
+:::
+
+## 结尾
+
+缓存击穿的核心矛盾是**「只有一个热点 key 过期」vs「N 个并发请求同时到达」**。
+
+记住两个要点：
+
+1. **互斥锁是兜底方案**，简单可靠，但会牺牲性能
+2. **逻辑过期是性能方案**，用户体验好，但实现复杂
+
+下一节，我们来看缓存雪崩——当大量 key 同时过期时会发生什么，以及如何预防。

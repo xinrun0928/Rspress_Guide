@@ -1,0 +1,466 @@
+import { Badge } from '@rspress/core/theme';
+
+# ZAB 协议
+
+<Badge text="分布式系统" type="tip" /> <Badge text="共识协议" type="warning" /> <Badge text="原理篇" type="info" />
+
+Zookeeper 是 Apache 旗下的分布式协调服务，被广泛应用于配置管理、命名服务、分布式锁、Leader 选举等场景。它的核心是 ZAB（Zookeeper Atomic Broadcast）协议——一种专门为 Zookeeper 设计的主备复制协议。
+
+理解 ZAB，不仅能帮助我们更好地使用 Zookeeper，还能让我们理解如何针对特定场景设计专用的共识协议。
+
+## ZAB 协议的设计背景
+
+Zookeeper 的设计目标是：
+
+1. **高可用**：集群中部分节点故障不影响服务
+2. **强一致**：客户端看到的数据是一致的
+3. **低延迟**：读写操作都要快
+
+ZAB 的设计者发现，Raft 和 Paxos 虽然是通用的共识算法，但对于 Zookeeper 的特定需求来说，有改进空间：
+
+- **写操作必须经过 Leader**：Raft 也是这样，但 ZAB 对 Leader 的依赖更强
+- **事务 ID（ZXID）**：ZAB 使用一种特殊的事务 ID，方便排序和同步
+- **恢复模式优化**：Leader 崩溃后的恢复过程被优化过
+
+```java
+/**
+ * ZAB vs Raft 的主要区别
+ */
+
+// 1. ZXID vs 日志索引
+// ZAB: 使用 ZXID（高 32 位 epoch + 低 32 位事务计数器）
+// Raft: 使用 (term, index) 对
+
+// 2. Leader 选举标准
+// ZAB: epoch 最大的优先，然后是 zxid 最大的，最后是 serverId 最大的
+// Raft: 日志最完整的优先
+
+// 3. 恢复过程
+// ZAB: Leader 收集 Quorum 的历史，然后同步
+// Raft: Leader 通过日志复制让 Follower 追上
+
+// 4. 提交语义
+// ZAB: Leader 提交需要 Quorum 确认
+// Raft: Leader 提交需要 Quorum 确认
+```
+
+## ZAB 的三种角色
+
+ZAB 中有两种核心角色：
+
+```java
+/**
+ * ZAB 的两种核心角色
+ */
+
+// 1. Leader（领导者）
+// - 接收客户端请求，生成事务
+// - 将事务广播给 Follower
+// - 协调事务提交
+
+// 2. Follower（跟随者）
+// - 接收 Leader 的广播消息
+// - 参与 Leader 选举投票
+// - 处理客户端的只读请求
+
+// 3. Observer（观察者）[Zookeeper 扩展]
+// - 不参与投票，不影响 Leader 选举
+// - 接收 Leader 的广播消息，保持数据同步
+// - 用于扩展读性能
+```
+
+## ZAB 的两种运行模式
+
+ZAB 有两种运行模式：
+
+### 1. 广播模式（Broadcast）
+
+正常运行时使用，用于复制事务：
+
+```java
+/**
+ * ZAB 广播模式
+ * 
+ * 类似于两阶段提交，但更简单
+ */
+public class ZABBroadcast {
+    
+    /**
+     * Leader 处理客户端请求
+     */
+    public void onClientRequest(Request request) {
+        // 1. 生成 ZXID
+        long zxid = generateZXID();
+        
+        // 2. 创建事务
+        Proposal proposal = new Proposal(zxid, request);
+        
+        // 3. 发送 Proposal 给所有 Follower
+        for (Follower follower : followers) {
+            sendProposal(follower, proposal);
+        }
+        
+        // 4. 等待多数派确认
+        int acks = waitForAcks(followers.size() / 2 + 1);
+        
+        // 5. 发送 Commit
+        for (Follower follower : followers) {
+            sendCommit(follower, zxid);
+        }
+        
+        // 6. 应用到状态机
+        applyToStateMachine(request);
+    }
+    
+    /**
+     * Follower 处理 Proposal
+     */
+    public void onProposal(Proposal proposal) {
+        // 1. 写入本地日志
+        writeToLog(proposal);
+        
+        // 2. 发送 ACK 给 Leader
+        sendAck(proposal.leader, proposal.zxid);
+    }
+    
+    /**
+     * Follower 处理 Commit
+     */
+    public void onCommit(long zxid) {
+        // 提交事务到状态机
+        commitToStateMachine(zxid);
+    }
+    
+    /**
+     * 生成 ZXID
+     */
+    private long generateZXID() {
+        // ZXID = (epoch << 32) | counter
+        // epoch: 选举轮次，每次选举递增
+        // counter: 事务计数器，每条事务递增
+        return (currentEpoch << 32) | (++transactionCounter);
+    }
+}
+```
+
+### 2. 恢复模式（Recovery）
+
+Leader 崩溃后，新 Leader 需要同步数据：
+
+```java
+/**
+ * ZAB 恢复模式
+ * 
+ * 新 Leader 需要同步 Follower 的数据
+ */
+public class ZABRecovery {
+    
+    /**
+     * Leader 启动时的恢复过程
+     */
+    public void recover() {
+        // 1. 从 Quorum 收集最新的历史
+        Map<Long, Proposal> history = collectHistory();
+        
+        // 2. 确定新的 epoch
+        long newEpoch = determineNewEpoch(history);
+        
+        // 3. 通知 Follower 新的 epoch
+        informNewEpoch(newEpoch);
+        
+        // 4. 同步 Follower 的数据
+        for (Follower follower : followers) {
+            long followerEpoch = follower.getLastEpoch();
+            List<Proposal> diff = getDiff(history, follower);
+            
+            // 发送缺失的 Proposal
+            for (Proposal p : diff) {
+                sendProposal(follower, p);
+            }
+            
+            // 发送 TRUNC 消息删除多余日志
+            if (follower.hasExtra()) {
+                sendTruncate(follower, history.lastZxid);
+            }
+        }
+        
+        // 5. 切换到广播模式
+        switchToBroadcast();
+    }
+    
+    /**
+     * 收集历史
+     * 
+     * 从 Quorum 节点获取最新的日志
+     */
+    private Map<Long, Proposal> collectHistory() {
+        Map<Long, Proposal> history = new HashMap<>();
+        
+        for (Follower follower : quorum) {
+            List<Proposal> peerHistory = follower.getHistory();
+            
+            // 取最完整的日志
+            if (peerHistory.size() > history.size()) {
+                history.clear();
+                for (Proposal p : peerHistory) {
+                    history.put(p.zxid, p);
+                }
+            }
+        }
+        
+        return history;
+    }
+    
+    /**
+     * 确定新的 epoch
+     */
+    private long determineNewEpoch(Map<Long, Proposal> history) {
+        // 新 epoch = 最大历史 epoch + 1
+        long maxEpoch = 0;
+        for (Proposal p : history.values()) {
+            maxEpoch = Math.max(maxEpoch, getEpoch(p.zxid));
+        }
+        return (maxEpoch + 1) << 32;  // epoch 在高 32 位
+    }
+}
+```
+
+## ZAB Leader 选举
+
+ZAB 使用 FastLeaderElection 算法进行 Leader 选举：
+
+```java
+/**
+ * ZAB Leader 选举
+ * 
+ * 使用 (epoch, zxid, serverId) 三元组比较
+ */
+public class ZABLeaderElection {
+    
+    /**
+     * 投票结构
+     */
+    public static class Vote {
+        long zxid;       // 事务 ID
+        long epoch;      // 轮次
+        int serverId;    // 服务器 ID
+        
+        // 比较规则：epoch 最重要，其次 zxid，最后 serverId
+        public boolean isGreaterThan(Vote other) {
+            if (this.epoch != other.epoch) {
+                return this.epoch > other.epoch;  // epoch 大的优先
+            }
+            if (this.zxid != other.zxid) {
+                return this.zxid > other.zxid;    // zxid 大的优先
+            }
+            return this.serverId > other.serverId; // serverId 大的优先
+        }
+    }
+    
+    /**
+     * 选举算法核心
+     */
+    public void lookForLeader() {
+        Vote currentVote = new Vote(
+            getLastZxid(),    // 最新事务 ID
+            getCurrentEpoch(), // 当前轮次
+            getServerId()      // 服务器 ID
+        );
+        
+        // 广播初始投票
+        broadcast(currentVote);
+        
+        // 等待多数派相同的投票
+        while (true) {
+            Vote receivedVote = waitForVote();
+            
+            // 比较投票
+            if (receivedVote.isGreaterThan(currentVote)) {
+                // 更新自己的投票
+                currentVote = receivedVote;
+                broadcast(currentVote);  // 重新广播
+            }
+            
+            // 检查是否选出 Leader
+            if (isMajoritySame(currentVote)) {
+                Vote leader = currentVote;
+                if (leader.serverId == getServerId()) {
+                    // 我是 Leader
+                    becomeLeader();
+                } else {
+                    // 等待 Leader 通知
+                    waitForLeaderNotification();
+                }
+                break;
+            }
+        }
+    }
+}
+```
+
+## ZXID 的设计
+
+ZXID 是 ZAB 的核心创新：
+
+```java
+/**
+ * ZXID 结构
+ * 
+ * 高 32 位：epoch（轮次）
+ * 低 32 位：事务计数器
+ */
+public class ZXID {
+    
+    /**
+     * 分解 ZXID
+     */
+    public static long getEpoch(long zxid) {
+        return zxid >>> 32;  // 无符号右移
+    }
+    
+    public static long getCounter(long zxid) {
+        return zxid & 0xFFFFFFFFL;  // 低 32 位
+    }
+    
+    /**
+     * 构建 ZXID
+     */
+    public static long makeZXID(long epoch, long counter) {
+        return (epoch << 32) | counter;
+    }
+}
+
+/**
+ * ZXID 的优势
+ */
+
+// 1. 全局有序
+// - epoch 保证不同轮次的事务有序
+// - counter 保证同一轮次内的事务有序
+
+// 2. 便于比较
+// - 直接比较 ZXID 即可判断事务先后
+// - 数值大的表示更新
+
+// 3. 便于恢复
+// - 新 Leader 只需比较 ZXID 就能确定同步点
+// - epoch 最大的节点包含最新数据
+
+// 4. 简化冲突检测
+// - 如果两个 ZXID 相同，说明是同一个事务
+// - 分布式事务的唯一 ID 可以用 ZXID
+```
+
+## ZAB 的特性
+
+### 1. 写操作的线性一致性
+
+```java
+/**
+ * ZAB 保证写操作是线性一致的
+ * 
+ * 所有写操作必须经过 Leader
+ * Leader 按顺序广播事务
+ * Follower 按顺序应用事务
+ */
+
+// 客户端 A 发送写请求
+// Leader 生成 ZXID=0x100000001，广播 Proposal
+// Leader 收到多数派 ACK，发送 Commit
+// 所有节点按顺序提交 ZXID=0x100000001 的事务
+```
+
+### 2. 读操作的灵活性
+
+```java
+/**
+ * ZAB 支持两种读操作
+ */
+
+// 1. 同步读（通过 Leader）
+// - 客户端连接到 Leader
+// - Leader 返回最新数据
+// - 保证读取最新数据
+
+// 2. 异步读（通过任意节点）
+// - 客户端可以连接到任意 Follower
+// - Follower 返回本地数据
+// - 可能读到稍旧的数据，但性能更好
+```
+
+### 3. Observer 的扩展
+
+```java
+/**
+ * Observer 不参与投票
+ * 用于扩展读性能
+ */
+public class ZABObserver {
+    
+    /**
+     * Observer 的行为
+     */
+    public void onProposal(Proposal proposal) {
+        // 1. 写入本地日志
+        writeToLog(proposal);
+        
+        // 2. 发送 ACK 给 Leader（但 ACK 不计入多数派）
+        sendAck(proposal.leader, proposal.zxid);
+    }
+    
+    public void onCommit(long zxid) {
+        // 提交事务
+        commitToStateMachine(zxid);
+    }
+}
+```
+
+## ZAB vs Raft
+
+| 维度 | ZAB | Raft |
+|---|---|---|
+| 提出时间 | 2007 | 2014 |
+| 应用场景 | Zookeeper | 多种系统 |
+| 事务 ID | ZXID (epoch + counter) | (term, index) |
+| 领导者选举标准 | epoch > zxid > serverId | 日志完整性 |
+| 日志连续性 | 必须连续 | 必须连续 |
+| Leader 变更 | 复杂 | 联合共识 |
+| Observer | 支持 | 需要扩展 |
+
+## ZAB 的正确性
+
+ZAB 的正确性基于以下保证：
+
+```java
+/**
+ * ZAB 的正确性保证
+ */
+
+// 1. Leader 的完整性（Leader Completeness）
+// 如果 Follower 在某个 epoch 投票给了某个 Leader
+// 那么该 Leader 必须包含该 Follower 在该 epoch 之前的所有已提交事务
+
+// 2. 领导者的唯一性（Leader Uniqueness）
+// 在任意 epoch 内，最多只有一个 Leader
+
+// 3. 交易的顺序性（Transaction Ordering）
+// 所有节点按相同的顺序提交事务
+// 顺序由 ZXID 定义
+
+// 4. 交易的合法性（Validity）
+// 只有 Leader 才能生成提议
+// 提议必须经过多数派确认才能提交
+```
+
+## 总结
+
+ZAB 协议是专门为 Zookeeper 设计的主备复制协议。它的核心思想包括：
+
+1. **ZXID**：通过 epoch + counter 的设计，简化了事务排序和恢复
+2. **两种模式**：广播模式处理正常请求，恢复模式处理 Leader 变更
+3. **Leader 优先**：Leader 的选举和数据同步被优化
+4. **Observer 扩展**：通过 Observer 扩展读性能
+
+理解 ZAB，不仅对使用 Zookeeper 有帮助，还能让我们理解如何针对特定场景设计专用协议。
+
+> 理解了共识算法，下一章我们来看 [一致性哈希](/distributed/theory/core/consistent-hash)，它在分布式缓存和数据分片中发挥着重要作用。

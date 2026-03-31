@@ -1,0 +1,403 @@
+# EFK 日志架构
+
+你可能听过 ELK，但 EFK 是什么？F 指的是 Fluentd，一个轻量级的日志收集器。在 Kubernetes 环境中，EFK 正在成为越来越多团队的选择。
+
+## 为什么选择 EFK
+
+### ELK vs EFK
+
+| 组件 | ELK | EFK |
+|---|---|---|
+| 日志收集 | Logstash | Fluentd |
+| 日志存储 | Elasticsearch | Elasticsearch |
+| 可视化 | Kibana | Kibana |
+| 特点 | 功能强大，资源消耗大 | 轻量级，资源占用小 |
+| 适用 | 复杂日志处理 | 容器环境、云原生 |
+
+### Fluentd 的优势
+
+- **轻量**：资源消耗约为 Logstash 的 1/5
+- **可靠**：内存缓冲 + 文件缓冲双重保障
+- **插件丰富**：500+ 插件支持各种数据源
+- **云原生友好**：Kubernetes 原生支持
+
+## 架构设计
+
+### 经典架构
+
+```
+Pod 日志
+    │
+    ↓
+Fluent Bit（轻量收集）→ Fluentd（聚合处理）→ Elasticsearch ← Kibana
+                            │
+                            ↓
+                        Kafka（可选缓冲）
+```
+
+### Kubernetes 架构
+
+在 K8s 中，日志收集通常采用 DaemonSet 方式：
+
+```
+每个 Node 上部署 Fluentd/Fluent Bit
+    │
+    ├── 收集 kubelet 日志
+    ├── 收集容器日志
+    └── 收集系统日志
+```
+
+## Fluentd 部署与配置
+
+### DaemonSet 部署
+
+```yaml title="fluentd-daemonset.yaml"
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluentd
+  namespace: kube-logging
+  labels:
+    app: fluentd
+spec:
+  selector:
+    matchLabels:
+      app: fluentd
+  template:
+    metadata:
+      labels:
+        app: fluentd
+    spec:
+      serviceAccount: fluentd
+      containers:
+      - name: fluentd
+        image: fluent/fluentd:v1.16-1
+        env:
+        - name: FLUENTD_CONF
+          value: fluent.conf
+        resources:
+          requests:
+            cpu: 100m
+            memory: 200Mi
+          limits:
+            cpu: 500m
+            memory: 500Mi
+        volumeMounts:
+        - name: varlog
+          mountPath: /var/log
+        - name: varlibdockercontainers
+          mountPath: /var/lib/docker/containers
+          readOnly: true
+      volumes:
+      - name: varlog
+        hostPath:
+          path: /var/log
+      - name: varlibdockercontainers
+        hostPath:
+          path: /var/lib/docker/containers
+```
+
+### 配置文件
+
+```title="fluent.conf"
+# 收集 Docker 容器日志
+<source>
+  @type tail
+  @id inputtail-docker-containers
+  path /var/lib/docker/containers/*/*.log
+  pos_file /var/log/fluentd-docker-containers.log.pos
+  tag docker.*
+  
+  <parse>
+    @type json
+    time_format %Y-%m-%dT%H:%M:%S.%NZ
+  </parse>
+</source>
+
+# 收集 Kubernetes 日志
+<source>
+  @type tail
+  @id inputtail-kubernetes
+  path /var/log/containers/*.log
+  pos_file /var/log/fluentd-containers.log.pos
+  tag kubernetes.*
+  
+  <parse>
+    @type json
+    time_format %Y-%m-%dT%H:%M:%S.%NZ
+  </parse>
+</source>
+
+# 添加 Kubernetes 元数据
+<filter kubernetes.**>
+  @type kubernetes_metadata
+  @id kubernetes_metadata
+</filter>
+
+# 输出到 Elasticsearch
+<match kubernetes.**>
+  @type elasticsearch
+  @id output-elasticsearch
+  host elasticsearch.logging.svc.cluster.local
+  port 9200
+  logstash_format true
+  logstash_prefix kubernetes
+  
+  buffer_type file
+  buffer_path /var/log/fluentd-buffers/output.buffer
+  buffer_chunk_limit 2M
+  buffer_queue_limit 8
+</match>
+```
+
+## Fluent Bit：更轻量的选择
+
+### 为什么选择 Fluent Bit
+
+| 特性 | Fluentd | Fluent Bit |
+|---|---|---|
+| 资源消耗 | 较高 | 极低 |
+| 内存占用 | 50-200MB | 5-10MB |
+| CPU 占用 | 较高 | 极低 |
+| 角色 | 聚合处理 | 边缘收集 |
+| 插件数量 | 500+ | 80+ |
+
+### Fluent Bit 部署
+
+```yaml title="fluentbit-daemonset.yaml"
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluent-bit
+  namespace: kube-logging
+spec:
+  selector:
+    matchLabels:
+      app: fluent-bit
+  template:
+    metadata:
+      labels:
+        app: fluent-bit
+    spec:
+      containers:
+      - name: fluent-bit
+        image: fluent/fluent-bit:2.2.0
+        ports:
+        - containerPort: 2020
+        env:
+        - name: FLUENT_BIT_CONFIG_BOLTDB_PATH
+          value: /fluent-bit/etc/fluent-bit.db
+        resources:
+          requests:
+            cpu: 50m
+            memory: 50Mi
+        volumeMounts:
+        - name: varlog
+          mountPath: /var/log
+        - name: varlibdockercontainers
+          mountPath: /var/lib/docker/containers
+          readOnly: true
+```
+
+### Fluent Bit 配置
+
+```title="fluent-bit.conf"
+[SERVICE]
+    Flush         5
+    Daemon        Off
+    Log_Level     info
+    Parsers_File  parsers.conf
+
+[INPUT]
+    Name              tail
+    Path              /var/log/containers/*.log
+    Parser            docker
+    Tag               kube.*
+    Refresh_Interval  5
+
+[FILTER]
+    Name                kubernetes
+    Match               kube.*
+    Kube_URL            https://kubernetes.default.svc:443
+    Kube_CA_File        /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+    Kube_Token_File    /var/run/secrets/kubernetes.io/serviceaccount/token
+    Kube_Tag_Prefix    kube.var.log.containers.
+
+[OUTPUT]
+    Name            es
+    Match           kube.*
+    Host            elasticsearch.logging.svc.cluster.local
+    Port            9200
+    Logstash_Format On
+    Retry_Limit     False
+```
+
+## Elasticsearch 配置
+
+### 生产环境配置
+
+```yaml title="elasticsearch-statefulset.yaml"
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: elasticsearch-master
+  namespace: kube-logging
+spec:
+  serviceName: elasticsearch
+  replicas: 3
+  selector:
+    matchLabels:
+      app: elasticsearch
+  template:
+    spec:
+      initContainers:
+      - name: fix-permissions
+        command:
+        - bash
+        - -c
+        - |
+          chown -R 1000:1000 /usr/share/elasticsearch/data
+      containers:
+      - name: elasticsearch
+        image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+        env:
+        - name: discovery.type
+          value: single-node
+        - name: ES_JAVA_OPTS
+          value: "-Xmx2g -Xms2g"
+        - name: xpack.security.enabled
+          value: "false"
+        ports:
+        - containerPort: 9200
+          name: http
+        - containerPort: 9300
+          name: transport
+        volumeMounts:
+        - name: elasticsearch-data
+          mountPath: /usr/share/elasticsearch/data
+        resources:
+          requests:
+            memory: 4Gi
+            cpu: 500m
+          limits:
+            memory: 8Gi
+```
+
+### 索引模板配置
+
+```json title="index-template.json"
+{
+  "index_patterns": ["kubernetes-*"],
+  "template": {
+    "settings": {
+      "number_of_shards": 2,
+      "number_of_replicas": 1,
+      "index.lifecycle.name": "kubernetes-policy",
+      "index.lifecycle.rollover_alias": "kubernetes"
+    }
+  }
+}
+```
+
+## Kibana 可视化
+
+### 索引模式配置
+
+在 Kibana 中创建索引模式：
+
+```
+Index pattern: kubernetes-*
+Time field: @timestamp
+```
+
+### 日志查询示例
+
+```json
+{
+  "query": {
+    "bool": {
+      "must": [
+        { "match": { "kubernetes.namespace_name": "production" } },
+        { "match": { "kubernetes.container_name": "order-service" } },
+        { "range": { "@timestamp": { "gte": "now-1h" } } }
+      ]
+    }
+  }
+}
+```
+
+## 性能优化
+
+### Fluentd 缓冲配置
+
+```title="fluent.conf"
+<match **>
+  @type elasticsearch
+  
+  # 文件缓冲配置
+  buffer_type file
+  buffer_path /var/log/fluentd-buffers/elastic.buffer
+  buffer_chunk_limit 256M
+  buffer_queue_limit 128
+  
+  # 刷新策略
+  flush_interval 10s
+  flush_thread_count 8
+  
+  # 重试策略
+  retry_type exponential_backoff
+  retry_wait 10s
+  retry_timeout 72h
+</match>
+```
+
+### Elasticsearch 冷热分离
+
+```json title="ilm-policy.json"
+{
+  "policy": {
+    "phases": {
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_age": "1d",
+            "max_size": "50gb"
+          }
+        }
+      },
+      "warm": {
+        "min_age": "7d",
+        "actions": {
+          "shrink": { "number_of_shards": 1 },
+          "forcemerge": { "max_num_segments": 1 }
+        }
+      },
+      "delete": {
+        "min_age": "30d",
+        "actions": {
+          "delete": {}
+        }
+      }
+    }
+  }
+}
+```
+
+## 总结
+
+EFK 是云原生时代的日志解决方案：
+
+| 组件 | 职责 |
+|---|---|
+| Fluent Bit | 边缘收集，轻量高效 |
+| Fluentd | 聚合处理，过滤转换 |
+| Elasticsearch | 海量存储，快速检索 |
+| Kibana | 可视化分析 |
+
+选择建议：
+
+- 小规模集群：直接用 Fluent Bit → Elasticsearch
+- 中等规模：Fluent Bit → Fluentd → Elasticsearch
+- 大规模集群：Fluent Bit → Kafka → Fluentd → Elasticsearch
+
+日志系统的最终目标是：让日志可搜索、可分析、可追溯。

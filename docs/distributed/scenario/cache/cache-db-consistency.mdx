@@ -1,0 +1,384 @@
+# 缓存与数据库双写一致性
+
+「缓存是枷锁，数据库是真相。」
+
+这句话道出了缓存系统的核心矛盾：我们用缓存来提升性能，但缓存数据随时可能「过期」。当缓存和数据库数据不一致时，应该听谁的？
+
+今天我们深入剖析这个分布式系统的经典问题，看看如何在性能和数据一致性之间找到平衡。
+
+## 一、问题的本质
+
+### 1.1 为什么缓存和数据库会不一致
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        写操作时序问题                                    │
+│                                                                         │
+│   T1: 线程A 查询商品，缓存未命中                                         │
+│   T2: 线程A 查询数据库，得到 price=100                                   │
+│   T3: 线程B 更新商品，price=200                                          │
+│   T4: 线程B 更新数据库成功                                               │
+│   T5: 线程B 删除缓存（因为要更新）                                       │
+│   T6: 线程A 写入缓存，price=100（过期数据！）                            │
+│   T7: 线程C 查询商品，命中缓存，得到 price=100（错误！）                  │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 1.2 一致性的分类
+
+| 级别 | 说明 | 能否接受 |
+|---|---|---|
+| **强一致性** | 缓存和数据库完全一致 | 不可能，代价太大 |
+| **最终一致性** | 允许短暂不一致，但最终会一致 | **这是我们的目标** |
+| **弱一致性** | 不保证什么时候一致 | 一般不用 |
+
+**结论**：我们追求的是**最终一致性**，而不是强一致性。
+
+## 二、四种经典方案
+
+### 2.1 方案一：Cache Aside（旁路缓存）
+
+这是最常用、最简单、也是 Facebook 推荐的一致性模式。
+
+```
+读：
+应用 ──▶ 查缓存 ──▶ 命中？ ──▶ 返回
+              │         │
+              │      未命中
+              │         │
+              └─────▶ 查数据库 ──▶ 写缓存 ──▶ 返回
+
+写：
+应用 ──▶ 写数据库 ──▶ 删除缓存（注意：不是更新缓存）
+```
+
+**为什么删除而不是更新？**
+
+- 更新缓存可能造成数据不一致
+- 删除缓存后，下次读会自然回填最新数据
+- 删除操作幂等，可以安全重试
+
+```java title="Cache Aside 实现"
+@Service
+public class CacheAsideService {
+    @Autowired
+    private RedisTemplate<String, Product> redisTemplate;
+    @Autowired
+    private ProductMapper productMapper;
+
+    public Product getProduct(Long id) {
+        String key = "product:" + id;
+        Product cached = redisTemplate.opsForValue().get(key);
+        if (cached != null) {
+            return cached;
+        }
+        Product product = productMapper.selectById(id);
+        if (product != null) {
+            redisTemplate.opsForValue().set(key, product, 1, TimeUnit.HOURS);
+        }
+        return product;
+    }
+
+    @Transactional
+    public void updateProduct(Product product) {
+        productMapper.updateById(product);
+        String key = "product:" + product.getId();
+        redisTemplate.delete(key); // 删除，不是更新！
+    }
+}
+```
+
+### 2.2 方案二：Read Through（读穿透）
+
+缓存是透明层，应用不感知缓存存在。
+
+```java title="Read Through 实现"
+@Service
+public class ReadThroughService {
+    @Autowired
+    private Cache<String, Product> productCache;
+    @Autowired
+    private ProductMapper productMapper;
+
+    public Product getProduct(Long id) {
+        String key = "product:" + id;
+        return productCache.get(key, () -> productMapper.selectById(id));
+    }
+}
+```
+
+### 2.3 方案三：Write Through（写穿透）
+
+写操作同时写缓存和数据库。
+
+```java title="Write Through 实现"
+@Service
+public class WriteThroughService {
+    @Autowired
+    private Cache<String, Product> productCache;
+    @Autowired
+    private ProductMapper productMapper;
+
+    public void updateProduct(Product product) {
+        String key = "product:" + product.getId();
+        productCache.put(key, product); // 先写缓存
+        productMapper.updateById(product); // 再写数据库
+    }
+}
+```
+
+### 2.4 方案四：Write Behind（异步写）
+
+先写缓存，后台异步写数据库。性能最高，但风险也最大。
+
+```java title="Write Behind 实现"
+@Service
+public class WriteBehindService {
+    @Autowired
+    private RedisTemplate<String, Product> redisTemplate;
+    private BlockingQueue<UpdateTask> updateQueue = new LinkedBlockingQueue<>();
+
+    public void updateProduct(Product product) {
+        String key = "product:" + product.getId();
+        redisTemplate.opsForValue().set(key, product); // 先写缓存
+        updateQueue.offer(new UpdateTask("update", product)); // 异步写数据库
+    }
+
+    @Scheduled(fixedRate = 100)
+    public void flushToDatabase() {
+        while (!updateQueue.isEmpty()) {
+            UpdateTask task = updateQueue.poll();
+            if ("update".equals(task.getType())) {
+                productMapper.updateById(task.getProduct());
+            }
+        }
+    }
+}
+```
+
+## 三、延迟双删：解决并发更新问题
+
+### 3.1 问题复现
+
+```
+T1: 线程A 读 → 缓存未命中 → 查数据库（price=100）
+T2: 线程B 更新 → price=200 → 删缓存
+T3: 线程A 写缓存 → 写入 price=100（旧数据！）
+```
+
+### 3.2 延迟双删解决方案
+
+```java title="延迟双删实现"
+@Service
+public class DelayDoubleDeleteService {
+    @Autowired
+    private RedisTemplate<String, Product> redisTemplate;
+    @Autowired
+    private ProductMapper productMapper;
+
+    private static final int DELAY_MS = 500;
+
+    public void updateProduct(Product product) {
+        String key = "product:" + product.getId();
+        redisTemplate.delete(key); // 1. 先删除缓存
+        productMapper.updateById(product); // 2. 更新数据库
+        // 3. 延迟一段时间后再删除缓存
+        CompletableFuture.runAsync(() -> {
+            try {
+                Thread.sleep(DELAY_MS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            redisTemplate.delete(key);
+        });
+    }
+}
+```
+
+:::warning 延迟双删的目的
+延迟双删是为了让 T1 线程完成写缓存操作后，再删一次，确保旧数据被清除。
+:::
+
+## 四、订阅 MySQL Binlog 方案
+
+### 4.1 架构设计
+
+```
+MySQL ──▶ Binlog ──▶ Canal ──▶ MQ ──▶ 缓存更新
+```
+
+### 4.2 Canal 配置
+
+```java title="Canal 客户端实现"
+@Service
+@Slf4j
+public class CanalSyncService {
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    @PostConstruct
+    public void sync() {
+        Executors.newSingleThreadExecutor().submit(() -> {
+            while (true) {
+                Message message = connector.get(100);
+                for (Entry entry : message.getEntries()) {
+                    if (entry.getEntryType() == EntryType.ROWDATA) {
+                        RowChange rowChange = RowChange.parseFrom(entry.getStoreValue());
+                        for (RowData row : rowChange.getRowDatasList()) {
+                            if (rowChange.getEventType() == EventType.UPDATE) {
+                                handleUpdate(row);
+                            } else if (rowChange.getEventType() == EventType.DELETE) {
+                                handleDelete(row);
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    private void handleUpdate(RowData row) {
+        Long id = extractId(row);
+        Product product = extractProduct(row);
+        String key = "product:" + id;
+        redisTemplate.opsForValue().set(key, product);
+    }
+}
+```
+
+## 五、分布式事务方案
+
+### 5.1 Seata AT 模式
+
+```java title="Seata AT 模式"
+@Service
+public class SeataCacheService {
+    @GlobalTransactional(name = "update-product")
+    public void updateProductWithCache(Product product) {
+        productMapper.updateById(product); // 更新数据库
+        redisTemplate.delete("product:" + product.getId()); // 删除缓存
+    }
+}
+```
+
+## 六、实战代码：最终一致性方案
+
+```java title="最终一致性完整方案"
+@Service
+@Slf4j
+public class ConsistentCacheService {
+    @Autowired
+    private RedisTemplate<String, Product> redisTemplate;
+    @Autowired
+    private ProductMapper productMapper;
+
+    private static final int MAX_RETRY = 3;
+
+    public Product getProduct(Long id) {
+        String key = "product:" + id;
+        Product cached = redisTemplate.opsForValue().get(key);
+        if (cached != null) {
+            return cached;
+        }
+        Product product = productMapper.selectById(id);
+        if (product != null) {
+            redisTemplate.opsForValue().set(key, product, 1, TimeUnit.HOURS);
+        }
+        return product;
+    }
+
+    public void updateProduct(Product product) {
+        String key = "product:" + product.getId();
+        deleteWithRetry(key);
+        productMapper.updateById(product);
+        // 延迟双删
+        CompletableFuture.runAsync(() -> {
+            try {
+                Thread.sleep(300);
+                deleteWithRetry(key);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+    }
+
+    private void deleteWithRetry(String key) {
+        int attempts = 0;
+        while (attempts < MAX_RETRY) {
+            try {
+                Boolean result = redisTemplate.delete(key);
+                if (Boolean.TRUE.equals(result)) {
+                    return;
+                }
+            } catch (Exception e) {
+                log.warn("删除缓存失败，重试 {}/{}", attempts + 1, MAX_RETRY);
+            }
+            attempts++;
+        }
+    }
+}
+```
+
+## 七、监控与补偿
+
+```java title="一致性检测任务"
+@Service
+@Slf4j
+public class ConsistencyChecker {
+    @Scheduled(fixedRate = 60000)
+    public void checkConsistency() {
+        Set<String> keys = redisTemplate.keys("product:*");
+        if (keys == null) return;
+
+        for (String key : keys.stream().limit(100).collect(Collectors.toList())) {
+            Product cached = redisTemplate.opsForValue().get(key);
+            Long id = extractId(key);
+            Product dbProduct = productMapper.selectById(id);
+
+            if (cached == null && dbProduct != null) {
+                redisTemplate.opsForValue().set(key, dbProduct);
+            } else if (cached != null && dbProduct != null) {
+                if (!equals(cached, dbProduct)) {
+                    log.error("数据不一致: id={}", id);
+                    redisTemplate.delete(key);
+                }
+            }
+        }
+    }
+
+    private boolean equals(Product a, Product b) {
+        return a.getPrice().equals(b.getPrice());
+    }
+}
+```
+
+## 八、方案选型
+
+| 场景 | 推荐方案 | 理由 |
+|---|---|---|
+| 一般业务 | Cache Aside | 简单、够用 |
+| 高并发写 | 延迟双删 | 解决并发问题 |
+| 数据重要 | Binlog 同步 | 解耦、可靠 |
+| 强一致性要求 | Seata AT/TCC | 分布式事务支持 |
+
+:::tip 实战建议
+大多数场景用 **Cache Aside + 延迟双删** 就够了：
+
+1. Cache Aside 模式简单，延迟低
+2. 延迟双删解决并发更新问题
+3. 配合重试机制保证删除成功
+4. 定期一致性检测兜底
+:::
+
+## 结尾
+
+缓存与数据库的一致性，没有银弹。每种方案都有优缺点，关键是**根据业务场景选择合适的方案**。
+
+记住三个原则：
+
+1. **读优先缓存，写只用删除**
+2. **延迟双删是解决并发的有效手段**
+3. **最终一致性是目标，强一致性是陷阱**
+
+下一节，我们来看缓存系统的三大灾难：穿透、击穿、雪崩，以及如何应对。

@@ -1,0 +1,365 @@
+# Logstash 集群部署
+
+单个 Logstash 实例很难处理大规模数据流。生产环境中，通常需要部署多个 Logstash 实例，组成集群来提高吞吐量和可用性。
+
+这篇文章讲解 Logstash 集群的部署模式和配置管理。
+
+## 部署架构
+
+### 基本架构
+
+```
+                    ┌─────────────┐
+                    │  Kafka      │
+                    │  Cluster    │
+                    └──────┬──────┘
+                           │
+              ┌────────────┼────────────┐
+              │            │            │
+         ┌────▼────┐  ┌────▼────┐  ┌────▼────┐
+         │ Logstash│  │ Logstash│  │ Logstash│
+         │ Node 1  │  │ Node 2  │  │ Node 3  │
+         └─────────┘  └─────────┘  └─────────┘
+              │            │            │
+              └────────────┼────────────┘
+                           │
+                    ┌──────▼──────┐
+                    │Elasticsearch│
+                    │   Cluster   │
+                    └─────────────┘
+```
+
+Kafka 作为缓冲层，Logstash 消费 Kafka 消息并处理后写入 Elasticsearch。
+
+### 架构模式
+
+#### 模式一：Beat → Kafka → Logstash → ES
+
+```
+Filebeat → Kafka → Logstash → Elasticsearch
+Metricbeat  ↗
+Heartbeat  ↗
+```
+
+适用场景：大规模日志收集，需要 Kafka 作为缓冲。
+
+#### 模式二：Beat → Logstash → ES
+
+```
+Filebeat → Logstash (处理) → Elasticsearch
+            ↓
+         Redis (缓冲)
+```
+
+适用场景：中等规模，Redis 作为简单缓冲。
+
+#### 模式三：直接写入
+
+```
+Application → Logstash → Elasticsearch
+```
+
+适用场景：实时性要求高，数据量可控。
+
+## 配置文件管理
+
+### 目录结构
+
+```
+/etc/logstash/
+├── conf.d/
+│   ├── 00-inputs.conf
+│   ├── 10-filters.conf
+│   ├── 20-outputs.conf
+│   └── 99-cleanups.conf
+├── pipelines/
+│   ├── pipeline-a.yml
+│   └── pipeline-b.yml
+├── templates/
+│   └── es-template.json
+├── certs/
+│   ├── ca.crt
+│   ├── client.crt
+│   └── client.key
+└── jvm.options
+```
+
+### 模块化配置
+
+#### inputs.conf
+
+```ruby
+input {
+  kafka {
+    bootstrap_servers => "kafka1:9092,kafka2:9092,kafka3:9092"
+    topics_pattern => "app-.*"
+    group_id => "logstash-cluster"
+    consumer_threads => 4
+    codec => json
+  }
+}
+```
+
+#### filters.conf
+
+```ruby
+filter {
+  if [type] == "access" {
+    grok { ... }
+    geoip { ... }
+  } else if [type] == "error" {
+    multiline { ... }
+    grok { ... }
+  }
+
+  date {
+    match => ["timestamp", "ISO8601"]
+    target => "@timestamp"
+  }
+}
+```
+
+#### outputs.conf
+
+```ruby
+output {
+  if "debug" in [tags] {
+    stdout { codec => rubydebug }
+  }
+
+  elasticsearch {
+    hosts => ["es1:9200", "es2:9200", "es3:9200"]
+    index => "%{[@metadata][index_prefix]}-%{+YYYY.MM.dd}"
+    user => "logstash"
+    password => "${ES_PASSWORD}"
+  }
+}
+```
+
+### pipelines.yml 配置
+
+```yaml
+- pipeline.id: main
+  path.config: "/etc/logstash/conf.d/main/*.conf"
+  pipeline.workers: 4
+  pipeline.batch.size: 250
+  queue.type: persisted
+  queue.page_capacity: 250mb
+
+- pipeline.id: audit
+  path.config: "/etc/logstash/conf.d/audit/*.conf"
+  pipeline.workers: 2
+  pipeline.batch.size: 100
+  queue.type: memory
+```
+
+## 高可用配置
+
+### 健康检查
+
+```bash
+# 检查 Logstash 状态
+curl -s localhost:9600/_node/stats | jq '.pipeline'
+```
+
+### 监控集成
+
+#### Prometheus Exporter
+
+```ruby
+input {
+  http {
+    port => 9600
+  }
+}
+```
+
+启用后，Prometheus 可以从 `/metrics` 端点抓取指标。
+
+#### Metricbeat 监控
+
+```yaml
+# metricbeat.yml
+metricbeat.modules:
+- module: logstash
+  metricsets: ["node", "node_stats"]
+  period: 10s
+  hosts: ["logstash-node1:9600", "logstash-node2:9600"]
+```
+
+### 自动重启
+
+使用 systemd 管理 Logstash：
+
+```ini
+# /etc/systemd/system/logstash.service
+[Unit]
+Description=Logstash
+After=network.target
+
+[Service]
+Type=simple
+User=logstash
+Group=logstash
+ExecStart=/usr/share/logstash/bin/logstash "--path.settings" "/etc/logstash"
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+systemctl enable logstash
+systemctl restart logstash
+```
+
+## Docker 部署
+
+### Dockerfile
+
+```dockerfile
+FROM docker.elastic.co/logstash/logstash:8.12.0
+
+# 安装插件
+RUN logstash-plugin install logstash-input-kafka
+
+# 复制配置
+COPY pipelines/ /usr/share/logstash/pipelines/
+COPY config/ /usr/share/logstash/config/
+
+# 设置工作目录
+WORKDIR /usr/share/logstash
+
+# 启动命令
+CMD ["-f", "/usr/share/logstash/pipelines"]
+```
+
+### docker-compose.yml
+
+```yaml
+version: '3.8'
+
+services:
+  logstash:
+    image: logstash:8.12.0
+    volumes:
+      - ./config/logstash.yml:/usr/share/logstash/config/logstash.yml
+      - ./pipelines:/usr/share/logstash/pipelines
+      - ./data:/usr/share/logstash/data
+    ports:
+      - "5044:5044"
+      - "9600:9600"
+    environment:
+      - "LS_JAVA_OPTS=-Xmx1g -Xms1g"
+    deploy:
+      replicas: 3
+    restart: unless-stopped
+```
+
+## Kubernetes 部署
+
+### Deployment
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: logstash
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: logstash
+  template:
+    metadata:
+      labels:
+        app: logstash
+    spec:
+      containers:
+      - name: logstash
+        image: logstash:8.12.0
+        ports:
+        - containerPort: 9600
+        env:
+        - name: "LS_JAVA_OPTS"
+          value: "-Xmx1g -Xms1g"
+        volumeMounts:
+        - name: config
+          mountPath: /usr/share/logstash/config
+        - name: pipeline
+          mountPath: /usr/share/logstash/pipelines
+      volumes:
+      - name: config
+        configMap:
+          name: logstash-config
+      - name: pipeline
+        configMap:
+          name: logstash-pipeline
+```
+
+### 配置 ConfigMap
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: logstash-config
+data:
+  logstash.yml: |
+    http.host: "0.0.0.0"
+    api.environment: "production"
+    queue.type: persisted
+    queue.page_capacity: 250mb
+```
+
+## 常见问题
+
+### 配置更新后生效
+
+```bash
+# 重启单个实例
+systemctl restart logstash
+
+# 热加载配置（不重启）
+kill -SIGHUP $(pid of logstash)
+```
+
+### 日志查看
+
+```bash
+# journald 日志
+journalctl -u logstash -f
+
+# Docker 日志
+docker logs -f logstash
+
+# Pod 日志
+kubectl logs -f logstash-xxx
+```
+
+### 性能调优
+
+每个 Logstash 实例的 workers 数量：
+
+```ruby
+pipeline {
+  workers => 4  # 根据 CPU 核心数调整
+}
+```
+
+根据集群规模和数据量，适当调整。
+
+## 总结
+
+Logstash 集群部署的关键点：
+
+**架构设计**：根据数据规模和可靠性要求选择合适的架构模式。
+
+**配置管理**：模块化配置，便于维护和复用。
+
+**高可用**：多实例部署 + 监控告警 + 自动重启。
+
+**容器化**：Docker 和 Kubernetes 是现代部署的标准方式。
+
+合理的集群部署，可以让你的日志收集系统稳定高效地运行。

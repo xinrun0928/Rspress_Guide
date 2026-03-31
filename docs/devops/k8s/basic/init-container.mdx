@@ -1,0 +1,515 @@
+import { Badge } from '@rspress/core/theme';
+
+# Init 容器
+
+<Badge text="Principle" type="warning" /> <Badge text="Init Container" type="tip" />
+
+你的应用需要连接数据库，但数据库启动比 Pod 慢。你的应用先于数据库启动，连接失败，重试几次后仍然失败，最终容器退出，Pod 进入 CrashLoopBackOff。
+
+你当然可以让应用实现重试逻辑，但这样会让应用逻辑变得复杂。更优雅的方案是：让 Pod 等待依赖就绪后再启动主容器。
+
+这就是 Init 容器的作用。
+
+## Init 容器简介
+
+Init 容器是一种特殊类型的容器，它在应用容器之前运行。如果 Init 容器失败，应用容器不会被启动。
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: app-with-init
+spec:
+  containers:
+  - name: main-app
+    image: myapp:latest
+  initContainers:
+  - name: wait-for-db
+    image: busybox:1.36
+    command:
+    - sh
+    - -c
+    - "echo 'Waiting for database...'; sleep 30; nc -z db-service 5432"
+```
+
+**执行顺序**：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                  Init Container 执行顺序                      │
+│                                                              │
+│  ┌──────────────┐                                          │
+│  │ init-mysql   │ ← 等待 MySQL 就绪                        │
+│  └──────────────┘                                          │
+│         │                                                   │
+│         ▼ Success                                           │
+│  ┌──────────────┐                                          │
+│  │ init-config  │ ← 加载配置                                │
+│  └──────────────┘                                          │
+│         │                                                   │
+│         ▼ Success                                           │
+│  ┌──────────────┐                                          │
+│  │ init-secret  │ ← 准备密钥                                │
+│  └──────────────┘                                          │
+│         │                                                   │
+│         ▼ Success                                           │
+│  ┌──────────────┐                                          │
+│  │   main-app   │ ← 主容器启动                              │
+│  └──────────────┘                                          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Init 容器与普通容器的区别
+
+| 特性 | Init 容器 | 普通容器 |
+|---|---|---|
+| 执行顺序 | 按数组顺序执行，全部成功后才启动主容器 | 与同 Pod 其他容器并行执行 |
+| 重试行为 | 失败会重试，直到成功或超过阈值 | 失败后按 restartPolicy 重启 |
+| 镜像支持 | 可以使用与主容器不同的镜像 | - |
+| 资源限制 | 单独计算，不与主容器共享 | 共享 Pod 资源 |
+| 端口冲突 | 不占用 Pod 网络端口 | 占用网络端口 |
+| 探针支持 | 不支持 Liveness/Readiness/Startup Probe | 支持 |
+| 环境变量 | 支持 | 支持 |
+| 卷挂载 | 支持 | 支持 |
+
+## 常见使用场景
+
+### 场景 1：等待依赖服务就绪
+
+这是最常见的场景。Pod 启动前，等待依赖的数据库或服务就绪：
+
+```yaml
+initContainers:
+- name: wait-for-db
+  image: busybox:1.36
+  command:
+  - sh
+  - -c
+  - |
+    echo "Checking database availability..."
+    until nc -z db-service 5432; do
+      echo "Database not ready, waiting..."
+      sleep 5
+    done
+    echo "Database is ready!"
+
+- name: wait-for-cache
+  image: busybox:1.36
+  command:
+  - sh
+  - -c
+  - |
+    echo "Checking Redis availability..."
+    until nc -z redis-service 6379; do
+      echo "Redis not ready, waiting..."
+      sleep 5
+    done
+    echo "Redis is ready!"
+```
+
+### 场景 2：预加载配置
+
+在主容器启动前，从 ConfigMap 或 Secret 加载配置并处理：
+
+```yaml
+initContainers:
+- name: prepare-config
+  image: busybox:1.36
+  command:
+  - sh
+  - -c
+  - |
+    # 合并多个配置文件
+    cat /etc/config/default.yaml
+    cat /etc/config/overrides.yaml
+    > /etc/app/config.yaml
+    
+    # 生成环境特定配置
+    envsubst < /etc/templates/app.tpl > /etc/app/app.conf
+  volumeMounts:
+  - name: config
+    mountPath: /etc/config
+  - name: template
+    mountPath: /etc/templates
+  - name: app-config
+    mountPath: /etc/app
+```
+
+### 场景 3：准备数据目录
+
+某些应用需要预先创建数据目录并设置权限：
+
+```yaml
+initContainers:
+- name: prepare-storage
+  image: busybox:1.36
+  command:
+  - sh
+  - -c
+  - |
+    mkdir -p /data/app /data/logs /data/cache
+    chmod 777 /data/logs /data/cache
+    
+    # 恢复持久化数据（如果有）
+    if [ -f /backup/data.tar.gz ]; then
+      tar xzf /backup/data.tar.gz -C /data
+    fi
+  volumeMounts:
+  - name: app-storage
+    mountPath: /data
+  - name: backup
+    mountPath: /backup
+```
+
+### 场景 4：注册到服务发现
+
+某些应用不支持动态注册，需要 Pod 启动前预先注册：
+
+```yaml
+initContainers:
+- name: register-service
+  image: curlimages/curl:latest
+  command:
+  - sh
+  - -c
+  - |
+    # 注册到 Consul
+    curl -X PUT -d '{"ID":"${POD_NAME}","Name":"myapp","Address":"${POD_IP}","Port":8080}' \
+      http://consul:8500/v1/agent/service/register
+    
+    # 注册清理钩子
+    trap "curl -X DELETE http://consul:8500/v1/agent/service/deregister/${POD_NAME}" EXIT
+  env:
+  - name: POD_NAME
+    valueFrom:
+      fieldRef:
+        fieldPath: metadata.name
+  - name: POD_IP
+    valueFrom:
+      fieldRef:
+        fieldPath: status.podIP
+```
+
+### 场景 5：下载依赖资源
+
+对于大型镜像，可以将部分资源放到启动时下载：
+
+```yaml
+initContainers:
+- name: download-models
+  image: python:3.11
+  command:
+  - sh
+  - -c
+  - |
+    pip install --no-cache-dir -r requirements.txt
+    
+    # 下载 ML 模型（如果需要动态更新）
+    if [ ! -f /models/classifier.pkl ]; then
+      curl -L -o /models/classifier.pkl ${MODEL_URL}
+    fi
+  volumeMounts:
+  - name: models
+    mountPath: /models
+```
+
+## Sidecar 模式与 Init 容器
+
+### 传统 Sidecar 与 Init Sidecar
+
+| 模式 | 实现方式 | 生命周期 |
+|---|---|---|
+| **Sidecar 容器** | 普通容器 | 与主容器共存亡 |
+| **Init Sidecar** | Init 容器 | 完成初始化后退出 |
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     Sidecar 容器                            │
+│                                                              │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐    │
+│  │   nginx      │  │   main-app   │  │    redis     │    │
+│  │   (sidecar)  │  │   (主容器)     │  │   (sidecar)  │    │
+│  └──────────────┘  └──────────────┘  └──────────────┘    │
+│                                                              │
+│  生命周期：nginx 启动 → main-app 启动 → main-app 停止 → nginx 停止 │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│                    Init Sidecar 容器                         │
+│                                                              │
+│  ┌──────────────┐                                          │
+│  │ init-log-    │                                          │
+│  │  bootstrap   │                                          │
+│  └──────────────┘                                          │
+│                                                              │
+│  ┌──────────────┐                                          │
+│  │   main-app   │                                          │
+│  │   (主容器)    │                                          │
+│  └──────────────┘                                          │
+│                                                              │
+│  生命周期：bootstrap 完成 → 退出 → main-app 启动 → 运行 → 停止    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 使用 Init 容器模拟一次性 Sidecar
+
+如果 Sidecar 只需要在启动时执行一次，可以使用 Init 容器：
+
+```yaml
+# Init 容器方式（轻量）
+initContainers:
+- name: init-logging
+  image: fluent/fluent-bit:latest
+  command:
+  - sh
+  - -c
+  - |
+    # 等待主容器日志目录就绪
+    until [ -d /var/log/app ]; do sleep 1; done
+    
+    # 配置日志转发
+    /fluent-bit/bin/fluent-bit \
+      -c /fluent-bit/config/fluent-bit.conf &
+    
+    # 保持进程前台运行（Init 容器退出意味着失败）
+    wait
+
+# 注意：这个方案有问题，Init 容器退出后日志转发就停了
+
+# 更好的方案：使用普通 Sidecar
+```
+
+:::warning Init 容器的局限
+Init 容器完成后会退出，不能用于提供持续的服务（如日志收集）。对于持续运行的任务，应该使用普通的 Sidecar 容器。
+:::
+
+## 实战：完整的应用示例
+
+### WordPress + MySQL
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: wordpress
+  labels:
+    app: wordpress
+spec:
+  initContainers:
+  # 等待 MySQL 就绪
+  - name: wait-for-mysql
+    image: busybox:1.36
+    command:
+    - sh
+    - -c
+    - |
+      echo "Waiting for MySQL to be ready..."
+      until nc -z mysql 3306; do
+        echo "MySQL is not ready, waiting 5 seconds..."
+        sleep 5
+      done
+      echo "MySQL is ready!"
+
+  # 等待数据库初始化完成
+  - name: wait-for-db-init
+    image: mysql:8.0-client
+    command:
+    - sh
+    - -c
+    - |
+      # 等待数据库表创建完成
+      echo "Waiting for database initialization..."
+      until mysql -h mysql -u root -p${MYSQL_ROOT_PASSWORD} -e "SELECT 1" > /dev/null 2>&1; do
+        echo "Database not initialized, waiting..."
+        sleep 5
+      done
+      echo "Database is ready!"
+    env:
+    - name: MYSQL_ROOT_PASSWORD
+      valueFrom:
+        secretKeyRef:
+          name: mysql-secret
+          key: root-password
+  containers:
+  - name: wordpress
+    image: wordpress:6.2-php8.2-apache
+    ports:
+    - containerPort: 80
+    env:
+    - name: WORDPRESS_DB_HOST
+      value: "mysql:3306"
+    - name: WORDPRESS_DB_USER
+      value: "wordpress"
+    - name: WORDPRESS_DB_PASSWORD
+      valueFrom:
+        secretKeyRef:
+          name: mysql-secret
+          key: wordpress-password
+    volumeMounts:
+    - name: wordpress-data
+      mountPath: /var/www/html
+  volumes:
+  - name: wordpress-data
+    emptyDir: {}
+```
+
+### Java 微服务依赖检查
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: java-microservice
+spec:
+  initContainers:
+  # 检查所有依赖服务
+  - name: dependency-check
+    image: curlimages/curl:latest
+    command:
+    - sh
+    - -c
+    - |
+      # 依赖服务列表
+      SERVICES="user-service:8080 auth-service:8080 config-server:8888"
+      
+      for service in $SERVICES; do
+        NAME=$(echo $service | cut -d':' -f1)
+        PORT=$(echo $service | cut -d':' -f2)
+        
+        echo "Checking $NAME..."
+        until curl -sf "http://${NAME}:${PORT}/actuator/health" > /dev/null 2>&1; do
+          echo "$NAME is not ready, waiting..."
+          sleep 5
+        done
+        echo "$NAME is ready!"
+      done
+      
+      echo "All dependencies are ready!"
+
+  # 预热缓存
+  - name: warmup-cache
+    image: myjavaapp:1.0
+    command:
+    - java
+    - -jar
+    - /app/warmup.jar
+    env:
+    - name: SPRING_PROFILES_ACTIVE
+      value: "prod"
+    - name: WARMUP_MODE
+      value: "true"
+```
+
+## Init 容器失败处理
+
+### 重试机制
+
+Init 容器失败后会自动重试，直到成功或达到阈值：
+
+```yaml
+spec:
+  initContainers:
+  - name: may-fail
+    image: busybox:1.36
+    restartPolicy: Always  # Init 容器的默认重试策略
+    command:
+    - sh
+    - -c
+    - "echo 'Trying...'; exit 1"
+```
+
+### 超时处理
+
+```yaml
+spec:
+  initContainers:
+  - name: slow-init
+    image: busybox:1.36
+    command:
+    - sh
+    - -c
+    - |
+      # 设置超时
+      TIMEOUT=120
+      START=$(date +%s)
+      
+      until nc -z service 80 || (($(date +%s) - START > TIMEOUT)); do
+        sleep 1
+      done
+      
+      if (($(date +%s) - START > TIMEOUT)); then
+        echo "Timeout waiting for service"
+        exit 1
+      fi
+```
+
+### 查看 Init 容器状态
+
+```bash
+# 查看 Init 容器状态
+kubectl get pod <pod-name> -o jsonpath='{.spec.initContainers[*].name}'
+# 输出: wait-for-db init-config
+
+# 查看详细状态
+kubectl describe pod <pod-name> | grep -A 20 "Init Containers:"
+
+# 查看 Init 容器日志
+kubectl logs <pod-name> -c wait-for-db --previous
+```
+
+## 最佳实践
+
+| 实践 | 说明 |
+|---|---|
+| **保持 Init 容器轻量** | Init 容器增加 Pod 启动时间，应该尽量快速 |
+| **使用共享卷传递数据** | Init 容器与主容器通过 emptyDir 或 PVC 共享数据 |
+| **实现优雅超时** | Init 逻辑应该有超时机制，避免永久阻塞 |
+| **添加详细的日志输出** | 便于排查 Init 容器失败问题 |
+| **考虑使用 wait-for 工具** | 如 `wait-for-it.sh`、`dockerize` |
+
+### 优雅的超时等待脚本
+
+```bash
+#!/bin/sh
+# wait-for-service.sh
+# 通用的服务等待脚本
+
+set -e
+
+SERVICE_HOST="$1"
+SERVICE_PORT="$2"
+TIMEOUT="${3:-60}"
+
+START_TIME=$(date +%s)
+
+echo "Waiting for $SERVICE_HOST:$SERVICE_PORT (timeout: ${TIMEOUT}s)..."
+
+while ! nc -z "$SERVICE_HOST" "$SERVICE_PORT"; do
+  CURRENT_TIME=$(date +%s)
+  ELAPSED=$((CURRENT_TIME - START_TIME))
+  
+  if [ $ELAPSED -ge $TIMEOUT ]; then
+    echo "Timeout after ${TIMEOUT}s waiting for $SERVICE_HOST:$SERVICE_PORT"
+    exit 1
+  fi
+  
+  echo "Service not ready, waiting... (${ELAPSED}s elapsed)"
+  sleep 2
+done
+
+echo "$SERVICE_HOST:$SERVICE_PORT is ready!"
+```
+
+## 总结
+
+Init 容器是 Kubernetes 提供的强大机制，用于在主容器启动前完成准备工作：
+
+| 场景 | Init 容器职责 |
+|---|---|
+| 依赖等待 | 等待数据库、外部服务就绪 |
+| 配置准备 | 从 ConfigMap/Secret 加载并处理配置 |
+| 数据准备 | 创建目录、恢复持久化数据 |
+| 权限设置 | 设置文件权限、生成密钥 |
+| 服务注册 | 向服务发现系统注册实例 |
+
+正确使用 Init 容器，可以让主容器专注于业务逻辑，提高应用的健壮性。

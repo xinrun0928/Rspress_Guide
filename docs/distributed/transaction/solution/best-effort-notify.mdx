@@ -1,0 +1,440 @@
+import { Badge } from '@rspress/core/theme';
+
+# 最大努力通知
+
+<Badge text="分布式事务" type="tip" /> <Badge text="最终一致" type="warning" /> <Badge text="通知机制" type="info" />
+
+你有没有想过：当你完成支付后，商户是如何收到通知的？
+
+支付完成后，支付渠道会异步通知商户系统：「某笔订单已支付成功」。但通知可能失败、延迟、甚至丢失。商户系统需要能够容忍这些情况，通过「最大努力通知」来处理。
+
+**最大努力通知**是一种实现最终一致性的简单方案——尽最大努力通知，但不保证最终成功。
+
+## 核心思想
+
+```java
+/**
+ * 最大努力通知的核心思想
+ */
+
+// 核心理念：
+// - 发起方主动通知接收方
+// - 接收方需要幂等处理
+// - 通知失败时多次重试
+// - 超过最大次数后放弃
+
+/**
+ * 与可靠消息的区别
+ */
+
+// 可靠消息：
+// - 发送方发送消息
+// - 接收方消费消息
+// - 发送方保证消息能送达
+
+// 最大努力通知：
+// - 发起方主动通知
+// - 接收方被动接收
+// - 发起方多次重试
+// - 不保证最终成功
+```
+
+## 典型场景
+
+```java
+/**
+ * 最大努力通知的典型场景
+ */
+
+// 1. 支付结果通知
+// - 支付渠道通知商户
+// - 商户处理支付结果
+
+// 2. 订单状态同步
+// - 平台同步订单状态到商家
+// - 商家系统接收并处理
+
+// 3. 对账文件推送
+// - 支付渠道推送对账文件
+// - 商户下载并处理
+
+// 4. 资质审核通知
+// - 审核完成后通知申请方
+```
+
+## 代码实现
+
+### 通知方实现
+
+```java
+/**
+ * 最大努力通知服务（通知方）
+ */
+@Service
+public class BestEffortNotifyService {
+    
+    @Autowired
+    private NotificationTaskDao notificationTaskDao;
+    
+    @Autowired
+    private RestTemplate restTemplate;
+    
+    private static final int MAX_RETRY = 5;
+    private static final long[] RETRY_INTERVALS = {
+        60 * 1000,        // 1 分钟
+        5 * 60 * 1000,    // 5 分钟
+        30 * 60 * 1000,   // 30 分钟
+        2 * 60 * 60 * 1000,   // 2 小时
+        24 * 60 * 60 * 1000   // 24 小时
+    };
+    
+    /**
+     * 发起通知
+     */
+    public void notify(Long businessId, String notifyUrl, Object notifyData) {
+        // 1. 创建通知任务
+        NotificationTask task = new NotificationTask();
+        task.setBusinessId(businessId);
+        task.setNotifyUrl(notifyUrl);
+        task.setNotifyData(JSON.toJSONString(notifyData));
+        task.setStatus(NotificationStatus.PENDING);
+        task.setRetryCount(0);
+        task.setNextNotifyTime(new Date());
+        
+        notificationTaskDao.insert(task);
+        
+        // 2. 立即发起第一次通知
+        sendNotify(task);
+    }
+    
+    /**
+     * 发送通知
+     */
+    private void sendNotify(NotificationTask task) {
+        try {
+            // 1. 发送 HTTP POST 请求
+            HttpHeaders headers = new HttpHeaders();
+            headers.setContentType(MediaType.APPLICATION_JSON);
+            headers.set("X-Notify-Signature", sign(task.getNotifyData()));
+            headers.set("X-Notify-Timestamp", String.valueOf(System.currentTimeMillis()));
+            
+            HttpEntity<String> request = new HttpEntity<>(task.getNotifyData(), headers);
+            
+            ResponseEntity<Map> response = restTemplate.postForEntity(
+                task.getNotifyUrl(),
+                request,
+                Map.class
+            );
+            
+            // 2. 检查响应
+            if (response.getStatusCode() == HttpStatus.OK) {
+                Map<String, Object> body = response.getBody();
+                if (body != null && "SUCCESS".equals(body.get("code"))) {
+                    // 通知成功
+                    updateTaskStatus(task.getId(), NotificationStatus.SUCCESS);
+                    return;
+                }
+            }
+            
+            // 3. 通知失败，安排重试
+            scheduleRetry(task);
+            
+        } catch (Exception e) {
+            log.error("通知失败", e);
+            scheduleRetry(task);
+        }
+    }
+    
+    /**
+     * 安排重试
+     */
+    private void scheduleRetry(NotificationTask task) {
+        int retryCount = task.getRetryCount() + 1;
+        
+        if (retryCount > MAX_RETRY) {
+            // 超过最大重试次数
+            updateTaskStatus(task.getId(), NotificationStatus.GIVE_UP);
+            return;
+        }
+        
+        // 更新重试信息
+        task.setRetryCount(retryCount);
+        task.setNextNotifyTime(new Date(System.currentTimeMillis() 
+            + RETRY_INTERVALS[retryCount - 1]));
+        task.setStatus(NotificationStatus.RETRY);
+        
+        notificationTaskDao.update(task);
+    }
+    
+    /**
+     * 签名
+     */
+    private String sign(String data) {
+        return DigestUtils.md5Hex(data + SECRET_KEY);
+    }
+}
+```
+
+### 通知任务调度
+
+```java
+/**
+ * 通知任务调度器
+ */
+@Service
+public class NotificationScheduler {
+    
+    @Autowired
+    private NotificationTaskDao notificationTaskDao;
+    
+    @Autowired
+    private BestEffortNotifyService notifyService;
+    
+    /**
+     * 定时扫描待通知任务
+     */
+    @Scheduled(fixedDelay = 60000)  // 每分钟执行一次
+    public void scanAndNotify() {
+        // 1. 查询待通知的任务
+        List<NotificationTask> tasks = notificationTaskDao.selectPendingNotify(
+            new Date(),  // 当前时间之前的
+            100         // 每次最多处理 100 个
+        );
+        
+        // 2. 发送通知
+        for (NotificationTask task : tasks) {
+            try {
+                notifyService.sendNotify(task);
+            } catch (Exception e) {
+                log.error("发送通知失败", e);
+            }
+        }
+    }
+}
+```
+
+### 接收方实现
+
+```java
+/**
+ * 通知接收服务（接收方）
+ */
+@RestController
+@RequestMapping("/callback")
+public class NotifyCallbackController {
+    
+    @Autowired
+    private NotificationService notificationService;
+    
+    /**
+     * 处理支付结果通知
+     */
+    @PostMapping("/payment")
+    public Map<String, Object> handlePaymentNotify(HttpServletRequest request, 
+                                                   @RequestBody PaymentNotify notify) {
+        // 1. 验证签名
+        String signature = request.getHeader("X-Notify-Signature");
+        String timestamp = request.getHeader("X-Notify-Timestamp");
+        
+        if (!verifySignature(notify, signature, timestamp)) {
+            return buildResponse("FAIL", "签名验证失败");
+        }
+        
+        // 2. 检查时间戳（防止重放攻击）
+        if (isExpired(timestamp)) {
+            return buildResponse("FAIL", "通知已过期");
+        }
+        
+        try {
+            // 3. 幂等处理
+            if (notificationService.isProcessed(notify.getOrderId())) {
+                return buildResponse("SUCCESS", "已处理");
+            }
+            
+            // 4. 处理通知
+            notificationService.processPaymentNotify(notify);
+            
+            // 5. 返回成功
+            return buildResponse("SUCCESS", "处理成功");
+            
+        } catch (Exception e) {
+            log.error("处理通知失败", e);
+            return buildResponse("FAIL", "处理失败");
+        }
+    }
+    
+    /**
+     * 验证签名
+     */
+    private boolean verifySignature(PaymentNotify notify, 
+                                    String signature, String timestamp) {
+        String data = JSON.toJSONString(notify) + timestamp + SECRET_KEY;
+        String expected = DigestUtils.md5Hex(data);
+        return expected.equalsIgnoreCase(signature);
+    }
+    
+    /**
+     * 检查是否过期（5 分钟内有效）
+     */
+    private boolean isExpired(String timestamp) {
+        long notifyTime = Long.parseLong(timestamp);
+        long now = System.currentTimeMillis();
+        return (now - notifyTime) > 5 * 60 * 1000;
+    }
+    
+    /**
+     * 构建响应
+     */
+    private Map<String, Object> buildResponse(String code, String message) {
+        Map<String, Object> response = new HashMap<>();
+        response.put("code", code);
+        response.put("message", message);
+        response.put("timestamp", System.currentTimeMillis());
+        return response;
+    }
+}
+```
+
+### 接收方幂等处理
+
+```java
+/**
+ * 接收方幂等处理
+ */
+@Service
+public class NotificationService {
+    
+    @Autowired
+    private ProcessedNotificationDao processedDao;
+    
+    /**
+     * 检查是否已处理
+     */
+    public boolean isProcessed(Long orderId) {
+        return processedDao.existsByOrderId(orderId);
+    }
+    
+    /**
+     * 处理支付通知
+     */
+    @Transactional
+    public void processPaymentNotify(PaymentNotify notify) {
+        // 1. 查询订单
+        Order order = orderDao.selectById(notify.getOrderId());
+        
+        // 2. 检查订单状态
+        if (order.getStatus() != OrderStatus.PENDING_PAYMENT) {
+            // 订单状态不是待支付，可能已处理过
+            return;
+        }
+        
+        // 3. 更新订单状态
+        order.setStatus(OrderStatus.PAID);
+        order.setPayTime(new Date());
+        order.setTransactionId(notify.getTransactionId());
+        orderDao.update(order);
+        
+        // 4. 发送支付成功消息
+        mq.send("order:paid", order);
+        
+        // 5. 标记已处理
+        ProcessedNotification record = new ProcessedNotification();
+        record.setOrderId(notify.getOrderId());
+        record.setNotifyType("PAYMENT");
+        record.setProcessedTime(new Date());
+        processedDao.insert(record);
+    }
+}
+```
+
+## 通知协议设计
+
+```java
+/**
+ * 通知协议设计
+ */
+
+// 通知请求
+public class NotifyRequest {
+    String notifyId;        // 通知 ID
+    Long orderId;          // 订单 ID
+    String status;          // 状态
+    BigDecimal amount;      // 金额
+    Long timestamp;         // 时间戳
+    String signature;       // 签名
+}
+
+// 通知响应
+public class NotifyResponse {
+    String code;            // SUCCESS/FAIL
+    String message;         // 消息
+    Long timestamp;         // 时间戳
+}
+
+/**
+ * 通知流程
+ */
+
+// 1. 发起方构建通知
+// 2. 发起方签名
+// 3. 发起方发送请求
+// 4. 接收方验证签名
+// 5. 接收方幂等处理
+// 6. 接收方返回响应
+// 7. 发起方根据响应决定是否重试
+```
+
+## 与其他方案对比
+
+```java
+/**
+ * 方案对比
+ */
+
+// 最大努力通知：
+// - 发送方主动通知
+// - 多次重试
+// - 不保证成功
+// - 适合非关键业务
+
+// 可靠消息：
+// - 发送方发送消息
+// - 消息队列传递
+// - 接收方消费
+// - 保证最终一致
+
+// TCC：
+// - 预留资源
+// - 两阶段确认
+// - 强一致性
+
+/**
+ * 选择建议
+ */
+
+// 选择最大努力通知：
+// - 非关键业务
+// - 可以容忍通知失败
+// - 接收方能幂等处理
+
+// 选择可靠消息：
+// - 需要保证消息送达
+// - 接收方需要主动拉取
+
+// 选择 TCC：
+// - 需要强一致性
+// - 对业务有侵入
+```
+
+## 总结
+
+最大努力通知是一种简单有效的最终一致性方案：
+
+1. **主动通知**：发起方多次重试
+2. **幂等处理**：接收方保证幂等
+3. **递增间隔**：重试间隔逐渐增大
+4. **放弃机制**：超过最大次数后放弃
+
+这种方案适合非关键业务，如支付结果通知、订单状态同步等。
+
+> 下一章，我们来看 [AT vs TCC vs SAGA 对比](/distributed/transaction/solution/mode-compare)，总结各种分布式事务方案的特点。

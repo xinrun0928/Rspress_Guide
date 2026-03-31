@@ -1,0 +1,442 @@
+import { Badge } from '@rspress/core/theme';
+
+# ZooKeeper 监听机制
+
+你打开一个在线文档，朋友的编辑实时出现在你的屏幕上。你们没有刷新页面，没有轮询请求——服务器主动把变化推给了你。这就是 Watch 机制的核心：**服务端主动通知，客户端被动接收**。
+
+ZooKeeper 的 Watch 机制与此类似，但它有一个独特的设计：**一次性触发**。
+
+## Watch 的工作原理
+
+### 发布-订阅模式
+
+Watch 是一种简单的发布-订阅机制：
+
+```
+┌─────────────┐                    ┌─────────────┐
+│   订阅者     │                    │   ZooKeeper │
+│  (客户端)    │                    │   (服务端)   │
+└──────┬──────┘                    └──────┬──────┘
+       │                                   │
+       │──── GET /path WATCH ─────────────▶│
+       │◀─── DATA + 注册 Watch ────────────│
+       │                                   │
+       │                                   │  数据变化
+       │                                   │
+       │◀─── WATCH 事件 ──────────────────│
+       │                                   │
+       │   ⚠️ Watch 已失效                  │
+       │                                   │
+       │   需重新注册才能继续监听           │
+```
+
+### 与轮询的区别
+
+| 维度 | 轮询 | Watch |
+|---|---|---|
+| 响应速度 | 有延迟（取决于轮询间隔） | 即时 |
+| 服务器压力 | 大（每次都查询） | 小（变化时推送） |
+| 客户端复杂度 | 简单 | 稍复杂 |
+| 可靠性 | 高 | 高（事件不丢失） |
+
+## Watch 的注册与触发
+
+### 可监听的事件类型
+
+| 事件类型 | 说明 | 触发条件 |
+|---|---|---|
+| `NodeCreated` | 节点创建 | `create()` |
+| `NodeDeleted` | 节点删除 | `delete()` |
+| `NodeDataChanged` | 数据变化 | `setData()` |
+| `NodeChildrenChanged` | 子节点列表变化 | `create()` / `delete()` |
+
+### API 使用
+
+```java
+public class WatchDemo {
+
+    private ZooKeeper zk;
+
+    /**
+     * 监听节点数据变化
+     */
+    public void watchDataChanges(String path) throws Exception {
+        // 注册 Watch
+        byte[] data = zk.getData(path, event -> {
+            switch (event.getType()) {
+                case NodeDataChanged:
+                    System.out.println("数据已更新: " + new String(event.getData()));
+                    // 重新注册 Watch
+                    watchDataChanges(path);
+                    break;
+                case NodeDeleted:
+                    System.out.println("节点已删除");
+                    break;
+            }
+        }, null);
+
+        System.out.println("当前数据: " + (data != null ? new String(data) : "null"));
+    }
+
+    /**
+     * 监听子节点变化
+     */
+    public void watchChildrenChanges(String path) throws Exception {
+        // exists() 监听节点本身
+        // getData() 监听节点数据
+        // getChildren() 监听子节点列表
+
+        List<String> children = zk.getChildren(path, event -> {
+            if (event.getType() == Event.EventType.NodeChildrenChanged) {
+                System.out.println("子节点发生变化");
+                try {
+                    // 获取最新子节点列表
+                    List<String> newChildren = zk.getChildren(path, false);
+                    System.out.println("当前子节点: " + newChildren);
+                    // 重新注册 Watch
+                    watchChildrenChanges(path);
+                } catch (Exception e) {
+                    e.printStackTrace();
+                }
+            }
+        });
+
+        System.out.println("当前子节点: " + children);
+    }
+}
+```
+
+## Watch 的触发机制
+
+### 服务端处理流程
+
+```
+1. 客户端发送请求，附加 watch=true
+   GET /path WATCH=true
+
+2. 服务端注册 Watch 到 ZKWatchManager
+   watchManager.addWatch(path, clientId)
+
+3. 服务端返回数据
+
+4. 数据变化时，服务端检查是否有 Watch
+   watchedEvent = createEvent(path, type, state)
+   watchManager.triggerWatch(path, type, watchedEvent)
+
+5. 服务端向客户端发送 Watch 事件
+```
+
+### WatchManager 的实现
+
+```java
+public class ZKWatchManager {
+    // 节点路径 -> Watcher 集合
+    private final Map<String, Set<Watcher>> watchTable = new HashMap<>();
+
+    // Watcher -> 节点路径集合
+    private final Map<Watcher, Set<String>> watch2Paths = new HashMap<>();
+
+    public void addWatch(String path, Watcher watcher) {
+        synchronized (this) {
+            // 添加到 watchTable
+            Set<Watcher> watchers = watchTable.getOrDefault(path, new HashSet<>());
+            watchers.add(watcher);
+            watchTable.put(path, watchers);
+
+            // 添加到 watch2Paths
+            Set<String> paths = watch2Paths.getOrDefault(watcher, new HashSet<>());
+            paths.add(path);
+            watch2Paths.put(watcher, paths);
+        }
+    }
+
+    public Set<Watcher> triggerWatch(String path, EventType type) {
+        synchronized (this) {
+            Set<Watcher> watchers = watchTable.get(path);
+            if (watchers == null || watchers.isEmpty()) {
+                return Collections.emptySet();
+            }
+
+            WatchedEvent event = new WatchedEvent(type, KeeperState.SyncConnected, path);
+            Set<Watcher> result = new HashSet<>(watchers);
+
+            // 触发后清除 Watch
+            for (Watcher watcher : watchers) {
+                watcher.process(event);
+            }
+
+            return result;
+        }
+    }
+}
+```
+
+## Watch 的特性
+
+### 特性一：一次性触发
+
+```java
+// ⚠️ 错误示例：只注册一次，Watch 失效后不再监听
+zk.getData("/path", event -> {
+    System.out.println("数据变化: " + new String(event.getData()));
+}, null);
+// 第一次变化会收到通知
+// 第二次变化不会收到通知
+
+// ✅ 正确示例：在回调中重新注册
+zk.getData("/path", event -> {
+    System.out.println("数据变化: " + new String(event.getData()));
+    // 重新注册 Watch
+    try {
+        zk.getData("/path", this, null);  // this 作为 Watcher
+    } catch (Exception e) {
+        e.printStackTrace();
+    }
+}, null);
+```
+
+### 特性二：客户端串行处理
+
+```java
+// Watch 事件由客户端同步串行处理
+// 一个 Watch 回调没有执行完，不会触发下一个 Watch
+
+// 这意味着：
+// 1. Watch 回调应该快速完成
+// 2. 不要在回调中做耗时操作
+// 3. 避免在回调中抛出异常
+
+// ✅ 正确示例：回调中异步处理
+zk.getData("/path", event -> {
+    executor.submit(() -> {
+        // 实际处理逻辑
+        processDataChange(event);
+    });
+}, null);
+```
+
+### 特性三：轻量级
+
+```java
+// Watch 事件只包含以下信息：
+WatchedEvent {
+    KeeperState  state;     // 连接状态
+    EventType    type;      // 事件类型
+    String       path;       // 触发 Watch 的路径
+}
+
+// 不包含变化的具体数据！
+// 需要主动获取
+
+zk.getData("/path", event -> {
+    if (event.getType() == EventType.NodeDataChanged) {
+        // 主动获取最新数据
+        try {
+            byte[] newData = zk.getData("/path", false, null);
+            System.out.println("最新数据: " + new String(newData));
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+}, null);
+```
+
+## Watch 与 Curator
+
+Apache Curator 封装了原生 ZooKeeper 的 Watch 机制，提供了更易用的 API：
+
+### Maven 依赖
+
+```xml
+<dependency>
+    <groupId>org.apache.curator</groupId>
+    <artifactId>curator-recipes</artifactId>
+    <version>5.5.0</version>
+</dependency>
+```
+
+### NodeCache：监听节点数据
+
+```java
+public class NodeCacheDemo {
+
+    public void watchNode(String path) throws Exception {
+        CuratorFramework client = CuratorClientFactory.createClient();
+        client.start();
+
+        // NodeCache：监听单个节点的数据变化
+        NodeCache nodeCache = new NodeCache(client, path);
+        nodeCache.start();
+
+        // 添加监听器
+        nodeCache.getListenable().addListener(() -> {
+            ChildData data = nodeCache.getCurrentData();
+            if (data != null) {
+                System.out.println("节点数据: " + new String(data.getData()));
+            } else {
+                System.out.println("节点已删除");
+            }
+        });
+
+        // 注意：Curator 的 Watch 是持久的，不需要重新注册
+    }
+}
+```
+
+### PathChildrenCache：监听子节点
+
+```java
+public void watchChildren(String path) throws Exception {
+    CuratorFramework client = CuratorClientFactory.createClient();
+    client.start();
+
+    // PathChildrenCache：监听子节点列表变化
+    PathChildrenCache cache = new PathChildrenCache(
+        client, path, true  // 缓存数据
+    );
+    cache.start();
+
+    cache.getListenable().addListener((curatorClient, event) -> {
+        switch (event.getType()) {
+            case CHILD_ADDED:
+                System.out.println("子节点添加: " + event.getData().getPath());
+                break;
+            case CHILD_UPDATED:
+                System.out.println("子节点更新: " + event.getData().getPath());
+                break;
+            case CHILD_REMOVED:
+                System.out.println("子节点删除: " + event.getData().getPath());
+                break;
+        }
+    });
+}
+```
+
+### TreeCache：监听整个树
+
+```java
+public void watchTree(String path) throws Exception {
+    CuratorFramework client = CuratorClientFactory.createClient();
+    client.start();
+
+    // TreeCache：监听整个子树
+    TreeCache cache = new TreeCache(client, path);
+    cache.start();
+
+    cache.getListenable().addListener((curatorClient, event) -> {
+        ChildData data = event.getData();
+        if (data != null) {
+            System.out.println(event.getType() + ": " + data.getPath());
+        }
+    });
+}
+```
+
+## 典型应用场景
+
+### 场景一：配置变更监听
+
+```java
+@Service
+public class ConfigListener {
+
+    private CuratorFramework client;
+    private volatile String currentConfig;
+
+    @PostConstruct
+    public void init() throws Exception {
+        client = CuratorClientFactory.createClient();
+        client.start();
+
+        watchConfig("/configs/app");
+    }
+
+    private void watchConfig(String path) throws Exception {
+        // 使用 NodeCache 监听配置变化
+        NodeCache cache = new NodeCache(client, path, false);
+        cache.start();
+
+        cache.getListableListenable().addListener(() -> {
+            ChildData data = cache.getCurrentData();
+            if (data != null) {
+                currentConfig = new String(data.getData());
+                System.out.println("配置已更新: " + currentConfig);
+                // 通知应用配置变更
+                notifyConfigChange(currentConfig);
+            }
+        });
+
+        // 初始化当前值
+        if (cache.getCurrentData() != null) {
+            currentConfig = new String(cache.getCurrentData().getData());
+        }
+    }
+}
+```
+
+### 场景二：服务注册与发现
+
+```java
+@Service
+public class ServiceDiscovery {
+
+    private CuratorFramework client;
+    private List<String> serviceInstances = new CopyOnWriteArrayList<>();
+
+    public void watchServices(String serviceName) throws Exception {
+        String servicePath = "/services/" + serviceName;
+
+        // 监听子节点变化
+        PathChildrenCache cache = new PathChildrenCache(
+            client, servicePath, true);
+        cache.start();
+
+        cache.getListenable().addListener((curatorClient, event) -> {
+            switch (event.getType()) {
+                case CHILD_ADDED:
+                    serviceInstances.add(event.getData().getPath());
+                    System.out.println("服务上线: " + event.getData().getPath());
+                    break;
+                case CHILD_REMOVED:
+                    serviceInstances.remove(event.getData().getPath());
+                    System.out.println("服务下线: " + event.getData().getPath());
+                    break;
+            }
+            // 负载均衡选择
+            selectService();
+        });
+    }
+
+    private String selectService() {
+        if (serviceInstances.isEmpty()) {
+            throw new RuntimeException("没有可用的服务实例");
+        }
+        // 简单轮询
+        return serviceInstances.get(
+            (int) (System.currentTimeMillis() % serviceInstances.size()));
+    }
+}
+```
+
+## Watch 的注意事项
+
+:::warning
+**Watch 不保证有序**：Watch 事件可能延迟或乱序到达。如果需要严格有序，使用事务（Txn）操作。
+
+**Watch 不跨会话**：Watch 是一次性的，不会在新会话中保留。每次连接 ZooKeeper 后需要重新注册。
+
+**大量 Watch 影响性能**：每个 Watch 都会消耗服务端资源。避免在大量节点上注册 Watch。
+:::
+
+## 总结
+
+ZooKeeper 的 Watch 机制是分布式协调的核心：
+
+1. **主动推送**：变化时服务端主动通知，无需客户端轮询
+2. **一次性触发**：简单可靠，但需要客户端重新注册
+3. **轻量级**：只通知变化，不携带数据
+4. **Curator 封装**：提供了更易用的持久 Watch
+
+理解 Watch 机制后，你可以更好地理解分布式锁、服务注册等高级功能是如何实现的。
+
+下一节，我们将探讨 ZooKeeper 的 **会话机制**，看看客户端如何与 ZooKeeper 服务端保持连接。

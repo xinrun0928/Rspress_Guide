@@ -1,0 +1,264 @@
+# RocketMQ 顺序消息：单 Queue 全局顺序 vs 分区顺序
+
+## 场景切入：消息顺序为什么重要？
+
+订单流程中，消息的顺序至关重要：
+
+1. 创建订单
+2. 扣减库存
+3. 扣减余额
+4. 发货
+
+如果顺序乱了，可能导致：库存还没扣就发货了，余额还没扣就订单创建成功了……
+
+RocketMQ 如何保证消息的顺序性？
+
+---
+
+## 一、顺序消息类型
+
+### 1.1 两种顺序类型
+
+| 类型 | 说明 | 实现方式 |
+|---|---|---|
+| **全局顺序** | Topic 中所有消息按顺序消费 | 单 Queue + 单 Consumer |
+| **分区顺序** | 同一 MessageQueue 中的消息按顺序消费 | MessageQueueSelector |
+
+```
+全局顺序：
+┌─────────────────────────────────────────────────────────────┐
+│  Topic (1 个 Queue)                                         │
+│                                                             │
+│  [msg 1] → [msg 2] → [msg 3] → [msg 4] → Consumer       │
+│                                                             │
+│  所有消息按顺序消费                                          │
+└─────────────────────────────────────────────────────────────┘
+
+分区顺序：
+┌─────────────────────────────────────────────────────────────┐
+│  Topic (多个 Queue)                                         │
+│                                                             │
+│  Queue A: [订单1的消息1, 订单1的消息2, 订单1的消息3]      │
+│  Queue B: [订单2的消息1, 订单2的消息2]                   │
+│  Queue C: [订单3的消息1, 订单3的消息2, 订单3的消息3]      │
+│                                                             │
+│  同一订单的消息按顺序消费，不同订单的消息并行消费             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 二、全局顺序实现
+
+### 2.1 配置方式
+
+创建 Topic 时指定只有一个 Queue：
+
+```bash
+# 创建只有一个 Queue 的 Topic
+mqadmin updateTopic -n 127.0.0.1:9876 -t order-topic \
+  -c DefaultCluster -r 1 -w 1
+```
+
+### 2.2 消费方式
+
+```java
+// 全局顺序消费
+DefaultMQPushConsumer consumer = new DefaultMQPushConsumer("order-consumer-group");
+consumer.setNamesrvAddr("127.0.0.1:9876");
+consumer.subscribe("order-topic", "*");
+
+// 使用顺序监听器
+consumer.registerMessageListener(new MessageListenerOrderly() {
+    @Override
+    public ConsumeOrderlyStatus consumeMessage(List<MessageExt> msgs,
+                                             ConsumeOrderlyContext context) {
+        // 单线程顺序处理
+        for (MessageExt msg : msgs) {
+            System.out.println("收到消息：" + new String(msg.getBody()));
+        }
+        return ConsumeOrderlyStatus.SUCCESS;
+    }
+});
+
+consumer.start();
+```
+
+---
+
+## 三、分区顺序实现
+
+### 3.1 发送端配置
+
+```java
+// 分区顺序发送
+producer.send(msg, new MessageQueueSelector() {
+    @Override
+    public MessageQueue select(List<MessageQueue> mqs, Message msg, Object arg) {
+        // 按订单 ID 选择 Queue
+        Long orderId = (Long) arg;
+        int index = (int) (orderId % mqs.size());
+        return mqs.get(index);
+    }
+}, orderId);  // 订单 ID 作为参数
+```
+
+### 3.2 完整发送示例
+
+```java
+// 订单流程消息发送
+public void sendOrderMessages(Order order) {
+    // 1. 创建订单消息
+    Message createMsg = new Message("order-topic", "create", order.getId(),
+        ("创建订单:" + order.getId()).getBytes());
+    producer.send(createMsg, queueSelector, order.getId());
+
+    // 2. 扣减库存消息
+    Message inventoryMsg = new Message("order-topic", "inventory", order.getId(),
+        ("扣减库存:" + order.getId()).getBytes());
+    producer.send(inventoryMsg, queueSelector, order.getId());
+
+    // 3. 扣减余额消息
+    Message accountMsg = new Message("order-topic", "account", order.getId(),
+        ("扣减余额:" + order.getId()).getBytes());
+    producer.send(accountMsg, queueSelector, order.getId());
+
+    // 4. 发货消息
+    Message shipMsg = new Message("order-topic", "ship", order.getId(),
+        ("发货:" + order.getId()).getBytes());
+    producer.send(shipMsg, queueSelector, order.getId());
+}
+
+// MessageQueueSelector 实现
+MessageQueueSelector queueSelector = new MessageQueueSelector() {
+    @Override
+    public MessageQueue select(List<MessageQueue> mqs, Message msg, Object arg) {
+        Long orderId = (Long) arg;
+        return mqs.get((int) (orderId % mqs.size()));
+    }
+};
+```
+
+### 3.3 消费端配置
+
+```java
+// 分区顺序消费
+consumer.registerMessageListener(new MessageListenerOrderly() {
+    @Override
+    public ConsumeOrderlyStatus consumeMessage(List<MessageExt> msgs,
+                                             ConsumeOrderlyContext context) {
+        // 按标签顺序处理
+        for (MessageExt msg : msgs) {
+            String tag = msg.getTags();
+            switch (tag) {
+                case "create":
+                    processCreate(msg);
+                    break;
+                case "inventory":
+                    processInventory(msg);
+                    break;
+                case "account":
+                    processAccount(msg);
+                    break;
+                case "ship":
+                    processShip(msg);
+                    break;
+            }
+        }
+        return ConsumeOrderlyStatus.SUCCESS;
+    }
+});
+```
+
+---
+
+## 四、顺序保证的代价
+
+### 4.1 性能影响
+
+| 类型 | 性能 | 说明 |
+|---|---|---|
+| **全局顺序** | 最低 | 单 Queue 单 Consumer |
+| **分区顺序** | 中等 | 按 Key 分散到多个 Queue |
+| **普通消息** | 最高 | 多 Queue 多 Consumer 并行 |
+
+### 4.2 如何选择
+
+```
+选择流程：
+
+是否需要消息有序？
+    │
+    ├── 否 → 使用普通消息（高吞吐）
+    │
+    └── 是 → 继续
+            │
+            ├── 全局有序？→ 使用全局顺序（性能最低）
+            │
+            └── 同一业务 ID 有序？
+                    │
+                    ├── 是 → 使用分区顺序
+                    │
+                    └── 否 → 使用全局顺序
+```
+
+---
+
+## 五、常见问题与解决
+
+### 5.1 消息乱序的原因
+
+| 原因 | 解决方案 |
+|---|---|
+| **多 Consumer** | 使用 MessageListenerOrderly |
+| **Rebalance** | 配置合理的 Rebalance 策略 |
+| **重试** | 使用顺序重试机制 |
+
+### 5.2 顺序重试
+
+```java
+// 顺序消息重试机制
+consumer.registerMessageListener(new MessageListenerOrderly() {
+    @Override
+    public ConsumeOrderlyStatus consumeMessage(List<MessageExt> msgs,
+                                             ConsumeOrderlyContext context) {
+        for (MessageExt msg : msgs) {
+            try {
+                processMessage(msg);
+            } catch (Exception e) {
+                // 重试次数判断
+                if (msg.getReconsumeTimes() < 3) {
+                    // 重新消费
+                    return ConsumeOrderlyStatus.SUSPEND_CURRENT_QUEUE_A_MOMENT;
+                }
+            }
+        }
+        return ConsumeOrderlyStatus.SUCCESS;
+    }
+});
+```
+
+---
+
+## 六、面试追问预判
+
+### 追问一：RocketMQ 如何保证消息顺序？
+
+RocketMQ 通过**分区顺序**保证消息顺序：
+
+1. 使用 `MessageQueueSelector` 按业务 ID 选择 Queue
+2. 同一业务 ID 的消息发送到同一 Queue
+3. 消费者使用 `MessageListenerOrderly` 顺序消费
+
+### 追问二：全局顺序和分区顺序有什么区别？
+
+| 类型 | Queue 数量 | Consumer 数量 | 性能 |
+|---|---|---|---|
+| **全局顺序** | 1 | 1 | 最低 |
+| **分区顺序** | 多 | 多（按 Queue） | 中 |
+
+### 追问三：顺序消息的性能如何优化？
+
+1. **合理选择分区键**：避免热点 Key
+2. **增加 Queue 数量**：提高并行度
+3. **减少重试**：避免阻塞队列

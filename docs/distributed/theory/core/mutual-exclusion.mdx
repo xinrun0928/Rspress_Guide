@@ -1,0 +1,513 @@
+import { Badge } from '@rspress/core/theme';
+
+# 分布式互斥
+
+<Badge text="分布式系统" type="tip" /> <Badge text="资源访问" type="warning" /> <Badge text="核心问题" type="info" />
+
+想象一个场景：两个用户同时在电商平台购买同一件商品，库存只剩最后一件。系统需要保证这件商品只能被其中一个用户购买，不能出现「超卖」。
+
+在单机环境下，这个问题很简单——只需要一个锁就够了。但在分布式环境下，多个节点可能同时访问共享资源，如何保证「同一时刻只有一个节点能访问」？
+
+这就是**分布式互斥**要解决的问题。
+
+## 为什么需要分布式互斥？
+
+单机系统通过操作系统提供的锁机制（如 synchronized、ReentrantLock）来保证互斥。但在分布式环境下：
+
+1. **进程分布在不同的机器上**：没有共享内存，无法使用进程内锁
+2. **网络通信不可靠**：消息可能延迟、丢失、乱序
+3. **节点可能故障**：持有锁的节点可能崩溃
+
+```java
+// 单机互斥（不适用于分布式）
+public class单机锁 {
+    private final Lock lock = new ReentrantLock();
+    
+    public void accessResource() {
+        lock.lock();
+        try {
+            // 临界区操作
+        } finally {
+            lock.unlock();
+        }
+    }
+}
+
+// 分布式场景：多个 JVM 实例需要协调
+// Node A 上的线程 T1 需要访问
+// Node B 上的线程 T2 也需要访问
+// 但同一时刻只能有一个线程能访问
+```
+
+## 分布式互斥的要求
+
+分布式互斥算法需要满足以下基本要求：
+
+```java
+/**
+ * 分布式互斥算法的基本要求
+ */
+public class DMERequirements {
+    
+    /**
+     * 1. 互斥性（Mutual Exclusion）
+     * 临界资源同一时刻只能被一个进程持有
+     */
+    boolean mutualExclusion();
+    
+    /**
+     * 2. 无死锁（Deadlock Freedom）
+     * 如果没有进程持有临界资源，且有进程想要进入临界区，
+     * 那么最终某个进程会进入临界区
+     * 不会永远等待
+     */
+    boolean deadlockFree();
+    
+    /**
+     * 3. 无饥饿（Starvation Freedom）
+     * 每个请求进入临界区的进程最终都会获得临界区访问权
+     * 不会永远等待
+     */
+    boolean starvationFree();
+    
+    /**
+     * 4. 公平性（Fairness）
+     * 进程获得临界区访问权的顺序与请求顺序一致
+     * 先请求的先获得
+     */
+    boolean fair();
+}
+```
+
+## 分布式互斥算法分类
+
+分布式互斥算法可以分为以下几类：
+
+| 类型 | 代表算法 | 特点 |
+|---|---|---|
+| 基于集中协调者 | 中央协调者 | 简单，但单点故障 |
+| 基于令牌环 | Token Ring | 公平，但绕一圈开销大 |
+| 基于分布式算法 | Ricart-Agrawala | 无单点，但复杂 |
+| 基于 quorum | Quorum 互斥 | 可调一致性级别 |
+
+## 基于集中协调者的互斥
+
+最简单的方案是引入一个协调者，所有访问请求都经过协调者：
+
+```java
+public class CentralizedMutex {
+    
+    private final Coordinator coordinator;
+    
+    /**
+     * 请求获取锁
+     */
+    public void acquire() throws InterruptedException {
+        // 1. 向协调者发送请求
+        coordinator.request(getProcessId());
+        
+        // 2. 等待协调者授权
+        while (!coordinator.hasPermission(getProcessId())) {
+            Thread.sleep(10);  // 等待
+        }
+    }
+    
+    /**
+     * 释放锁
+     */
+    public void release() {
+        coordinator.release(getProcessId());
+    }
+}
+
+/**
+ * 协调者实现
+ */
+public class Coordinator {
+    
+    private String holder = null;  // 当前持有者
+    private Queue<String> waitQueue = new LinkedList<>();  // 等待队列
+    
+    public synchronized void request(String processId) {
+        if (holder == null) {
+            holder = processId;  // 授权
+        } else {
+            waitQueue.add(processId);  // 加入等待队列
+        }
+    }
+    
+    public synchronized void release(String processId) {
+        if (holder.equals(processId)) {
+            if (waitQueue.isEmpty()) {
+                holder = null;
+            } else {
+                holder = waitQueue.poll();  // 授权给下一个
+            }
+        }
+    }
+    
+    public synchronized boolean hasPermission(String processId) {
+        return holder != null && holder.equals(processId);
+    }
+}
+```
+
+### 优缺点分析
+
+```java
+// 优点
+// 1. 简单易懂
+// 2. 容易实现
+// 3. 效率高（只需一次网络往返）
+
+// 缺点
+// 1. 单点故障：协调者崩溃会导致整个系统无法工作
+// 2. 性能瓶颈：所有请求都经过协调者
+// 3. 不公平：后来的请求可能先获得锁（取决于协调者实现）
+```
+
+## 基于令牌的互斥（Token Ring）
+
+在 Token Ring 算法中，所有进程组成一个环，令牌在环中传递：
+
+```java
+public class TokenRingMutex {
+    
+    private final int processId;
+    private final int ringSize;
+    private boolean hasToken = false;
+    private volatile boolean wantCS = false;  // 是否想进入临界区
+    
+    /**
+     * 请求临界区
+     */
+    public void requestCriticalSection() {
+        wantCS = true;
+        
+        // 如果没有令牌，等待令牌传过来
+        while (!hasToken) {
+            receiveToken();
+        }
+        
+        // 持有令牌，准备进入临界区
+        if (canEnter()) {
+            enterCriticalSection();
+        } else {
+            // 不想进入，传给下一个
+            passToken();
+        }
+    }
+    
+    private boolean canEnter() {
+        return wantCS && hasToken;
+    }
+    
+    /**
+     * 进入临界区
+     */
+    private void enterCriticalSection() {
+        System.out.println("进程 " + processId + " 进入临界区");
+        hasToken = false;
+        wantCS = false;
+        // 执行临界区操作
+        criticalSection();
+        // 释放后继续传递令牌
+        passToken();
+    }
+    
+    /**
+     * 传递令牌给下一个进程
+     */
+    private void passToken() {
+        int nextProcess = (processId + 1) % ringSize;
+        sendToken(nextProcess);
+    }
+}
+```
+
+### 优缺点分析
+
+```java
+// 优点
+// 1. 无单点故障：令牌在环中循环，任意节点故障后可以重新组织环
+// 2. 公平性好：令牌按顺序传递
+// 3. 实现简单
+
+// 缺点
+// 1. 令牌传递开销大：如果临界区访问不频繁，所有进程都要等待令牌
+// 2. 令牌丢失：需要检测和恢复机制
+// 3. 延迟不确定：取决于令牌绕环一周的时间
+```
+
+## Ricart-Agrawala 算法
+
+Ricart-Agrawala 算法是第一个无中心化的分布式互斥算法，它基于Lamport 时钟来排序请求：
+
+```java
+public class RicartAgrawalaMutex {
+    
+    private final int processId;
+    private final int totalProcesses;
+    private final Map<Integer, Integer> requestTs = new HashMap<>();  // 各进程请求时间戳
+    private final Map<Integer, Boolean> replyReceived = new HashMap<>();  // 回复接收状态
+    private int localTs = 0;
+    private volatile boolean wantCS = false;
+    private volatile boolean inCS = false;
+    
+    /**
+     * 请求临界区
+     */
+    public synchronized void requestCS() {
+        wantCS = true;
+        localTs++;  // 获取时间戳
+        int myTs = localTs;
+        
+        // 重置所有回复状态
+        for (int i = 0; i < totalProcesses; i++) {
+            replyReceived.put(i, false);
+        }
+        
+        // 向所有其他进程发送请求
+        for (int i = 0; i < totalProcesses; i++) {
+            if (i != processId) {
+                sendRequest(i, myTs);
+            }
+        }
+        
+        // 等待所有回复
+        waitForReplies();
+        
+        inCS = true;
+        wantCS = false;
+    }
+    
+    private void waitForReplies() {
+        int repliesNeeded = totalProcesses - 1;
+        int repliesReceived = 0;
+        
+        while (repliesReceived < repliesNeeded) {
+            try {
+                wait();
+                repliesReceived = countReplies();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+    
+    private int countReplies() {
+        int count = 0;
+        for (Boolean received : replyReceived.values()) {
+            if (received) count++;
+        }
+        return count;
+    }
+    
+    /**
+     * 处理收到的请求
+     */
+    public synchronized void onRequest(int senderId, int ts) {
+        requestTs.put(senderId, ts);
+        
+        if (wantCS) {
+            // 自己也想进入，检查优先级
+            if (ts < localTs || (ts == localTs && senderId < processId)) {
+                // 对方优先级更高，发送回复
+                sendReply(senderId);
+            } else {
+                // 自己优先级更高，等待
+            }
+        } else {
+            // 自己不想进入，立即回复
+            sendReply(senderId);
+        }
+    }
+    
+    /**
+     * 处理收到的回复
+     */
+    public synchronized void onReply(int senderId) {
+        replyReceived.put(senderId, true);
+        notifyAll();
+    }
+    
+    /**
+     * 释放临界区
+     */
+    public synchronized void releaseCS() {
+        inCS = false;
+        notifyAll();  // 通知等待的请求
+    }
+}
+```
+
+### 优缺点分析
+
+```java
+// 优点
+// 1. 无单点故障：完全分布式
+// 2. 性能好：只需与所有进程通信一次
+
+// 缺点
+// 1. 消息复杂：需要 N 条请求 + N 条回复 = 2(N-1) 条消息
+// 2. 实现复杂：需要处理消息乱序、丢失等
+// 3. 不适合大规模系统：消息数量随节点数线性增长
+```
+
+## Quorum 互斥
+
+Quorum 互斥算法借鉴了读写 quorum 的思想：
+
+```java
+public class QuorumMutex {
+    
+    private final int N;  // 总节点数
+    private final int R;  // 读 quorum
+    private final int W;  // 写 quorum
+    private final QuorumRegistry registry;
+    
+    public QuorumMutex() {
+        // N=3, R=2, W=2 是一种常见配置
+        // 保证 W + R > N，实现读写互斥
+        this.N = 3;
+        this.R = 2;
+        this.W = 2;
+        this.registry = new QuorumRegistry();
+    }
+    
+    /**
+     * 获取锁
+     */
+    public void acquire() {
+        int attempt = 0;
+        while (!tryAcquire()) {
+            attempt++;
+            if (attempt > MAX_ATTEMPTS) {
+                throw new LockAcquisitionException("获取锁失败");
+            }
+            sleep(randomBackoff());
+        }
+    }
+    
+    private boolean tryAcquire() {
+        // 1. 向 quorum 数量的节点发送获取请求
+        Set<Node> quorum = registry.selectQuorum(W);
+        
+        // 2. 等待多数派确认
+        Set<Node> confirmed = new HashSet<>();
+        for (Node node : quorum) {
+            if (node.grantLock()) {
+                confirmed.add(node);
+            }
+        }
+        
+        // 3. 如果获得多数派授权，获取成功
+        return confirmed.size() >= W;
+    }
+    
+    /**
+     * 释放锁
+     */
+    public void release() {
+        Set<Node> holders = registry.getLockHolders();
+        for (Node node : holders) {
+            node.releaseLock();
+        }
+    }
+}
+```
+
+## 实际应用：Redis 分布式锁
+
+在生产环境中，Redis 分布式锁是最常用的方案之一：
+
+```java
+public class RedisDistributedLock {
+    
+    private final Jedis jedis;
+    private final String lockKey;
+    private final String lockValue;
+    private final long expireMs;
+    
+    public RedisDistributedLock(Jedis jedis, String lockKey, long expireMs) {
+        this.jedis = jedis;
+        this.lockKey = lockKey;
+        this.lockValue = UUID.randomUUID().toString();
+        this.expireMs = expireMs;
+    }
+    
+    /**
+     * 获取锁（非阻塞）
+     */
+    public boolean tryLock() {
+        // SET key value NX PX milliseconds
+        // NX: 仅当 key 不存在时设置
+        // PX: 设置过期时间（毫秒）
+        String result = jedis.set(lockKey, lockValue, 
+                                  SetParams.setParams().nx().px(expireMs));
+        return "OK".equals(result);
+    }
+    
+    /**
+     * 获取锁（阻塞）
+     */
+    public boolean lock() {
+        long startTime = System.currentTimeMillis();
+        long endTime = startTime + expireMs;
+        
+        while (System.currentTimeMillis() < endTime) {
+            if (tryLock()) {
+                return true;
+            }
+            try {
+                Thread.sleep(100);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        return false;
+    }
+    
+    /**
+     * 释放锁（Lua 脚本保证原子性）
+     */
+    public boolean unlock() {
+        // Lua 脚本：只有持有者才能释放锁
+        String script = 
+            "if redis.call('get', KEYS[1]) == ARGV[1] then " +
+            "    return redis.call('del', KEYS[1]) " +
+            "else " +
+            "    return 0 " +
+            "end";
+        
+        Long result = jedis.eval(script, 
+                                  Collections.singletonList(lockKey),
+                                  Collections.singletonList(lockValue));
+        return result != null && result > 0;
+    }
+}
+```
+
+:::warning 分布式锁的注意事项
+
+1. **必须设置过期时间**：防止持锁进程崩溃后锁无法释放
+2. **value 必须唯一**：用于安全的释放锁（只有持有者才能释放）
+3. **建议使用 Redisson**：它提供了更完善的分布式锁实现，包括看门狗自动续期
+4. **单机 Redis 不是真正的分布式锁**：需要使用 RedLock 或集群模式
+
+:::
+
+## 总结
+
+分布式互斥是分布式系统中的基础问题，不同的算法适用于不同的场景：
+
+| 算法 | 消息复杂度 | 优点 | 缺点 |
+|---|---|---|---|
+| 中央协调者 | O(2) | 简单高效 | 单点故障 |
+| Token Ring | O(N) | 公平无死锁 | 延迟不确定 |
+| Ricart-Agrawala | O(2(N-1)) | 无单点 | 复杂、消息多 |
+| Quorum | O(N) | 可调一致性 | 需要多数派 |
+
+选择哪种算法，需要根据系统的规模、可靠性要求和性能需求来综合考虑。
+
+> 理解了分布式互斥，下一章我们将讨论与之相关但不同的另一个问题——[分布式选举算法](/distributed/theory/core/leader-election)，看看如何在多个节点中选出一个领导者。

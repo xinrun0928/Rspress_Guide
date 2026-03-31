@@ -1,0 +1,243 @@
+# 服务重试
+
+网络抖动了 500ms，服务调用超时了。你点击「重试」按钮，请求成功了。
+
+但如果是自动化重试呢？机器抖动了一下，重试；再抖动一下，再重试——然后你发现账户被扣了两次钱。
+
+重试（Retry）是一把双刃剑：用得好，是系统 resilience 的保障；用不好，是灾难的导火索。
+
+## 什么时候应该重试
+
+### 适合重试的场景
+
+```yaml
+# 适合重试的场景
+1. 瞬时故障
+   - 网络抖动
+   - 临时连接失败
+   - 服务的短暂不可用
+   - 负载过高导致的超时
+2. 读操作
+   - GET 请求
+   - 查询类接口
+3. 幂等操作
+   - 已经被设计为可以安全重试的操作
+```
+
+### 不适合重试的场景
+
+```yaml
+# 不适合重试的场景
+1. 非瞬时故障
+   - 数据库连接配置错误
+   - 业务逻辑错误
+2. 写操作（未做幂等）
+   - 创建订单
+   - 支付扣款
+3. 有副作用的操作
+   - 发送短信验证码
+   - 第三方支付接口
+```
+
+## 重试策略
+
+### 1. 重试次数
+
+```java
+// Spring Retry
+@Service
+public class OrderService {
+
+    @Retryable(
+        value = { RemoteServiceException.class, TimeoutException.class },
+        maxAttempts = 3,
+        backoff = @Backoff(delay = 1000, multiplier = 2)
+    )
+    public Order createOrder(OrderRequest request) {
+        return remoteOrderService.create(request);
+    }
+}
+```
+
+### 2. 重试间隔
+
+```java
+// 指数退避策略
+@Configuration
+public class BackoffRetryConfig {
+
+    @Bean
+    public RetryTemplate retryTemplate() {
+        ExponentialBackOffPolicy exponentialBackOff = new ExponentialBackOffPolicy();
+        exponentialBackOff.setInitialInterval(1000);
+        exponentialBackOff.setMultiplier(2.0);
+        exponentialBackOff.setMaxInterval(10000);
+
+        return RetryTemplate.builder()
+                .maxAttempts(3)
+                .backoffPolicy(exponentialBackOff)
+                .build();
+    }
+}
+```
+
+```yaml
+# 重试间隔策略对比
+策略          特点
+─────────────────────────────────────────────────
+固定间隔        简单，可能在故障期重复失败
+指数退避        推荐，快速恢复又不浪费资源
+指数退避+抖动   防止多实例同时重试
+```
+
+### 3. 抖动（Jitter）
+
+```java
+// 带抖动的指数退避
+public class JitterExponentialBackOff {
+
+    public static long calculateDelay(int attempt, long baseDelay, double jitterFactor) {
+        long delay = (long) (baseDelay * Math.pow(2, attempt));
+        double jitter = 1.0 + (Math.random() * 2 - 1) * jitterFactor;
+        return (long) (delay * jitter);
+    }
+}
+```
+
+## 重试的实现
+
+### Spring Retry
+
+```java
+@Configuration
+@EnableRetry
+public class SpringRetryConfig {
+
+    @Bean
+    public RetryTemplate retryTemplate() {
+        ExponentialBackOffPolicy backOffPolicy = new ExponentialBackOffPolicy();
+        backOffPolicy.setInitialInterval(1000);
+        backOffPolicy.setMultiplier(2.0);
+        backOffPolicy.setMaxInterval(10000);
+
+        RetryTemplate template = new RetryTemplate();
+        template.setBackOffPolicy(backOffPolicy);
+        return template;
+    }
+}
+
+// 使用
+@Service
+public class PaymentService {
+
+    @Autowired
+    private RetryTemplate retryTemplate;
+
+    public String pay(Long orderId, BigDecimal amount) {
+        return retryTemplate.execute(context -> {
+            log.info("支付尝试，第 {} 次", context.getRetryCount() + 1);
+            return paymentGateway.pay(orderId, amount);
+        }, recovery -> {
+            log.error("支付失败，已重试 {} 次", context.getRetryCount());
+            return "支付暂不可用，请稍后重试";
+        });
+    }
+}
+```
+
+### Resilience4j Retry
+
+```java
+@Configuration
+public class Resilience4jConfig {
+
+    @Bean
+    public RetryRegistry retryRegistry() {
+        RetryConfig config = RetryConfig.custom()
+                .maxAttempts(3)
+                .retryInterval(1000)
+                .retryIntervalExponentialBackoffMultiplier(2)
+                .maxRetryInterval(10000)
+                .retryExceptions(TransientException.class, TimeoutException.class)
+                .ignoreExceptions(BusinessException.class)
+                .build();
+
+        return RetryRegistry.of(config);
+    }
+}
+```
+
+## 重试的注意事项
+
+### 注意事项一：幂等性是重试的前提
+
+```java
+// 幂等重试实现
+@Service
+public class IdempotentOrderService {
+
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+
+    public Order createOrder(OrderRequest request) {
+        String idempotentKey = "order:idempotent:" + request.getIdempotentId();
+
+        // 检查是否已处理
+        String existing = redisTemplate.opsForValue().get(idempotentKey);
+        if (existing != null) {
+            return parseOrder(existing);
+        }
+
+        try {
+            Order order = doCreateOrder(request);
+            redisTemplate.opsForValue().set(idempotentKey, serialize(order), 24, TimeUnit.HOURS);
+            return order;
+        } catch (Exception e) {
+            throw e;
+        }
+    }
+}
+```
+
+### 注意事项二：重试要有监控
+
+```java
+// 重试监控
+@Service
+public class RetryMonitor {
+
+    @Autowired
+    private MetricsService metricsService;
+
+    @OnRetry
+    public void onRetry(RetryContext context) {
+        metricsService.increment("retry.count",
+            Tags.of("service", context.getName(),
+                    "attempt", String.valueOf(context.getRetryCount())));
+    }
+
+    @AfterRetriesExhausted
+    public void afterRetriesExhausted(RetryContext context) {
+        metricsService.increment("retry.exhausted",
+            Tags.of("service", context.getName()));
+    }
+}
+```
+
+## 总结
+
+重试是系统 resilience 的重要组成部分，但必须谨慎使用。
+
+**核心要点回顾：**
+
+- 只对瞬时故障、幂等操作进行重试
+- 使用指数退避 + 抖动防止惊群效应
+- 幂等性是重试的前提
+- 重试要有监控和告警
+- 重试要有上限，不能无限重试
+
+---
+
+服务治理的八大核心主题就讲到这里。从服务发现到健康检查，从负载均衡到熔断降级，从限流超时到重试幂等，这些机制共同构成了一套完整的微服务可靠性保障体系。
+
+接下来的章节，我们将进入另一个重要主题——**服务调用**，深入探讨 RPC 框架的原理与实践，包括 Dubbo、Feign、gRPC 等主流框架的使用。

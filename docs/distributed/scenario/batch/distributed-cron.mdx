@@ -1,0 +1,270 @@
+# 定时任务的分布式化：广播模式与分片模式
+
+单机环境下，定时任务很简单：Spring `@Scheduled` 注解配上 cron 表达式，一个进程搞定一切。
+
+但一旦服务集群部署，问题就来了——多个节点同时触发定时任务，数据重复处理、外部接口被击垮、幂等性问题爆发。
+
+分布式定时任务，是每个微服务系统都必须面对的问题。
+
+## 问题分析：为什么集群环境下定时任务会重复执行？
+
+```
+定时器触发（每分钟）
+    ↓
+Node A 的 @Scheduled 触发
+Node B 的 @Scheduled 触发
+Node C 的 @Scheduled 触发
+    ↓
+三个节点同时执行同一个任务
+```
+
+Spring 的 `@Scheduled` 是进程级别的，**它只管自己这个进程，不管集群里有多少个进程**。
+
+## 方案一：单机部署（最朴素的方案）
+
+```java
+@Configuration
+@EnableScheduling
+public class SingleNodeScheduler {
+    
+    @Scheduled(cron = "0 0 * * * ?")  // 每小时整点执行
+    public void dailyReport() {
+        // 生成日报
+    }
+}
+```
+
+```yaml
+# deployment.yaml
+# 只部署 1 个实例，用 nodeSelector 或亲和性限制调度
+spec:
+  replicas: 1
+  template:
+    spec:
+      nodeSelector:
+        scheduling: batch-tasks
+```
+
+**优点**：简单，不需要额外组件。
+**缺点**：单点故障，扩展性差，定时任务和业务进程耦合。
+
+:::warning 缺点
+单机部署意味着：定时任务所在的机器挂了，整个定时任务就停了。这对于核心业务是不可接受的。
+:::
+
+## 方案二：分布式锁抢任务（最常用）
+
+所有节点竞争同一把锁，只有抢到锁的节点才执行。
+
+```java
+@Service
+public class DistributedScheduledTasks {
+    
+    @Autowired
+    private RedissonClient redisson;
+    
+    @Scheduled(cron = "0 0/5 * * * ?")  // 每 5 分钟
+    public void syncDataTask() {
+        RLock lock = redisson.getLock("scheduled-task:sync-data");
+        
+        // 抢锁：最多等待 0 秒，锁 4 分钟后自动过期（比调度间隔略短）
+        if (lock.tryLock(0, 4, TimeUnit.MINUTES)) {
+            try {
+                doSyncData();
+            } finally {
+                if (lock.isHeldByCurrentThread()) {
+                    lock.unlock();
+                }
+            }
+        } else {
+            log.debug("syncDataTask 被其他节点抢走了");
+        }
+    }
+}
+```
+
+### 分布式锁方案的问题
+
+**问题一：锁失效导致任务漏执行**
+
+如果任务执行时间超过锁的过期时间，锁自动释放后，其他节点可能开始执行：
+
+```
+节点 A 抢到锁，开始执行任务（预计 10 分钟）
+    ↓
+6 分钟后，锁自动过期（任务还在执行）
+    ↓
+节点 B 抢到锁（同一个任务！），也开始执行
+    ↓
+节点 A 和节点 B 同时执行同一任务
+```
+
+**解决方案**：用 Redisson 的看门狗（Watchdog）自动续期：
+
+```java
+// 不设置过期时间，Redisson 自动续期
+lock.lock();
+// 或者设置一个很长的过期时间
+lock.lock(30, TimeUnit.MINUTES);
+// 业务执行完后释放锁
+lock.unlock();
+```
+
+看门狗机制：默认每 10 秒检查一次，如果锁仍被持有，则续期 30 秒。
+
+## 方案三：调度中心模式（XXL-Job / ElasticJob）
+
+把调度逻辑从业务进程中抽离出来，由一个独立的调度中心统一触发。
+
+```
+┌─────────────────────────────────────────┐
+│              调度中心                     │
+│  (XXL-Job / ElasticJob Admin)            │
+│                                          │
+│  定时触发 → 按分片策略分发给执行节点       │
+└──────────────────┬──────────────────────┘
+                   │ HTTP / RPC 调用
+     ┌─────────────┼─────────────┐
+     ▼             ▼             ▼
+┌─────────┐  ┌─────────┐  ┌─────────┐
+│ Node A  │  │ Node B  │  │ Node C  │
+│ 执行任务 │  │ 执行任务 │  │ 执行任务 │
+└─────────┘  └─────────┘  └─────────┘
+```
+
+```java
+// XXL-Job 示例
+@XxlJob("dataCleanJob")
+public ReturnT<String> execute() {
+    // 获取当前节点的分片参数
+    ShardingUtil.ShardingVO sharding = ShardingUtil.getSharding();
+    int shardIndex = sharding.getIndex();    // 本节点的分片序号
+    int shardTotal = sharding.getTotal();    // 总分片数
+    
+    // 查询本节点负责的数据
+    List<Record> records = queryRecordsByShard(shardIndex, shardTotal);
+    
+    for (Record record : records) {
+        cleanData(record);
+    }
+    
+    return SUCCESS;
+}
+```
+
+### 两种调度模式
+
+| 模式 | 说明 | 适用场景 |
+|---|---|---|
+| **Bean 模式** | 在执行节点上写 Java 代码，调度中心远程调用 | 轻量级任务 |
+| **Glue 模式** | 在调度中心编写脚本（Java/Shell/Python），动态下发 | 需要频繁修改的任务 |
+
+### 分片广播 vs 分片作业
+
+| 模式 | 行为 | 适用场景 |
+|---|---|---|
+| **分片广播** | 每个节点都执行，适合轻量级同步任务 | 通知、缓存刷新 |
+| **分片作业** | 每个节点执行自己的分片，适合数据处理任务 | 数据同步、报表生成 |
+
+## 方案四：消息队列延迟消息
+
+用 RocketMQ 的延迟消息实现定时任务，天然分布式，无需额外调度中心：
+
+```java
+// 发送延迟消息（延迟 5 分钟）
+@Service
+public class ScheduledTaskViaMQ {
+    
+    @Autowired
+    private RocketMQTemplate rocketMQTemplate;
+    
+    // 每次任务执行时，发送一个延迟消息，5 分钟后再触发自己
+    public void scheduleNextExecution(String taskId) {
+        // 延迟消息：5 分钟后触发
+        rocketMQTemplate.asyncSend(
+            "scheduled-task-delay",
+            taskId,
+            new MessageDelayLevel(5)  // 延迟等级：5 = 延迟 5 分钟
+        );
+    }
+    
+    // 消费延迟消息，执行任务
+    @RocketMQMessageListener(
+        consumerGroup = "scheduled-task-consumer",
+        topic = "scheduled-task-delay"
+    )
+    public class ScheduledTaskConsumer implements RocketMQListener<String> {
+        @Override
+        public void onMessage(String taskId) {
+            doExecuteTask(taskId);
+            // 执行完再发下一个延迟消息（如果是周期性任务）
+            scheduleNextExecution(taskId);
+        }
+    }
+}
+```
+
+:::tip 推荐
+RocketMQ 延迟消息适合**固定间隔的周期性任务**，且不需要精确到秒级的调度（延迟消息的精度是秒级）。
+:::
+
+## 方案五：时间片轮询（数据库排他）
+
+用数据库的排他更新实现分布式定时触发：
+
+```sql
+-- 定时任务调度表
+CREATE TABLE cron_task_schedule (
+    task_key VARCHAR(64) PRIMARY KEY,  -- 任务唯一标识
+    cron_expression VARCHAR(32),        -- cron 表达式
+    next_fire_time BIGINT,              -- 下次触发时间（时间戳）
+    status VARCHAR(16),                  -- IDLE / RUNNING
+    lock_node VARCHAR(64)                -- 当前执行节点
+);
+
+-- 调度器：定时查询可执行的任务
+SELECT * FROM cron_task_schedule
+WHERE status = 'IDLE'
+  AND next_fire_time <= UNIX_TIMESTAMP() * 1000
+LIMIT 10;
+-- 如果有结果，说明有任务需要执行
+```
+
+```java
+@Scheduled(fixedDelay = 1000)  // 每秒轮询一次
+public void pollAndExecuteTasks() {
+    List<CronTask> tasks = queryRunnableTasks();
+    
+    for (CronTask task : tasks) {
+        // 尝试抢占任务
+        boolean acquired = tryAcquire(task.getTaskKey());
+        if (acquired) {
+            // 异步执行任务
+            executor.submit(() -> executeTask(task));
+        }
+    }
+}
+```
+
+## 各种方案对比
+
+| 方案 | 精确度 | 可靠性 | 实现成本 | 适用场景 |
+|---|---|---|---|---|
+| 单机部署 | 高 | 低 | 极低 | 非核心任务 |
+| 分布式锁抢任务 | 中 | 中 | 低 | 集群内抢任务 |
+| XXL-Job / ElasticJob | 高 | 高 | 中 | 生产级调度 |
+| MQ 延迟消息 | 低（秒级） | 高 | 低 | 固定间隔周期任务 |
+| 数据库排他轮询 | 中 | 高 | 中 | 无外部组件依赖 |
+
+## 总结
+
+分布式定时任务的核心问题是**调度权和执行权的分配**：
+
+- **调度权和执行权合一**（单机）：简单但单点故障
+- **调度权和执行权分离**（XXL-Job）：可靠但需要额外运维
+- **调度权和执行权合并**（分布式锁）：简单可靠，适合中小规模
+
+选型建议：
+- 小规模（`≤` 5 个节点）：分布式锁方案足够
+- 中大规模、核心任务：XXL-Job 或 ElasticJob
+- 不想引入额外组件：数据库排他轮询

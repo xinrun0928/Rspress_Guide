@@ -1,0 +1,581 @@
+import { Badge } from '@rspress/core/theme';
+
+# Seata 全局事务原理
+
+<Badge text="分布式事务" type="tip" /> <Badge text="原理篇" type="warning" /> <Badge text="全局事务" type="info" />
+
+在前面的章节中，我们了解了 Seata 的整体架构。这一章，让我们深入理解 Seata 全局事务的执行原理，看看一条 SQL 语句是如何在 Seata 的管理下参与分布式事务的。
+
+## 全局事务的完整生命周期
+
+```java
+/**
+ * 全局事务生命周期
+ */
+
+// 1. 创建全局事务
+// TM 发起 begin()，TC 创建 GlobalSession
+
+// 2. 注册分支事务
+// RM 执行 SQL 时，向 TC 注册 BranchSession
+
+// 3. 执行分支事务
+// RM 执行 SQL，生成 Undo Log，提交本地事务
+
+// 4. 提交/回滚全局事务
+// TM 发起 commit()/rollback()，TC 协调分支事务
+```
+
+## 核心数据结构
+
+### GlobalSession
+
+```java
+/**
+ * GlobalSession（全局会话）
+ */
+
+// 每个全局事务对应一个 GlobalSession
+// TC 通过 SessionManager 管理所有 GlobalSession
+
+/**
+ * GlobalSession 结构
+ */
+public class GlobalSession {
+    
+    // 唯一标识
+    private String xid;
+    
+    // 应用信息
+    private String applicationId;          // 应用 ID
+    private String transactionServiceGroup;  // 事务组
+    
+    // 事务状态
+    private TransactionStatus status;
+    
+    // 分支会话列表
+    private Map<Long, BranchSession> branchSessions;
+    
+    // 补偿相关
+    private Map<String, UndoLog> undoLogs;
+    
+    // 时间戳
+    private long beginTime;
+    private long endTime;
+    
+    // 锁计数
+    private int lockCount;
+    
+    /**
+     * 添加分支会话
+     */
+    public void addBranchSession(BranchSession branchSession) {
+        branchSessions.put(branchSession.getBranchId(), branchSession);
+    }
+    
+    /**
+     * 改变状态
+     */
+    public void changeStatus(TransactionStatus status) {
+        this.status = status;
+        this.activeTime = System.currentTimeMillis();
+    }
+    
+    /**
+     * 是否可以全局提交
+     */
+    public boolean canGlobalCommit() {
+        // 所有分支都成功才能提交
+        for (BranchSession bs : branchSessions.values()) {
+            if (!bs.canCommit()) {
+                return false;
+            }
+        }
+        return true;
+    }
+    
+    /**
+     * 是否可以全局回滚
+     */
+    public boolean canGlobalRollback() {
+        // 至少有一个分支可以回滚
+        for (BranchSession bs : branchSessions.values()) {
+            if (bs.canRollback()) {
+                return true;
+            }
+        }
+        return false;
+    }
+}
+```
+
+### BranchSession
+
+```java
+/**
+ * BranchSession（分支会话）
+ */
+
+// 每个分支事务对应一个 BranchSession
+// 记录分支事务的执行状态
+
+/**
+ * BranchSession 结构
+ */
+public class BranchSession {
+    
+    // 分支事务 ID
+    private long branchId;
+    
+    // 所属全局事务 ID
+    private String xid;
+    
+    // 资源信息
+    private String resourceId;        // 资源 ID（如 dbcp://127.0.0.1:3306/db1）
+    private String resourceGroupId;   // 资源组 ID
+    
+    // 应用信息
+    private String applicationData;    // 应用数据（JSON）
+    
+    // 分支类型
+    private BranchType branchType;    // AT / TCC / SAGA / XA
+    
+    // 分支状态
+    private BranchStatus status;
+    
+    // SQL 信息（AT 模式）
+    private String lockKey;           // 锁 Key
+    private List<SQLUndoLog> undoLogs;  // Undo Log 列表
+    
+    /**
+     * 计算锁 Key
+     */
+    public void buildLockKey(String tableName, String pk) {
+        // lockKey = resourceId + ":" + tableName + ":" + pk
+        // 例如：dbcp://127.0.0.1:3306/db1:product:1
+        this.lockKey = resourceId + ":" + tableName + ":" + pk;
+    }
+    
+    /**
+     * 记录 Undo Log
+     */
+    public void addUndoLog(SQLUndoLog undoLog) {
+        if (this.undoLogs == null) {
+            this.undoLogs = new ArrayList<>();
+        }
+        this.undoLogs.add(undoLog);
+    }
+}
+```
+
+## 全局事务执行流程
+
+### 1. 开启全局事务
+
+```java
+/**
+ * 开启全局事务
+ */
+
+// TM 端调用
+public class GlobalTransactionProxy {
+    
+    public void begin(String name, int timeout) {
+        // 1. 生成 XID
+        String xid = UUID.randomUUID().toString();
+        
+        // 2. 向 TC 注册全局事务
+        DefaultGlobalTransaction globalTx = new DefaultGlobalTransaction(xid, name, timeout);
+        
+        // 3. 存储到上下文
+        RootContext.bind(xid);
+        
+        return globalTx;
+    }
+}
+
+/**
+ * TC 端处理
+ */
+public class DefaultCoordinator {
+    
+    public String begin(String applicationId, String transactionServiceGroup, 
+                       String name, int timeout) {
+        // 1. 创建 GlobalSession
+        GlobalSession session = GlobalSession.createGlobalSession(
+            applicationId, transactionServiceGroup, name, timeout);
+        
+        // 2. 添加到 SessionManager
+        sessionManager.addGlobalSession(session);
+        
+        // 3. 开启心跳
+        session.addSessionLifecycleListener(
+            new ServerSessionLifecycleListener());
+        
+        // 4. 返回 XID
+        return session.getXid();
+    }
+}
+```
+
+### 2. 执行分支事务
+
+```java
+/**
+ * 执行分支事务
+ */
+
+// RM 端（通过 DataSourceProxy）
+public class ConnectionProxy {
+    
+    @Override
+    public Statement createStatement() {
+        Statement target = originalConnection.createStatement();
+        return new StatementProxy(this, target);
+    }
+}
+
+/**
+ * StatementProxy - 执行 SQL
+ */
+public class StatementProxy {
+    
+    /**
+     * 执行 SQL
+     */
+    public void execute(String sql, Object[] parameters) {
+        // 1. 判断是否是写操作
+        if (isWrite(sql)) {
+            // 2. 获取 XID
+            String xid = RootContext.getXID();
+            
+            if (xid != null) {
+                // 3. 执行带分支事务的 SQL
+                executeWithinGlobalTransaction(sql, parameters);
+            } else {
+                // 4. 普通执行
+                target.execute(sql, parameters);
+            }
+        }
+    }
+    
+    /**
+     * 在全局事务中执行
+     */
+    private void executeWithinGlobalTransaction(String sql, Object[] parameters) 
+        throws SQLException {
+        try {
+            // 1. 解析 SQL，获取表名和主键
+            TableRecords beforeImage = buildBeforeImage(sql, parameters);
+            
+            // 2. 执行 SQL
+            target.execute(sql, parameters);
+            
+            // 3. 获取执行后的数据（后镜像）
+            TableRecords afterImage = buildAfterImage(sql, parameters);
+            
+            // 4. 注册分支事务
+            BranchSession branchSession = registerBranch(sql, beforeImage, afterImage);
+            
+            // 5. 写入 Undo Log
+            for (SQLUndoLog undoLog : branchSession.getUndoLogs()) {
+                undoLogManager.appendUndoLog(branchSession.getBranchId(), undoLog);
+            }
+            
+            // 6. 提交本地事务
+            originalConnection.commit();
+            
+        } catch (Exception e) {
+            // 回滚本地事务
+            originalConnection.rollback();
+            throw e;
+        }
+    }
+}
+```
+
+### 3. 分支注册
+
+```java
+/**
+ * 分支注册
+ */
+public class BranchSession {
+    
+    public static BranchSession createBranchSession(
+        GlobalSession globalSession,
+        String resourceId,
+        BranchType branchType,
+        String applicationData,
+        String lockKey) {
+        
+        // 1. 创建分支会话
+        BranchSession branchSession = new BranchSession();
+        branchSession.setXid(globalSession.getXid());
+        branchSession.setBranchId(generateBranchId());
+        branchSession.setResourceId(resourceId);
+        branchSession.setBranchType(branchType);
+        branchSession.setApplicationData(applicationData);
+        branchSession.setLockKey(lockKey);
+        
+        // 2. 添加到全局会话
+        globalSession.addBranchSession(branchSession);
+        
+        // 3. 注册到 TC
+        asyncWorker.registerBranch(globalSession, branchSession);
+        
+        return branchSession;
+    }
+}
+
+/**
+ * 向 TC 注册分支
+ */
+public class AsyncWorker {
+    
+    public void registerBranch(GlobalSession globalSession, 
+                               BranchSession branchSession) {
+        // 1. 向 TC 发送注册请求
+        boolean success = tcClient.branchRegister(
+            globalSession.getXid(),
+            branchSession.getBranchId(),
+            resourceId,
+            applicationData,
+            lockKey
+        );
+        
+        // 2. 注册失败，抛出异常
+        if (!success) {
+            throw new BranchRegisterFailedException();
+        }
+    }
+}
+```
+
+### 4. 前后镜像生成
+
+```java
+/**
+ * AT 模式的前后镜像
+ */
+
+// Before Image（执行前镜像）
+// - 执行 SELECT 语句获取修改前的数据
+
+// After Image（执行后镜像）
+// - 执行 SELECT 语句获取修改后的数据
+
+// Undo Log
+// - Before Image + After Image + SQL
+// - 用于回滚
+
+/**
+ * 构建前镜像
+ */
+public TableRecords buildBeforeImage(String sql, Object[] params) {
+    // 1. 解析 SQL，获取表名和 WHERE 条件
+    SqlStatement sqlStatement = SqlParser.parse(sql);
+    String tableName = sqlStatement.getTableName();
+    String whereCondition = sqlStatement.getWhereCondition();
+    
+    // 2. 构建查询 SQL
+    String querySql = "SELECT * FROM " + tableName + " WHERE " + whereCondition;
+    
+    // 3. 执行查询
+    ResultSet rs = target.executeQuery(querySql, params);
+    
+    // 4. 封装为 TableRecords
+    TableRecords beforeImage = new TableRecords(tableName);
+    while (rs.hasNext()) {
+        beforeImage.add(toRecord(rs));
+    }
+    
+    return beforeImage;
+}
+
+/**
+ * 构建后镜像
+ */
+public TableRecords buildAfterImage(String sql, Object[] params) {
+    // 1. 直接查询刚才修改的数据
+    // 2. 使用主键或唯一索引查询
+    String pkQuery = "SELECT * FROM " + tableName + 
+        " WHERE " + primaryKey + " IN (" + pks + ")";
+    
+    // 3. 执行查询
+    ResultSet rs = target.executeQuery(pkQuery);
+    
+    // 4. 封装为 TableRecords
+    return toTableRecords(rs);
+}
+```
+
+### 5. 全局提交
+
+```java
+/**
+ * 全局提交
+ */
+
+// TM 端
+public class GlobalTransaction {
+    
+    public void commit() {
+        // 1. 检查状态
+        if (status != TransactionStatus.BEGIN) {
+            throw new TransactionException("Status is not BEGIN");
+        }
+        
+        // 2. 向 TC 发送提交请求
+        boolean success = tcClient.globalCommit(xid);
+        
+        // 3. 更新状态
+        status = success ? TransactionStatus.COMMITTED : TransactionStatus.COMMIT_FAILED;
+    }
+}
+
+/**
+ * TC 端处理提交
+ */
+public class DefaultCoordinator {
+    
+    public boolean doGlobalCommit(GlobalSession globalSession) {
+        // 1. 检查是否可以提交
+        if (!globalSession.canGlobalCommit()) {
+            return false;
+        }
+        
+        // 2. 改变状态
+        globalSession.changeStatus(TransactionStatus.COMMITTING);
+        
+        // 3. 异步提交所有分支
+        for (BranchSession branchSession : globalSession.getBranchSessions()) {
+            asyncWorker.doBranchCommit(branchSession);
+        }
+        
+        // 4. 改变状态
+        globalSession.changeStatus(TransactionStatus.COMMITTED);
+        
+        return true;
+    }
+}
+
+/**
+ * 异步删除 Undo Log
+ */
+public class AsyncWorker {
+    
+    public void doBranchCommit(BranchSession branchSession) {
+        // 异步删除 Undo Log
+        // 因为分支已经提交成功了
+        // Undo Log 可以异步删除
+        CompletableFuture.runAsync(() -> {
+            undoLogManager.deleteUndoLog(branchSession.getBranchId());
+        });
+    }
+}
+```
+
+### 6. 全局回滚
+
+```java
+/**
+ * 全局回滚
+ */
+
+// TM 端
+public class GlobalTransaction {
+    
+    public void rollback() {
+        // 1. 检查状态
+        if (status != TransactionStatus.BEGIN) {
+            throw new TransactionException("Status is not BEGIN");
+        }
+        
+        // 2. 向 TC 发送回滚请求
+        boolean success = tcClient.globalRollback(xid);
+        
+        // 3. 更新状态
+        status = success ? TransactionStatus.ROLLED_BACK : TransactionStatus.ROLLBACK_FAILED;
+    }
+}
+
+/**
+ * TC 端处理回滚
+ */
+public class DefaultCoordinator {
+    
+    public boolean doGlobalRollback(GlobalSession globalSession) {
+        // 1. 检查是否可以回滚
+        if (!globalSession.canGlobalRollback()) {
+            return false;
+        }
+        
+        // 2. 改变状态
+        globalSession.changeStatus(TransactionStatus.ROLLBACKING);
+        
+        // 3. 回滚所有分支
+        for (BranchSession branchSession : globalSession.getBranchSessions()) {
+            asyncWorker.doBranchRollback(branchSession);
+        }
+        
+        // 4. 改变状态
+        globalSession.changeStatus(TransactionStatus.ROLLED_BACK);
+        
+        return true;
+    }
+}
+
+/**
+ * 分支回滚
+ */
+public class AsyncWorker {
+    
+    public void doBranchRollback(BranchSession branchSession) {
+        // 1. 获取 Undo Log
+        List<SQLUndoLog> undoLogs = getUndoLogs(branchSession.getBranchId());
+        
+        // 2. 生成反向 SQL 并执行
+        for (SQLUndoLog undoLog : undoLogs) {
+            String reverseSql = generateReverseSql(undoLog);
+            execute(reverseSql);
+        }
+        
+        // 3. 删除 Undo Log
+        undoLogManager.deleteUndoLog(branchSession.getBranchId());
+    }
+    
+    /**
+     * 生成反向 SQL
+     */
+    private String generateReverseSql(SQLUndoLog undoLog) {
+        TableRecords beforeImage = undoLog.getBeforeImage();
+        
+        // 生成 UPDATE 或 DELETE 语句
+        if (undoLog.getSqlType() == SqlType.UPDATE) {
+            // UPDATE product SET count = ? WHERE id = ?
+            // 使用 Before Image 的值
+            Record record = beforeImage.getRecords().get(0);
+            return "UPDATE " + record.getTableName() + 
+                " SET " + record.getValues() + 
+                " WHERE " + record.getPrimaryKey();
+        }
+        
+        // 其他类型的 SQL...
+        return null;
+    }
+}
+```
+
+## 总结
+
+Seata 全局事务的执行原理可以概括为：
+
+1. **全局事务开启**：TM 发起 begin()，TC 创建 GlobalSession
+2. **分支事务执行**：RM 解析 SQL，生成前后镜像，执行 SQL，注册分支
+3. **全局提交**：TC 协调各分支提交，异步删除 Undo Log
+4. **全局回滚**：TC 协调各分支回滚，使用 Undo Log 生成反向 SQL
+
+理解这些原理，能帮助我们更好地使用 Seata，也能帮助我们解决实际问题。
+
+> 下一章，我们来看 [Seata 高可用](/distributed/transaction/principle/seata-ha)，了解 Seata Server 如何实现高可用。

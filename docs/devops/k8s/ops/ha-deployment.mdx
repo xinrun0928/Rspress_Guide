@@ -1,0 +1,429 @@
+# Kubernetes 高可用部署：生产环境集群架构
+
+你有没有想过：如果你只有一个 K8s Master 节点，它挂了会发生什么？API Server 无法响应，Scheduler 停止工作，整个集群陷入瘫痪。这意味着：应用无法调度、新 Pod 无法创建、连 kubectl 都连不上——即使工作节点上的 Pod 还在正常运行。
+
+这就是为什么生产环境必须部署高可用（High Availability，HA）集群。本质问题是：**单点故障是生产环境的死穴**。
+
+## 高可用架构概述
+
+### K8s 组件分类
+
+K8s 集群组件分为两大类：
+
+| 类型 | 组件 | 高可用要求 |
+|---|---|---|
+| 控制平面（Control Plane） | API Server、Scheduler、Controller Manager、Etcd | 必须 HA |
+| 工作节点（Worker） | Kubelet、Kube-Proxy、Container Runtime | 建议多节点 |
+
+### 高可用部署原则
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                      负载均衡器                          │
+│                    (外部 LB / 云 LB)                      │
+└─────────────────────────────────────────────────────────┘
+         │                    │                    │
+    ┌────┴────┐          ┌────┴────┐          ┌────┴────┐
+    │ Master1 │          │ Master2 │          │ Master3 │
+    │ API     │          │ API     │          │ API     │
+    │ Scheduler│         │ Scheduler│         │ Scheduler│
+    │ CCM     │          │ CCM     │          │ CCM     │
+    └────┬────┘          └────┬────┘          └────┬────┘
+         │                    │                    │
+    ┌────┴────────────────────┴────────────────────┴────┐
+    │                    Etcd 集群                       │
+    │               (3 节点 Raft 共识)                    │
+    └───────────────────────────────────────────────────┘
+```
+
+**三层高可用**：
+
+1. **API Server 无状态**：多实例并行，通过 LB 统一入口
+2. **Etcd 数据存储**：奇数节点 Raft 共识，保证数据一致性
+3. **Scheduler/CCM**：Leader 选举，竞争上岗
+
+## Etcd 高可用
+
+### 为什么 Etcd 必须 HA
+
+Etcd 是 K8s 的唯一数据存储，所有集群状态都保存在这里。如果 Etcd 不可用：
+
+- API Server 无法读写数据
+- 所有 K8s 对象无法创建/修改
+- Scheduler 无法获取 Pod 信息
+- Controller Manager 无法协调状态
+
+:::danger Etcd 单点故障的后果
+Etcd 故障 = 集群不可用。即使工作节点上的 Pod 继续运行，也无法创建新 Pod 或修改现有配置。
+:::
+
+### Etcd 集群配置
+
+Etcd 集群至少需要 3 个节点（奇数原则）：
+
+```bash title="使用 kubeadm 部署 etcd"
+# 在第一个 Master 节点初始化
+kubeadm init phase etcd local
+
+# 查看 etcd 成员
+etcdctl --endpoints=https://127.0.0.1:2379 \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  member list
+```
+
+```yaml title="etcd 静态 Pod 配置"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: etcd
+  namespace: kube-system
+spec:
+  containers:
+  - name: etcd
+    image: registry.k8s.io/etcd:3.5.9
+    command:
+    - etcd
+    - --data-dir=/var/lib/etcd
+    - --name=etcd-1
+    - --listen-client-urls=https://0.0.0.0:2379
+    - --advertise-client-urls=https://192.168.1.1:2379
+    - --listen-peer-urls=https://0.0.0.0:2380
+    - --initial-cluster=etcd-1=https://192.168.1.1:2380,etcd-2=https://192.168.1.2:2380,etcd-3=https://192.168.1.3:2380
+    - --initial-cluster-state=new
+    - --client-cert-auth=true
+    - --trusted-ca-file=/etc/kubernetes/pki/etcd/ca.crt
+    - --cert-file=/etc/kubernetes/pki/etcd/server.crt
+    - --key-file=/etc/kubernetes/pki/etcd/server.key
+    - --peer-client-cert-auth=true
+    - --peer-trusted-ca-file=/etc/kubernetes/pki/etcd/ca.crt
+    - --peer-cert-file=/etc/kubernetes/pki/etcd/peer.crt
+    - --peer-key-file=/etc/kubernetes/pki/etcd/peer.key
+```
+
+### etcd 节点数量选择
+
+| 节点数 | 容忍失败 | 推荐场景 |
+|---|---|---|
+| 1 | 0 | 开发/测试 |
+| 3 | 1 | 小规模生产 |
+| 5 | 2 | 大规模生产 |
+| 7 | 3 | 超大规模 |
+
+:::tip 奇数原则
+Etcd 使用 Raft 共识算法，需要多数节点同意才能写入。3 节点集群可容忍 1 节点故障，5 节点可容忍 2 节点故障。偶数节点（如 4 节点）没有优势，反而增加复杂度。
+:::
+
+## API Server 高可用
+
+### API Server 无状态设计
+
+API Server 是无状态服务，可以水平扩展。多实例部署时：
+
+- 通过 LB 统一入口
+- 各实例独立运行，不共享状态
+- Kubelet/Controller/Scheduler 智能重试
+
+### 负载均衡器配置
+
+```yaml title="外部 LB 配置示例（Keepalived + HAProxy）"
+# keepalived.conf
+global_defs {
+  router_id api_server_lb
+}
+vrrp_instance VI_1 {
+  state MASTER
+  interface eth0
+  virtual_router_id 51
+  priority 100
+  advert_int 1
+  unicast_peer {
+    192.168.1.2
+    192.168.1.3
+  }
+  virtual_ipaddress {
+    192.168.1.100
+  }
+}
+---
+# haproxy.cfg
+frontend kubernetes-apiserver
+  bind 192.168.1.100:6443
+  mode tcp
+  option tcplog
+  default_backend kubernetes-apiserver-backend
+
+backend kubernetes-apiserver-backend
+  mode tcp
+  option tcp-check
+  balance roundrobin
+  server master1 192.168.1.1:6443 check inter 2000 rise 2 fall 3
+  server master2 192.168.1.2:6443 check inter 2000 rise 2 fall 3
+  server master3 192.168.1.3:6443 check inter 2000 rise 2 fall 3
+```
+
+云环境推荐使用云厂商提供的 LoadBalancer 服务。
+
+### kubeconfig 多集群配置
+
+```yaml title="~/.kube/config"
+apiVersion: v1
+kind: Config
+clusters:
+- name: production-ha
+  cluster:
+    server: https://192.168.1.100:6443  # LB VIP
+    certificate-authority-data: <base64-ca>
+contexts:
+- name: production-ha
+  context:
+    cluster: production-ha
+    user: admin
+current-context: production-ha
+users:
+- name: admin
+  user:
+    client-certificate-data: <base64-cert>
+    client-key-data: <base64-key>
+```
+
+## 控制平面组件 HA
+
+### Scheduler 和 Controller Manager
+
+Scheduler 和 Controller Manager 是有状态的（通过 Leader 选举），只能有一个 Leader 活跃实例：
+
+```bash
+# 查看当前 Leader
+kubectl get endpoints kube-controller-manager -n kube-system -o yaml
+
+kubectl get endpoints kube-scheduler -n kube-system -o yaml
+```
+
+使用 `--leader-elect` 参数启动，确保只有一个 Leader：
+
+```bash title="Controller Manager 配置"
+kube-controller-manager \
+  --leader-elect=true \
+  --leader-elect-lease-duration=15s \
+  --leader-elect-renew-deadline=10s \
+  --leader-elect-retry-period=5s
+```
+
+### 选举机制
+
+```
+┌──────────────┐      ┌──────────────┐      ┌──────────────┐
+│   Master1    │      │   Master2    │      │   Master3    │
+│  (Leader)    │      │  (Candidate) │      │  (Candidate) │
+│     ★        │      │              │      │              │
+└──────┬───────┘      └──────────────┘      └──────────────┘
+       │
+       │ Lease 续约（每 10s）
+       │
+       ▼
+┌──────────────────────────────────────────────────────────┐
+│                     Etcd (lease)                          │
+└──────────────────────────────────────────────────────────┘
+```
+
+## 工作节点分布
+
+### 故障域隔离
+
+工作节点应该分布在不同的故障域：
+
+| 故障域 | 示例 |
+|---|---|
+| 机架 | rack-1、rack-2、rack-3 |
+| 可用区 | zone-a、zone-b、zone-c |
+| 区域 | region-east、region-west |
+
+```yaml title="多可用区节点配置"
+# Node Affinity 示例
+apiVersion: v1
+kind: Pod
+metadata:
+  name: multi-az-pod
+spec:
+  affinity:
+    nodeAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        preference:
+          matchExpressions:
+          - key: topology.kubernetes.io/zone
+            operator: In
+            values:
+            - zone-a
+            - zone-b
+      - weight: 50
+        preference:
+          matchExpressions:
+          - key: topology.kubernetes.io/zone
+            operator: In
+            values:
+            - zone-c
+  tolerations:
+  - key: "node.kubernetes.io/not-ready"
+    operator: "Exists"
+    effect: "NoExecute"
+    tolerationSeconds: 300
+```
+
+### Pod 拓扑分布约束
+
+```yaml title="Pod 拓扑分布约束"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-app
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web
+  template:
+    spec:
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: DoNotSchedule
+        labelSelector:
+          matchLabels:
+            app: web
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app: web
+```
+
+## 部署工具对比
+
+| 工具 | 适用场景 | 复杂度 |
+|---|---|---|
+| kubeadm | 手动部署，完全控制 | 高 |
+| kubespray | Ansible 自动化部署 | 中 |
+| RKE2 | Rancher 发行版，简化部署 | 低 |
+| 云厂商托管 | 云环境一键创建 | 最低 |
+| kubeadm + HA | kubeadm 高可用模式 | 高 |
+
+### kubeadm 高可用模式
+
+```bash
+# 初始化第一个 Master（高可用模式）
+kubeadm init \
+  --control-plane-endpoint "192.168.1.100:6443" \
+  --upload-certs \
+  --pod-network-cidr=10.244.0.0/16
+
+# 获取加入命令
+kubeadm token create --print-join-command
+
+# 其他 Master 加入
+kubeadm join 192.168.1.100:6443 \
+  --token <token> \
+  --discovery-token-ca-cert-hash sha256:<hash> \
+  --control-plane \
+  --certificate-key <cert-key>
+
+# Worker 加入
+kubeadm join 192.168.1.100:6443 \
+  --token <token> \
+  --discovery-token-ca-cert-hash sha256:<hash>
+```
+
+### RKE2 简化部署
+
+```bash title="RKE2 高可用配置"
+# server1
+curl -sfL https://get.rke2.io | sh -
+mkdir -p /etc/rancher/rke2/
+cat > /etc/rancher/rke2/config.yaml <<EOF
+server: https://rke2-server1:9345
+token: <shared-token>
+tls-san:
+  - 192.168.1.100
+  - rke2-server1
+  - rke2-server2
+  - rke2-server3
+EOF
+systemctl enable rke2-server.service
+systemctl start rke2-server.service
+```
+
+## 故障恢复
+
+### Master 节点故障恢复
+
+```bash
+# 1. 诊断
+kubectl get nodes
+etcdctl --endpoints=$ENDPOINTS endpoint health
+
+# 2. 如果一个 Master 故障
+#    - 检查网络连接
+#    - 检查 etcd 进程
+#    - 重启服务
+
+# 3. 如果 etcd 成员丢失
+etcdctl member add etcd-3 --peer-urls=https://192.168.1.3:2380
+
+# 4. 如果无法恢复，移除故障成员
+etcdctl member remove <member-id>
+```
+
+### Etcd 数据恢复
+
+```bash
+# 1. 停止所有 API Server
+# 2. 从备份恢复
+etcdctl snapshot restore /backup/etcd-snapshot.db \
+  --name=etcd-1 \
+  --initial-cluster=etcd-1=https://192.168.1.1:2380,etcd-2=https://192.168.1.2:2380,etcd-3=https://192.168.1.3:2380 \
+  --initial-cluster-token=etcd-cluster \
+  --initial-advertise-peer-urls=https://192.168.1.1:2380 \
+  --data-dir=/var/lib/etcd
+# 3. 重启 etcd
+# 4. 重启 API Server
+```
+
+## 面试追问方向
+
+1. **为什么 Etcd 节点数必须是奇数？**
+   - Raft 共识需要多数节点同意
+   - 奇数节点可以在容忍更多故障的同时，使用更少资源
+
+2. **API Server 为什么可以水平扩展？**
+   - 无状态设计
+   - 通过 LB 统一入口
+
+3. **Scheduler 和 Controller Manager 如何实现 HA？**
+   - Leader 选举机制
+   - Lease 续约保证只有一个 Leader
+
+4. **如何设计多可用区 HA？**
+   - 节点分布在不同可用区
+   - Pod 拓扑分布约束
+   - 资源配额隔离
+
+## 总结
+
+高可用集群是生产环境的基础。核心设计原则：
+
+- **Etcd HA**：至少 3 节点，Raft 共识
+- **API Server HA**：多实例 + LB
+- **组件 HA**：Leader 选举
+- **节点分布**：跨故障域
+- **故障恢复**：定期演练
+
+投入足够资源建设 HA 集群，是保障业务连续性的前提。
+
+**面试追问方向**：
+- Etcd 备份与恢复流程？
+- 如何监控集群健康状态？
+- 滚动升级时如何保证 HA？
+- 故障域隔离的具体实现方式？

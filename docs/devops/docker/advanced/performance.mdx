@@ -1,0 +1,363 @@
+# 性能优化
+
+容器启动慢、占用内存高、磁盘 I/O 慢——这些性能问题往往不是「硬件不够」，而是「配置不当」。
+
+## 镜像优化
+
+镜像体积直接影响拉取速度和启动时间。
+
+### 1. 选择合适的基础镜像
+
+| 镜像类型 | 大小 | 适用场景 |
+|---|---|---|
+| `alpine` | `~5MB` | 追求极致体积 |
+| `slim` | `~50-100MB` | 需要 glibc 兼容性 |
+| `distroless` | `~10-20MB` | 生产环境，安全性优先 |
+| `full` | `数百MB` | 开发调试 |
+
+```dockerfile
+# 生产推荐：使用 distroless
+FROM gcr.io/distroless/nodejs18-debian11
+
+# 次选：Alpine
+FROM node:18-alpine
+```
+
+### 2. 多阶段构建
+
+```dockerfile title="Dockerfile"
+# 构建阶段
+FROM maven:3.9-eclipse-temurin-17 AS builder
+WORKDIR /app
+COPY pom.xml .
+COPY src ./src
+RUN mvn package -DskipTests
+
+# 运行阶段
+FROM eclipse-temurin:17-jre-alpine
+COPY --from=builder /app/target/myapp.jar /app.jar
+ENTRYPOINT ["java", "-jar", "/app.jar"]
+```
+
+### 3. 减少层数
+
+```dockerfile
+# 合并 RUN 指令
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        curl \
+        git \
+        ca-certificates && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# 使用单行合并
+RUN apt-get update && apt-get install -y --no-install-recommends curl git && apt-get clean && rm -rf /var/lib/apt/lists/*
+```
+
+### 4. 清理不必要的文件
+
+```dockerfile
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends my-package && \
+    # 清理缓存和文档
+    rm -rf /var/lib/apt/lists/* \
+           /usr/share/doc/* \
+           /usr/share/man/* \
+           /tmp/* \
+           /var/tmp/*
+```
+
+## 构建优化
+
+### 利用层缓存
+
+Docker 按顺序使用缓存，一旦某层变化，后续层全部重新构建：
+
+```dockerfile
+# 好的顺序：依赖先变，代码后变
+COPY package*.json ./
+RUN npm ci --only=production
+COPY . .
+
+# 不好的顺序：代码变一点就要重新 npm install
+COPY . .
+RUN npm ci --only=production
+```
+
+### BuildKit 缓存挂载
+
+```dockerfile
+# npm 缓存持久化
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --only=production
+
+# pip 缓存持久化
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r requirements.txt
+
+# go 模块缓存
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go build -o myapp .
+```
+
+### 并行构建
+
+BuildKit 自动分析依赖关系并并行构建独立步骤：
+
+```bash
+# 启用 BuildKit
+export DOCKER_BUILDKIT=1
+
+# 或使用 buildx
+docker buildx build -t myapp .
+```
+
+## 网络优化
+
+### 使用非默认网桥
+
+自定义网桥性能优于默认网桥：
+
+```bash
+# 创建自定义网桥
+docker network create --driver bridge mynet
+
+# 使用
+docker run -d --network mynet --name app nginx:alpine
+```
+
+### 避免 NAT 开销
+
+同主机容器间通信，默认网桥需要通过 NAT：
+
+```bash
+# 更好的方式：使用自定义网桥
+docker network create mynet
+docker run -d --network mynet --name web nginx:alpine
+docker run -d --network mynet --name api node:alpine
+# web 和 api 直接通过二层交换通信，无 NAT
+```
+
+### DNS 缓存
+
+高频 DNS 查询会影响性能：
+
+```bash
+# 使用自定义 DNS 服务器
+docker run -d \
+  --dns=8.8.8.8 \
+  --dns=8.8.4.4 \
+  --name app \
+  nginx:alpine
+```
+
+## 存储优化
+
+### 优先使用 Volume
+
+频繁写入的数据使用 Volume：
+
+```bash
+# 写入 Volume（绕过 CoW）
+docker run -d -v myvolume:/data --name app nginx:alpine
+
+# 避免写入容器可写层
+# docker run -d --name app nginx:alpine
+# docker exec app sh -c "echo data >> /data/file"  ← 不好
+```
+
+### 选择合适的存储驱动
+
+| 驱动 | 写入性能 | 推荐场景 |
+|---|---|---|
+| `overlay2` | 好 | 大多数场景 |
+| `btrfs` | 好 | 需要压缩 |
+| `zfs` | 好 | 需要配额/校验 |
+| `devicemapper` | 好 | 遗留系统 |
+
+### tmpfs 用于临时数据
+
+```bash
+# 临时文件使用 tmpfs
+docker run -d \
+  --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+  --name app \
+  nginx:alpine
+```
+
+## 资源优化
+
+### 合理设置资源限制
+
+```bash
+# CPU 绑定避免上下文切换
+docker run -d --cpuset-cpus="0,1" --name app nginx:alpine
+
+# 内存限制避免 OOM
+docker run -d -m="512m" --memory-swap="1g" --name app nginx:alpine
+
+# PID 限制防止 fork 炸弹
+docker run -d --pids-limit=100 --name app nginx:alpine
+```
+
+### 禁用不必要的 capabilities
+
+```bash
+docker run -d --cap-drop=ALL --name app nginx:alpine
+```
+
+## 容器运行时优化
+
+### 容器数量控制
+
+每个容器都有系统开销，合理的容器数量：
+
+| 应用类型 | 建议 |
+|---|---|
+| 高性能服务 | 独占 CPU 核心 |
+| Web 应用 | 1-2 核/容器 |
+| 后台任务 | 资源按需分配 |
+| 数据库 | 根据并发量配置 |
+
+### 健康检查优化
+
+避免频繁健康检查影响性能：
+
+```bash
+# 合理的检查间隔
+docker run -d \
+  --health-cmd="curl -f http://localhost/health || exit 1" \
+  --health-interval=30s \
+  --health-timeout=3s \
+  --health-retries=3 \
+  --name app \
+  nginx:alpine
+```
+
+## 监控与诊断
+
+### 查看资源使用
+
+```bash
+# 实时资源统计
+docker stats
+
+# 查看特定容器
+docker stats --no-stream container-name
+
+# 格式化输出
+docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}"
+```
+
+### 性能分析
+
+```bash
+# 查看容器进程
+docker top container-name
+
+# 查看容器详细配置
+docker inspect container-name
+
+# 查看容器事件
+docker events --since '10m'
+```
+
+### 延迟测试
+
+```bash
+# 测试容器网络延迟
+docker exec container-a ping -c 10 container-b
+
+# 测试存储 I/O
+docker exec container-name dd if=/dev/zero of=/tmp/test bs=1M count=100 oflag=direct
+```
+
+## 完整优化配置示例
+
+```bash title="docker-compose.yml"
+services:
+  web:
+    image: myapp:latest
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+    networks:
+      - frontend
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  api:
+    image: myapi:latest
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 1G
+        reservations:
+          cpus: '1.0'
+          memory: 512M
+    healthcheck:
+      test: ["CMD-SHELL", "node /app/check.js"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks:
+      - frontend
+      - backend
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:15-alpine
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+networks:
+  frontend:
+    driver: bridge
+  backend:
+    driver: bridge
+
+volumes:
+  db-data:
+```
+
+## 总结
+
+Docker 性能优化涉及多个层面：
+
+| 层面 | 优化点 |
+|---|---|
+| 镜像 | 小体积镜像、多阶段构建、减少层数 |
+| 构建 | BuildKit、缓存挂载、并行构建 |
+| 网络 | 自定义网桥、DNS 缓存 |
+| 存储 | Volume、tmpfs |
+| 资源 | 合理限制、CPU 绑定 |
+| 监控 | stats、健康检查 |
+
+性能优化是持续的过程，需要根据实际负载和监控数据不断调整。

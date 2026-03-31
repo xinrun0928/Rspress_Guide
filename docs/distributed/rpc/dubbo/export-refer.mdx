@@ -1,0 +1,433 @@
+# Dubbo 服务导出与引用
+
+Dubbo 服务启动后，是如何暴露给消费者发现的？消费者又是如何找到并调用远程服务的？
+
+这背后就是 Dubbo 的服务导出（Export）和引用（Refer）机制在起作用。
+
+## 服务导出（Export）
+
+服务导出是 Provider 启动时，将本地服务暴露为远程服务的过程。
+
+### 服务导出流程
+
+```yaml
+# 服务导出流程
+┌─────────────────────────────────────────────────────────────┐
+│                     服务导出流程                             │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  1. Spring 容器启动完成                                     │
+│     │                                                      │
+│     │  @Service 注解被扫描                                  │
+│     ▼                                                      │
+│  2. ServiceBean.export() 被调用                            │
+│     │                                                      │
+│     │  解析配置（超时、重试、协议等）                         │
+│     ▼                                                      │
+│  3. 创建 Invoker                                            │
+│     │                                                      │
+│     │  将本地服务封装为 Dubbo Invoker                        │
+│     ▼                                                      │
+│  4. 创建 Exporter                                           │
+│     │                                                      │
+│     │  根据协议创建Exporter                                │
+│     ▼                                                      │
+│  5. 打开 Server                                             │
+│     │                                                      │
+│     │  Netty Server 启动，监听端口                         │
+│     ▼                                                      │
+│  6. 注册到注册中心                                           │
+│     │                                                      │
+│     │  将 URL 注册到 Zookeeper/Nacos                       │
+│     ▼                                                      │
+│  7. 服务导出完成                                             │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 服务导出源码解析
+
+```java
+// ServiceBean 导出服务
+public class ServiceBean<T> extends ServiceConfig<T>
+        implements ApplicationListener<ContextRefreshedEvent> {
+
+    @Override
+    public void onApplicationEvent(ContextRefreshedEvent event) {
+        // Spring 容器刷新完成后导出服务
+        if (!isExported() && !isUnexported()) {
+            export();
+        }
+    }
+
+    @Override
+    public void export() {
+        // 延迟导出配置
+        if (delay != null && delay > 0) {
+            // 延迟导出
+            delayExportExecutor.schedule(() -> doExport(), delay, TimeUnit.MILLISECONDS);
+        } else {
+            doExport();
+        }
+    }
+
+    protected synchronized void doExport() {
+        // 检查配置
+        checkAndUpdateSubProperties();
+
+        // 构建服务 URL
+        URL serviceUrl = buildProviderUrl();
+
+        // 遍历所有协议，导出服务
+        for (Protocol protocol : protocols) {
+            // 如果是 Injvm 协议，跳过
+            if (ExtensionLoader.getExtensionLoader(Protocol.class)
+                    .hasExtension(Constants.INJVM_PROTOCOL)) {
+                continue;
+            }
+
+            // 创建 Invoker
+            Invoker<?> invoker = proxyFactory.getInvoker(ref, interfaceClass, serviceUrl);
+
+            // 创建 Exporter
+            Exporter<?> exporter = protocol.export(invoker);
+
+            // 添加到导出器列表
+            exporters.add(exporter);
+        }
+
+        // 注册到注册中心
+        register();
+    }
+
+    // 注册到注册中心
+    private void register() {
+        // 将服务 URL 注册到注册中心
+        registry.register(serviceUrl);
+    }
+}
+```
+
+### 延迟导出配置
+
+```yaml
+# 延迟导出服务
+dubbo:
+  provider:
+    delay: 5000    # 延迟 5 秒导出（-1 表示延迟到 Spring 容器刷新后）
+```
+
+### 多协议导出
+
+```java
+// 同时暴露多个协议
+@Service(protocol = {"dubbo", "rest", "grpc"})
+public class UserServiceImpl implements UserService {
+
+}
+```
+
+## 服务引用（Refer）
+
+服务引用是 Consumer 启动时，获取远程服务代理的过程。
+
+### 服务引用流程
+
+```yaml
+# 服务引用流程
+┌─────────────────────────────────────────────────────────────┐
+│                     服务引用流程                             │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  1. Spring 容器启动完成                                     │
+│     │                                                      │
+│     │  @Reference 注解被扫描                                │
+│     ▼                                                      │
+│  2. ReferenceBean.getObject() 被调用                       │
+│     │                                                      │
+│     │  构建消费者 URL                                       │
+│     ▼                                                      │
+│  3. 订阅注册中心                                            │
+│     │                                                      │
+│     │  订阅 Provider 服务列表                              │
+│     ▼                                                      │
+│  4. 获得 Provider 列表                                     │
+│     │                                                      │
+│     │  从注册中心获取可用服务列表                            │
+│     ▼                                                      │
+│  5. 创建 Invoker                                            │
+│     │                                                      │
+│     │  创建 Cluster Invoker                                │
+│     ▼                                                      │
+│  6. 创建代理                                                │
+│     │                                                      │
+│     │  通过 ProxyFactory 创建代理                          │
+│     ▼                                                      │
+│  7. 返回代理                                                │
+│     │                                                      │
+│     │  注入到 Bean 中                                      │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 服务引用源码解析
+
+```java
+// ReferenceBean 引用服务
+public class ReferenceBean<T> extends ReferenceConfig<T>
+        implements FactoryBean, ApplicationContextAware,
+                   InitializingBean, DisposableBean {
+
+    @Override
+    public Object getObject() throws Exception {
+        return get();
+    }
+
+    @Override
+    public T get() {
+        // 检查是否已初始化
+        if (ref == null) {
+            init();
+        }
+        return ref;
+    }
+
+    private synchronized void init() {
+        // 构建消费者 URL
+        URL consumerUrl = buildConsumerUrl();
+
+        // 订阅注册中心
+        subscribe(consumerUrl);
+
+        // 创建 Invoker
+        Invoker<T> invoker = protocol.refer(interfaceClass, consumerUrl);
+
+        // 创建代理
+        ref = proxyFactory.getProxy(invoker);
+
+        return ref;
+    }
+
+    // 订阅注册中心
+    private void subscribe(URL url) {
+        // 向注册中心订阅服务
+        // 注册中心会推送 Provider 列表变化
+        registry.subscribe(url, new NotifyListener() {
+            @Override
+            public void notify(List<URL> urls) {
+                // Provider 列表变化时更新 Invoker
+                invokerList.addAll(urls);
+                refreshInvoker();
+            }
+        });
+    }
+}
+```
+
+### 直连提供者
+
+```yaml
+# 直连模式：绕过注册中心，直接指定 Provider 地址
+# 适合开发测试环境
+@Reference(
+    url = "dubbo://192.168.1.100:20880"
+)
+private UserService userService;
+```
+
+```yaml
+# application.yml
+dubbo:
+  consumer:
+    # 直连多个 Provider
+    url: dubbo://192.168.1.100:20880?dubbo.client.as_grizzly_jdk_client=true
+```
+
+## 服务 URL
+
+Dubbo 使用 URL 来描述服务信息，理解 URL 结构对于调试和排错非常重要。
+
+### URL 结构
+
+```yaml
+# Dubbo URL 结构
+┌─────────────────────────────────────────────────────────────┐
+│                     Dubbo URL 结构                          │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  dubbo://192.168.1.100:20880/com.example.UserService      │
+│  ?version=1.0.0&group=prod&timeout=3000&retries=2          │
+│                                                             │
+│  ┌────────────┬────────────────────────────────────────┐  │
+│  │ Protocol   │    dubbo://                             │  │
+│  ├────────────┼────────────────────────────────────────┤  │
+│  │   Host     │    192.168.1.100:20880                  │  │
+│  ├────────────┼────────────────────────────────────────┤  │
+│  │ Interface  │    com.example.UserService             │  │
+│  ├────────────┼────────────────────────────────────────┤  │
+│  │ Parameters │    version=1.0.0                       │  │
+│  │            │    group=prod                          │  │
+│  │            │    timeout=3000                        │  │
+│  │            │    retries=2                           │  │
+│  └────────────┴────────────────────────────────────────┘  │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 常见 URL 参数
+
+```yaml
+# Provider 端 URL 参数
+参数              说明                  默认值
+─────────────────────────────────────────────────────────────────
+interface         接口名                必填
+version           版本号                0.0.0
+group             分组                  -
+method           方法名                 -
+timeout          调用超时              1000ms
+retries          重试次数              2
+weight           权重                  100
+loadbalance     负载均衡策略           random
+active          最大并发调用数         0（无限制）
+executes        服务提供者最大并发数    0（无限制）
+```
+
+```yaml
+# Consumer 端 URL 参数
+参数              说明                  默认值
+─────────────────────────────────────────────────────────────────
+interface         接口名                必填
+version           版本号                0.0.0
+group            分组                  -
+method           方法名                 -
+timeout          调用超时              1000ms
+retries          重试次数              2
+check            启动时检查             true
+lazy            懒连接                 false
+```
+
+## 服务版本与分组
+
+版本和分组是实现服务隔离和多版本共存的重要手段。
+
+### 服务版本
+
+```java
+// Provider 发布多个版本
+@Service(version = "1.0.0")
+public class UserServiceImplV1 implements UserService {
+    // v1 实现
+}
+
+@Service(version = "2.0.0")
+public class UserServiceImplV2 implements UserService {
+    // v2 实现
+}
+
+// Consumer 指定版本
+@Reference(version = "2.0.0")
+private UserService userService;
+
+// Consumer 不指定版本，调用所有版本
+@Reference
+private UserService userService;
+```
+
+### 服务分组
+
+```java
+// Provider 按分组发布
+@Service(group = "prod")
+public class UserServiceImplProd implements UserService {
+    // 生产环境实现
+}
+
+@Service(group = "test")
+public class UserServiceImplTest implements UserService {
+    // 测试环境实现
+}
+
+// Consumer 指定分组
+@Reference(group = "prod")
+private UserService userService;
+
+// Consumer 合并多个分组
+@Reference(group = "prod,test")
+private UserService userService;
+
+// Consumer 使用通配符
+@Reference(group = "*")
+private UserService userService;
+```
+
+### 版本 + 分组组合
+
+```yaml
+# 版本和分组组合
+┌─────────────────────────────────────────────────────────────┐
+│                     服务版本分组                            │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  Provider                                                   │
+│  ┌─────────────────────────────────────────────────────┐  │
+│  │ group=prod, version=1.0.0  → UserServiceImpl-1     │  │
+│  │ group=prod, version=2.0.0  → UserServiceImpl-2     │  │
+│  │ group=test,  version=1.0.0  → UserServiceImpl-3     │  │
+│  └─────────────────────────────────────────────────────┘  │
+│                                                             │
+│  Consumer                                                   │
+│  ┌─────────────────────────────────────────────────────┐  │
+│  │ group=prod, version=*      → 调用 prod 所有版本     │  │
+│  │ group=*, version=1.0.0     → 调用 version=1.0.0    │  │
+│  │ group=prod;test, version=* → 合并 prod 和 test     │  │
+│  └─────────────────────────────────────────────────────┘  │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## 服务启动检查
+
+```yaml
+# 服务启动检查
+dubbo:
+  consumer:
+    # 启动时检查 Provider 是否可用
+    check: false           # 默认 true，启动时报错
+    # 启动时不检查注册中心
+    registry: check: false
+```
+
+```java
+// 禁用启动检查
+@Reference(check = false)
+private UserService userService;
+
+// 或者全局禁用
+@Configuration
+public class DisableCheckConfig {
+    @Bean
+    public ConsumerConfig consumerConfig() {
+        ConsumerConfig config = new ConsumerConfig();
+        config.setCheck(false);
+        return config;
+    }
+}
+```
+
+## 总结
+
+服务导出和引用是 Dubbo 实现透明 RPC 调用的核心机制。
+
+**核心要点回顾：**
+
+- 服务导出：Provider 将本地服务暴露为远程服务
+- 服务引用：Consumer 获取远程服务的代理
+- Dubbo 使用 URL 描述服务信息
+- 版本和分组可以实现服务隔离和多版本共存
+- 直连模式可以绕过注册中心
+
+---
+
+**下一章预告：**
+
+Dubbo 的扩展性是其核心优势之一。Dubbo 如何通过 SPI 机制实现框架的零侵入式扩展？下一章，我们将深入探讨 Dubbo 的 SPI 扩展机制。

@@ -1,0 +1,419 @@
+# Loki 日志系统
+
+你有没有这种感觉：Elasticsearch 存储日志太贵了，但又舍不得放弃强大的查询能力？
+
+Grafana Labs 推出的 Loki 就是来解决这个痛点的——它借鉴了 Prometheus 的标签索引思路，只索引元数据，不索引日志内容，从而实现极低的存储成本。
+
+## Loki 核心理念
+
+### 与 ELK 的本质区别
+
+| 维度 | Elasticsearch | Loki |
+|---|---|---|
+| 索引方式 | 全文索引 | 标签索引 |
+| 存储内容 | 原始日志 + 索引 | 原始日志（Chunk）+ 标签索引 |
+| 存储成本 | 高 | 低（约为 ES 的 1/10） |
+| 查询能力 | 全文检索 | 基于标签的检索 |
+| 适用场景 | 复杂日志分析 | 日志聚合、排查问题 |
+
+### Loki 数据模型
+
+```logql
+{service="order-service", namespace="production", pod=~"order-.*"}
+  |= "ERROR"
+  |= "orderId=12345"
+  | json
+  | line_format "{{.timestamp}} {{.level}} {{.message}}"
+```
+
+- **Label**：标签，类比 Prometheus，用于快速筛选
+- **Stream**：同一组标签的所有日志
+- **Chunk**：日志块，按时间分片
+
+## 架构设计
+
+### 组件架构
+
+```
+Promtail（收集）→ Loki Distributor → Ingester → AWS S3/GCS/MinIO
+                                                         │
+                        Loki Query Frontend ←────────────┘
+                                    │
+                              Grafana UI
+```
+
+| 组件 | 职责 |
+|---|---|
+| Distributor | 接收日志流，验证标签，分发到 Ingester |
+| Ingester | 接收日志，压缩存储，定期刷新到对象存储 |
+| Querier | 查询日志，支持标签过滤 |
+| Query Frontend | 查询分片、缓存、负载均衡 |
+
+### 部署模式
+
+```yaml title="loki-distributed.yaml"
+apiVersion: grafana.com/v1alpha1
+kind: Loki
+metadata:
+  name: loki
+spec:
+  image: grafana/loki:2.9.2
+  
+  replicationFactor: 1
+  
+  limits_config:
+    enforce_metric_name: false
+    reject_old_samples: true
+    reject_old_samples_max_age: 168h
+  
+  storage_config:
+    boltdb_shipper:
+      active_index_directory: /data/index
+      cache_location: /data/index-cache
+    aws:
+      bucketnames: loki-storage
+      endpoint: s3.amazonaws.com
+  
+  schema_config:
+    configs:
+    - from: 2024-01-01
+      store: boltdb-shipper
+      object_store: aws
+      schema: v11
+      index:
+        prefix: loki_index_
+```
+
+## Promtail 日志收集
+
+### Kubernetes 部署
+
+```yaml title="promtail-daemonset.yaml"
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: promtail
+  namespace: monitoring
+spec:
+  selector:
+    matchLabels:
+      app: promtail
+  template:
+    spec:
+      containers:
+      - name: promtail
+        image: grafana/promtail:2.9.2
+        args:
+        - -config.file=/etc/promtail/promtail.yaml
+        volumeMounts:
+        - name: config
+          mountPath: /etc/promtail
+        - name: run
+          mountPath: /run/promtail
+        - name: docker
+          mountPath: /var/lib/docker/logs
+          readOnly: true
+        - name: pods
+          mountPath: /var/log/pods
+          readOnly: true
+        - name: syslog
+          mountPath: /var/log/syslog
+          readOnly: true
+      volumes:
+      - name: config
+        configMap:
+          name: promtail
+      - name: run
+        hostPath:
+          path: /run/promtail
+      - name: docker
+        hostPath:
+          path: /var/lib/docker/containers
+      - name: pods
+        hostPath:
+          path: /var/log/pods
+      - name: syslog
+        hostPath:
+          path: /var/log/syslog
+```
+
+### Promtail 配置
+
+```yaml title="promtail-configmap.yaml"
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: promtail
+  namespace: monitoring
+data:
+  promtail.yaml: |
+    server:
+      http_listen_port: 3101
+    
+    positions:
+      filename: /run/promtail/positions.yaml
+    
+    client:
+      url: http://loki-gateway:3100/loki/api/v1/push
+    
+    scrape_configs:
+    # 收集 Kubernetes Pod 日志
+    - job_name: kubernetes-pods
+      pipeline_stages:
+      - json:
+          expressions:
+            timestamp: timestamp
+            message: message
+            level: level
+      kubernetes_sd_configs:
+      - role: pod
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+      - source_labels: [__meta_kubernetes_namespace]
+        target_label: namespace
+      - source_labels: [__meta_kubernetes_pod_container_name]
+        target_label: container
+      - action: labelmap
+        regex: __meta_kubernetes_pod_label_(.+)
+```
+
+### 服务发现
+
+```yaml title="promtail-servicediscovery.yaml"
+scrape_configs:
+- job_name: kubernetes-pods
+  kubernetes_sd_configs:
+  - role: pod
+    namespaces:
+      names:
+      - production
+      - staging
+  
+  relabel_configs:
+  # 添加服务标签
+  - source_labels: [__meta_kubernetes_pod_label_app]
+    target_label: service
+  
+  # 过滤特定容器
+  - source_labels: [__meta_kubernetes_pod_container_name]
+    action: keep
+    regex: (order-service|payment-service|inventory-service)
+  
+  # 添加环境标签
+  - source_labels: [__meta_kubernetes_namespace]
+    target_label: env
+    replacement: ${1}
+```
+
+## LogQL 查询语言
+
+### 基础查询
+
+```logql
+# 查询所有日志
+{service="order-service"}
+
+# 带标签过滤
+{service="order-service", namespace="production"}
+
+# 关键词搜索
+{service="order-service"} |= "ERROR"
+
+# 排除关键词
+{service="order-service"} != "DEBUG"
+
+# 正则匹配
+{service="order-service"} |~ "orderId=\d{6}"
+```
+
+### 日志格式化
+
+```logql
+# JSON 解析
+{service="order-service"} | json | level="error"
+
+# 提取字段
+{service="order-service"} | json | line_format "{{.timestamp}} {{.message}}"
+
+# 正则提取
+{service="order-service"} | regex "orderId=(?P<order_id>\d+)"
+
+# 过滤提取的字段
+{service="order-service"} | json | line_format "{{.timestamp}} [{{.level}}] {{.message}}"
+```
+
+### 聚合查询
+
+```logql
+# 统计每秒日志量
+rate({service="order-service"}[1m])
+
+# 统计错误日志数量
+count_over_time({service="order-service"} |= "ERROR"[5m])
+
+# Top N 服务
+topk(5, sum by (service) (rate({namespace="production"}[5m])))
+```
+
+## 与 Grafana 集成
+
+### 配置数据源
+
+```yaml title="grafana-datasource.yaml"
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-datasources
+  namespace: monitoring
+data:
+  loki.yaml: |
+    apiVersion: 1
+    datasources:
+    - name: Loki
+      type: loki
+      access: proxy
+      url: http://loki-gateway:3100
+      jsonData:
+        timeInterval: "30s"
+        derivedFields:
+        - name: TraceID
+          matcherRegex: "traceId=(\\w+)"
+          url: http://jaeger-query:16686/trace/$${1}
+```
+
+### Explore 查询面板
+
+```json
+{
+  "expr": "{service=\"order-service\", namespace=\"production\"} |= \"ERROR\" | json",
+  "legendFormat": "{{pod}}"
+}
+```
+
+## 存储配置
+
+### AWS S3
+
+```yaml title="loki-s3-storage.yaml"
+storage_config:
+  aws:
+    bucketnames: my-loki-storage
+    endpoint: s3.amazonaws.com
+    region: us-east-1
+    s3forcepathstyle: false
+```
+
+### MinIO（私有部署）
+
+```yaml title="loki-minio-storage.yaml"
+storage_config:
+  aws:
+    bucketnames: loki
+    endpoint: minio.minio.svc.cluster.local:9000
+    access_key_id: minioadmin
+    secret_access_key: minioadmin
+    s3forcepathstyle: true
+    region: us-east-1
+```
+
+## 性能调优
+
+### Ingester 配置
+
+```yaml title="loki-ingester.yaml"
+limits_config:
+  # 最大标签数量
+  max_label_name_length: 1024
+  max_label_value_length: 2048
+  max_label_pairs_per_stream: 16384
+  
+  # 分块配置
+  chunk_block_size: 262144
+  chunk_encoding: gzip
+  max_chunk_age: 15m
+
+ingester:
+  chunk_target_size: 2097152
+  flush_check_period: 30s
+  max_chunk_age: 15m
+  wal:
+    enabled: true
+    dir: /var/wal
+```
+
+### Querier 配置
+
+```yaml title="loki-querier.yaml"
+querier:
+  # 并行查询
+  max_concurrent: 4
+  
+  # 查询范围限制
+  query_timeout: 300s
+  
+  # 引擎配置
+  engine:
+    max_look_back_period: 30d
+
+query_range:
+  # 查询分片
+  parallelise_shardable_queries: true
+  max_retries: 3
+```
+
+## 与 Prometheus 统一管理
+
+### Prometheus Agent 模式
+
+```yaml title="prometheus-agent.yaml"
+server:
+  config:
+    scrape_configs:
+    - job_name: 'prometheus'
+      static_configs:
+      - targets: ['localhost:9090']
+
+    # 与 Loki 集成
+    remote_write:
+    - url: http://loki:3100/loki/api/v1/push
+```
+
+### 日志与指标关联
+
+```logql
+# 查询延迟高的请求的日志
+{service="order-service"} 
+  | json 
+  | __error__ = ""
+  | latency > 1000
+
+# 同一时间窗口关联
+{service="order-service"} 
+  and 
+rate({service="order-service"}[1m]) > 0.5
+```
+
+## 总结
+
+Loki 是云原生时代的日志解决方案：
+
+| 特点 | 说明 |
+|---|---|
+| 成本低 | 只索引标签，不索引内容 |
+| 云原生 | 与 Prometheus、Grafana 原生集成 |
+| 水平扩展 | 分布式架构，支持大规模部署 |
+| 简单运维 | 不需要复杂的索引管理 |
+
+适用场景：
+
+- Kubernetes 环境日志聚合
+- 需要与 Prometheus 指标关联
+- 日志存储成本敏感
+
+不适用的场景：
+
+- 需要全文检索的复杂日志分析
+- 超大规模的日志存储（需要更复杂的架构）
+
+Loki 的出现，让日志变得简单且经济。

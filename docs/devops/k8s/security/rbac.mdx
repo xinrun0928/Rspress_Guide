@@ -1,0 +1,359 @@
+# 为什么开发账号可以删除生产环境的 Pod？——RBAC 权限管理的坑
+
+凌晨三点，你被一条告警惊醒：生产环境有一个 Deployment 的所有 Pod 都被删除了。你紧急排查日志，发现是一个开发账号的操作——他只是想查看某个 Pod 的日志，却意外获得了删除权限。
+
+这不是孤例。在 K8s 集群中，RBAC 配置错误是导致安全事故的主要原因之一。本质问题是：**权限放得太宽，而管理员又疏于审计**。
+
+## RBAC 是什么
+
+RBAC（Role-Based Access Control）是 K8s 基于角色的访问控制机制，用于管理「谁可以对哪些资源做什么操作」。它由四个核心概念组成：
+
+| 概念 | 说明 | 作用域 |
+|---|---|---|
+| Role | 权限集合 | 特定 Namespace |
+| ClusterRole | 权限集合 | 整个集群 |
+| RoleBinding | 将 Role 绑定到主体 | 特定 Namespace |
+| ClusterRoleBinding | 将 ClusterRole 绑定到主体 | 整个集群 |
+
+:::tip Role vs ClusterRole
+Role 只能引用本 Namespace 内的资源，ClusterRole 可以引用集群级别的资源（Nodes、PersistentVolumes、Namespaces 本身），也可以引用 Non-resource URLs（如 `/healthz`）。
+:::
+
+## 核心概念详解
+
+### 1. 权限的基本组成
+
+K8s 的每个 API 权限由三个要素构成：**资源（Resource）**、**动作（Verb）**、**资源名称（ResourceName，可选）**。
+
+```yaml title="Role 示例"
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: default
+  name: pod-reader
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch"]
+```
+
+这个 Role 允许读取 default Namespace 下的 Pod。如果想限制到特定 Pod，加上 `resourceNames`：
+
+```yaml title="精确到资源名的 Role"
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: default
+  name: specific-pod-reader
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  resourceNames: ["my-app-pod"]
+  verbs: ["get", "watch"]
+```
+
+### 2. 支持的 Verbs 动作
+
+K8s API 的操作分为以下几类：
+
+| Verb | 对应 HTTP 方法 | 说明 |
+|---|---|---|
+| `get` | GET | 获取单个资源 |
+| `list` | GET (带 fieldSelector) | 列出资源集合 |
+| `watch` | GET (带 watch) | 监听资源变化 |
+| `create` | POST | 创建新资源 |
+| `update` | PUT | 更新已有资源 |
+| `patch` | PATCH | 部分更新资源 |
+| `delete` | DELETE | 删除单个资源 |
+| `deletecollection` | DELETE | 批量删除资源 |
+
+:::warning deletecollection 的危险性
+`deletecollection` 是一个极其危险的权限，允许删除整个类型的资源。如果开发账号拥有这个权限，配合 kubectl 批量删除操作，可能导致灾难性后果。
+:::
+
+### 3. API Groups
+
+K8s API 按照功能分为多个 API Groups：
+
+| API Group | 示例资源 |
+|---|---|
+| `""`（核心组） | Pod、Service、ConfigMap、Secret、Deployment |
+| `apps` | Deployment、DaemonSet、StatefulSet、ReplicaSet |
+| `batch` | Job、CronJob |
+| `networking.k8s.io` | NetworkPolicy、Ingress |
+| `rbac.authorization.k8s.io` | Role、RoleBinding、ClusterRole |
+| `storage.k8s.io` | StorageClass |
+| `autoscaling` | HorizontalPodAutoscaler |
+
+### 4. Subject 主体类型
+
+RoleBinding 和 ClusterRoleBinding 将权限绑定到三种主体：
+
+| 类型 | 说明 | 标识方式 |
+|---|---|---|
+| `User` | 普通用户账号 | 字符串名称 |
+| `Group` | 用户组 | 字符串名称 |
+| `ServiceAccount` | 服务账号 | namespace/name |
+
+## RoleBinding vs ClusterRoleBinding
+
+### RoleBinding：绑定到 Namespace 级别
+
+RoleBinding 将 Role（或 ClusterRole）绑定到特定 Namespace 内的主体：
+
+```yaml title="RoleBinding 示例"
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: read-pods-binding
+  namespace: default
+subjects:
+# 绑定到用户
+- kind: User
+  name: alice
+  apiGroup: rbac.authorization.k8s.io
+# 绑定到服务账号
+- kind: ServiceAccount
+  name: my-app-sa
+  namespace: production
+roleRef:
+  kind: Role
+  name: pod-reader
+  apiGroup: rbac.authorization.k8s.io
+```
+
+### ClusterRoleBinding：绑定到集群级别
+
+ClusterRoleBinding 将 ClusterRole 绑定到整个集群的主体：
+
+```yaml title="ClusterRoleBinding 示例"
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cluster-admin-binding
+subjects:
+- kind: Group
+  name: system:masters
+  apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: cluster-admin
+  apiGroup: rbac.authorization.k8s.io
+```
+
+:::danger system:masters 组的危险性
+`system:masters` 组拥有 `cluster-admin` ClusterRole，是 K8s 最高权限组。任何被绑定到这个组的账号可以执行任何操作，包括删除整个集群。**永远不要把业务账号绑定到这个组**。
+:::
+
+## ClusterRole 的特殊能力
+
+ClusterRole 有一个独特优势：可以绑定给 RoleBinding，在 Namespace 范围内生效：
+
+```yaml title="使用 RoleBinding 引用 ClusterRole"
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: view-all-pods
+  namespace: default
+subjects:
+- kind: User
+  name: bob
+  apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: view  # 内置只读 ClusterRole
+  apiGroup: rbac.authorization.k8s.io
+```
+
+这种模式的好处是：定义一次 ClusterRole，在多个 Namespace 中复用。
+
+## 内置 ClusterRole
+
+K8s 提供了一组预定义的 ClusterRole，可以直接使用：
+
+| ClusterRole | 权限 |
+|---|---|
+| `cluster-admin` | 超级管理员，所有权限 |
+| `admin` | Namespace 管理员（通过 RoleBinding 使用） |
+| `edit` | 读写 Namespace 内大多数资源 |
+| `view` | 只读 Namespace 内大多数资源 |
+
+:::tip 推荐实践
+对于普通开发者，使用 `view` ClusterRole 绑定到对应 Namespace。需要在特定场景下临时授予更多权限时，通过 Time-to-Live（TTL）机制自动回收。
+:::
+
+## 常见 RBAC 坑与避坑指南
+
+### 坑一：ClusterRole 的聚合
+
+K8s 1.9 引入了 RBAC 聚合，允许将多个 Role 的权限聚合到一个 ClusterRole：
+
+```yaml title="聚合示例"
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: custom-reader
+aggregationRule:
+  clusterRoleSelectors:
+  - matchLabels:
+      rbac.example.com/aggregate-to-reader: "true"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: custom-pod-reader
+  labels:
+    rbac.example.com/aggregate-to-reader: "true"
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+```
+
+这个 ClusterRole 的实际权限是自身权限加上所有匹配标签 Role 的权限。**如果修改聚合标签，需要等待几秒钟才会生效**。
+
+### 坑二：ServiceAccount 的默认权限
+
+每个 Namespace 有一个默认 ServiceAccount（`default`），但它的 token 默认不会挂载到 Pod（除非 Pod 没有指定 ServiceAccount）。如果 Pod 需要访问 API Server，必须显式创建专用的 ServiceAccount。
+
+### 坑三：RBAC 不控制 Webhook 准入控制器
+
+RBAC 控制的是 API 请求的权限，但**不能阻止恶意镜像、不能防止资源配额滥用**。这些需要依赖其他机制：Pod Security Policy（已废弃，改用 PSS）、LimitRange、OPA Gatekeeper 等。
+
+## 最小权限实践
+
+### 最佳实践清单
+
+```yaml title="命名规范"
+# Role 命名：资源类型 + 动作
+# good: pod-reader, configmap-writer, secret-reader
+# bad: admin, manager, full-access
+```
+
+### 避免 cluster-admin 滥用
+
+过度授权的典型案例：
+
+```yaml title="危险配置：给开发团队 cluster-admin"
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: dev-team-full-access
+subjects:
+- kind: Group
+  name: developer-team
+roleRef:
+  kind: ClusterRole
+  name: cluster-admin  # 危险！
+```
+
+```yaml title="推荐配置：按需授予最小权限"
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: dev-team-view
+  namespace: development
+subjects:
+- kind: Group
+  name: developer-team
+roleRef:
+  kind: ClusterRole
+  name: edit  # 只在 development Namespace
+```
+
+### 跨 Namespace 权限授予
+
+如果一个服务需要访问多个 Namespace，使用 ClusterRole + RoleBinding：
+
+```yaml
+# 定义只读 ClusterRole（包含所有 Namespaces 的只读权限）
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: monitoring-reader
+rules:
+- apiGroups: [""]
+  resources: ["pods", "services"]
+  verbs: ["get", "list", "watch"]
+---
+# 在需要的 Namespace 绑定
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: monitoring-reader-binding
+  namespace: production
+subjects:
+- kind: ServiceAccount
+  name: prometheus
+  namespace: monitoring
+roleRef:
+  kind: ClusterRole
+  name: monitoring-reader
+  apiGroup: rbac.authorization.k8s.io
+```
+
+## 审计与合规
+
+### 查看当前权限
+
+```bash
+# 查看用户的 RoleBinding
+kubectl auth can-i --list --as=alice
+
+# 查看 ServiceAccount 的权限
+kubectl auth can-i get pods --as=system:serviceaccount:production:my-app-sa
+
+# 查看 Namespace 的所有 RoleBinding
+kubectl get rolebindings -n production -o wide
+```
+
+### 自动权限回收
+
+使用工具自动清理孤儿 RBAC：
+
+```bash
+# 使用 rbac-lookup 工具查看权限关系
+rbac-lookup alice -o wide
+
+# 使用 rbac-manager 审计孤儿绑定
+kubectl get clusterrolebindings -o json | jq '.items[] | select(.subjects == null)'
+```
+
+## 面试追问方向
+
+K8s 权限管理是高频面试题，常见的追问方向：
+
+1. **Role 和 ClusterRole 的区别？**
+   - Role 作用于 Namespace，ClusterRole 作用于集群
+   - ClusterRole 可以引用集群级别资源
+
+2. **RoleBinding 和 ClusterRoleBinding 的区别？**
+   - RoleBinding 绑定 Role 或 ClusterRole 到 Namespace 主体
+   - ClusterRoleBinding 只能绑定 ClusterRole 到集群主体
+
+3. **如何实现最小权限？**
+   - 使用 resourceNames 限制具体资源
+   - 避免通配符 `*`
+   - 避免 cluster-admin 滥用
+
+4. **ServiceAccount 的 Token 是如何挂载的？**
+   - TokenRequest API
+   - Projected Volume
+
+## 总结
+
+RBAC 是 K8s 安全的基石。正确使用 RBAC 需要：
+
+- **理解四个核心概念**：Role、ClusterRole、RoleBinding、ClusterRoleBinding
+- **遵循最小权限原则**：避免 `*`，避免 cluster-admin
+- **区分主体类型**：User、Group、ServiceAccount
+- **合理使用内置 ClusterRole**：view、edit、admin
+- **持续审计权限**：定期清理孤儿 RBAC
+
+**面试加分点**：能够结合实际案例说明 RBAC 配置错误的后果，以及如何排查和修复。
+
+**面试追问方向**：
+- 如何审计集群中的 RBAC 配置？
+- RBAC 和 ABAC（Attribute-Based Access Control）的区别？
+- 如何实现基于时间的权限回收？
+- ServiceAccount 和 User 的认证方式有什么区别？

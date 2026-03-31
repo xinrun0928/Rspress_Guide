@@ -1,0 +1,565 @@
+import { Badge } from '@rspress/core/theme';
+
+# K8s 存储卷：Volume 完全指南
+
+emptyDir 和 hostPath 有什么区别？——K8s 存储卷的正确打开方式
+
+在 Kubernetes 中，Pod 是有生命周期的——创建、调度、运行、销毁。Pod 销毁后，如果数据只存在于容器的文件系统里，那数据也就跟着消失了。
+
+这对有状态应用是个致命问题。数据库需要存储数据，日志需要持久化，临时文件需要共享……怎么办？
+
+这就是 K8s **Volume** 存在的意义——为 Pod 提供持久化的存储能力，让数据跨越容器的生命周期。
+
+## 一、Volume 的核心概念
+
+K8s 的 Volume 是一种资源，与 Pod 绑定，而非容器。每个容器都可以挂载同一个 Volume，但要注意的是：**容器的重启不会导致 Volume 数据丢失，只有 Pod 被删除时才会**。
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: my-pod
+spec:
+  containers:
+  - name: app
+    image: nginx
+    volumeMounts:
+    - name: data
+      mountPath: /app/data
+  volumes:
+  - name: data
+    emptyDir: {}
+```
+
+在这个例子中，`volumes` 定义了一个名为 `data` 的 Volume，`volumeMounts` 将其挂载到容器的 `/app/data` 目录。
+
+**关键点**：Volume 定义在 Pod 级别，所以同一个 Pod 内的所有容器都可以访问它（取决于 Volume 类型）。
+
+---
+
+## 二、Volume 类型一览
+
+K8s 支持多种 Volume 类型，大致可以分为几类：
+
+- **临时存储**：emptyDir、configMap、secret、downwardAPI
+- **节点级别持久化**：hostPath
+- **网络存储**：nfs、gcePersistentDisk、awsElasticBlockStore、azureDisk
+- **特殊资源**：projected
+
+### 2.1 emptyDir：临时存储的首选
+
+`emptyDir` 是最简单的一种 Volume 类型——Pod 被调度到节点后，K8s 在该节点上创建一个**空目录**，供容器使用。
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: my-pod
+spec:
+  containers:
+  - name: app
+    image: nginx
+    volumeMounts:
+    - name: cache
+      mountPath: /app/cache
+  volumes:
+  - name: cache
+    emptyDir: {}
+```
+
+**特点**：
+
+- Pod 删除后，Volume 及其数据被自动删除
+- 适合临时存储：缓存、临时合并文件
+- 生命周期与 Pod 绑定，不受容器重启影响
+
+**存储介质**：
+
+默认情况下，emptyDir 使用节点的标准磁盘存储。如果节点有 tmpfs 资源（如内存文件系统），可以指定 `medium: Memory`，将数据存储在内存中。
+
+```yaml
+volumes:
+- name: cache
+  emptyDir:
+    medium: Memory
+    sizeLimit: 100Mi
+```
+
+:::warning 内存限制
+使用 `medium: Memory` 时，`sizeLimit` 是硬性限制。如果容器尝试写入超过限制的数据，写入会失败。生产环境中使用内存存储时务必设置 `sizeLimit`。
+:::
+
+**典型使用场景**：
+
+1. **缓存目录**：应用生成的临时缓存文件
+2. **临时合并**：一个容器从多个来源下载数据，合并后由另一个容器处理
+3. **Web 服务器的临时上传目录**
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cache-app
+spec:
+  containers:
+  - name: fetcher
+    image: busybox
+    command: ["sh", "-c", "while true; do sleep 3600; done"]
+    volumeMounts:
+    - name: shared-data
+      mountPath: /shared
+  - name: processor
+    image: busybox
+    command: ["sh", "-c", "while true; do sleep 3600; done"]
+    volumeMounts:
+    - name: shared-data
+      mountPath: /shared
+  volumes:
+  - name: shared-data
+    emptyDir: {}
+```
+
+这个 Pod 定义了两个容器，通过同一个 `emptyDir` Volume 实现容器间的数据共享。
+
+---
+
+### 2.2 hostPath：节点级别的持久化
+
+`hostPath` 将节点（Node）上的文件或目录挂载到 Pod 中。这是一种**节点级别**的存储，数据存在于特定的节点上。
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: my-pod
+spec:
+  containers:
+  - name: app
+    image: nginx
+    volumeMounts:
+    - name: log-dir
+      mountPath: /var/log/nginx
+  volumes:
+  - name: log-dir
+    hostPath:
+      path: /data/nginx-logs
+      type: Directory
+```
+
+**type 选项**：
+
+| type | 说明 |
+|---|---|
+| `Directory` | 路径必须是已存在的目录 |
+| `DirectoryOrCreate` | 如果路径不存在，自动创建 |
+| `File` | 路径必须是已存在的文件 |
+| `FileOrCreate` | 如果路径不存在，自动创建（父目录不存在则失败） |
+| `Socket` | Unix 域套接字 |
+| `CharDevice` | 字符设备 |
+| `BlockDevice` | 块设备 |
+
+:::danger 安全风险
+`hostPath` 会绕过 K8s 的资源隔离，直接访问宿主机的文件系统。这带来严重的安全风险：
+
+1. 恶意 Pod 可以读取宿主机的敏感文件
+2. Pod 可能修改宿主机的系统配置
+3. 如果 Pod 不是调度到预期节点，数据可能不可用
+
+**最佳实践**：仅在 DaemonSet 中使用 hostPath，且仅用于系统级组件（如日志收集、监控 Agent）。
+:::
+
+**使用场景**：
+
+1. **系统级组件**：日志收集 Agent、监控 Agent（通常以 DaemonSet 部署）
+2. **需要访问节点资源的应用**：如需要访问 Docker 守护进程的容器
+3. **CNI 网络插件**：需要访问节点的网络配置
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: log-collector
+spec:
+  tolerations:
+  - operator: Exists
+  containers:
+  - name: fluentd
+    image: fluentd
+    volumeMounts:
+    - name: varlog
+      mountPath: /var/log
+    - name: dockercontainers
+      mountPath: /var/lib/docker/containers
+      readOnly: true
+  volumes:
+  - name: varlog
+    hostPath:
+      path: /var/log
+  - name: dockercontainers
+    hostPath:
+      path: /var/lib/docker/containers
+```
+
+---
+
+### 2.3 网络存储：nfs
+
+NFS（Network File System）是一种网络文件系统，可以将远程 NFS 服务器的目录挂载到 Pod 中。
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nfs-pod
+spec:
+  containers:
+  - name: app
+    image: nginx
+    volumeMounts:
+    - name: nfs-data
+      mountPath: /app/data
+  volumes:
+  - name: nfs-data
+    nfs:
+      server: nfs-server.example.com
+      path: /shared/data
+```
+
+**特点**：
+
+- 数据存储在网络存储服务器上
+- 多个 Pod 可以同时读写同一份数据
+- 适合需要跨节点共享数据的场景
+- 性能取决于网络状况
+
+**使用场景**：
+
+- 共享配置文件（如多实例 Web 服务器使用同一份静态资源）
+- 日志集中存储
+- 多节点访问的共享存储
+
+---
+
+### 2.4 云厂商存储
+
+K8s 原生支持多种云厂商的块存储：
+
+**GCE Persistent Disk**：
+
+```yaml
+volumes:
+- name: gce-disk
+  gcePersistentDisk:
+    pdName: my-disk
+    fsType: ext4
+    partition: 1
+    readOnly: false
+```
+
+**AWS EBS**：
+
+```yaml
+volumes:
+- name: aws-disk
+  awsElasticBlockStore:
+    volumeID: aws://us-east-1a/vol-1234567890abcdef0
+    fsType: ext4
+    partition: 1
+    readOnly: false
+```
+
+**Azure Disk**：
+
+```yaml
+volumes:
+- name: azure-disk
+  azureDisk:
+    diskName: my-disk
+    diskURI: /subscriptions/xxx/resourceGroups/xxx/providers/Microsoft.Compute/disks/my-disk
+    fsType: ext4
+    readOnly: false
+```
+
+:::warning 云存储限制
+云厂商的块存储通常有以下限制：
+
+1. **单节点挂载**：大多数块存储（如 AWS EBS、GCE PD）只能挂载到**一个节点**，不支持多节点读写
+2. **Zone 限制**：存储卷必须在 Pod 所在的可用区
+3. **动态卷可能需要 StorageClass**：需要预先配置云厂商的存储插件
+:::
+
+---
+
+### 2.5 configMap 与 Secret：作为 Volume 使用
+
+ConfigMap 和 Secret 不仅是存储配置和密钥的方式，还可以作为 Volume 挂载到容器中。
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+data:
+  config.json: |
+    {
+      "database": "mysql",
+      "host": "localhost",
+      "port": 3306
+    }
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: my-pod
+spec:
+  containers:
+  - name: app
+    image: my-app
+    volumeMounts:
+    - name: config
+      mountPath: /app/config
+      readOnly: true
+  volumes:
+  - name: config
+    configMap:
+      name: app-config
+```
+
+挂载后，ConfigMap 的每个 key 对应一个文件：
+
+```
+/app/config/
+├── config.json    # 内容为 ConfigMap 中 config.json 的值
+```
+
+**Secret 作为 Volume**：
+
+```yaml
+volumes:
+- name: credentials
+  secret:
+    secretName: app-credentials
+    items:
+    - key: username
+      path: db-user
+    - key: password
+      path: db-pass
+      mode: 0644
+```
+
+**自动更新**：
+
+ConfigMap 和 Secret 作为 Volume 挂载时，K8s 支持**自动更新**。当 ConfigMap/Secret 更新后，挂载的文件也会更新。
+
+:::warning 更新延迟
+默认情况下，K8s 使用符号链接实现挂载，更新可能需要几十秒才能生效。如果需要立即生效，可以使用 `subPath` 挂载（但这会导致 Pod 重建时无法获取最新数据）。
+:::
+
+---
+
+### 2.6 downwardAPI：Pod 元数据挂载
+
+`downwardAPI` 允许将 Pod 的元数据作为文件挂载到容器中。
+
+```yaml
+volumes:
+- name: pod-info
+  downwardAPI:
+    items:
+    - path: "labels"
+      fieldRef:
+        fieldPath: metadata.labels
+    - path: "annotations"
+      fieldRef:
+        fieldPath: metadata.annotations
+    - path: "namespace"
+      fieldRef:
+        fieldPath: metadata.namespace
+    - path: "pod.yaml"
+      resourceFieldRef:
+        containerName: app
+        resource: limits.cpu
+        divisor: "1"
+```
+
+挂载后的文件结构：
+
+```
+/etc/pod-info/
+├── labels
+├── annotations
+├── namespace
+└── pod.yaml
+```
+
+**可用字段**：
+
+| fieldRef | 说明 |
+|---|---|
+| `metadata.name` | Pod 名称 |
+| `metadata.namespace` | Pod 所在命名空间 |
+| `metadata.uid` | Pod 的 UID |
+| `metadata.labels` | Pod 的所有标签（JSON 格式） |
+| `metadata.annotations` | Pod 的所有注解（JSON 格式） |
+
+---
+
+### 2.7 projected：组合多个 Volume 源
+
+`projected` 是一种特殊的 Volume 类型，可以将多个来源（如 Secret、ConfigMap、downwardAPI、ServiceAccountToken）组合到同一个目录。
+
+```yaml
+volumes:
+- name: projected-vol
+  projected:
+    sources:
+    - secret:
+        name: my-secret
+        items:
+        - key: username
+          path: secrets/username
+    - configMap:
+        name: my-config
+        items:
+        - key: data
+          path: config/data
+    - downwardAPI:
+        items:
+        - path: "pod-name"
+          fieldRef:
+            fieldPath: metadata.name
+```
+
+挂载后的目录结构：
+
+```
+/etc/projected/
+├── secrets/
+│   └── username
+├── config/
+│   └── data
+└── pod-name
+```
+
+---
+
+## 三、Volume 类型对比
+
+| Volume 类型 | 持久性 | 共享性 | 典型使用场景 |
+|---|---|---|---|
+| `emptyDir` | Pod 生命周期 | Pod 内共享 | 临时缓存、容器间共享 |
+| `hostPath` | 节点级别 | 单节点 | 系统组件、日志收集 |
+| `nfs` | 持久化 | 多节点共享 | 共享存储、文件服务 |
+| `gcePersistentDisk` | 持久化 | 单节点 | 云环境数据库 |
+| `awsElasticBlockStore` | 持久化 | 单节点 | 云环境数据库 |
+| `configMap` | ConfigMap 生命周期 | Pod 引用 | 配置文件 |
+| `secret` | Secret 生命周期 | Pod 引用 | 敏感信息 |
+| `downwardAPI` | Pod 生命周期 | Pod 内 | Pod 元数据 |
+| `projected` | 各来源决定 | 各来源决定 | 统一挂载点 |
+
+---
+
+## 四、实战：选择合适的 Volume 类型
+
+### 场景 1：临时缓存
+
+```yaml
+volumes:
+- name: cache
+  emptyDir:
+    medium: Memory
+    sizeLimit: 100Mi
+```
+
+### 场景 2：多容器数据共享
+
+```yaml
+spec:
+  containers:
+  - name: producer
+    image: busybox
+    args: ["sh", "-c", "echo data > /shared/data.txt && sleep 3600"]
+    volumeMounts:
+    - name: shared
+      mountPath: /shared
+  - name: consumer
+    image: busybox
+    args: ["sh", "-c", "while true; do cat /shared/data.txt; sleep 5; done"]
+    volumeMounts:
+    - name: shared
+      mountPath: /shared
+  volumes:
+  - name: shared
+    emptyDir: {}
+```
+
+### 场景 3：读取节点日志
+
+```yaml
+volumes:
+- name: varlog
+  hostPath:
+    path: /var/log
+    type: Directory
+```
+
+### 场景 4：配置文件挂载
+
+```yaml
+volumes:
+- name: config
+  configMap:
+    name: app-config
+    items:
+    - key: nginx.conf
+      path: nginx.conf
+```
+
+---
+
+## 五、常见问题与最佳实践
+
+### 5.1 Pod 删除后 Volume 数据是否还在？
+
+这取决于 Volume 类型：
+
+- `emptyDir`：Pod 删除后，Volume 数据被删除
+- `hostPath`：数据存在于节点上，不受 Pod 影响
+- 网络存储（nfs、云存储）：数据存在于存储服务器，不受 Pod 影响
+- `configMap`/`secret`：作为 Volume 挂载时，ConfigMap/Secret 本身不受 Pod 影响
+
+### 5.2 为什么选择 hostPath 而不是 emptyDir？
+
+`hostPath` 和 `emptyDir` 看起来功能相似，但有本质区别：
+
+- `emptyDir` 的数据存储在**Pod 被调度的任意节点**上
+- `hostPath` 的数据存储在**特定的节点**上
+
+如果 Pod 被调度到其他节点，`emptyDir` 的数据会丢失，但 `hostPath` 仍然存在（前提是 Pod 仍被调度到同一节点）。
+
+### 5.3 Volume 与 PVC/PV 的区别
+
+这里讲的 Volume 是**Pod 直接定义**的 Volume，适合简单的存储需求。K8s 还有一套更强大的存储抽象——**PersistentVolume（PV）和 PersistentVolumeClaim（PVC）**，适合需要动态供给、持久化存储的场景。
+
+两者关系：
+
+- **Volume**：Pod 内部定义，与 Pod 紧耦合
+- **PV/PVC**：集群级别的存储抽象，与 Pod 解耦，适合有状态应用
+
+下一节我们会详细讲解 PV 和 PVC。
+
+---
+
+## 六、总结
+
+K8s 的 Volume 是 Pod 与存储之间的桥梁。理解不同 Volume 类型的特点，才能在设计有状态应用时做出正确的选择。
+
+记住几个关键点：
+
+- **临时存储用 `emptyDir`**，适合缓存和容器间共享
+- **节点资源用 `hostPath`**，但要注意安全风险
+- **网络共享用 NFS**，适合多节点访问
+- **配置数据用 `configMap`**，敏感数据用 `secret`**
+- **Pod 元数据用 `downwardAPI`**
+
+在实际项目中，Volume 往往与 PV/PVC 结合使用，实现真正的持久化存储。

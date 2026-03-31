@@ -1,0 +1,483 @@
+# Kafka 控制器（Controller）：Broker 选举与故障转移
+
+## 场景切入：Controller 是 Kafka 集群的大脑
+
+在一个 Kafka 集群中，有一个特殊的 Broker，它被称为 Controller。
+
+Controller 负责管理整个集群的元数据：分区 Leader 选举、副本分配、Broker 上下线……如果 Controller 宕机了，整个集群会怎样？
+
+理解 Controller 的原理，是深入掌握 Kafka 高可用机制的关键。
+
+## 一、Controller 概述
+
+### 1.1 Controller 的职责
+
+Controller 是 Kafka 集群中的特殊 Broker，负责：
+
+| 职责 | 说明 |
+|---|---|
+| **分区 Leader 选举** | 当 Leader 宕机时，选择新 Leader |
+| **分区副本分配** | 管理分区的副本分配 |
+| **Broker 注册/注销** | 处理 Broker 的上下线 |
+| **ISR 管理** | 监控副本状态，维护 ISR |
+| **Topic 管理** | 创建、删除、修改 Topic |
+
+### 1.2 集群架构
+
+```
+Kafka 集群架构：
+
+┌─────────────────────────────────────────────────────────┐
+│                                                         │
+│  ZooKeeper 集群                                         │
+│  ┌─────────┐   ┌─────────┐   ┌─────────┐             │
+│  │   ZK1   │   │   ZK2   │   │   ZK3   │             │
+│  └─────────┘   └─────────┘   └─────────┘             │
+│                                                         │
+│  Controller 选举基于 ZooKeeper 临时节点                 │
+│                                                         │
+└─────────────────────────────────────────────────────────┘
+                │
+                │ Controller 选举
+                ▼
+┌─────────────────────────────────────────────────────────┐
+│                  Kafka Broker 集群                       │
+│                                                         │
+│   ┌─────────┐   ┌─────────┐   ┌─────────┐             │
+│   │ Broker-1│   │ Broker-2│   │ Broker-3│             │
+│   │(Controller)│ │         │   │         │             │
+│   └─────────┘   └─────────┘   └─────────┘             │
+│                                                         │
+└─────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 二、Controller 选举原理
+
+### 2.1 基于 ZooKeeper 的选举
+
+```
+Controller 选举流程：
+
+1. Broker 启动时，尝试在 ZooKeeper 创建临时节点
+   ZooKeeper 路径：/kafka/controller
+   │
+2. 第一个创建的 Broker 成为 Controller
+   │
+3. 其他 Broker 监听 controller 节点变化
+   │
+4. Controller 宕机，临时节点消失
+   │
+5. 其他 Broker 竞争创建 controller 节点
+   │
+6. 胜出的 Broker 成为新 Controller
+```
+
+```bash
+# ZooKeeper 中的 Controller 节点
+# 节点路径：/kafka/controller
+# 节点内容：{"brokerid": 1, "version": 1, "timestamp": "1234567890"}
+
+# 查看 Controller
+zkCli.sh -server localhost:2181
+get /kafka/controller
+
+# Controller epoch（防止脑裂）
+# 节点路径：/kafka/controller_epoch
+# 每次 Controller 变化，epoch + 1
+get /kafka/controller_epoch
+```
+
+### 2.2 选举核心代码
+
+```java
+// Controller 选举核心逻辑
+public class ZkLeaderElector {
+
+    public void elect() {
+        try {
+            // 尝试创建临时节点
+            String result = zk.create(
+                "/kafka/controller",
+                brokerId.getBytes(),
+                Ids.OPEN_ACL_UNSAFE,
+                CreateMode.EPHEMERAL  // 临时节点
+            );
+
+            if (result.equals("/kafka/controller")) {
+                // 选举成功，成为 Controller
+                becomeController();
+            }
+
+        } catch (NodeExistsException e) {
+            // 节点已存在，说明已有 Controller
+            // 监听节点变化
+            watchControllerChanges();
+        }
+    }
+}
+```
+
+### 2.3 任期机制（Epoch）
+
+```
+Epoch 机制防止脑裂：
+
+Epoch 是一个递增的版本号，每次 Controller 变化 +1
+
+Broker 收到 Controller 消息时：
+  1. 检查消息中的 Epoch
+  2. 如果消息 Epoch > 本地记录的 Epoch
+     → 接受消息，更新本地 Epoch
+  3. 如果消息 Epoch < 本地记录的 Epoch
+     → 拒绝消息（说明是旧 Controller 的消息）
+
+这样就避免了脑裂问题：
+  Broker A 认为自己是 Controller（Epoch = 1）
+  Broker B 认为自己是 Controller（Epoch = 2）
+  Broker B 的消息会被 Broker A 拒绝
+```
+
+---
+
+## 三、Controller 的职责详解
+
+### 3.1 Broker 注册
+
+```java
+// Broker 注册流程
+public class Controller {
+
+    public void registerBroker(Broker broker) {
+        // 1. 在 ZooKeeper 中注册 Broker
+        zk.create("/kafka/broker/ids/" + broker.id(),
+            broker.toJsonBytes(),
+            Ids.OPEN_ACL_UNSAFE,
+            CreateMode.PERSISTENT);
+
+        // 2. 更新 Controller 的 Broker 列表
+        this.liveBrokers.add(broker);
+
+        // 3. 触发分区重新分配（如果需要）
+        if (isController()) {
+            reassignPartitionsIfNeeded();
+        }
+    }
+}
+```
+
+### 3.2 Broker 注销
+
+```java
+// Broker 注销流程
+public class Controller {
+
+    public void onBrokerFailure(int brokerId) {
+        // 1. 从 liveBrokers 中移除
+        this.liveBrokers.remove(brokerId);
+
+        // 2. 处理该 Broker 上的分区
+        List<TopicPartition> partitions = getPartitionsForBroker(brokerId);
+
+        for (TopicPartition partition : partitions) {
+            // 3. 触发 Leader 选举
+            handlePartitionLeaderElection(partition);
+
+            // 4. 更新 ISR
+            shrinkIsr(partition, brokerId);
+        }
+    }
+}
+```
+
+### 3.3 分区 Leader 选举
+
+```java
+// 分区 Leader 选举
+public class Partition {
+
+    public void electNewLeader() {
+        // 1. 获取 ISR
+        List<Integer> isr = this.isr;
+
+        // 2. 过滤掉已宕机的 Broker
+        List<Integer> availableIsr = isr.stream()
+            .filter(brokerId -> isBrokerAlive(brokerId))
+            .collect(Collectors.toList());
+
+        // 3. 从 ISR 中选择新 Leader
+        //    策略：选择 ISR 中第一个存活的 Broker
+        if (!availableIsr.isEmpty()) {
+            int newLeader = availableIsr.get(0);
+            this.leader = newLeader;
+            this.isr = availableIsr;
+        } else {
+            // 4. ISR 为空，标记为无 Leader
+            this.leader = NO_LEADER;
+        }
+
+        // 5. 更新 ZooKeeper
+        updateLeaderAndIsrInZk();
+    }
+}
+```
+
+---
+
+## 四、故障转移流程
+
+### 4.1 Controller 故障检测
+
+```
+故障检测流程：
+
+ZooKeeper                                Controller
+    │                                      │
+    │  Watch 监听 /kafka/controller         │
+    │<─────────────────────────────────────│
+    │                                      │
+    │  Controller 宕机                      │
+    │  临时节点消失                          │
+    │────────────────────────────>
+    │
+    │  通知所有监听者
+    ▼
+其他 Broker 收到通知，触发选举
+```
+
+### 4.2 Controller 故障转移
+
+```
+Controller 故障转移流程：
+
+时刻 T1: Controller (Broker-1) 宕机
+  │
+  ▼
+时刻 T2: ZooKeeper 通知所有 Broker
+  │
+  ▼
+时刻 T3: Broker-2 和 Broker-3 竞争创建 Controller 节点
+  │
+  ▼
+时刻 T4: Broker-2 竞争成功，成为新 Controller
+  │
+  ▼
+时刻 T5: Broker-2 加载集群元数据
+  │
+  ▼
+时刻 T6: Broker-2 执行 Leader 选举
+  │
+  ▼
+时刻 T7: Broker-2 通知所有 Broker 更新元数据
+  │
+  ▼
+时刻 T8: 故障转移完成
+  总耗时：通常 < 10 秒
+```
+
+### 4.3 元数据同步
+
+```java
+// Controller 切换后的元数据同步
+public class KafkaController {
+
+    public void onControllerFailover() {
+        // 1. 从 ZooKeeper 加载所有 Broker 信息
+        List<Broker> allBrokers = loadAllBrokers();
+
+        // 2. 从 ZooKeeper 加载所有 Topic 和分区信息
+        Map<Topic, List<Partition>> allTopics = loadAllTopics();
+
+        // 3. 初始化 Broker 信息
+        this.liveBrokers = new HashMap<>();
+        for (Broker broker : allBrokers) {
+            if (isBrokerAlive(broker.id())) {
+                this.liveBrokers.put(broker.id(), broker);
+            }
+        }
+
+        // 4. 触发分区 Leader 选举
+        for (Partition partition : allTopics.values()) {
+            if (partition.leader() == null) {
+                partition.electNewLeader();
+            }
+        }
+
+        // 5. 发送 UpdateMetadata 请求给所有 Broker
+        sendUpdateMetadataRequest(allBrokers);
+    }
+}
+```
+
+---
+
+## 五、脑裂问题与解决
+
+### 5.1 什么是脑裂
+
+脑裂是指网络分区导致多个 Broker 都认为自己是 Controller：
+
+```
+脑裂场景：
+
+网络分区后：
+┌─────────┐         ┌─────────┐
+│ Broker-1│         │ Broker-2│
+│ZK 连接 1│         │ZK 连接 2│
+└─────────┘         └─────────┘
+     │                   │
+     ├───── X ───────────┤  网络分区
+     │                   │
+     ▼                   ▼
+  /kafka/controller    /kafka/controller
+  (临时节点 A)          (临时节点 B)
+
+Broker-1 和 Broker-2 都认为自己是 Controller
+```
+
+### 5.2 Epoch 机制解决脑裂
+
+```java
+// Epoch 机制防止脑裂
+public class ControllerContext {
+
+    // 当前 Controller 的 Epoch
+    private int controllerEpoch;
+
+    // 当前 Controller 的 Broker ID
+    private int activeControllerId;
+
+    // 收到 Controller 消息时检查 Epoch
+    public boolean onControllerMessage(int messageEpoch, int messageBrokerId) {
+        if (messageEpoch > this.controllerEpoch) {
+            // 新 Epoch，接受消息
+            this.controllerEpoch = messageEpoch;
+            this.activeControllerId = messageBrokerId;
+            return true;
+        } else {
+            // 旧 Epoch，拒绝消息
+            return false;
+        }
+    }
+}
+```
+
+### 5.3 ZooKeeper 连接优化
+
+```properties
+# ZooKeeper 连接配置
+zookeeper.connection.timeout.ms=3000        # ZooKeeper 连接超时
+zookeeper.session.timeout.ms=6000          # ZooKeeper 会话超时
+zookeeper.sync.time.ms=2000               # ZooKeeper 同步时间
+```
+
+---
+
+## 六、Controller 高可用
+
+### 6.1 Controller 设计
+
+```
+Controller 设计：
+
+┌─────────────────────────────────────────────────────────┐
+│                      Controller                          │
+│                                                         │
+│  ┌──────────────┐   ┌──────────────┐               │
+│  │  Event Queue │   │  Controller  │               │
+│  │  (事件队列)  │──>│   Context   │               │
+│  └──────────────┘   └──────────────┘               │
+│                            │                          │
+│                            ▼                          │
+│                    ┌──────────────┐               │
+│                    │  分区状态机  │               │
+│                    │ (Partition   │               │
+│                    │  StateMachine)│               │
+│                    └──────────────┘               │
+│                            │                          │
+│                            ▼                          │
+│                    ┌──────────────┐               │
+│                    │  副本状态机  │               │
+│                    │ (Replica     │               │
+│                    │  StateMachine)│               │
+│                    └──────────────┘               │
+│                                                         │
+└─────────────────────────────────────────────────────────┘
+```
+
+### 6.2 状态机设计
+
+```java
+// 事件驱动的状态机
+public class PartitionStateMachine {
+
+    // 分区状态
+    public enum PartitionState {
+        NON_EXISTENT,      // 分区不存在
+        NEW,                // 新建
+        ONLINE,             // 在线
+        OFFLINE,            // 下线
+        DELETION_STARTED    // 开始删除
+    }
+
+    // 状态转换
+    public void handleStateChange(Partition partition, PartitionState targetState) {
+        switch (partition.currentState()) {
+            case NON_EXISTENT:
+                if (targetState == NEW) {
+                    partition.createPartition();
+                }
+                break;
+
+            case NEW:
+                if (targetState == ONLINE) {
+                    partition.electLeader();
+                }
+                break;
+
+            case ONLINE:
+                if (targetState == OFFLINE) {
+                    partition.markOffline();
+                }
+                break;
+
+            // ...
+        }
+    }
+}
+```
+
+---
+
+## 七、面试追问预判
+
+### 追问一：Controller 是如何选举的？
+
+Controller 基于 ZooKeeper 临时节点选举：
+1. Broker 启动时尝试创建 `/kafka/controller` 临时节点
+2. 第一个创建成功的成为 Controller
+3. 其他 Broker 监听该节点变化
+4. Controller 宕机后，节点消失，其他 Broker 竞争创建
+
+### 追问二：Controller 宕机会有什么影响？
+
+1. **Leader 选举暂停**：无法选举新的分区 Leader
+2. **元数据更新暂停**：Broker 上下线无法处理
+3. **ISR 变化暂停**：副本状态无法更新
+4. **影响时间**：通常 < 10 秒后新 Controller 上任
+
+### 追问三：如何防止脑裂？
+
+Kafka 使用 Epoch（任期）机制防止脑裂：
+- 每次 Controller 变化，Epoch + 1
+- Broker 收到 Controller 消息时检查 Epoch
+- 旧 Epoch 的消息被拒绝
+
+### 追问四：Kafka 3.0 的 KRaft 模式有什么变化？
+
+KRaft 模式使用 Raft 协议替代 ZooKeeper：
+- 消除了对 ZooKeeper 的依赖
+- Controller 选举更简单
+- 元数据管理更高效
+- Kafka 3.0+ 支持 KRaft 模式（生产环境推荐 Kafka 3.5+）

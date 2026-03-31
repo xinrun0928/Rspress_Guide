@@ -1,0 +1,225 @@
+# RabbitMQ 高可用与负载均衡
+
+## 场景切入：高可用不只是集群
+
+RabbitMQ 宕机了，服务就不可用了。
+
+高可用不只是搭建集群，还需要：**负载均衡、健康检查、故障转移**。本文讲解如何构建高可用的 RabbitMQ 架构。
+
+## 一、高可用架构
+
+### 1.1 高可用架构图
+
+```
+高可用架构：
+
+                         ┌─────────────────────────────────┐
+                         │           负载均衡器               │
+                         │     (Nginx / HAProxy / VIP)       │
+                         └─────────────────────────────────┘
+                                   │           │
+                    ┌──────────────┘           └──────────────┐
+                    ▼                                           ▼
+          ┌─────────────────┐                     ┌─────────────────┐
+          │    RabbitMQ 集群  │                     │    RabbitMQ 集群  │
+          │                   │                     │                   │
+          │  ┌────┐ ┌────┐ ┌────┐              │  ┌────┐ ┌────┐ ┌────┐ │
+          │  │ HA  │ │ HA  │ │ HA  │              │  │ HA  │ │ HA  │ │ HA  │ │
+          │  │Master│ │Mirror│ │Mirror│              │  │Master│ │Mirror│ │Mirror│ │
+          │  └────┘ └────┘ └────┘              │  └────┘ └────┘ └────┘ │
+          └─────────────────┘                     └─────────────────┘
+                    │                                           │
+                    └────────────────────┬────────────────────┘
+                                         ▼
+                               ┌─────────────────┐
+                               │     ZooKeeper     │
+                               │   (用于协调)     │
+                               └─────────────────┘
+```
+
+### 1.2 组件说明
+
+| 组件 | 说明 |
+|---|---|
+| **负载均衡器** | 分发请求到集群节点 |
+| **RabbitMQ 集群** | 多节点集群，提供高可用 |
+| **HAProxy/Nginx** | 负载均衡软件 |
+| **ZooKeeper** | 用于集群协调（可选） |
+
+---
+
+## 二、负载均衡配置
+
+### 2.1 HAProxy 配置
+
+```bash
+# /etc/haproxy/haproxy.cfg
+
+listen rabbitmq_cluster
+    bind 0.0.0.0:5672
+    mode tcp
+    balance roundrobin
+    option tcplog
+
+    # RabbitMQ 节点
+    server rabbit1 rabbit1:5672 check inter 5000 rise 2 fall 3
+    server rabbit2 rabbit2:5672 check inter 5000 rise 2 fall 3
+    server rabbit3 rabbit3:5672 check inter 5000 rise 2 fall 3
+
+# 管理界面
+listen rabbitmq_management
+    bind 0.0.0.0:15672
+    mode http
+    balance roundrobin
+    option httplog
+
+    server rabbit1 rabbit1:15672 check inter 5000 rise 2 fall 3
+    server rabbit2 rabbit2:15672 check inter 5000 rise 2 fall 3
+    server rabbit3 rabbit3:15672 check inter 5000 rise 2 fall 3
+```
+
+### 2.2 Nginx 配置
+
+```nginx
+# /etc/nginx/conf.d/rabbitmq.conf
+
+upstream rabbitmq_cluster {
+    least_conn;  # 最少连接
+    server rabbit1:5672 weight=1;
+    server rabbit2:5672 weight=1;
+    server rabbit3:5672 weight=1;
+}
+
+server {
+    listen 5672;
+    proxy_pass rabbitmq_cluster;
+    tcp_nodelay on;
+}
+```
+
+---
+
+## 三、健康检查
+
+### 3.1 HAProxy 健康检查
+
+```bash
+# 健康检查配置
+server rabbit1 rabbit1:5672
+    check inter 5000      # 检查间隔 5 秒
+    rise 2                # 连续 2 次成功，认为上线
+    fall 3                # 连续 3 次失败，认为下线
+    slowstart 30s         # 慢启动 30 秒
+```
+
+### 3.2 应用端健康检查
+
+```java
+// 应用端健康检查
+public class RabbitMQHealthCheck {
+
+    public boolean isHealthy() {
+        try {
+            Connection connection = connectionFactory.newConnection();
+            connection.close();
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    // 重连机制
+    public void reconnect() {
+        int retryCount = 0;
+        while (retryCount < maxRetries) {
+            try {
+                connection = connectionFactory.newConnection();
+                channel = connection.createChannel();
+                return;
+            } catch (Exception e) {
+                retryCount++;
+                Thread.sleep(retryInterval);
+            }
+        }
+    }
+}
+```
+
+---
+
+## 四、故障转移
+
+### 4.1 应用端重连
+
+```java
+// 自动重连配置
+ConnectionFactory factory = new ConnectionFactory();
+factory.setAutomaticRecoveryEnabled(true);       // 启用自动重连
+factory.setNetworkRecoveryInterval(10000);      // 重连间隔 10 秒
+factory.setTopologyRecoveryEnabled(true);       // 恢复拓扑
+```
+
+### 4.2 连接管理
+
+```java
+// 连接管理最佳实践
+public class RabbitMQConnectionManager {
+
+    private Connection connection;
+    private Channel channel;
+
+    public Channel getChannel() {
+        if (channel == null || !channel.isOpen()) {
+            channel = connection.createChannel();
+        }
+        return channel;
+    }
+
+    public void reconnect() {
+        close();
+        connection = connectionFactory.newConnection();
+        channel = connection.createChannel();
+    }
+
+    public void close() {
+        try {
+            if (channel != null && channel.isOpen()) {
+                channel.close();
+            }
+            if (connection != null && connection.isOpen()) {
+                connection.close();
+            }
+        } catch (Exception e) {
+            log.error("关闭连接失败", e);
+        }
+    }
+}
+```
+
+---
+
+## 五、面试追问预判
+
+### 追问一：如何保证 RabbitMQ 的高可用？
+
+高可用需要多层保障：
+
+1. **集群部署**：使用镜像队列或仲裁队列
+2. **负载均衡**：使用 HAProxy 或 Nginx
+3. **健康检查**：配置健康检查和故障转移
+4. **应用端重连**：启用自动重连机制
+
+### 追问二：RabbitMQ 宕机了怎么办？
+
+1. **负载均衡器自动切换**：请求分发到其他节点
+2. **镜像队列自动恢复**：从节点接管
+3. **应用端自动重连**：重连到可用节点
+
+### 追问三：如何监控 RabbitMQ？
+
+| 指标 | 说明 |
+|---|---|
+| **队列消息数** | 监控队列积压 |
+| **消费者数量** | 监控消费者状态 |
+| **连接数** | 监控连接数 |
+| **内存使用** | 监控内存使用率 |

@@ -1,0 +1,300 @@
+# ES 搜索原理
+
+你点击搜索按钮的那一刻，Elasticsearch 背后到底发生了什么？
+
+一次看似简单的搜索请求，在集群内部经历了复杂的协调、路由、并行查询、结果合并过程。理解这个流程，才能真正掌握 Elasticsearch 的性能调优和问题排查。
+
+这篇文章深入剖析 Elasticsearch 的搜索流程，包括 Query Phase 和 Fetch Phase 两个核心阶段，以及相关性评分机制。
+
+## 搜索的整体流程
+
+一次完整的搜索请求经历以下步骤：
+
+```
+1. 客户端 → 协调节点（请求到达）
+2. 解析查询，构建查询计划
+3. 广播查询到所有相关分片
+4. 各分片并行执行查询
+5. 协调节点收集并合并结果
+6. 返回最终结果给客户端
+```
+
+这个过程分为两个主要阶段：**Query Phase**（查询阶段）和 **Fetch Phase**（取回阶段）。
+
+## Query Phase
+
+### 请求解析与分发
+
+协调节点收到查询请求后，首先解析查询 DSL，构建查询计划。然后根据路由规则，确定需要查询哪些分片。
+
+```json
+GET /my-index/_search
+{
+  "query": {
+    "match": { "title": "elasticsearch" }
+  },
+  "from": 0,
+  "size": 10,
+  "sort": [
+    { "created_at": "desc" }
+  ]
+}
+```
+
+假设 `my-index` 有 5 个主分片。协调节点会将查询请求**并发**发送到所有 5 个分片（默认查询主分片和副本分片中的一个）。
+
+### 各分片执行查询
+
+每个分片节点收到查询请求后，在本地执行以下步骤：
+
+1. **词法分析**：解析查询语句，识别需要查询的词
+2. **查询倒排索引**：根据词找到匹配的文档列表
+3. **评分计算**：计算每篇文档与查询的相关性得分
+4. **排序**：按得分或指定字段排序
+5. **分页**：截取 `from + size` 条记录
+
+关键问题来了：每个分片只返回 `from + size` 条记录。
+
+如果查询 `from=90, size=10`，每个分片会返回 100 条记录（90+10），然后协调节点汇总后取第 91-100 条。
+
+这意味着 **深度分页的成本很高**——需要各分片扫描大量数据。后面讲分页时我们会详细讨论这个问题。
+
+### 查询类型
+
+Elasticsearch 支持多种查询类型：
+
+**叶子节点查询（Leaf Queries）**：
+- `match`：全文匹配
+- `term`：精确值匹配
+- `range`：范围查询
+- `bool`：布尔组合
+
+**复合查询（Compound Queries）**：
+- `bool`：组合多个查询
+- `constant_score`：忽略相关性评分
+- `function_score`：自定义评分函数
+
+### Query Phase 返回
+
+每个分片返回一个轻量级的结果列表，包含：
+- 匹配的文档 ID 列表
+- 每个文档的得分
+- 如果有排序，排序字段值
+
+```json
+{
+  "_shard": 2,
+  "_node": "node-1",
+  "hits": {
+    "total": 1250,
+    "hits": [
+      {
+        "_index": "my-index",
+        "_id": "doc_123",
+        "_score": 5.67,
+        "sort": ["2024-01-15"]
+      },
+      // ... more hits
+    ]
+  }
+}
+```
+
+注意每个分片返回的 `hits.total` 只是该分片的统计，不是全局总数。如果需要精确总数，`track_total_hits` 参数可以强制计算：
+
+```json
+GET /my-index/_search
+{
+  "track_total_hits": true,
+  "query": { "match_all": {} }
+}
+```
+
+## Fetch Phase
+
+### 取回完整文档
+
+协调节点收集了所有分片的查询结果后，需要获取文档的完整内容——这发生在 Fetch Phase。
+
+协调节点根据文档 ID 列表，向对应分片发起请求，获取每个文档的 `_source` 内容。
+
+```json
+GET /_msearch
+{
+  "index": "my-index"
+}
+{"search_type":"query_then_fetch"}
+{"query":{"match_all":{}},"from":0,"size":10}
+```
+
+### Fetch Phase 的优化
+
+Fetch Phase 可能产生大量的小请求。为了减少网络开销，Elasticsearch 会**合并请求**——将多个需要从同一分片获取的文档合并成一次批量请求。
+
+```java
+// 伪代码：合并取回请求
+Map<Node, List<DocId>> nodeToDocIds = groupByNode(docIds);
+for (node : nodeToDocIds) {
+    List<DocId> docIds = nodeToDocIds.get(node);
+    bulkFetchRequest = createBulkFetch(node, docIds);
+    sendAsync(bulkFetchRequest);
+}
+```
+
+## 全局排序问题
+
+### 跨分片排序的局限性
+
+考虑一个查询：按 `created_at` 降序排序，返回前 10 条。
+
+```
+分片 0: [doc_9, doc_8, doc_7, doc_6, doc_5 ...]
+分片 1: [doc_9, doc_8, doc_7, doc_6, doc_5 ...]
+分片 2: [doc_9, doc_8, doc_7, doc_6, doc_5 ...]
+分片 3: [doc_9, doc_8, doc_7, doc_6, doc_5 ...]
+分片 4: [doc_9, doc_8, doc_7, doc_6, doc_5 ...]
+```
+
+每个分片只知道自己的 Top 10。协调节点拿到 5 个分片各自的 Top 10 后，合并出全局 Top 10。
+
+问题是：**全局 Top 10 可能来自不同的分片**。比如全局最新的文档可能全在分片 0 上，而分片 1 的 Top 10 可能在全局排名 11-20。
+
+这意味着**真正的全局 Top 10 查询是不准确的**——除非只有一个分片，或者查询所有分片的所有数据。
+
+### dfs_query_then_fetch
+
+如果你确实需要精确的全局排序，可以使用 `search_type=dfs_query_then_fetch`：
+
+```json
+GET /my-index/_search?search_type=dfs_query_then_fetch
+{
+  "sort": [
+    { "created_at": "desc" }
+  ]
+}
+```
+
+`dfs` 是 Distributed Frequency Search 的缩写。这个模式下：
+
+1. 协调节点先向所有分片请求词频统计（DFS 阶段）
+2. 根据全局词频计算文档得分
+3. 执行 Query Phase
+4. 执行 Fetch Phase
+
+**代价**：多了一次网络往返，性能下降约 15-20%。通常情况下，使用默认的 `query_then_fetch` 即可。
+
+## 相关性评分机制
+
+### TF-IDF
+
+Elasticsearch 使用 **TF-IDF**（词频-逆文档频率）作为相关性评分的基础：
+
+```
+score(q, d) = queryBoost × coord(q, d) × Σ [ tf(t in d) × idf(t)² × fieldNorm(t, d) × t.getBoost() ]
+```
+
+- **TF（Term Frequency）**：词在文档中出现的次数。出现越多，相关性越高。
+- **IDF（Inverse Document Frequency）**：词在多少文档中出现。出现文档越多，权重越低。
+- **fieldNorm**：字段长度归一化因子。短字段比长字段权重高。
+
+### BM25
+
+Elasticsearch 5.0 之后，默认评分算法从 TF-IDF 升级为 **BM25**（Best Matching 25）。
+
+BM25 对 TF 进行了饱和处理——词频增加到一定程度后，边际收益递减，避免长文档因为包含更多关键词而获得过高评分。
+
+```json
+GET /my-index/_search
+{
+  "query": {
+    "match": {
+      "content": {
+        "query": "elasticsearch guide",
+        "operator": "and"
+      }
+    }
+  }
+}
+```
+
+`operator` 参数控制多词查询的匹配逻辑：
+
+- `or`（默认）：文档包含任意一个词即匹配
+- `and`：文档必须包含所有词
+
+### function_score
+
+除了内置的评分机制，Elasticsearch 还支持自定义评分函数：
+
+```json
+GET /my-index/_search
+{
+  "query": {
+    "function_score": {
+      "query": {
+        "match": { "title": "elasticsearch" }
+      },
+      "functions": [
+        {
+          "filter": { "term": { "status": "published" } },
+          "weight": 2
+        },
+        {
+          "gauss": {
+            "published_at": {
+              "origin": "now",
+              "scale": "30d",
+              "decay": 0.5
+            }
+          }
+        }
+      ],
+      "score_mode": "sum",
+      "boost_mode": "multiply"
+    }
+  }
+}
+```
+
+这个查询：
+- 基础分：匹配「elasticsearch」
+- 加分：已发布文章权重 × 2
+- 加分：越接近当前的日期，分数越高
+
+## 查询缓存
+
+### 节点级别缓存
+
+Elasticsearch 在每个节点维护多个缓存：
+
+**Query Cache**：缓存查询结果集（doc id 列表）。相同查询在不同请求间复用。
+
+```json
+GET /my-index/_search?request_cache=true
+{
+  "query": { "match_all": {} }
+}
+```
+
+**Request Cache**：缓存聚合计算结果，如 `max`、`avg` 等。
+
+**Field Data Cache**：缓存字段的列式数据，用于排序和聚合。
+
+### 缓存失效
+
+缓存按 Segment 失效。当 Segment 被合并或删除时，相关缓存自动清除。
+
+```json
+PUT /my-index/_settings
+{
+  "index.queries.cache.enabled": true
+}
+```
+
+## 总结
+
+搜索流程看似简单，实则包含 Query Phase 和 Fetch Phase 两个核心阶段。
+
+Query Phase 各分片并行执行，返回 doc id 和得分；Fetch Phase 协调节点取回完整文档内容。全局排序是跨分片查询的固有局限，`dfs_query_then_fetch` 可以解决但有性能代价。
+
+相关性评分从 TF-IDF 演进到 BM25，提供了更合理的词频饱和处理。理解这些底层机制，才能在遇到性能问题或结果不符合预期时快速定位原因。

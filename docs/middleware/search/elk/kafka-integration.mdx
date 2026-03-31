@@ -1,0 +1,262 @@
+# ELK 与 Kafka 组合架构
+
+在上一节的 ELK 架构中，我们提到了 Kafka 作为缓冲层。这个组合是处理大规模日志的经典方案。
+
+但为什么要引入 Kafka？直接用 Logstash 不好吗？
+
+这个问题的答案，藏在每一次流量高峰里。
+
+## 为什么要引入 Kafka？
+
+想象这个场景：每秒 10 万条日志涌入你的 ELK 系统。突然，Elasticsearch 因为某个索引写入过载开始变慢。此时会发生什么？
+
+```
+日志涌入
+    ↓
+Logstash 开始积压
+    ↓
+Filebeat 连接 Logstash 超时
+    ↓
+日志丢失 💥
+```
+
+这就是没有缓冲层的问题。Kafka 解决了这个问题。
+
+## Kafka 在 ELK 中的角色
+
+```
+┌─────────┐
+│ Filebeat │
+└────┬────┘
+     │
+     ▼
+┌─────────┐     ┌─────────┐     ┌─────────┐     ┌─────────┐
+│  Kafka   │────▶│ Logstash │────▶│   ES    │────▶│ Kibana  │
+│ (缓冲层) │     │ (处理层) │     │ (存储)  │     │ (展示)  │
+└─────────┘     └─────────┘     └─────────┘     └─────────┘
+```
+
+### Kafka 的优势
+
+**削峰填谷**：即使 Elasticsearch 暂时不可用，Kafka 也能缓冲数小时的日志。
+
+**解耦**：Filebeat 不需要关心下游的处理能力，只管往 Kafka 写。
+
+**负载均衡**：多个 Logstash 实例可以并行消费 Kafka 消息。
+
+**重放**：Kafka 的消息持久化让你可以重新处理历史数据。
+
+## 架构设计
+
+### 基础架构
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                        Kafka 集群                            │
+│  ┌─────────┐  ┌─────────┐  ┌─────────┐                     │
+│  │Topic:   │  │Topic:   │  │Topic:   │                     │
+│  │app-logs │  │nginx-   │  │system-  │                     │
+│  │         │  │logs     │  │metrics  │                     │
+│  └─────────┘  └─────────┘  └─────────┘                     │
+│       │             │             │                         │
+│       │      Partition 0 │       │ Partition 0              │
+│       │      Partition 1 │       │ Partition 1              │
+│       │      Partition 2 │       │ Partition 2              │
+└───────┼─────────────────┼───────┼───────────────────────────┘
+        │                 │       │
+┌───────▼─────────────────▼───────▼───────────────────────────┐
+│                    Logstash 集群                             │
+│  ┌─────────┐  ┌─────────┐  ┌─────────┐                    │
+│  │实例 1   │  │实例 2   │  │实例 3   │                    │
+│  │Consumer │  │Consumer │  │Consumer │                    │
+│  │Group A  │  │Group A  │  │Group A  │                    │
+│  └─────────┘  └─────────┘  └─────────┘                    │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### Topic 设计
+
+```yaml
+# Topic 命名规范
+app-logs-prod         # 生产环境应用日志
+app-logs-test         # 测试环境应用日志
+nginx-logs-prod       # Nginx 访问日志
+system-metrics        # 系统指标
+audit-logs            # 审计日志
+
+# 分区数量
+分区数 = max(消费者数量, 预期吞吐量 / 单分区吞吐量)
+通常：3-10 个分区
+
+# 副本因子
+测试环境: 1
+生产环境: 3
+```
+
+### Logstash Kafka Input 配置
+
+```yaml
+input {
+  kafka {
+    bootstrap_servers => "kafka1:9092,kafka2:9092,kafka3:9092"
+    topics => ["app-logs-prod", "nginx-logs-prod"]
+    group_id => "logstash-consumers"
+    consumer_threads => 4
+    decorate_events => true
+    codec => json
+    
+    # 消费者配置
+    max_poll_records => "500"
+    max_poll_interval_ms => "300000"
+    session_timeout_ms => "30000"
+  }
+}
+```
+
+### Filebeat Kafka Output 配置
+
+```yaml
+output.kafka:
+  hosts: ["kafka1:9092", "kafka2:9092", "kafka3:9092"]
+  topic: "app-logs-prod"
+  partition.hash:
+    reachable_only: false
+  compression: snappy
+  batch_size: 2048
+  linger_ms: 5
+  required_acks: 1
+```
+
+### 数据处理流程
+
+```ruby
+# Logstash 管道
+input {
+  kafka {
+    bootstrap_servers => "kafka:9092"
+    topics => ["app-logs-prod"]
+    group_id => "logstash-processor"
+    codec => json
+  }
+}
+
+filter {
+  # 时间解析
+  date {
+    match => ["timestamp", "ISO8601"]
+    target => "@timestamp"
+  }
+  
+  # GeoIP 富化
+  geoip {
+    source => "client_ip"
+    target => "geoip"
+  }
+  
+  # 用户代理解析
+  useragent {
+    source => "user_agent"
+    target => "ua"
+  }
+  
+  # 字段处理
+  mutate {
+    remove_field => ["host"]
+    add_field => { "[@metadata][index]" => "app-logs-%{+YYYY.MM.dd}" }
+  }
+}
+
+output {
+  elasticsearch {
+    hosts => ["es1:9200", "es2:9200"]
+    index => "%{[@metadata][index]}"
+  }
+}
+```
+
+## 容量规划
+
+### Kafka 容量估算
+
+```yaml
+原始日志大小: 500 字节/条
+每秒日志量: 10,000 条
+日日志量: 10,000 × 86400 = 864,000,000 条
+日存储量: 500B × 864,000,000 = 432GB
+
+保留 7 天: 432GB × 7 = 3TB
+考虑副本: 3TB × 3 = 9TB
+总存储: ~10TB
+```
+
+### 集群配置建议
+
+```yaml
+# 小规模 (< 1TB/天)
+Broker 数: 3
+分区数: 9
+副本: 3
+
+# 中规模 (1-10TB/天)
+Broker 数: 6
+分区数: 18-36
+副本: 3
+
+# 大规模 (> 10TB/天)
+Broker 数: 9+
+分区数: 54+
+副本: 3
+```
+
+## 监控与告警
+
+### Kafka 监控指标
+
+| 指标 | 说明 | 告警阈值 |
+|---|---|---|
+| consumer_lag | 消费者滞后 | > 10000 |
+| under_replicated_partitions | 未同步分区 | > 0 |
+| offline_partitions | 离线分区 | > 0 |
+| disk_usage | 磁盘使用率 | > 80% |
+
+### 消费者滞后告警
+
+```yaml
+# Prometheus 告警规则
+groups:
+  - name: kafka-consumer-lag
+    rules:
+      - alert: KafkaConsumerLag
+        expr: kafka_consumer_lag_consumer_group{topic="app-logs-prod"} > 10000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Kafka 消费者滞后过高"
+          description: "消费者组 {{ $labels.consumergroup }} 在主题 {{ $labels.topic }} 上滞后 {{ $value }} 条消息"
+```
+
+## 常见问题
+
+### Q: Kafka 会增加延迟吗？
+
+Kafka 是异步写入，消费者按批次拉取数据。在 ELK 场景下，端到端延迟通常增加 1-5 秒。对于日志场景，这是可接受的。
+
+### Q: 如何选择 Kafka 版本？
+
+推荐使用 Kafka 3.x 或更新版本。相比 2.x，新版本有更好的性能和安全特性。
+
+### Q: Kafka 故障了怎么办？
+
+Filebeat 支持故障转移配置，可以配置多个 Kafka broker 列表。同时可以配置降级策略，当 Kafka 不可用时直接写入 Elasticsearch。
+
+```
+Filebeat Output:
+  kafka:
+    hosts: ["kafka1:9092","kafka2:9092"]
+  elasticsearch:
+    hosts: ["es1:9200"]
+    # 当 Kafka 不可用时，降级到 ES
+```
+
+Kafka 解决了流量高峰的问题，但它不是银弹。合理的容量规划和监控同样重要。

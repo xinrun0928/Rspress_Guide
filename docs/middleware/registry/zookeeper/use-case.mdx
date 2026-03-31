@@ -1,0 +1,364 @@
+import { Badge } from '@rspress/core/theme';
+
+# ZooKeeper 使用场景
+
+ZooKeeper 的层次化数据模型、Watch 机制和临时节点特性，使其成为构建分布式协调服务的基础组件。本节介绍 ZooKeeper 在实际生产环境中最常见的四种应用场景：配置中心、命名服务、Master 选举，以及分布式队列。
+
+## 配置中心：配置变更实时推送
+
+配置中心是最直接的 ZooKeeper 应用场景之一。将配置数据存储在 ZooKeeper 的 ZNode 中，通过 Watch 机制感知配置变更，实现配置的**集中管理和实时推送**。
+
+### 实现原理
+
+```
+配置结构：
+/config
+  /database
+    maxConnections = 100
+    timeout = 5000
+  /redis
+    poolSize = 50
+    host = 10.0.0.1
+```
+
+```java
+public class ZkConfigCenter {
+    private final ZooKeeper zk;
+
+    // 获取配置（首次读取 + 注册 Watch）
+    public String getConfig(String path) throws Exception {
+        byte[] data = zk.getData(path, event -> {
+            if (event.getType() == EventType.NodeDataChanged) {
+                // 重新读取配置
+                String newValue = getConfig(path);
+                notifyConfigChange(path, newValue);
+            }
+        }, null);
+        return new String(data);
+    }
+
+    // 更新配置
+    public void updateConfig(String path, String value) throws Exception {
+        zk.setData(path, value.getBytes(), -1);
+        // 触发 Watch，所有订阅者收到通知
+    }
+}
+```
+
+### 配置中心的核心要素
+
+| 要素 | 说明 |
+|---|---|
+| **配置隔离** | 使用不同路径隔离不同环境、应用的配置 |
+| **版本管理** | 可在 ZNode 数据中存储版本号，支持回滚 |
+| **热更新** | Watch 机制保证配置变更实时推送到客户端 |
+| **容错** | 客户端本地缓存配置，网络断开时使用本地缓存 |
+
+### 与专业配置中心的对比
+
+| 维度 | ZooKeeper | Apollo | Nacos |
+|---|---|---|---|
+| 配置模型 | 简单 K-V | 完整配置管理 + 灰度 + 回滚 | K-V + YAML |
+| 推送效率 | 高（长连接） | 高（长连接 + 推送） | 高（长连接） |
+| 管理界面 | 无 | 完整管理界面 | 有 |
+| 多语言支持 | 好（原生 HTTP） | 一般（主要 Java） | 好（多语言 SDK） |
+
+ZooKeeper 的配置中心适合**简单场景**，如果需要配置发布、灰度、回滚等高级功能，建议使用 Apollo 或 Nacos。
+
+## 命名服务：服务注册与发现
+
+命名服务是分布式系统中用于**将服务名映射到实际地址**的组件。ZooKeeper 可以用来构建轻量级的服务注册中心。
+
+### 实现原理
+
+```
+服务注册结构：
+/services
+  /order-service
+    /192.168.1.10:8080  (临时节点，存储权重、健康检查信息)
+    /192.168.1.11:8080
+  /user-service
+    /192.168.1.20:8080
+    /192.168.1.21:8080
+    /192.168.1.22:8080
+```
+
+**服务注册**：当服务实例启动时，创建临时节点：
+
+```java
+public class ServiceRegistry {
+    private final ZooKeeper zk;
+    private final String serviceName;
+    private final String instanceId;
+
+    public void register(String host, int port) throws Exception {
+        String path = "/services/" + serviceName + "/" + instanceId;
+        String data = JSON.toJSONString(new ServiceInstance(host, port));
+
+        // 创建临时节点，服务宕机自动删除
+        zk.create(path, data.getBytes(),
+                  ZooDefs.Ids.OPEN_ACL_UNSAFE,
+                  CreateMode.EPHEMERAL_SEQUENTIAL);
+    }
+}
+```
+
+**服务发现**：获取所有子节点即可获得服务实例列表：
+
+```java
+public List<ServiceInstance> discover(String serviceName) throws Exception {
+    String path = "/services/" + serviceName;
+    List<String> children = zk.getChildren(path, false);
+
+    List<ServiceInstance> instances = new ArrayList<>();
+    for (String child : children) {
+        String childPath = path + "/" + child;
+        byte[] data = zk.getData(childPath, false, null);
+        instances.add(JSON.parseObject(new String(data), ServiceInstance.class));
+    }
+    return instances;
+}
+```
+
+### 服务健康检查
+
+临时节点依赖客户端心跳来维持。如果客户端长时间未发送心跳（默认 tickTime 的 10 倍，约 20 秒），ZooKeeper 会认为客户端已断开，删除其创建的所有临时节点。
+
+对于需要更精细健康检查的场景（如 HTTP 服务），可以在节点数据中存储健康指标：
+
+```java
+// 服务端定期更新健康状态
+public void updateHealthStatus(String path, HealthStatus status) throws Exception {
+    // 使用带版本的更新，避免覆盖其他客户端的更新
+    zk.setData(path, JSON.toJSONString(status).getBytes(), stat.getVersion());
+}
+```
+
+## Master 选举：抢注实现主节点
+
+Master 选举用于在分布式系统中选出一个协调者。当前的 Master 宕机后，其他节点能快速感知并选出新的 Master。
+
+### 基于临时节点抢注
+
+最简单的 Master 选举方案是利用**临时节点的唯一性**——只有第一个创建节点的客户端能成功：
+
+```java
+public class MasterElection {
+    private final String masterPath = "/master";
+
+    public boolean tryBecomeMaster() throws Exception {
+        try {
+            // 尝试创建 Master 节点，如果已存在则抛异常
+            zk.create(masterPath,
+                      getCurrentServerId().getBytes(),
+                      ZooDefs.Ids.OPEN_ACL_UNSAFE,
+                      CreateMode.EPHEMERAL);
+            return true; // 成功成为 Master
+        } catch (KeeperException.NodeExistsException e) {
+            return false; // 已被其他节点抢占
+        }
+    }
+
+    // 监听 Master 节点删除事件
+    public void watchMasterChange(Runnable callback) throws Exception {
+        zk.exists(masterPath, event -> {
+            if (event.getType() == EventType.NodeDeleted) {
+                callback.run(); // Master 宕机，执行选举逻辑
+            }
+        });
+    }
+}
+```
+
+### 基于临时顺序节点：公平选举
+
+上述方案的问题是非公平——后来的节点无法按顺序排队。基于临时顺序节点的方案可以解决这个问题：
+
+```
+选举结构：/election
+
+创建节点：
+- 服务器 A：/election/lock-000000001
+- 服务器 B：/election/lock-000000002
+- 服务器 C：/election/lock-000000003
+
+判断逻辑：
+- A 的序号最小，A 是 Master
+- B 监听 A，A 删除后 B 成为 Master
+- C 监听 B，B 删除后 C 成为 Master
+```
+
+```java
+public class FairMasterElection {
+    private String currentNodePath;
+
+    public void elect() throws Exception {
+        // 创建临时顺序节点
+        currentNodePath = zk.create("/election/lock-",
+                                     getServerId().getBytes(),
+                                     ZooDefs.Ids.OPEN_ACL_UNSAFE,
+                                     CreateMode.EPHEMERAL_SEQUENTIAL);
+
+        // 判断自己是否为最小节点
+        List<String> children = zk.getChildren("/election", false);
+        Collections.sort(children);
+
+        String myNodeName = currentNodePath.split("/")[2];
+        if (children.get(0).equals(myNodeName)) {
+            becomeMaster();
+        } else {
+            // 监听前一个节点
+            watchPreviousNode();
+        }
+    }
+
+    private void watchPreviousNode() throws Exception {
+        List<String> children = zk.getChildren("/election", false);
+        Collections.sort(children);
+
+        String myNodeName = currentNodePath.split("/")[2];
+        int myIndex = children.indexOf(myNodeName);
+        String previousNode = children.get(myIndex - 1);
+
+        zk.exists("/election/" + previousNode, event -> {
+            if (event.getType() == EventType.NodeDeleted) {
+                elect(); // 重新尝试成为 Master
+            }
+        });
+    }
+}
+```
+
+### 选举的触发时机
+
+| 触发时机 | 说明 |
+|---|---|
+| **启动时** | 所有服务器同时启动，参与选举 |
+| **Master 宕机** | Watch 机制感知节点删除，触发重新选举 |
+| **网络抖动** | 可能导致临时节点被误删，引发不必要的选举 |
+
+:::warning
+**网络抖动风险**：如果 ZooKeeper 服务器与客户端之间的网络出现短暂抖动（如 30 秒内的恢复），临时节点会被删除又重建，触发 Master 重新选举。建议在生产环境中配置合理的 tickTime 和心跳超时时间，并在选举逻辑中加入「成为 Master 后等待一段时间再真正接管」的缓冲逻辑。
+:::
+
+## 分布式队列：FIFO 队列
+
+ZooKeeper 的顺序节点可以用于实现简单的分布式 FIFO 队列。
+
+### 实现原理
+
+```
+队列结构：/queue
+
+入队：创建顺序节点
+- /queue/task-000000001
+- /queue/task-000000002
+- /queue/task-000000003
+
+出队：找到序号最小的节点，处理后删除
+```
+
+```java
+public class DistributedQueue {
+    // 入队
+    public void enqueue(String task) throws Exception {
+        zk.create("/queue/task-", task.getBytes(),
+                  ZooDefs.Ids.OPEN_ACL_UNSAFE,
+                  CreateMode.PERSISTENT_SEQUENTIAL);
+    }
+
+    // 出队
+    public String dequeue() throws Exception {
+        while (true) {
+            List<String> children = zk.getChildren("/queue", false);
+            if (children.isEmpty()) {
+                Thread.sleep(100); // 队列为空，等待
+                continue;
+            }
+
+            Collections.sort(children);
+            String minNode = children.get(0);
+            String nodePath = "/queue/" + minNode;
+
+            try {
+                // 尝试获取并删除最小节点（原子操作）
+                byte[] data = zk.getData(nodePath, false, null);
+                zk.delete(nodePath, -1);
+                return new String(data);
+            } catch (KeeperException.NoNodeException e) {
+                // 节点已被其他消费者取走，重试
+                continue;
+            }
+        }
+    }
+}
+```
+
+### 分布式 Barrier
+
+Barrier（屏障）是另一种常见的分布式协同模式：**所有参与者都到达后，才允许同时放行**。
+
+```java
+public class DistributedBarrier {
+    private final String barrierPath;
+    private final int parties; // 参与者的总数
+
+    public void enter() throws Exception {
+        // 创建临时节点表示到达
+        zk.create("/barrier/node-", getServerId().getBytes(),
+                  ZooDefs.Ids.OPEN_ACL_UNSAFE,
+                  CreateMode.EPHEMERAL_SEQUENTIAL);
+
+        // 检查是否所有参与者都已到达
+        while (true) {
+            int count = zk.getChildren("/barrier", false).size();
+            if (count >= parties) {
+                return; // 所有参与者到达，放行
+            }
+            // 等待其他参与者
+            synchronized (lock) {
+                lock.wait();
+            }
+        }
+    }
+
+    public void leave() throws Exception {
+        // 最后一个离开的节点删除屏障
+        zk.delete("/barrier", -1);
+    }
+}
+```
+
+## 应用框架的 ZooKeeper 集成
+
+ZooKeeper 不仅仅是一个独立的组件，更是很多分布式框架的基础设施：
+
+| 框架 | ZooKeeper 的用途 |
+|---|---|
+| **Kafka** | Controller 选举、消费者组 offset 存储、分区 leader 选举 |
+| **HBase** | Master 选举、元数据存储、RegionServer 健康检查 |
+| **Dubbo** | 服务注册与发现、配置中心、负载均衡 |
+| **Solr** | Leader 选举、分布式索引管理 |
+| **YARN** | ResourceManager 高可用、NodeManager 注册 |
+
+:::tip
+**为什么这么多框架选择 ZooKeeper？**
+1. **可靠**：经过大规模生产验证，ZAB 协议保证了强一致性
+2. **简单**：数据模型简单，API 清晰，容易集成
+3. **生态**：Watch 机制天然适合协调场景
+4. **成熟**：社区活跃，文档丰富，各种语言的客户端完善
+:::
+
+## 总结
+
+| 场景 | ZooKeeper 实现方式 | 适用情况 |
+|---|---|---|
+| **配置中心** | ZNode 存储配置 + Watch 感知变更 | 简单配置，无需管理界面 |
+| **命名服务** | 临时节点注册 + 子节点列表获取 | 服务数量有限，无需多机房 |
+| **Master 选举** | 临时节点抢注 / 临时顺序节点排队 | 需要快速故障转移的场景 |
+| **分布式锁** | 临时顺序节点 + 最小节点判断 | 需要公平锁、可重入锁 |
+| **分布式队列** | 持久顺序节点实现 FIFO | 简单队列，无持久化需求 |
+
+<Badge text="配置中心" type="info" /> 适合简单配置管理
+<Badge text="Master 选举" type="tip" /> 临时节点抢注实现快速选主
+<Badge text="框架集成" type="info" /> Kafka、HBase、Dubbo 等框架的协调基础

@@ -1,0 +1,429 @@
+# 超时重试风暴治理
+
+服务 A 超时了，重试；服务 B 超时了，重试；服务 C 也超时了，继续重试。结果：1 个请求变成了 100 个，系统被自己的重试打垮了。
+
+这就是**重试风暴**。今天我们剖析这个问题的根源，并给出解决方案。
+
+## 一、重试风暴的根源
+
+### 1.1 问题分析
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        重试风暴示意                                    │
+│                                                                         │
+│   初始请求：1 个                                                       │
+│       │                                                                 │
+│       ▼                                                                 │
+│   服务A 超时 ──▶ 重试 3 次                                             │
+│       │                                                                 │
+│       ▼                                                                 │
+│   服务B 超时 ──▶ 重试 3 次                                             │
+│       │                                                                 │
+│       ▼                                                                 │
+│   服务C 超时 ──▶ 重试 3 次                                             │
+│       │                                                                 │
+│       ▼                                                                 │
+│   实际请求：27 个（3 × 3 × 3）！                                       │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 1.2 重试放大系数
+
+| 调用层级 | 每层重试次数 | 总放大倍数 |
+|---|---|---|
+| 1 层 | 3 | 3 |
+| 2 层 | 3 | 9 |
+| 3 层 | 3 | 27 |
+| 4 层 | 3 | 81 |
+
+## 二、重试原则
+
+### 2.1 重试三大原则
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        重试三大原则                                    │
+│                                                                         │
+│   1. 只重试幂等的操作                                                  │
+│   - GET 请求天然幂等                                                   │
+│   - DELETE 请求天然幂等                                               │
+│   - POST 需要业务层面幂等                                              │
+│                                                                         │
+│   2. 限制重试次数和间隔                                                │
+│   - 重试次数 ≤ 3                                                     │
+│   - 间隔采用指数退避                                                   │
+│                                                                         │
+│   3. 设置超时时间                                                      │
+│   - 单次调用超时 < 重试间隔                                            │
+│   - 总超时 = 重试次数 × 单次超时                                      │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 2.2 指数退避
+
+```java title="指数退避")
+@Service
+public class ExponentialBackoff {
+    private static final int MAX_RETRIES = 3;
+    private static final long BASE_DELAY_MS = 100;
+    private static final long MAX_DELAY_MS = 5000;
+
+    /**
+     * 计算重试延迟
+     */
+    public long getDelay(int retryCount) {
+        // 指数退避：100ms, 200ms, 400ms...
+        long delay = BASE_DELAY_MS * (1L << retryCount);
+        // 添加随机抖动
+        delay = (long) (delay * (0.5 + Math.random()));
+
+        return Math.min(delay, MAX_DELAY_MS);
+    }
+
+    /**
+     * 执行带重试的操作
+     */
+    public <T> T executeWithRetry(Supplier<T> operation) {
+        Exception lastException = null;
+
+        for (int i = 0; i < MAX_RETRIES; i++) {
+            try {
+                return operation.get();
+            } catch (Exception e) {
+                lastException = e;
+                if (i < MAX_RETRIES - 1) {
+                    long delay = getDelay(i);
+                    log.warn("操作失败，准备重试: attempt={}, delay={}ms",
+                            i + 1, delay);
+                    sleep(delay);
+                }
+            }
+        }
+
+        throw new RuntimeException("重试失败", lastException);
+    }
+
+    private void sleep(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+}
+```
+
+## 三、Feign 重试配置
+
+### 3.1 Feign 重试配置
+
+```java title="Feign 重试")
+@Configuration
+public class FeignRetryConfig {
+    @Bean
+    public Retryer retryer() {
+        // 最大重试 3 次，间隔 100ms-500ms
+        return new Retryer.Default(100, 500, 3);
+    }
+}
+```
+
+### 3.2 超时配置
+
+```yaml title="application.yml"
+feign:
+  client:
+    config:
+      default:
+        connect-timeout: 2000
+        read-timeout: 5000
+        retryer: never  # 全局关闭重试，由业务层控制
+```
+
+### 3.3 禁用重试
+
+```java title="禁用重试")
+@FeignClient(name = "order-service", configuration = FeignNoRetryConfig.class)
+public interface OrderFeignClient {
+    @RequestMapping(method = RequestMethod.GET, value = "/order/{id}")
+    Order getOrder(@PathVariable("id") Long id);
+}
+
+@Configuration
+public class FeignNoRetryConfig {
+    @Bean
+    public Retryer retryer() {
+        // 不重试
+        return Retryer.NEVER_RETRY;
+    }
+}
+```
+
+## 四、RestTemplate 重试
+
+### 4.1 重试配置
+
+```java title="RestTemplate 重试")
+@Configuration
+public class RestTemplateRetryConfig {
+    @Bean
+    public RetryTemplate retryTemplate() {
+        RetryTemplate template = new RetryTemplate();
+
+        // 简单策略
+        SimpleRetryPolicy policy = new SimpleRetryPolicy();
+        policy.setMaxAttempts(3);
+        template.setRetryPolicy(policy);
+
+        // 指数退避
+        ExponentialBackOffPolicy backOff = new ExponentialBackOffPolicy();
+        backOff.setInitialInterval(100);
+        backOff.setMultiplier(2);
+        backOff.setMaxInterval(5000);
+        template.setBackOffPolicy(backOff);
+
+        return template;
+    }
+
+    @Bean
+    public RestTemplate restTemplate(RetryTemplate retryTemplate) {
+        return new RestTemplateBuilder()
+                .setRetryTemplate(retryTemplate)
+                .build();
+    }
+}
+```
+
+### 4.2 重试条件
+
+```java title="重试条件")
+@Configuration
+public class ConditionalRetryConfig {
+    @Bean
+    public RetryTemplate selectiveRetryTemplate() {
+        RetryTemplate template = new RetryTemplate();
+
+        // 只在特定异常时重试
+        Map<Class<? extends Throwable>, Boolean> retryable =
+                Collections.singletonMap(
+                        TimeoutException.class,
+                        true
+                );
+
+        SimpleRetryPolicy policy = new SimpleRetryPolicy(3, retryable);
+        template.setRetryPolicy(policy);
+
+        return template;
+    }
+}
+```
+
+## 五、重试风暴治理
+
+### 5.1 熔断器防止风暴
+
+```java title="熔断器防风暴")
+@Service
+@Slf4j
+public class RetryStormProtection {
+    private final AtomicInteger concurrentRetries = new AtomicInteger(0);
+    private volatile boolean circuitOpen = false;
+    private static final int MAX_CONCURRENT_RETRIES = 100;
+
+    /**
+     * 带保护的重试
+     */
+    public <T> T retryWithProtection(Supplier<T> operation, Supplier<T> fallback) {
+        // 检查熔断状态
+        if (circuitOpen) {
+            log.warn("重试熔断打开，直接降级");
+            return fallback.get();
+        }
+
+        // 检查并发重试数
+        if (concurrentRetries.get() >= MAX_CONCURRENT_RETRIES) {
+            log.warn("并发重试数过多，直接降级");
+            return fallback.get();
+        }
+
+        concurrentRetries.incrementAndGet();
+        try {
+            return executeWithRetry(operation);
+        } finally {
+            concurrentRetries.decrementAndGet();
+        }
+    }
+
+    /**
+     * 触发熔断
+     */
+    public void triggerCircuitOpen() {
+        circuitOpen = true;
+        log.error("重试熔断打开");
+
+        // 30 秒后尝试恢复
+        CompletableFuture.runAsync(() -> {
+            try {
+                Thread.sleep(30000);
+                circuitOpen = false;
+                log.info("重试熔断关闭");
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+    }
+}
+```
+
+### 5.2 限流防止风暴
+
+```java title="限流防止风暴")
+@Service
+@Slf4j
+public class RetryRateLimiter {
+    private final Semaphore semaphore = new Semaphore(50);
+    private final RateLimiter rateLimiter = RateLimiter.create(100); // 100 QPS
+
+    /**
+     * 限流重试
+     */
+    public <T> T retryWithLimit(Supplier<T> operation) {
+        // 限流获取
+        if (!rateLimiter.tryAcquire()) {
+            throw new RetryRejectedException("重试请求被限流");
+        }
+
+        // 并发限制
+        if (!semaphore.tryAcquire()) {
+            throw new RetryRejectedException("并发重试数超限");
+        }
+
+        try {
+            return operation.get();
+        } finally {
+            semaphore.release();
+        }
+    }
+}
+```
+
+### 5.3 单链路重试
+
+```java title="单链路重试")
+@Service
+@Slf4j
+public class Single链路重试Service {
+    private final ThreadLocal<Boolean> retrying = ThreadLocal.withInitial(() -> false);
+
+    /**
+     * 只在最外层重试
+     */
+    public <T> T executeWithSingleRetry(Supplier<T> operation) {
+        // 如果已经在重试中，直接调用
+        if (retrying.get()) {
+            return operation.get();
+        }
+
+        try {
+            retrying.set(true);
+            return executeWithRetry(operation);
+        } finally {
+            retrying.set(false);
+        }
+    }
+}
+```
+
+## 六、重试最佳实践
+
+### 6.1 重试清单
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        重试检查清单                                    │
+│                                                                         │
+│   □ 操作是否幂等？                                                     │
+│   □ 重试次数是否限制（≤3）？                                          │
+│   □ 间隔是否采用退避策略？                                             │
+│   □ 是否设置了超时？                                                   │
+│   □ 是否有熔断保护？                                                   │
+│   □ 是否只在最外层重试？                                              │
+│   □ 重试失败是否有降级？                                              │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 6.2 不可重试的场景
+
+| 场景 | 原因 | 处理 |
+|---|---|---|
+| POST 创建资源 | 可能产生重复资源 | 业务幂等 + 唯一键 |
+| 支付操作 | 资金安全 | 不重试，人工处理 |
+| 删除操作 | 资源已删除 | 幂等，返回成功 |
+| 非幂等查询 | 结果可能变化 | 不重试 |
+
+### 6.3 监控告警
+
+```java title="重试监控")
+@Service
+@Slf4j
+public class RetryMonitor {
+    @Autowired
+    private MeterRegistry meterRegistry;
+
+    private Counter retrySuccessCounter;
+    private Counter retryFailureCounter;
+    private Timer retryDuration;
+
+    @PostConstruct
+    public void init() {
+        retrySuccessCounter = meterRegistry.counter("retry.success");
+        retryFailureCounter = meterRegistry.counter("retry.failure");
+        retryDuration = meterRegistry.timer("retry.duration");
+    }
+
+    public <T> T monitorRetry(Supplier<T> operation) {
+        Timer.Sample sample = Timer.start(meterRegistry);
+
+        try {
+            T result = operation.get();
+            retrySuccessCounter.increment();
+            return result;
+        } catch (Exception e) {
+            retryFailureCounter.increment();
+            throw e;
+        } finally {
+            sample.stop(retryDuration);
+        }
+    }
+}
+```
+
+## 七、总结
+
+| 问题 | 解决方案 |
+|---|---|
+| 无限重试 | 限制重试次数 |
+| 快速重试 | 指数退避 |
+| 嵌套重试 | 单链路重试 |
+| 并发风暴 | 熔断器 + 限流 |
+| 无降级 | 降级兜底 |
+
+:::tip 实战建议
+1. **默认不重试**：让重试成为例外，而不是默认
+2. **退避很重要**：避免重试风暴
+3. **幂等是前提**：重试的基础是幂等
+:::
+
+## 结尾
+
+重试是双刃剑，用好是保护，用不好是灾难。记住三个要点：
+
+1. **重试要克制**：能不多次就不重试
+2. **退避是必须的**：让系统有时间恢复
+3. **幂等是前提**：没有幂等就不要重试
+
+下一节，我们来看系统自适应限流——如何让限流更智能。

@@ -1,0 +1,447 @@
+# 蓝绿部署与金丝雀发布
+
+「我们要上线新功能，今晚凌晨 2 点停机部署。」
+
+如果你还在用停机部署的方式，说明你需要了解蓝绿部署和金丝雀发布了。这两种策略让你的系统升级像「换轮胎」一样不停服务。
+
+## 为什么需要部署策略
+
+### 传统部署的问题
+
+```
+用户请求 → 服务器（更新中）→ 失败！
+           │
+           ▼
+        停机维护窗口
+           │
+           ▼
+        服务恢复
+```
+
+| 问题 | 说明 |
+|---|---|
+| 停机时间长 | 用户无法访问 |
+| 回滚困难 | 需要重新部署旧版本 |
+| 风险集中 | 所有用户同时受影响 |
+| 不可预测 | 问题暴露在生产环境 |
+
+## 蓝绿部署
+
+### 原理
+
+蓝绿部署维护两套完全相同的环境：蓝环境（旧版本）和绿环境（新版本）。部署时，流量一次性切换到新环境。
+
+```
+                    ┌─────────────┐
+                    │   负载均衡   │
+                    └──────┬──────┘
+                           │
+            ┌──────────────┴──────────────┐
+            ▼                              ▼
+      ┌──────────┐                  ┌──────────┐
+      │ 蓝环境   │                  │ 绿环境   │
+      │ v1.0.0  │                  │ v1.1.0  │
+      │ (旧)    │                  │ (新)     │
+      └──────────┘                  └──────────┘
+```
+
+### 切换流程
+
+```
+1. 初始状态：蓝环境 v1.0.0 在线处理流量
+2. 部署准备：绿环境部署 v1.1.0，不接收流量
+3. 验证阶段：验证绿环境是否正常
+4. 流量切换：负载均衡切换到绿环境
+5. 监控阶段：监控新版本运行情况
+6. 回滚备用：若有问题，切换回蓝环境
+```
+
+### Kubernetes 实现
+
+```yaml title="blue-green-service.yaml"
+# 蓝环境 Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: myapp-blue
+  labels:
+    app: myapp
+    version: blue
+spec:
+  selector:
+    app: myapp
+    color: blue
+  ports:
+  - port: 80
+    targetPort: 8080
+
+---
+# 绿环境 Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: myapp-green
+  labels:
+    app: myapp
+    version: green
+spec:
+  selector:
+    app: myapp
+    color: green
+  ports:
+  - port: 80
+    targetPort: 8080
+```
+
+```yaml title="blue-deployment.yaml"
+# 蓝环境 Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: myapp-blue
+  labels:
+    app: myapp
+    color: blue
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: myapp
+      color: blue
+  template:
+    metadata:
+      labels:
+        app: myapp
+        color: blue
+    spec:
+      containers:
+      - name: myapp
+        image: myapp:v1.0.0
+        ports:
+        - containerPort: 8080
+```
+
+```yaml title="green-deployment.yaml"
+# 绿环境 Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: myapp-green
+  labels:
+    app: myapp
+    color: green
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: myapp
+      color: green
+  template:
+    metadata:
+      labels:
+        app: myapp
+        color: green
+    spec:
+      containers:
+      - name: myapp
+        image: myapp:v1.1.0
+        ports:
+        - containerPort: 8080
+```
+
+### 切换命令
+
+```bash
+# 查看当前环境
+kubectl get svc myapp-blue
+
+# 切换流量到绿环境
+kubectl patch service myapp -p '{"spec":{"selector":{"color":"green"}}}'
+
+# 若需回滚
+kubectl patch service myapp -p '{"spec":{"selector":{"color":"blue"}}}'
+```
+
+### GitLab CI 自动化
+
+```yaml title="blue-green-ci.yml"
+deploy:blue-green:
+  stage: deploy
+  image: bitnami/kubectl:latest
+  script:
+    - |
+      # 1. 部署蓝环境（当前在线，版本不变）
+      kubectl apply -f k8s/blue-deployment.yaml
+      
+      # 2. 部署绿环境（新版本）
+      kubectl apply -f k8s/green-deployment.yaml
+      
+      # 3. 等待绿环境 Ready
+      kubectl rollout status deployment/myapp-green --timeout=300s
+      
+      # 4. 健康检查
+      for i in {1..10}; do
+        RESPONSE=$(curl -s http://myapp-green/health)
+        if [ "$RESPONSE" == "OK" ]; then
+          echo "Health check passed"
+          break
+        fi
+        echo "Waiting for health check... ($i/10)"
+        sleep 5
+      done
+      
+      # 5. 切换流量
+      kubectl patch service myapp -p '{"spec":{"selector":{"color":"green"}}}'
+      
+      # 6. 监控 5 分钟
+      sleep 300
+      
+      # 7. 检查是否有错误
+      ERROR_RATE=$(kubectl logs -l app=myapp,color=green --since=5m | grep -c "ERROR" || echo "0")
+      
+      if [ $ERROR_RATE -gt 10 ]; then
+        echo "High error rate detected, rolling back..."
+        kubectl patch service myapp -p '{"spec":{"selector":{"color":"blue"}}}'
+        exit 1
+      fi
+      
+      # 8. 完成：删除旧环境
+      kubectl delete deployment myapp-blue
+      
+  environment:
+    name: production
+  when: manual
+  only:
+    - main
+```
+
+## 金丝雀发布
+
+### 原理
+
+金丝雀发布先部署新版本到小部分实例，逐步将流量切换到新版本，观察正常后再全量切换。
+
+```
+                   ┌─────────────┐
+                   │   负载均衡   │
+                   │  10% 权重   │
+                   └──────┬──────┘
+                          │
+         ┌────────────────┴────────────────┐
+         ▼                                 ▼
+    ┌──────────┐                    ┌──────────┐
+    │ 金丝雀    │                    │ 稳定版本  │
+    │ v1.1.0   │                    │ v1.0.0   │
+    │ 1 个实例  │                    │ 9 个实例  │
+    │ 10% 流量 │                    │ 90% 流量  │
+    └──────────┘                    └──────────┘
+```
+
+### Flagger 实现
+
+Flagger 是 Kubernetes 原生的渐进式交付工具：
+
+```yaml title="canary-flagger.yaml"
+apiVersion: flagger.app/v1beta1
+kind: Canary
+metadata:
+  name: myapp
+  namespace: production
+spec:
+  # 指向原始 Deployment
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: myapp-primary
+  
+  # HPA 配置
+  autoscalerRef:
+    apiVersion: autoscaling/v2
+    kind: HorizontalPodAutoscaler
+    name: myapp-hpa
+  
+  analysis:
+    # 每次增加 10% 流量
+    interval: 1m
+    stepWeight: 10
+    # 最大流量权重
+    maxWeight: 50
+    # 验证阈值（连续失败次数）
+    threshold: 5
+    
+    # 自动回滚条件
+    metrics:
+    - name: request-success-rate
+      interval: 1m
+      # 成功率低于 99% 则回滚
+      thresholdRange:
+        min: 99
+    - name: request-duration
+      interval: 30s
+      # P99 延迟超过 500ms 则回滚
+      thresholdRange:
+        max: 500
+    - name: pod-memory-utilization
+      interval: 30s
+      thresholdRange:
+        max: 90
+    
+    # Webhook 验证
+    webhooks:
+    - name: smoke-test
+      type: pre-rollout
+      url: http://smoke-test.production.svc.cluster.local
+      timeout: 30s
+```
+
+### 手动金丝雀
+
+如果没有 Flagger，也可以手动实现：
+
+```bash
+# 1. 部署金丝雀（1 个副本）
+kubectl set image deployment/myapp myapp=myapp:v1.1.0 --name=canary
+kubectl scale deployment/myapp-canary --replicas=1
+
+# 2. 创建金丝雀 Service
+kubectl expose deployment myapp \
+  --name=myapp-canary-svc \
+  --selector=app=myapp,version=canary \
+  --port=80 --target-port=8080
+
+# 3. 流量分配（使用 Istio）
+kubectl apply -f - <<EOF
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: myapp
+spec:
+  hosts:
+  - myapp
+  http:
+  - route:
+    - destination:
+        host: myapp-primary
+      weight: 90
+    - destination:
+        host: myapp-canary
+      weight: 10
+EOF
+
+# 4. 观察金丝雀
+kubectl logs -l app=myapp,version=canary --tail=100
+
+# 5. 逐步增加流量
+kubectl apply -f - <<EOF
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: myapp
+spec:
+  hosts:
+  - myapp
+  http:
+  - route:
+    - destination:
+        host: myapp-primary
+      weight: 50
+    - destination:
+        host: myapp-canary
+      weight: 50
+EOF
+
+# 6. 确认正常后完全切换
+kubectl patch service myapp -p '{"spec":{"selector":{"version":"v1.1.0"}}}'
+
+# 7. 清理金丝雀
+kubectl delete deployment myapp-canary
+```
+
+## 对比与选择
+
+### 蓝绿部署 vs 金丝雀发布
+
+| 特性 | 蓝绿部署 | 金丝雀发布 |
+|---|---|---|
+| 流量切换 | 全量或无 | 渐进式 |
+| 资源需求 | 双倍资源 | 增量资源 |
+| 回滚速度 | 即时回滚 | 逐步回滚 |
+| 风险控制 | 切换后发现问题 | 小范围验证 |
+| 适用场景 | 重大版本升级 | 功能迭代验证 |
+
+### 选择建议
+
+| 场景 | 推荐策略 |
+|---|---|
+| 大版本升级，可能破坏兼容性 | 蓝绿部署 |
+| 常规功能迭代 | 金丝雀发布 |
+| 基础设施变更 | 蓝绿部署 |
+| A/B 测试 | 金丝雀发布 |
+| 资源受限 | 金丝雀发布 |
+
+## 最佳实践
+
+### 1. 健康检查
+
+```yaml title="health-check.yaml"
+livenessProbe:
+  httpGet:
+    path: /health/live
+    port: 8080
+  initialDelaySeconds: 30
+  periodSeconds: 10
+
+readinessProbe:
+  httpGet:
+    path: /health/ready
+    port: 8080
+  initialDelaySeconds: 10
+  periodSeconds: 5
+```
+
+### 2. 监控告警
+
+```yaml title="canary-monitor.yaml"
+# 部署期间监控
+monitor:canary:
+  script:
+    - |
+      ERROR_RATE=$(prometheus query "rate(http_requests_total{status=~'5..',version='canary'}[5m])")
+      SUCCESS_RATE=$(prometheus query "rate(http_requests_total{version='canary'}[5m])")
+      
+      if [ $(echo "$ERROR_RATE / $SUCCESS_RATE > 0.01" | bc) -eq 1 ]; then
+        echo "Error rate too high: $(echo "scale=2; $ERROR_RATE / $SUCCESS_RATE * 100" | bc)%"
+        # 触发回滚
+      fi
+```
+
+### 3. 回滚策略
+
+```bash
+# Flagger 自动回滚（配置在 Canary CRD 中）
+
+# 手动回滚
+kubectl rollback deployment myapp-primary
+
+# 或者直接切换标签
+kubectl patch service myapp -p '{"spec":{"selector":{"color":"blue"}}}'
+```
+
+## 总结
+
+蓝绿部署和金丝雀发布是现代部署的核心策略：
+
+| 策略 | 核心优势 | 适用场景 |
+|---|---|---|
+| 蓝绿部署 | 即时切换，即时回滚 | 大版本升级 |
+| 金丝雀发布 | 小范围验证，风险可控 | 功能迭代 |
+
+最佳实践：
+
+1. **始终准备回滚方案**：无论用什么策略
+2. **自动化健康检查**：减少人工判断
+3. **渐进式流量切换**：不要一次性全部切换
+4. **完善的监控**：及时发现问题
+5. **自动化整个流程**：减少人为错误
+
+记住：部署不是赌博，而是可控的实验。

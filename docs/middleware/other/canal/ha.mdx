@@ -1,0 +1,268 @@
+# Canal 高可用部署
+
+Canal 支持高可用集群部署，通过 ZooKeeper 实现主备切换和状态协调，保证数据同步的连续性。
+
+## 高可用原理
+
+### 为什么需要 HA？
+
+```
+单点问题：
+
+Canal Server ──→ MySQL
+    │
+    ▼ (故障)
+    ✗ ──→ 同步中断！
+
+高可用：
+
+Canal Server 1 ──→ MySQL (主)
+Canal Server 2 ──→ MySQL (备)
+    │
+    ▼
+ZooKeeper ──→ 选举 ──→ 主节点接管
+```
+
+### ZooKeeper 协调
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                       ZooKeeper 协调机制                             │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│   ZooKeeper 节点结构：                                              │
+│                                                                     │
+│   /otter/canal                                                    │
+│   ├── destinations                                                │
+│   │   └── destination_1                                           │
+│   │       ├── running                                              │
+│   │       │   └── server:1:100                                    │
+│   │       ├── cluster                                              │
+│   │       │   ├── server:1:100                                    │
+│   │       │   └── server:2:100                                    │
+│   │       └── cursor                                               │
+│   │           └── 1001|mysql-bin.001|12345|xxx                   │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+## 部署架构
+
+### 架构图
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         Canal HA 部署架构                            │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│   ┌─────────────┐                                                  │
+│   │   MySQL    │                                                  │
+│   │  Master    │                                                  │
+│   └──────┬──────┘                                                  │
+│          │                                                         │
+│          │ binlog                                                  │
+│          ▼                                                         │
+│   ┌─────────────┐        ┌─────────────┐                           │
+│   │ Canal       │  HA    │ Canal       │                           │
+│   │ Server 1   │◄─────►│ Server 2    │                           │
+│   │ (Active)    │        │ (Standby)  │                           │
+│   └──────┬──────┘        └──────┬──────┘                           │
+│          │                       │                                  │
+│          └───────────┬───────────┘                                  │
+│                      │                                              │
+│                      ▼                                              │
+│              ┌─────────────┐                                       │
+│              │  ZooKeeper  │                                       │
+│              │   Cluster   │                                       │
+│              └─────────────┘                                       │
+│                      │                                              │
+│                      ▼                                              │
+│              ┌─────────────┐                                       │
+│              │   Clients   │                                       │
+│              └─────────────┘                                       │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 选举机制
+
+```bash
+# 节点注册
+create /otter/canal/destinations/destination_1/running ""
+create /otter/canal/destinations/destination_1/cluster ""
+
+# 主节点选举
+# ZooKeeper 通过临时节点和 Watch 实现选举
+# 第一个启动的 Server 注册为 running，成为 Active
+# 其他 Server 注册为 Cluster，处于 Standby
+```
+
+## 配置部署
+
+### MySQL 配置
+
+```ini title="my.cnf"
+[mysqld]
+# 启用 binlog
+log-bin = mysql-bin
+binlog-format = ROW
+binlog-row-image = FULL
+
+# Server ID（每个节点唯一）
+server-id = 1
+
+# GTID 模式（可选）
+gtid-mode = ON
+enforce-gtid-consistency = ON
+```
+
+### Canal Server 配置
+
+```yaml title="canal.properties"
+# Zookeeper 配置
+canal.zkServers = zk1:2181,zk2:2181,zk3:2181
+canal.port = 11111
+
+# Server ID（每个 Canal Server 唯一）
+canal.instance.global.zookeeper.genId =
+
+# HA 模式
+canal.instance.global.spring.xml = classpath:spring/file/hotel-instance.xml
+```
+
+```yaml title="instance.properties"
+# MySQL 连接
+canal.instance.master.address = mysql-host:3306
+
+# 认证
+canal.instance.master.journal.name =
+canal.instance.master.position =
+canal.instance.access.token = your-token
+
+# 过滤器
+canal.instance.filter.regex = order_db\\..*
+```
+
+### ZooKeeper 配置
+
+```conf title="zoo.cfg"
+tickTime=2000
+initLimit=10
+syncLimit=5
+dataDir=/data/zookeeper
+clientPort=2181
+
+server.1=zk1:2888:3888
+server.2=zk2:2888:3888
+server.3=zk3:2888:3888
+```
+
+## 客户端高可用
+
+### 自动 Failover
+
+```java
+public class HAClient {
+
+    public static void main(String[] args) {
+        // 使用 Cluster Connector
+        CanalConnector connector = CanalConnectors.newClusterConnector(
+            "zk1:2181,zk2:2181,zk3:2181",  // ZooKeeper 地址
+            "destination",                   // Instance 名称
+            "",                              // 用户名
+            ""                               // 密码
+        );
+
+        // 开启自动重连
+        ((ClusterCanalConnector) connector).setRetry(3);
+
+        connector.connect();
+        connector.subscribe();
+
+        while (true) {
+            try {
+                Message message = connector.get(100);
+                if (message.getId() != -1) {
+                    processEntries(message.getEntries());
+                    connector.ack(message.getId());
+                }
+            } catch (Exception e) {
+                // 自动重连到新的 Server
+                connector.reconnect();
+            }
+        }
+    }
+}
+```
+
+### 手动控制
+
+```java
+// 获取当前 Server
+String currentAddress = ((ClusterCanalClient) connector).getCurrentAddress();
+
+// 切换到指定 Server
+connector.stopRunning();
+connector.connect("192.168.1.2:11111");
+connector.subscribe();
+```
+
+## 状态管理
+
+### 查看状态
+
+```bash
+# 查看 running 节点
+get /otter/canal/destinations/destination_1/running
+
+# 查看集群节点
+ls /otter/canal/destinations/destination_1/cluster
+
+# 查看游标位置
+get /otter/canal/destinations/destination_1/cursor
+```
+
+### 手动切换
+
+```bash
+# 强制切换主节点
+delete /otter/canal/destinations/destination_1/running/server:1:100
+```
+
+## 监控
+
+### Prometheus 监控
+
+```yaml title="canal.properties"
+canal.metrics.pull.port = 11112
+canal.metrics.enable = true
+```
+
+```yaml title="prometheus.yml"
+scrape_configs:
+  - job_name: 'canal'
+    static_configs:
+      - targets: ['canal-server:11112']
+```
+
+### 监控指标
+
+| 指标 | 说明 |
+|---|---|
+| canal_client_input_count | 客户端接收消息数 |
+| canal_client_ack_count | 客户端确认消息数 |
+| canal_client_lag | 主从延迟 |
+| canal_destination_running | 是否运行 |
+
+## 总结
+
+HA 部署核心配置：
+
+| 配置项 | 说明 |
+|---|---|
+| `canal.zkServers` | ZooKeeper 地址 |
+| `canal.instance.global.spring.xml` | Instance 配置文件 |
+| `canal.instance.master.address` | MySQL 主库地址 |
+| `canal.access.token` | 认证 Token |
+
+> 下一步：了解了高可用部署后，让我们学习 Canal 的应用场景。

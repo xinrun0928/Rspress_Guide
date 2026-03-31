@@ -1,0 +1,603 @@
+# OAuth 2.0 在微服务架构中的实践
+
+你有没有想过，当你用微信登录某个 App 时，为什么这个 App 能获取你的昵称和头像，却无法获取你的聊天记录？为什么不同 App 能获取的微信数据权限不一样？
+
+这就是 OAuth 2.0 要解决的核心问题：**授权访问，而不是账户共享**。
+
+今天我们深入剖析 OAuth 2.0 的四种授权模式，以及在微服务架构中如何设计一套完整的授权服务体系。
+
+## 一、从一个场景理解 OAuth 2.0
+
+### 1.1 传统模式的问题
+
+假设你开发了一个「简历分析」应用，用户上传简历，系统自动提取关键信息。用户问：能不能用 GitHub 账号登录？
+
+**传统方案**：用户把 GitHub 账号密码给你，你直接登录 GitHub 获取数据。
+
+```
+问题：
+- 用户必须把密码给你
+- 你能访问用户 GitHub 的所有内容（不只是简历）
+- 你被黑客攻击，用户 GitHub 也危险了
+- 你和用户闹掰了，用户无法修改密码
+```
+
+### 1.2 OAuth 2.0 的解决方案
+
+OAuth 2.0 的核心理念：**我不给你密码，我只给你一把「受限的钥匙」**。
+
+```
+用户 → GitHub：「简历分析应用想访问我的公开资料」
+GitHub → 用户：「你同意吗？」
+用户 → GitHub：「同意」
+GitHub → 应用：「这是访问令牌，只能看公开资料，有效期 1 小时」
+应用 → GitHub：「我要看用户资料」（出示令牌）
+GitHub → 应用：「这是用户的公开资料」
+```
+
+用户掌握主动权：可以随时撤销这个令牌，可以在 GitHub 后台看到应用访问了哪些数据。
+
+## 二、OAuth 2.0 四种授权模式
+
+### 2.1 授权码模式（Authorization Code）—— 最安全
+
+这是最安全、最标准的模式，适合有后端服务器的应用。
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           授权码模式流程                                 │
+└─────────────────────────────────────────────────────────────────────────┘
+
+  浏览器                     客户端                 授权服务器
+    │                           │                        │
+    │  1. 访问应用              │                        │
+    │ ────────────────────────▶│                        │
+    │                           │                        │
+    │  2. 重定向到授权服务器     │                        │
+    │ ◀────────────────────────│                        │
+    │    (携带 client_id, redirect_uri, state)          │
+    │                           │                        │
+    │  3. 用户登录并同意授权     │                        │
+    │ ──────────────────────────────────────────────────▶
+    │                           │                        │
+    │  4. 重定向回应用           │                        │
+    │    (携带授权码 + state)   │                        │
+    │ ────────────────────────▶│                        │
+    │                           │                        │
+    │                           │  5. 用授权码换令牌      │
+    │                           │ ──────────────────────▶
+    │                           │    (client_id,         │
+    │                           │     client_secret,     │
+    │                           │     authorization_code)│
+    │                           │                        │
+    │                           │  6. 返回访问令牌        │
+    │                           │ ◀──────────────────────│
+    │                           │                        │
+```
+
+**为什么安全？**
+- 授权码换取令牌时，需要 `client_secret`，保证了令牌只能从后端换取
+- 令牌不经过浏览器，避免泄露
+- 支持 Refresh Token 长期有效
+
+```java title="授权服务器核心实现"
+@Service
+public class AuthorizationService {
+    @Autowired
+    private ClientService clientService;
+    @Autowired
+    private TokenService tokenService;
+    @Autowired
+    private UserService userService;
+
+    /**
+     * 生成授权码
+     */
+    public String generateAuthCode(String clientId, String userId, String redirectUri, String scope) {
+        // 验证客户端注册信息
+        Client client = clientService.getClient(clientId);
+        if (client == null || !client.getRedirectUri().equals(redirectUri)) {
+            throw new InvalidClientException("Invalid client or redirect_uri");
+        }
+
+        // 验证用户已登录（通过 Session）
+        if (userId == null) {
+            throw new UnauthorizedException("User not authenticated");
+        }
+
+        // 生成授权码（短期有效，最多使用一次）
+        String authCode = generateSecureCode(32);
+        authCodeCache.put(authCode, AuthCodeData.builder()
+                .clientId(clientId)
+                .userId(userId)
+                .redirectUri(redirectUri)
+                .scope(scope)
+                .createdAt(System.currentTimeMillis())
+                .build());
+
+        return authCode;
+    }
+
+    /**
+     * 用授权码换取令牌
+     */
+    public TokenResponse exchangeCodeForToken(String code, String clientId, String clientSecret) {
+        AuthCodeData data = authCodeCache.get(code);
+        if (data == null) {
+            throw new InvalidGrantException("Authorization code invalid or expired");
+        }
+
+        // 验证客户端
+        Client client = clientService.getClient(clientId);
+        if (!client.getClientSecret().equals(clientSecret)) {
+            throw new InvalidClientException("Invalid client credentials");
+        }
+
+        // 删除授权码（一次性使用）
+        authCodeCache.delete(code);
+
+        // 生成令牌
+        return tokenService.generateTokens(data.getUserId(), data.getScope());
+    }
+}
+```
+
+### 2.2 隐式授权模式（Implicit）—— 已过时
+
+早期用于纯前端应用，但因为安全风险已被废弃，不推荐使用。
+
+```
+风险：
+- 没有 client_secret，任何人都能伪装成应用申请令牌
+- 令牌通过 URL 传递，可能被浏览器历史记录、日志等记录
+- 无法刷新令牌
+```
+
+:::danger 重要提示
+如果你还在使用隐式授权，请尽快迁移到授权码模式 + PKCE 扩展。
+:::
+
+### 2.3 密码模式（Resource Owner Password Credentials）
+
+用户直接把用户名密码给应用，应用用这个信息向授权服务器申请令牌。
+
+```
+用户 → 应用：「我的账号密码」
+应用 → 授权服务器：「用户说这是他的密码」
+授权服务器 → 应用：「验证通过，这是令牌」
+```
+
+**适用场景**：高度信任的应用（如公司内部系统）
+**禁止场景**：第三方应用
+
+```java title="密码模式实现"
+public TokenResponse passwordGrant(String username, String password, String scope) {
+    // 直接验证用户名密码
+    User user = userService.authenticate(username, password);
+    if (user == null) {
+        throw new InvalidGrantException("Invalid username or password");
+    }
+
+    // 生成令牌
+    return tokenService.generateTokens(user.getId(), scope);
+}
+```
+
+### 2.4 客户端凭证模式（Client Credentials）
+
+这是**应用层面的授权**，不是用户授权。适用于微服务之间的 API 调用。
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  微服务 A ──── (client_id + client_secret) ────▶ 授权服务器              │
+│                   ◀─── (访问令牌) ────                                   │
+│                        │                                                 │
+│                        ▼                                                 │
+│                   微服务 B（资源服务器）                                  │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+```java title="客户端凭证模式实现"
+public TokenResponse clientCredentialsGrant(String clientId, String clientSecret, String scope) {
+    Client client = clientService.authenticateClient(clientId, clientSecret);
+    if (client == null) {
+        throw new InvalidClientException("Invalid client credentials");
+    }
+
+    return tokenService.generateTokens(client.getId(), scope, TokenType.CLIENT);
+}
+```
+
+## 三、微服务架构下的 OAuth 2.0 设计
+
+### 3.1 整体架构
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           客户端（浏览器/App）                           │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           API Gateway                                   │
+│   ┌─────────────────────────────────────────────────────────────────┐   │
+│   │  1. Token 验证（JWT 解析）                                         │   │
+│   │  2. Scope 校验（接口权限）                                         │   │
+│   │  3. 请求路由                                                      │   │
+│   └─────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────┘
+                                    │
+          ┌─────────────────────────┼─────────────────────────┐
+          ▼                         ▼                         ▼
+    ┌─────────────┐          ┌─────────────┐          ┌─────────────┐
+    │  Auth       │          │   Order     │          │    User     │
+    │  Service    │          │   Service   │          │   Service   │
+    │  (授权服务器)│          │  (资源服务器)│          │  (资源服务器)│
+    └─────────────┘          └─────────────┘          └─────────────┘
+          │                         │                         │
+          └─────────────────────────┼─────────────────────────┘
+                                    ▼
+                          ┌─────────────────┐
+                          │  Redis Cluster  │
+                          │  - 令牌存储       │
+                          │  - 用户会话       │
+                          │  - 授权码缓存     │
+                          └─────────────────┘
+```
+
+### 3.2 JWT Token 结构设计
+
+```json title="Access Token Payload"
+{
+  "iss": "https://auth.example.com",
+  "sub": "user_123456",
+  "aud": ["order-service", "user-service"],
+  "exp": 1699999999,
+  "iat": 1699996399,
+  "jti": "token_unique_id",
+  "scope": "read:order write:order read:user",
+  "client_id": "web_app",
+  "user": {
+    "username": "zhangsan",
+    "email": "zhangsan@example.com",
+    "roles": ["admin", "user"]
+  }
+}
+```
+
+```java title="JWT Token 生成"
+@Service
+public class JwtTokenService {
+    private static final String SECRET_KEY = "your-256-bit-secret";
+    private static final long ACCESS_TOKEN_EXPIRY = 3600; // 1小时
+    private static final long REFRESH_TOKEN_EXPIRY = 604800; // 7天
+
+    public String generateAccessToken(String userId, Set<String> scopes) {
+        Date now = new Date();
+        Date expiry = new Date(now.getTime() + ACCESS_TOKEN_EXPIRY * 1000);
+
+        return Jwts.builder()
+                .setIssuer("https://auth.example.com")
+                .setSubject(userId)
+                .setIssuedAt(now)
+                .setExpiration(expiry)
+                .claim("scope", String.join(" ", scopes))
+                .claim("jti", UUID.randomUUID().toString())
+                .signWith(Keys.hmacShaKeyFor(SECRET_KEY.getBytes()))
+                .compact();
+    }
+}
+```
+
+### 3.3 资源服务器配置
+
+```java title="Spring Security OAuth2 资源服务器配置"
+@Configuration
+@EnableResourceServer
+public class ResourceServerConfig extends ResourceServerConfigurerAdapter {
+
+    @Autowired
+    private JwtTokenService jwtTokenService;
+
+    @Override
+    public void configure(ResourceServerSecurityConfigurer resources) {
+        resources
+            .tokenServices(tokenServices())
+            .stateless(true);
+    }
+
+    @Bean
+    public ResourceServerTokenServices tokenServices() {
+        DefaultTokenServices services = new DefaultTokenServices();
+        services.setTokenEnhancer(new JwtTokenEnhancer());
+        services.setJwtTokenStore(new JwtTokenStore(jwtAccessTokenConverter()));
+        return services;
+    }
+
+    @Bean
+    public JwtAccessTokenConverter jwtAccessTokenConverter() {
+        JwtAccessTokenConverter converter = new JwtAccessTokenConverter();
+        converter.setSigningKey(SECRET_KEY);
+        return converter;
+    }
+
+    @Override
+    public void configure(HttpSecurity http) throws Exception {
+        http
+            .authorizeRequests()
+                .antMatchers("/public/**").permitAll()
+                .antMatchers("/actuator/**").permitAll()
+                .antMatchers("/orders/**").access("#oauth2.hasScope('read:order') or #oauth2.hasScope('write:order')")
+                .anyRequest().authenticated();
+    }
+}
+```
+
+## 四、Scope 权限设计
+
+### 4.1 Scope 命名规范
+
+推荐使用 `resource:action` 格式，便于理解和校验。
+
+| Scope | 说明 |
+|---|---|
+| `read:order` | 读取订单 |
+| `write:order` | 创建/修改订单 |
+| `delete:order` | 删除订单 |
+| `read:user` | 读取用户信息 |
+| `admin:*` | 管理员所有权限 |
+
+### 4.2 Scope 校验
+
+```java title="接口权限校验"
+@RestController
+@RequestMapping("/api/orders")
+public class OrderController {
+
+    @GetMapping("/{id}")
+    @PreAuthorize("hasAuthority('SCOPE_read:order')")
+    public Order getOrder(@PathVariable Long id) {
+        return orderService.getOrder(id);
+    }
+
+    @PostMapping
+    @Preauthorize("hasAuthority('SCOPE_write:order')")
+    public Order createOrder(@RequestBody OrderDTO orderDTO) {
+        return orderService.createOrder(orderDTO);
+    }
+
+    @DeleteMapping("/{id}")
+    @PreAuthorize("hasAuthority('SCOPE_delete:order')")
+    public void deleteOrder(@PathVariable Long id) {
+        orderService.deleteOrder(id);
+    }
+}
+```
+
+### 4.3 客户端 Scope 注册
+
+```json title="客户端配置"
+{
+  "clientId": "mobile_app",
+  "clientName": "移动端应用",
+  "clientSecret": "$2a$10$xxx", // BCrypt 加密
+  "redirectUris": ["myapp://oauth/callback"],
+  "allowedScopes": ["read:order", "write:order", "read:user"],
+  "accessTokenValidity": 3600,
+  "refreshTokenValidity": 2592000
+}
+```
+
+## 五、Refresh Token 机制
+
+### 5.1 为什么需要 Refresh Token
+
+```
+Access Token：短期（1小时），泄露后攻击窗口小
+Refresh Token：长期（7天），用于获取新的 Access Token
+```
+
+### 5.2 刷新流程
+
+```java title="Token 刷新实现"
+@Service
+public class TokenRefreshService {
+    @Autowired
+    private TokenRepository tokenRepository;
+    @Autowired
+    private JwtTokenService jwtTokenService;
+
+    public TokenResponse refresh(String refreshToken) {
+        // 验证 Refresh Token
+        RefreshToken stored = tokenRepository.findRefreshToken(refreshToken);
+        if (stored == null || stored.isExpired()) {
+            throw new InvalidTokenException("Refresh token invalid or expired");
+        }
+
+        // 检查 Token 家族（同一个 Access Token 刷新出来的）
+        String family = stored.getTokenFamily();
+        // 如果该家族的 Refresh Token 已被使用过（被撤回），则全部失效
+        if (tokenRepository.isTokenFamilyRevoked(family)) {
+            tokenRepository.revokeAllTokensInFamily(family);
+            throw new SecurityException("Token family has been revoked");
+        }
+
+        // 撤销旧 Refresh Token（一次性使用）
+        tokenRepository.revokeRefreshToken(refreshToken);
+
+        // 生成新令牌
+        String newAccessToken = jwtTokenService.generateAccessToken(stored.getUserId(), stored.getScopes());
+        String newRefreshToken = generateSecureRefreshToken();
+
+        // 存储新 Refresh Token（同一家族）
+        tokenRepository.saveRefreshToken(newRefreshToken, stored.getUserId(), stored.getScopes(), family);
+
+        return TokenResponse.builder()
+                .accessToken(newAccessToken)
+                .refreshToken(newRefreshToken)
+                .tokenType("Bearer")
+                .expiresIn(3600)
+                .build();
+    }
+}
+```
+
+:::tip Token 家族机制
+Refresh Token 采用「家族」管理：同一用户多次刷新获得的 Refresh Token 属于同一家族。当用户主动注销或怀疑 Token 泄露时，撤销整个家族，所有令牌同时失效。
+:::
+
+## 六、与 CAS 的核心区别
+
+| 对比维度 | OAuth 2.0 | CAS |
+|---|---|---|
+| 核心问题 | 授权访问（你能访问什么） | 身份认证（你是谁） |
+| 令牌类型 | Access Token | Service Ticket |
+| 令牌特点 | 长期有效，可重复使用 | 一次性，用完即废 |
+| 第三方登录 | 原生支持 | 需要扩展 |
+| Scope 支持 | 原生支持细粒度权限 | 不支持 |
+| 应用场景 | 开放平台、第三方登录 | 企业内部 SSO |
+
+**选择建议**：
+- 企业内部系统，域名统一 → CAS
+- 开放平台、第三方登录 → OAuth 2.0
+- 微服务架构 → OAuth 2.0 + JWT
+
+## 七、安全最佳实践
+
+### 7.1 令牌安全
+
+```java title="令牌安全措施"
+public class TokenSecurityService {
+    /**
+     * 令牌吊销（用于安全事件响应）
+     */
+    public void revokeToken(String token) {
+        String jti = extractJti(token);
+        // 加入黑名单，TTL 等于令牌剩余有效期
+        long ttl = calculateRemainingTtl(token);
+        redisTemplate.opsForValue().set("blacklist:" + jti, "revoked", ttl, TimeUnit.SECONDS);
+    }
+
+    /**
+     * 用户下线（吊销该用户所有令牌）
+     */
+    public void revokeUserTokens(String userId) {
+        String family = userService.getTokenFamily(userId);
+        tokenRepository.revokeAllTokensInFamily(family);
+    }
+
+    /**
+     * 异常登录检测
+     */
+    public void checkAnomalousLogin(String userId, LoginContext context) {
+        String lastLoginIp = userService.getLastLoginIp(userId);
+
+        // 异地登录告警
+        if (lastLoginIp != null && !lastLoginIp.equals(context.getIp())) {
+            String lastLocation = ip2Location(lastLoginIp);
+            String currentLocation = ip2Location(context.getIp());
+            if (!lastLocation.equals(currentLocation)) {
+                alertService.sendAlert(userId, "异地登录警告",
+                    String.format("上次登录：%s，当前登录：%s", lastLocation, currentLocation));
+            }
+        }
+
+        userService.updateLastLoginInfo(userId, context.getIp(), context.getDevice());
+    }
+}
+```
+
+### 7.2 PKCE 扩展
+
+对于移动端和 SPA 应用，推荐使用 PKCE（Proof Key for Code Exchange）增强安全性。
+
+```
+标准授权码：client_id + client_secret 证明身份
+PKCE：在标准授权码基础上，增加 code_verifier 动态验证
+```
+
+```java title="PKCE 实现"
+@Service
+public class PkceService {
+    private static final SecureRandom SECURE_RANDOM = new SecureRandom();
+
+    /**
+     * 生成 code_verifier（43-128位随机字符串）
+     */
+    public String generateCodeVerifier() {
+        byte[] buffer = new byte[32];
+        SECURE_RANDOM.nextBytes(buffer);
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(buffer);
+    }
+
+    /**
+     * 生成 code_challenge
+     * S256 方式：BASE64URL(SHA256(code_verifier))
+     */
+    public String generateCodeChallenge(String codeVerifier) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] hash = digest.digest(codeVerifier.getBytes(StandardCharsets.US_ASCII));
+            return Base64.getUrlEncoder().withoutPadding().encodeToString(hash);
+        } catch (NoSuchAlgorithmException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    /**
+     * 验证 code_verifier
+     */
+    public boolean verifyCodeVerifier(String codeVerifier, String codeChallenge, String method) {
+        if ("S256".equals(method)) {
+            return generateCodeChallenge(codeVerifier).equals(codeChallenge);
+        }
+        // plain 方法不推荐
+        return codeVerifier.equals(codeChallenge);
+    }
+}
+```
+
+## 八、总结与选型
+
+### 8.1 模式选择
+
+| 应用类型 | 推荐模式 |
+|---|---|
+| 有后端服务器的 Web 应用 | 授权码模式 |
+| 移动端 App | 授权码模式 + PKCE |
+| 单页应用（SPA） | 授权码模式 + PKCE |
+| 微服务间调用 | 客户端凭证模式 |
+| 公司内部系统 | 密码模式（高信任）或授权码模式 |
+
+### 8.2 架构建议
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          最佳实践架构                                   │
+│                                                                         │
+│  ┌─────────┐     ┌─────────┐     ┌─────────┐     ┌─────────┐         │
+│  │  授权    │     │   令牌   │     │   资源   │     │   客户端  │         │
+│  │  服务器   │────▶│  服务    │────▶│  服务器   │◀────│  注册    │         │
+│  └─────────┘     └─────────┘     └─────────┘     └─────────┘         │
+│       │               │                                                   │
+│       │               ▼                                                   │
+│       │         ┌─────────┐                                              │
+│       └────────▶│  Redis  │  (Token 存储、黑名单、授权码)                   │
+│                 └─────────┘                                              │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+:::tip 架构要点
+1. 授权服务器只负责授权，不处理业务逻辑
+2. Token 服务独立，负责生成、验证、刷新、吊销
+3. 资源服务器只校验 Token，不关心授权流程
+4. 所有 Token 存储在 Redis，支持实时吊销
+:::
+
+## 结尾
+
+OAuth 2.0 不是银弹，它解决的是「授权」问题，而不是「认证」问题。在实际项目中，很多团队把 OAuth 2.0 当作万能方案，结果把简单的事情搞复杂了。
+
+记住一个原则：**能用简单的方案解决，就不要用复杂的**。企业内部系统、用户量不大时，JWT + Session 可能更简单；需要对接第三方、构建开放平台时，OAuth 2.0 是最佳选择。
+
+下一节，我们回到微服务架构，看看如何在无状态场景下解决 Session 共享问题——这就是分布式 Session 要解决的问题。

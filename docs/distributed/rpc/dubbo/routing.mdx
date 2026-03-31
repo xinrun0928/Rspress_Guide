@@ -1,0 +1,433 @@
+# Dubbo 路由机制
+
+灰度发布时，你希望只有 10% 的流量打到新版本。流量染色怎么做？路由规则怎么配置？
+
+这就是 Dubbo 路由机制要解决的问题。
+
+## 什么是路由
+
+路由（Router）在 Dubbo 中负责根据条件，将调用请求路由到特定的 Provider 实例。它是 Dubbo 服务治理的重要组成部分，常用于：
+
+```yaml
+# 路由常见应用场景
+1. 灰度发布
+   - 新版本只接受少量流量
+   - 验证无问题后逐步扩大
+
+2. 流量染色
+   - 根据请求标签路由到特定实例
+   - 实现环境隔离
+
+3. 机房路由
+   - 同机房优先
+   - 减少跨机房延迟
+
+4. 读写分离
+   - 读请求路由到只读实例
+   - 写请求路由到主实例
+
+5. 条件路由
+   - 金丝雀发布
+   - A/B 测试
+```
+
+## 路由机制原理
+
+```yaml
+# 路由在调用链中的位置
+┌─────────────────────────────────────────────────────────────┐
+│                 Dubbo 调用链中的路由                         │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  Consumer                                                   │
+│     │                                                      │
+│     ▼                                                      │
+│  ┌──────────────────────────────────────────────┐          │
+│  │ 1. RouterChain                               │          │
+│  │    - 包含多个 Router                         │          │
+│  │    - 依次执行路由过滤                         │          │
+│  └─────────────────────┬────────────────────────┘          │
+│                        │                                     │
+│                        ▼                                     │
+│  ┌──────────────────────────────────────────────┐          │
+│  │ 2. TagRouter / ConditionRouter / AppRouter  │          │
+│  │    - 根据规则过滤 Invoker                   │          │
+│  └─────────────────────┬────────────────────────┘          │
+│                        │                                     │
+│                        ▼                                     │
+│  ┌──────────────────────────────────────────────┐          │
+│  │ 3. LoadBalance                              │          │
+│  │    - 在过滤后的 Invoker 中选择               │          │
+│  └──────────────────────────────────────────────┘          │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## 路由类型
+
+Dubbo 支持多种路由类型：
+
+```yaml
+# Dubbo 路由类型
+类型              描述                     特点
+─────────────────────────────────────────────────────────────────
+条件路由          基于条件表达式的路由       灵活、强大
+标签路由          基于请求标签的路由         简单、隔离
+文件路由          配置文件方式的路由         静态、可回滚
+脚本路由          JavaScript 脚本路由        极灵活（已废弃）
+```
+
+### 1. 条件路由
+
+条件路由是最灵活的路由方式，基于条件表达式进行匹配。
+
+```yaml
+# 条件路由语法
+# 格式：
+# route[服务名] => 条件
+# 条件 = 主机表达式 | 请求表达式
+# 主机表达式 = 消费者条件 | 提供者条件
+
+# 消费者条件：
+#   application = 应用名
+#   method = 方法名
+#   argument[index] = 参数值
+#   attachment = 附件
+#   ...
+# 提供者条件：
+#   host = IP 地址
+#   application = 应用名
+#   weight = 权重
+#   ...
+```
+
+```yaml
+# 条件路由示例
+# 1. 同机房优先路由
+route:
+  - name: same-region优先
+    priority: 1
+    enabled: true
+    force: false          # 找不到同机房时是否强制失败
+    conditions:
+      - consumer.host != provider.host
+        => provider.host REGION(provider.host) = consumer.host REGION(consumer.host)
+
+# 2. 金丝雀发布路由
+route:
+  - name: canary-10-percent
+    priority: 2
+    conditions:
+      # 10% 流量路由到新版本
+      - consumer.application = user-app
+        => provider.version = 2.0.0
+
+# 3. 禁止访问路由
+route:
+  - name: blacklist
+    priority: 0
+    conditions:
+      # 黑名单应用禁止访问
+      - consumer.application IN (bad-app1, bad-app2)
+        => false
+```
+
+```java
+// 动态配置条件路由
+Registry registry = new ZookeeperRegistry(...);
+Route route = new ConditionRouter();
+route.setRule("=> host = 192.168.1.*");
+route.setPriority(1);
+registry.register(route.toUrl());
+```
+
+### 2. 标签路由
+
+标签路由通过为请求和实例打标签，实现流量隔离。
+
+```yaml
+# 标签路由原理
+┌─────────────────────────────────────────────────────────────┐
+│                     标签路由模型                             │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  Provider 实例                                              │
+│  ┌─────────────────────┐                                   │
+│  │ tag = gray          │                                   │
+│  │ instances: 3        │                                   │
+│  └─────────────────────┘                                   │
+│  ┌─────────────────────┐                                   │
+│  │ tag = production    │                                   │
+│  │ instances: 10       │                                   │
+│  └─────────────────────┘                                   │
+│                                                             │
+│  Consumer 请求                                             │
+│  ┌─────────────────────┐                                   │
+│  │ tag = gray          │                                   │
+│  │ 请求将路由到 gray 组 │                                   │
+│  └─────────────────────┘                                   │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+```java
+// 服务提供者配置标签
+@Service(tag = "gray")
+public class UserServiceImpl implements UserService {
+    // 这个实例会被标记为 gray 标签
+}
+
+// 或者通过配置
+dubbo:
+  provider:
+    tag: gray
+```
+
+```java
+// 消费者请求指定标签
+public class UserServiceConsumer {
+
+    @DubboReference(tag = "gray")
+    private UserService userService;
+
+    public void callWithTag() {
+        RpcContext.getContext().setAttachment("dubbo.tag", "gray");
+        userService.getUser(1L);
+    }
+}
+```
+
+```yaml
+# 标签路由规则配置
+# Dubbo Admin 或 Nacos 控制台配置
+dubbo:
+  router:
+    type: tag
+    force: false      # force=true 时，找不到对应标签实例会失败
+    runtime: true     # runtime=true 时每次调用都执行路由
+```
+
+### 3. 脚本路由（已废弃）
+
+```yaml
+# 注意：Dubbo 3.0 已废弃脚本路由
+# 原因：安全风险，脚本执行引擎可能有漏洞
+# 替代方案：使用条件路由或自定义 Router SPI
+```
+
+## 路由规则配置
+
+### XML 配置
+
+```xml
+<!-- XML 配置路由 -->
+<beans>
+    <dubbo:protocol name="dubbo" port="20880"/>
+
+    <!-- 路由规则 -->
+    <dubbo:router priority="2" rule="condition" />
+</beans>
+```
+
+### Annotation 配置
+
+```java
+// 注解配置路由标签
+@Configuration
+public class RouterConfig {
+
+    @Bean
+    public TagRouter rule() {
+        TagRouter router = new TagRouter();
+        router.setPriority(1);
+        router.setForce(false);
+        return router;
+    }
+}
+```
+
+### 动态配置
+
+```java
+// 动态配置路由规则（通过注册中心）
+public class DynamicRouterConfig {
+
+    public static void main(String[] args) {
+        ConfigCenterConfig configCenter = new ConfigCenterConfig();
+        configCenter.setAddress("zookeeper://127.0.0.1:2181");
+
+        // 路由规则配置到配置中心
+        String rule = "[\n" +
+            "  {\n" +
+            "    \"name\": \"tag-router\",\n" +
+            "    \"priority\": 1,\n" +
+            "    \"enabled\": true,\n" +
+            "    \"force\": false,\n" +
+            "    \"runtime\": true,\n" +
+            "    \"tags\": [\n" +
+            "      {\n" +
+            "        \"name\": \"gray\",\n" +
+            "        \"addresses\": [\"192.168.1.*:20880\"]\n" +
+            "      },\n" +
+            "      {\n" +
+            "        \"name\": \"production\",\n" +
+            "        \"addresses\": [\"192.168.2.*:20880\"]\n" +
+            "      }\n" +
+            "    ]\n" +
+            "  }\n" +
+            "]";
+
+        configCenter.setConfig(rule);
+    }
+}
+```
+
+## 路由应用场景
+
+### 场景一：灰度发布
+
+```yaml
+# 灰度发布配置
+# 步骤 1: 新版本实例上线，打上新版本标签
+dubbo:
+  provider:
+    tag: v2.0.0
+
+# 步骤 2: 通过控制台配置路由规则
+# 10% 流量路由到新版本
+{
+  "name": "gray-route",
+  "type": "condition",
+  "priority": 1,
+  "enabled": true,
+  "conditions": [
+    "method = getUser => host = 192.168.1.*"  # 新版本实例 IP
+  ]
+}
+
+# 步骤 3: 验证通过后，逐步增加流量
+# 修改路由规则，20%, 50%, 100%
+```
+
+### 场景二：流量隔离
+
+```yaml
+# 测试环境与生产环境隔离
+# 消费者
+dubbo:
+  consumer:
+    tag: test-env
+
+# 提供者
+dubbo:
+  provider:
+    tag: test-env  # 测试环境实例
+
+# 路由规则：测试请求只能打到测试实例
+route:
+  - name: test-isolation
+    conditions:
+      - consumer.tag = test-env
+        => provider.tag = test-env
+```
+
+### 场景三：区域路由
+
+```yaml
+# 同区域优先路由
+route:
+  - name: region-aware
+    priority: 10
+    conditions:
+      # 如果有同区域实例，优先使用
+      - => address = ${region}.*.20880
+```
+
+### 场景四：读写分离
+
+```yaml
+# 读写分离路由
+# 读请求路由到只读实例
+route:
+  - name: read-write-split
+    conditions:
+      - method = list*, find*, get*, query*
+        => address = *-read.*:20880
+      - method = create*, update*, delete*
+        => address = *-write.*:20880
+```
+
+## 路由与负载均衡的配合
+
+```yaml
+# 路由 + 负载均衡配合
+┌─────────────────────────────────────────────────────────────┐
+│              路由与负载均衡的执行顺序                        │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  1. RouterChain 执行路由规则                                 │
+│     - 根据路由条件过滤 Invoker 列表                          │
+│     - 可能有多个 Router 链式执行                              │
+│                                                             │
+│  2. LoadBalance 在过滤后的列表中选择                         │
+│     - 路由后的 Invoker 可能只有几个                          │
+│     - 负载均衡在这些 Invoker 中选择                          │
+│                                                             │
+│  示例：                                                      │
+│  原始 Invokers: [A, B, C, D, E]                            │
+│  经过路由过滤: [A, B]           # C, D, E 不符合路由条件      │
+│  经过负载均衡: B               # 在 A, B 中加权随机选择      │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## 路由最佳实践
+
+### 实践一：路由优先级要合理
+
+```yaml
+# 路由优先级
+# priority 越大，优先级越高
+# 建议：
+# - 黑名单路由：priority = 100
+# - 服务降级路由：priority = 90
+# - 灰度发布路由：priority = 80
+# - 默认路由：priority = 0
+```
+
+### 实践二：路由规则要幂等
+
+```yaml
+# 路由规则要保证幂等性
+# 避免：不同路由规则相互冲突
+# 正确：一个请求应该只匹配一条路由规则
+```
+
+### 实践三：灰度发布要平滑
+
+```yaml
+# 灰度发布步骤
+# 1. 新版本实例小流量上线（10%）
+# 2. 观察监控和日志
+# 3. 逐步增加流量（20%, 50%）
+# 4. 验证通过后，全量切换
+# 5. 旧版本实例下线
+```
+
+## 总结
+
+Dubbo 的路由机制提供了强大的流量管控能力，可以实现灰度发布、流量隔离、区域路由等多种场景。
+
+**核心要点回顾：**
+
+- 路由在负载均衡之前执行，用于过滤 Invoker
+- 条件路由最灵活，支持复杂条件表达式
+- 标签路由简单，适合流量隔离
+- 路由规则支持动态配置
+- 路由与负载均衡配合，实现精细化的流量控制
+
+---
+
+**下一章预告：**
+
+当服务调用失败时，Dubbo 如何处理？这就涉及到集群容错策略。下一章，我们将探讨 Dubbo 的集群容错机制。

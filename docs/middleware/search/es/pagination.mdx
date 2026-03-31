@@ -1,0 +1,280 @@
+# ES 分页查询
+
+从 1000 万条数据中取出第 100 页，每页 10 条——这个看似简单的需求，在分布式系统中实现起来却暗藏玄机。
+
+深度分页是 Elasticsearch 中最容易被忽视的性能杀手。这篇文章详细讲解三种分页方式，以及它们的适用场景和潜在问题。
+
+## 三种分页方式
+
+| 方式 | 原理 | 优点 | 缺点 | 适用场景 |
+|---|---|---|---|---|
+| `from/size` | 跳到指定位置 | 简单直观 | 深度分页极慢 | 总页数 `<` 10000 |
+| `search_after` | 基于排序值定位 | 无深度限制 | 不能随机翻页 | 按相关性排序的翻页 |
+| `scroll` | 快照读取 | 可遍历全量 | 资源占用高 | 数据导出 |
+
+## from / size 分页
+
+### 基本用法
+
+```json
+GET /my-index/_search
+{
+  "from": 0,
+  "size": 10,
+  "query": {
+    "match": { "title": "elasticsearch" }
+  },
+  "sort": [
+    { "_score": "desc" },
+    { "_id": "asc" }
+  ]
+}
+```
+
+`from` 指定起始位置，`size` 指定返回数量。
+
+### 深度分页的问题
+
+假设索引有 5 个分片，查询 `from=9000, size=10`：
+
+1. 协调节点向 5 个分片发送查询，每个分片返回 `9010` 条记录（from + size）
+2. 协调节点汇总 5 × 9010 = 45050 条记录
+3. 协调节点按排序条件排序，取第 9001-9010 条返回
+
+当 `from + size` 很大时，每个分片需要返回大量数据，内存和 CPU 开销急剧上升。
+
+```json
+{
+  "error": {
+    "type": "search_phase_execution_exception",
+    "reason": "Result window is too large, from + size must be less than or equal to: [10000]"
+  }
+}
+```
+
+Elasticsearch 默认限制 `from + size` `<=` 10000。
+
+### 为什么深度分页慢？
+
+想象你要从图书馆找第 1000 页的内容：
+
+**翻书的方式**：你得把前 999 页全翻一遍，每页都看。
+
+**书签的方式**：你把第 999 页的位置记下来（search_after），下次直接翻到那里。
+
+`from/size` 就是翻书的方式，`search_after` 就是书签的方式。
+
+## search_after 分页
+
+### 基本原理
+
+`search_after` 使用上一页返回的排序值作为起点，跳过已显示的数据：
+
+```json
+// 第一页
+GET /my-index/_search
+{
+  "size": 10,
+  "query": { "match_all": {} },
+  "sort": [
+    { "published_at": "desc" },
+    { "_id": "asc" }
+  ]
+}
+```
+
+返回结果：
+
+```json
+{
+  "hits": {
+    "hits": [
+      { "_id": "1", "_score": 1.0, "sort": ["2024-01-15", "1"] },
+      { "_id": "2", "_score": 1.0, "sort": ["2024-01-15", "2"] }
+      // ...
+    ]
+  }
+}
+```
+
+```json
+// 第二页
+GET /my-index/_search
+{
+  "size": 10,
+  "query": { "match_all": {} },
+  "sort": [
+    { "published_at": "desc" },
+    { "_id": "asc" }
+  ],
+  "search_after": ["2024-01-15", "2"]
+}
+```
+
+`search_after` 使用上一页最后一条的排序值作为起点。
+
+### 为什么需要唯一排序值？
+
+排序值必须唯一，否则可能出现「跳页」问题：
+
+假设有两个文档排序值相同，都是 `2024-01-15`：
+
+```
+第一页最后一条：sort = ["2024-01-15", "doc_B"]
+第二页查询 search_after = ["2024-01-15", "doc_B"]
+```
+
+如果用 `doc_B` 作为搜索起点，可能漏掉排序值也是 `2024-01-15` 的 `doc_A`（因为 `doc_A` 在 `doc_B` 之前）。
+
+这就是为什么 `sort` 数组的最后一位通常是 `_id`——它保证了排序值的唯一性。
+
+### 适用场景
+
+`search_after` 适合需要不断向后翻页的场景：
+
+- 搜索结果列表
+- 商品列表
+- 消息列表
+
+不适合的场景：
+- 需要跳到任意页面（比如第 100 页）
+- 需要在页面间前后跳转
+
+## scroll 分页
+
+### 基本用法
+
+`scroll` 用于遍历全量数据，适合数据导出场景：
+
+```json
+// 第一次请求：创建快照
+GET /my-index/_search?scroll=5m
+{
+  "size": 100,
+  "query": { "match_all": {} }
+}
+```
+
+返回结果包含 `_scroll_id`：
+
+```json
+{
+  "_scroll_id": "DXF1ZXJ5QW5kRmV0Y2gBAAAAAAAAAAEWdG5KMEVxTm9Xdz...",
+  "hits": {
+    "hits": [ /* 100 documents */ ]
+  }
+}
+```
+
+```json
+// 后续请求：获取下一页
+POST /_search/scroll
+{
+  "scroll": "5m",
+  "scroll_id": "DXF1ZXJ5QW5kRmV0Y2gBAAAAAAAAAAEWdG5KMEVxTm9Xdz..."
+}
+```
+
+### scroll 的原理
+
+`scroll` 在 Elasticsearch 内部创建一个**快照**（snapshot）。后续查询从这个快照中读取数据，而不是实时数据。
+
+这意味着：
+- 在 `scroll` 执行期间，新增或删除的文档**可能看不到**
+- 已更新的文档**始终反映最新状态**
+
+### 清理 scroll
+
+`scroll` 会占用服务器资源，使用完毕后应该清理：
+
+```json
+DELETE /_search/scroll
+{
+  "scroll_id": ["DXF1ZXJ5QW5kRmV0Y2gB..."]
+}
+```
+
+或者清理所有 scroll：
+
+```json
+DELETE /_search/scroll/_all
+```
+
+### 使用建议
+
+:::warning scroll 的性能考量
+`scroll` 快照会占用内存，长时间不清理会导致内存泄漏。设置合理的 `scroll` 超时时间，并在使用完毕后及时清理。
+:::
+
+对于大规模数据导出，推荐使用 **PIT（Point In Time）** 替代 scroll：
+
+```json
+// 创建 PIT
+POST /my-index/_pit?keep_alive=5m
+
+// 使用 PIT 查询
+POST /_search
+{
+  "size": 100,
+  "pit": {
+    "id": "pit_id",
+    "keep_alive": "5m"
+  },
+  "sort": [{ "_id": "asc" }]
+}
+```
+
+## 实践建议
+
+### 选择分页方式
+
+```python
+if total_pages <= 10000:
+    # from/size，最简单
+    result = search(from_=offset, size=limit)
+
+elif need_deep_pagination:
+    # search_after，适合连续翻页
+    result = search(sort=sort_values, search_after=last_sort)
+    # 保存最后一页的 sort_values
+
+elif need_full_export:
+    # scroll，适合数据导出
+    result = scroll(scroll_id=scroll_id)
+```
+
+### 优化深度分页
+
+如果业务必须支持深度分页，考虑：
+
+1. **限制最大页数**：如电商搜索只允许前 100 页
+2. **改用 search_after**：引导用户按排序顺序翻页
+3. **使用别名路由**：将数据按维度拆分，减少查询分片数
+4. **预计算结果**：对热门查询定期计算结果，缓存起来
+
+### 分页参数建议
+
+```json
+{
+  "from": 0,
+  "size": 10,
+  "track_total_hits": false,
+  "_source": ["title", "author", "published_at"],
+  "query": { ... }
+}
+```
+
+- `track_total_hits: false`：如果不需要精确总数，跳过计数可以提升性能
+- `_source` 限制字段：只返回必要字段，减少数据传输
+
+## 总结
+
+三种分页方式各有适用场景：
+
+`from/size` 是最简单的方式，但深度分页性能急剧下降，只适合小数据量或限制最大页数。
+
+`search_after` 利用排序值实现高效的连续翻页，适合搜索结果、商品列表等需要不断向后翻页的场景。
+
+`scroll` 创建数据快照，适合全量数据导出，但会占用资源，不适合在线查询。
+
+理解它们的原理和限制，才能在实际业务中选择最合适的方案。

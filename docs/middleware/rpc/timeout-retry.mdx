@@ -1,0 +1,568 @@
+# RPC 超时控制与重试机制
+
+你有没有遇到过这种情况：服务 A 调用服务 B，服务 B 调用服务 C……调用链一长，其中某个服务卡住了，整个调用链都超时了，一堆服务同时告警。
+
+这就是分布式系统中经典的**级联故障**问题。
+
+这一节，我们来聊聊如何通过**超时控制**和**重试机制**来避免这类问题，让系统在故障时能「优雅地失败」而不是「集体崩溃」。
+
+## 为什么要控制超时？
+
+### 级联故障的根源
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    级联故障示意                          │
+│                                                          │
+│   请求 ──► 服务 A ──► 服务 B ──► 服务 C ──► 服务 D     │
+│                         │                               │
+│                      服务 B 变慢了                       │
+│                         │                               │
+│                   ┌─────┴─────┐                         │
+│                   │  超时累积  │                         │
+│                   │  线程堆积  │                         │
+│                   │  资源耗尽  │                         │
+│                   └───────────┘                         │
+└─────────────────────────────────────────────────────────┘
+```
+
+级联故障的发生过程：
+
+1. 服务 C 响应变慢（数据库慢查询）
+2. 服务 B 的线程开始堆积，等待服务 C
+3. 服务 B 的线程池耗尽，无法处理新请求
+4. 服务 A 也开始堆积，最终整个系统雪崩
+
+### 超时控制的价值
+
+合理的超时设置可以**快速失败**，避免资源被无效请求占用：
+
+- **保护调用方**：不让线程长时间阻塞
+- **快速切换**：超时后立即尝试其他实例
+- **避免雪崩**：不让故障扩散
+
+## 超时控制：如何设置合理的超时时间？
+
+### 超时设置的原则
+
+**核心原则**：超时时间应该大于 99% 分位数（P99）的响应时间，但不应过长。
+
+```
+响应时间分布：
+│
+│                          ████
+│                     ████████
+│                ████████████████
+│           ████████████████████████
+│      ████████████████████████████████
+├──────────────────────────────────────────────────►
+0ms          P99              P999        Max
+                ↑
+            超时应该设在这里附近
+```
+
+### 超时时间计算公式
+
+```java
+// 单次调用超时 = P99 响应时间 × 安全系数
+int timeout = (int) (p99ResponseTime * 1.5);  // 1.5 倍安全系数
+
+// 调用链超时分配
+// 假设总超时 3 秒，服务链 4 个调用
+// 可以按比例分配，或者给每个调用 800ms，最后留 200ms 余量
+int perCallTimeout = 800;  // 每个服务调用 800ms
+```
+
+### Dubbo 超时配置
+
+```java
+// 1. 注解方式
+@DubboReference(timeout = 3000)  // 全局超时 3 秒
+private OrderService orderService;
+
+// 2. 方法级别配置
+@DubboReference(timeout = 3000)
+interface OrderService {
+    @Timeout(method = 2000)  // 方法级别 2 秒
+    Order getOrderById(String orderId);
+}
+```
+
+```xml
+<!-- dubbo-provider.xml -->
+<dubbo:provider timeout="3000"/>
+
+<!-- dubbo-consumer.xml -->
+<dubbo:consumer timeout="3000"
+                retries="2"
+                actives="200"/>
+```
+
+### gRPC 超时配置
+
+```java
+// 设置调用级别超时
+ManagedChannel channel = ManagedChannelBuilder
+        .forAddress("localhost", 50051)
+        .build();
+
+OrderServiceGrpc.OrderServiceBlockingStub stub =
+        OrderServiceGrpc.newBlockingStub(channel);
+
+// 1 秒超时
+OrderResponse response = stub
+        .withDeadlineAfter(1, TimeUnit.SECONDS)
+        .getOrder(request);
+
+// 全局 Channel 超时
+ManagedChannel channel = ManagedChannelBuilder
+        .forAddress("localhost", 50051)
+        .keepAliveTime(30, TimeUnit.SECONDS)
+        .build();
+```
+
+```go
+// Go 客户端超时
+ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+defer cancel()
+
+response, err := client.GetOrder(ctx, &OrderRequest{OrderId: "123"})
+```
+
+## 超时传递：Trace 上下文中的超时管理
+
+在微服务调用链中，超时需要合理分配。
+
+### 超时传递的问题
+
+```
+请求入口：3 秒超时
+│
+├── 服务 A：500ms
+├── 服务 B：500ms
+│   │
+│   ├── 服务 C：1 秒
+│   └── 服务 D：1 秒
+│       │
+│       └── 服务 E：2 秒  ← 超时了！
+│
+└── 结果：整条链路超时
+```
+
+### 乐观超时分配
+
+```java
+public class TimeoutAllocator {
+
+    // 根据调用深度分配超时时间
+    public static long allocateTimeout(long totalTimeout, int depth, int currentDepth) {
+        // 越深层的调用，超时时间越短
+        double factor = Math.pow(0.6, depth - currentDepth);
+        return (long) (totalTimeout * factor);
+    }
+
+    // 示例：总超时 3 秒，4 层调用
+    // 第 1 层：1800ms
+    // 第 2 层：1080ms
+    // 第 3 层：648ms
+    // 第 4 层：389ms
+}
+```
+
+### gRPC 的超时传递
+
+gRPC 自动将超时信息通过 metadata 传递给下游：
+
+```java
+// 客户端设置超时
+ManagedChannel channel = ManagedChannelBuilder
+        .forAddress("localhost", 50051)
+        .build();
+
+OrderServiceGrpc.OrderServiceBlockingStub stub =
+        OrderServiceGrpc.newBlockingStub(channel);
+
+// 传递超时上下文
+Context context = Context.current().withValue(
+        Constants.DEADLINE, 3, TimeUnit.SECONDS);
+
+context.run(() -> {
+    stub.getOrder(request);  // 自动传递超时
+});
+```
+
+## 重试机制：让调用「再试一次」
+
+### 什么时候该重试？
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    重试决策树                            │
+│                                                          │
+│              这次调用是否可以重试？                         │
+│                      │                                  │
+│         ┌────────────┴────────────┐                    │
+│        是                       否                       │
+│         │                       │                       │
+│    是否幂等？              什么是幂等？                    │
+│    │     │               │       │                    │
+│   是    否              是       否                      │
+│    │     │              │         │                    │
+│    ▼     ▼              ▼         ▼                    │
+│  重试   不重试        重试       不重试                  │
+│  ✓     ✗            ✓         ✗                       │
+└─────────────────────────────────────────────────────────┘
+```
+
+**幂等操作**：执行一次和执行多次的结果相同
+
+- ✓ 幂等：`GET`、`PUT`、`DELETE` 查询、更新、删除
+- ✗ 非幂等：`POST` 创建、`PATCH` 部分更新
+
+### 重试策略
+
+#### 1. 立即重试
+
+失败后立即重试，适用于瞬时故障。
+
+```
+尝试 1: X ──► 失败 (100ms)
+尝试 2:      X ──► 失败 (100ms)
+尝试 3:           X ──► 成功
+```
+
+**问题**：如果服务暂时过载，立即重试会加剧负载。
+
+#### 2. 固定间隔重试
+
+每次失败后等待固定时间再重试。
+
+```java
+public <T> T retryWithFixedDelay(T operation, int maxRetries) {
+    int attempt = 0;
+    while (attempt < maxRetries) {
+        try {
+            return operation.execute();
+        } catch (Exception e) {
+            attempt++;
+            if (attempt >= maxRetries) throw e;
+            Thread.sleep(1000);  // 固定等待 1 秒
+        }
+    }
+    throw new RuntimeException("重试次数用尽");
+}
+```
+
+#### 3. 指数退避重试（Exponential Backoff）
+
+每次重试等待时间是上次的倍数。
+
+```
+尝试 1: X ──► 失败 (等待 100ms)
+尝试 2:      X ──► 失败 (等待 200ms)
+尝试 3:           X ──► 失败 (等待 400ms)
+尝试 4:                X ──► 成功
+```
+
+```java
+public <T> T retryWithBackoff(T operation, int maxRetries) {
+    int attempt = 0;
+    long delay = 100;  // 初始延迟 100ms
+
+    while (attempt < maxRetries) {
+        try {
+            return operation.execute();
+        } catch (Exception e) {
+            attempt++;
+            if (attempt >= maxRetries) throw e;
+
+            // 指数退避：100ms, 200ms, 400ms, 800ms...
+            Thread.sleep(delay);
+            delay = Math.min(delay * 2, 5000);  // 最大 5 秒
+
+            // 添加随机抖动（jitter）避免惊群效应
+            delay += ThreadLocalRandom.current().nextLong(delay / 4);
+        }
+    }
+    throw new RuntimeException("重试次数用尽");
+}
+```
+
+#### 4. 指数退避 + 抖动（Jitter）
+
+纯粹的指数退避可能导致多个客户端同时重试（惊群效应）。添加随机抖动可以分散重试时间。
+
+```java
+// Full Jitter
+long delay = ThreadLocalRandom.current().nextLong(baseDelay * (1 << attempt));
+
+// Equal Jitter
+long temp = Math.min(baseDelay * (1 << attempt), maxDelay);
+long delay = temp / 2 + ThreadLocalRandom.current().nextLong(temp / 2);
+```
+
+## Dubbo 重试配置
+
+### 基本配置
+
+```java
+@DubboReference(
+    retries = 2,           // 重试次数（不含首次调用）
+    timeout = 3000         // 超时时间
+)
+private OrderService orderService;
+```
+
+### 集群容错模式
+
+Dubbo 提供了多种集群容错模式：
+
+| 模式 | 说明 | 适用场景 |
+|---|---|---|
+| `failover` | 自动切换到其他实例 | 读操作，幂等场景 |
+| `failfast` | 快速失败，只调用一次 | 非幂等操作 |
+| `failsafe` | 失败安全，返回空结果 | 日志记录等次要操作 |
+| `failback` | 失败后后台重试 | 定时任务 |
+| `forking` | 并发调用多个实例，返回最快结果 | 需要高可靠性 |
+
+```java
+// 指定集群容错模式
+@DubboReference(
+    cluster = "failover",
+    retries = 2
+)
+private OrderService orderService;
+```
+
+### 幂等操作的重试
+
+```java
+// 幂等操作可以安全重试
+@DubboReference(cluster = "failover", retries = 2)
+private ProductService productService;  // 查询操作
+
+// 非幂等操作不重试
+@DubboReference(cluster = "failfast")
+private OrderService orderService;  // 创建订单
+```
+
+## 熔断降级：防止系统雪崩
+
+### 什么是熔断？
+
+熔断器模式（Circuit Breaker）借鉴了电力系统的保险丝：
+
+```
+正常状态 → 熔断触发 → 熔断开启 → 半开状态
+           │                       │
+           │                       │
+           └───────────────────────┘
+                    恢复尝试
+```
+
+当某个服务失败率过高时，「熔断器」打开，后续请求直接返回降级结果，不再调用有问题的服务。
+
+### 熔断状态机
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                   熔断器状态机                            │
+│                                                          │
+│   ┌─────────┐  失败率 > 阈值   ┌─────────┐              │
+│   │  CLOSED │ ──────────────► │  OPEN   │              │
+│   │  关闭    │                 │  开启    │              │
+│   └────┬────┘                 └────┬────┘              │
+│        │                            │                    │
+│        │  超时/重试成功             │ 超时时间后           │
+│        │                            │                    │
+│        │    ┌──────────────────────┘                   │
+│        │    │                                           │
+│        │    ▼                                           │
+│        │  ┌─────────┐  探测请求成功  ┌─────────┐        │
+│        └──│ HALF-   │ ─────────────► │ CLOSED  │        │
+│           │  OPEN   │                │  关闭    │        │
+│           │  半开    │  探测请求失败  └────┬────┘        │
+│           └────┬────┘ ───────────────► │             │
+│                │                          │             │
+│                └──────────────────────────┘             │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Sentinel 熔断降级
+
+Sentinel 是阿里巴巴开源的流量控制组件，提供基于响应时间的熔断策略：
+
+```java
+// 引入依赖
+<dependency>
+    <groupId>com.alibaba.csp</groupId>
+    <artifactId>sentinel-core</artifactId>
+    <version>1.8.6</version>
+</dependency>
+```
+
+```java
+// 基于慢调用比例
+@SentinelResource(value = "getOrder",
+    fallback = "getOrderFallback",
+    blockHandler = "getOrderBlockHandler")
+public Order getOrder(String orderId) {
+    return orderService.getOrderById(orderId);
+}
+
+// 降级方法
+public Order getOrderFallback(String orderId, Throwable ex) {
+    // 返回兜底数据
+    return new Order(orderId, "降级订单", 0);
+}
+
+// 熔断处理方法
+public Order getOrderBlockHandler(String orderId, BlockException ex) {
+    throw new ServiceUnavailableException("服务暂时不可用");
+}
+```
+
+### Sentinel 熔断规则
+
+```java
+// 基于慢调用比例熔断
+DegradeRule slowRatioRule = new DegradeRule("getOrder")
+    .setGrade(CircuitBreakerStrategy.SLOW_REQUEST_RATIO.getType())
+    .setCount(0.5)              // 响应时间阈值：500ms
+    .setRatioThreshold(0.5)      // 慢调用比例阈值：50%
+    .setMinRequestAmount(10)     // 最小请求数：10
+    .setStatIntervalMs(60000)    // 统计时间窗口：60 秒
+    .setRecoveryTimeoutMs(30000); // 熔断恢复时间：30 秒
+
+// 基于错误比例熔断
+DegradeRule errorRatioRule = new DegradeRule("getOrder")
+    .setGrade(CircuitBreakerStrategy.ERROR_RATIO.getType())
+    .setRatioThreshold(0.5)      // 错误比例阈值：50%
+    .setMinRequestAmount(10)
+    .setStatIntervalMs(60000)
+    .setRecoveryTimeoutMs(30000);
+```
+
+## Hystrix：另一种熔断选择
+
+Hystrix（Netflix）是更早的熔断组件，但已进入维护模式，推荐迁移到 Resilience4j 或 Sentinel。
+
+### Hystrix 基本使用
+
+```java
+// Hystrix 命令
+public class GetOrderCommand extends HystrixCommand<Order> {
+
+    private final OrderService orderService;
+    private final String orderId;
+
+    public GetOrderCommand(String orderId) {
+        super(Setter.withGroupKey(HystrixCommandGroupKey.Factory.asKey("OrderGroup"))
+                .andCommandKey(HystrixCommandKey.Factory.asKey("GetOrder"))
+                .andThreadPoolPropertiesDefaults(HystrixThreadPoolProperties.Setter()
+                        .withCoreSize(20)
+                        .withMaxQueueSize(100))
+                .andCircuitBreakerPropertiesDefaults(HystrixCircuitBreakerProperties.Setter()
+                        .withCircuitBreakerRequestVolumeThreshold(20)
+                        .withCircuitBreakerSleepWindowInMilliseconds(5000)
+                        .withCircuitBreakerErrorThresholdPercentage(50)));
+
+        this.orderId = orderId;
+        this.orderService = new OrderService();
+    }
+
+    @Override
+    protected Order run() throws Exception {
+        return orderService.getOrderById(orderId);
+    }
+
+    @Override
+    protected Order getFallback() {
+        // 降级逻辑
+        return new Order(orderId, "降级订单", 0);
+    }
+}
+
+// 调用
+Order order = new GetOrderCommand("12345").execute();
+```
+
+## 实战：综合配置示例
+
+### 完整配置示例
+
+```java
+@DubboReference(
+    timeout = 3000,              // 超时 3 秒
+    retries = 2,                 // 重试 2 次
+    cluster = "failover",        // 失败自动切换
+    loadbalance = "leastactive", // 最少活跃调用
+    actives = 100                // 最大并发数
+)
+private OrderService orderService;
+```
+
+### 配置优先级
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                  配置优先级（高到低）                      │
+│                                                          │
+│  1. 注解方法级别   @DubboReference(methods = @Timeout)   │
+│  2. 注解服务级别   @DubboReference(timeout = 3000)      │
+│  3. 全局配置       dubbo:consumer timeout                │
+│  4. 默认值         1000ms                                │
+└─────────────────────────────────────────────────────────┘
+```
+
+### 监控与告警
+
+```java
+// 监控超时和失败
+@Slf4j
+public class RpcMonitorFilter implements Filter {
+
+    @Override
+    public Result invoke(Invoker<?> invoker, Invocation invocation) {
+        long start = System.currentTimeMillis();
+        try {
+            Result result = invoker.invoke(invocation);
+            long duration = System.currentTimeMillis() - start;
+
+            // 记录超时
+            if (duration > 1000) {
+                log.warn("RPC 调用超时: service={}, method={}, duration={}ms",
+                        invoker.getInterface(), invocation.getMethodName(), duration);
+                MetricsCollector.recordTimeout(invoker.getInterface(), invocation.getMethodName());
+            }
+
+            // 记录失败
+            if (!result.hasException()) {
+                MetricsCollector.recordSuccess(invoker.getInterface());
+            } else {
+                MetricsCollector.recordFailure(invoker.getInterface(), result.getException());
+            }
+
+            return result;
+        } catch (RpcException e) {
+            log.error("RPC 调用异常: service={}, method={}",
+                    invoker.getInterface(), invocation.getMethodName(), e);
+            MetricsCollector.recordFailure(invoker.getInterface(), e);
+            throw e;
+        }
+    }
+}
+```
+
+## 总结
+
+超时控制和重试机制是保障系统稳定性的关键：
+
+1. **超时设置**：基于 P99 响应时间，1.5 倍安全系数
+2. **重试策略**：指数退避 + 抖动，只重试幂等操作
+3. **熔断降级**：防止故障扩散，快速失败
+4. **监控告警**：及时发现异常，提前处理
+
+没有银弹，需要根据业务场景灵活组合这些策略。
+
+下一节，我们来聊聊 RPC 的链路追踪——如何在分布式系统中追踪一次请求的完整调用链。

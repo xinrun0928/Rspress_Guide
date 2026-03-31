@@ -1,0 +1,543 @@
+# ELK Stack 日志系统
+
+ELK 是最流行的开源日志解决方案。
+
+"E" 是 Elasticsearch，"L" 是 Logstash，"K" 是 Kibana，"B" 是 Beats（可选但常用）。这四个组件组合起来，构成了一个完整的日志收集、存储、查询、可视化平台。
+
+## ELK 架构
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                              ELK Stack                                   │
+│                                                                         │
+│  ┌──────────┐     ┌──────────────┐     ┌───────────┐     ┌─────────┐ │
+│  │  Beats   │────►│  Logstash    │────►│Elasticsearch│◄───│ Kibana  │ │
+│  │          │     │  (ETL)       │     │  (存储)    │     │  (可视化)│ │
+│  └──────────┘     └──────────────┘     └───────────┘     └─────────┘ │
+│                                                                         │
+│  ┌──────────────────────────────────────────────────────────────────┐  │
+│  │                      Beats 家族                                   │  │
+│  │  ┌────────┐ ┌────────┐ ┌─────────┐ ┌──────────┐ ┌────────────┐  │  │
+│  │  │Filebeat│ │Metric- │ │Packet-  │ │Heartbeat │ │Journalbeat │  │  │
+│  │  │  收集   │ │ beat   │ │ beat   │ │  监控    │ │  systemd  │  │  │
+│  │  │ 日志文件│ │ 系统   │ │ 网络包  │ │  端点    │ │   日志    │  │  │
+│  │  └────────┘ └────────┘ └─────────┘ └──────────┘ └────────────┘  │  │
+│  └──────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+## Elasticsearch
+
+### 核心概念
+
+| 概念 | 说明 |
+|---|---|
+| **Index** | 索引，相当于数据库 |
+| **Document** | 文档，相当于表的一行 |
+| **Shard** | 分片，索引的水平拆分 |
+| **Replica** | 副本，分片的高可用备份 |
+
+### 数据结构
+
+```json
+{
+  "_index": "app-logs-2024.01.15",
+  "_type": "_doc",
+  "_id": "abc123",
+  "_source": {
+    "@timestamp": "2024-01-15T10:30:00.000Z",
+    "level": "ERROR",
+    "service": "user-service",
+    "host": "server-01",
+    "message": "Database connection timeout",
+    "request_id": "req-123456",
+    "duration_ms": 5000
+  }
+}
+```
+
+### 集群规划
+
+```yaml
+# elasticsearch.yml
+cluster.name: my-cluster
+
+node.name: node-1
+node.master: true
+node.data: true
+
+# 最小主节点数（n/2 + 1）
+discovery.zen.minimum_master_nodes: 2
+
+# 分片配置
+index.number_of_shards: 3
+index.number_of_replicas: 1
+
+# 内存配置
+bootstrap.memory_lock: true
+```
+
+### ILM（索引生命周期管理）
+
+```json
+PUT _ilm/policy/app-logs-policy
+{
+  "policy": {
+    "phases": {
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_size": "50gb",
+            "max_age": "7d"
+          },
+          "set_priority": {
+            "priority": 100
+          }
+        }
+      },
+      "warm": {
+        "min_age": "30d",
+        "actions": {
+          "shrink": {
+            "number_of_shards": 1
+          },
+          "forcemerge": {
+            "max_num_segments": 1
+          },
+          "set_priority": {
+            "priority": 50
+          }
+        }
+      },
+      "cold": {
+        "min_age": "90d",
+        "actions": {
+          "freeze": {},
+          "set_priority": {
+            "priority": 0
+          }
+        }
+      },
+      "delete": {
+        "min_age": "365d",
+        "actions": {
+          "delete": {}
+        }
+      }
+    }
+  }
+}
+```
+
+## Logstash
+
+### 作用
+
+Logstash 是 ETL 工具，负责：
+- 收集日志
+- 解析日志格式
+- 转换数据结构
+- 输出到目标存储
+
+### 配置文件结构
+
+```ruby title="pipeline.conf"
+input {
+  # 输入源
+  beats {
+    port => 5044
+  }
+}
+
+filter {
+  # 过滤和转换
+  grok {
+    match => { "message" => "%{TIMESTAMP_ISO8601:timestamp} %{LOGLEVEL:level} %{DATA:service} - %{GREEDYDATA:log_message}" }
+  }
+  
+  date {
+    match => [ "timestamp", "ISO8601" ]
+    target => "@timestamp"
+  }
+  
+  mutate {
+    remove_field => [ "timestamp" ]
+    lowercase => [ "level" ]
+  }
+  
+  if [level] == "ERROR" {
+    mutate {
+      add_tag => [ "alert" ]
+    }
+  }
+}
+
+output {
+  # 输出目标
+  elasticsearch {
+    hosts => ["elasticsearch:9200"]
+    index => "app-logs-%{+YYYY.MM.dd}"
+  }
+  
+  # 同时输出到其他地方
+  stdout {
+    codec => rubydebug
+  }
+}
+```
+
+### 常用 Filter
+
+**Grok 解析：**
+
+```ruby
+# 解析 Nginx 访问日志
+grok {
+  match => { "message" => '%{IPORHOST:clientip} %{USER:ident} %{USER:auth} \[%{HTTPDATE:timestamp}\] "%{WORD:method} %{URIPATHPARAM:request} HTTP/%{NUMBER:httpversion}" %{NUMBER:status:int} %{NUMBER:bytes:int} "%{IPV4:client_ip}"' }
+}
+```
+
+**JSON 解析：**
+
+```ruby
+json {
+  source => "message"
+  target => "parsed"
+}
+```
+
+**GeoIP 地理位置：**
+
+```ruby
+geoip {
+  source => "client_ip"
+  target => "geoip"
+}
+```
+
+**Mutate 转换：**
+
+```ruby
+mutate {
+  add_field => { "environment" => "production" }
+  remove_field => [ "host", "agent" ]
+  rename => { "old_field" => "new_field" }
+  convert => {
+    "status" => "integer"
+    "duration" => "float"
+  }
+}
+```
+
+## Beats
+
+### Filebeat
+
+最常用的日志收集器，轻量级、零依赖。
+
+```yaml title="filebeat.yml"
+filebeat.inputs:
+  - type: log
+    enabled: true
+    paths:
+      - /var/log/*.log
+      - /var/log/nginx/*.log
+    fields:
+      service: myapp
+      environment: production
+    multiline:
+      pattern: '^\['
+      negate: true
+      match: after
+
+processors:
+  - add_host_metadata:
+      when.not.contains.tags: forwarded
+  - add_cloud_metadata: ~
+  - add_docker_metadata: ~
+  - decode_json_fields:
+      fields: ["message"]
+      target: ""
+      overwrite_keys: true
+      add_error_key: true
+      message_key: log
+
+output.logstash:
+  hosts: ["logstash:5044"]
+
+logging.level: info
+```
+
+### Metricbeat
+
+系统和服务指标收集。
+
+```yaml
+metricbeat.modules:
+  - module: system
+    metricsets:
+      - cpu
+      - memory
+      - network
+      - process
+    period: 10s
+    processes: ['.*']
+  
+  - module: nginx
+    metricsets:
+      - stubstatus
+    hosts: ["http://nginx:80"]
+    server_status_path: /nginx_status
+
+output.elasticsearch:
+  hosts: ["elasticsearch:9200"]
+```
+
+### Heartbeat
+
+端点可用性监控。
+
+```yaml
+heartbeat.monitors:
+  - type: http
+    name: api-health
+    schedule: '@every 10s'
+    urls:
+      - https://api.example.com/health
+    check.response.status: [200]
+    fields:
+      service: api
+  
+  - type: tcp
+    name: mysql-connection
+    schedule: '@every 30s'
+    hosts: ["mysql:3306"]
+  
+  - type: icmp
+    name: server-ping
+    schedule: '@every 60s'
+    hosts: ["192.168.1.10"]
+```
+
+## Kibana
+
+### 主要功能
+
+| 功能 | 说明 |
+|---|---|
+| **Discover** | 搜索和过滤日志 |
+| **Visualize** | 创建可视化图表 |
+| **Dashboard** | 组合多个可视化 |
+| **Dev Tools** | 直接操作 ES |
+| **Maps** | 地理信息可视化 |
+| **Logs UI** | 专门的日志界面 |
+
+### 日志查询语法
+
+```bash
+# 基础查询
+level:ERROR
+
+# 多条件
+level:ERROR AND service:user-service
+
+# 范围查询
+duration_ms:>1000
+
+# 通配符
+message:*timeout*
+
+# 正则
+message:/connection.*failed/
+
+# 聚合统计
+GET app-logs-2024.01.15/_search
+{
+  "size": 0,
+  "aggs": {
+    "by_level": {
+      "terms": { "field": "level" }
+    },
+    "by_service": {
+      "terms": { "field": "service.keyword" }
+    },
+    "error_rate": {
+      "filter": { "term": { "level": "ERROR" } }
+    }
+  }
+}
+```
+
+### Dashboard 示例
+
+```json
+{
+  "title": "Application Logs Dashboard",
+  "panels": [
+    {
+      "title": "Log Level Distribution",
+      "type": "pie",
+      "gridData": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "aggType": "count",
+      "groupBy": "level.keyword"
+    },
+    {
+      "title": "Logs Over Time",
+      "type": "line",
+      "gridData": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "timeField": "@timestamp",
+      "aggType": "count"
+    },
+    {
+      "title": "Error Logs by Service",
+      "type": "data_table",
+      "gridData": { "x": 0, "y": 8, "w": 24, "h": 8 },
+      "query": "level:ERROR"
+    }
+  ]
+}
+```
+
+## 日志分析实战
+
+### 1. 错误日志分析
+
+```bash
+# 查询所有 ERROR 日志
+level:ERROR
+
+# 查询特定服务的错误
+level:ERROR AND service:payment-service
+
+# 查询最近 1 小时的错误
+level:ERROR AND @timestamp:[now-1h TO now]
+
+# 统计每个服务的错误数量
+GET /app-logs/_search
+{
+  "size": 0,
+  "query": {
+    "bool": {
+      "filter": [
+        { "term": { "level": "ERROR" } },
+        { "range": { "@timestamp": { "gte": "now-1h" } } }
+      ]
+    }
+  },
+  "aggs": {
+    "errors_by_service": {
+      "terms": { "field": "service.keyword", "size": 10 }
+    }
+  }
+}
+```
+
+### 2. 性能分析
+
+```bash
+# 查询慢请求
+duration_ms:>5000
+
+# 统计 P99 延迟
+GET /app-logs/_search
+{
+  "size": 0,
+  "query": {
+    "bool": {
+      "filter": [
+        { "exists": { "field": "duration_ms" } }
+      ]
+    }
+  },
+  "aggs": {
+    "latency_percentiles": {
+      "percentiles": {
+        "field": "duration_ms",
+        "percents": [50, 90, 95, 99]
+      }
+    }
+  }
+}
+```
+
+### 3. 用户行为分析
+
+```bash
+# 按用户分组统计
+GET /app-logs/_search
+{
+  "size": 0,
+  "query": {
+    "bool": {
+      "filter": [
+        { "term": { "service": "user-service" } }
+      ]
+    }
+  },
+  "aggs": {
+    "by_user": {
+      "terms": { "field": "user_id.keyword", "size": 20 },
+      "aggs": {
+        "by_action": {
+          "terms": { "field": "action.keyword" }
+        }
+      }
+    }
+  }
+}
+```
+
+## 最佳实践
+
+### 1. 日志格式设计
+
+```json
+{
+  "@timestamp": "2024-01-15T10:30:00.000Z",
+  "level": "INFO",
+  "service": "user-service",
+  "version": "1.2.3",
+  "host": "server-01",
+  "trace_id": "abc123",
+  "span_id": "def456",
+  "message": "User logged in",
+  "context": {
+    "user_id": "12345",
+    "ip": "192.168.1.1"
+  }
+}
+```
+
+### 2. 索引命名规范
+
+```
+# 按时间滚动
+app-logs-2024.01.15
+app-logs-2024.01.16
+...
+
+# 按环境隔离
+prod-app-logs-2024.01.15
+staging-app-logs-2024.01.15
+```
+
+### 3. 容量规划
+
+| 数据量/天 | 推荐配置 |
+|---|---|
+| < 10GB | 单节点 |
+| 10-50GB | 3 节点集群 |
+| 50-200GB | 5+ 节点集群 |
+| > 200GB | 考虑数据分层 + ILM |
+
+## 总结
+
+ELK Stack 核心要点：
+
+1. **Beats**：轻量级日志收集器，Filebeat 最常用
+2. **Logstash**：强大的 ETL，支持复杂解析
+3. **Elasticsearch**：分布式搜索引擎，存储和查询
+4. **Kibana**：可视化界面，搜索和 Dashboard
+5. **ILM**：索引生命周期管理，自动冷热切换
+
+ELK 是日志系统的经典选择，功能强大但资源消耗较大。

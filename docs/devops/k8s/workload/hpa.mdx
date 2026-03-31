@@ -1,0 +1,291 @@
+# HorizontalPodAutoscaler
+
+想象一个电商网站在双十一零点促销时，流量可能在几分钟内暴涨 100 倍。如果你的服务副本数是固定的，要么因为资源不足导致大量超时，要么为了应对峰值提前准备大量资源造成浪费。
+
+HorizontalPodAutoscaler（HPA）正是解决这个问题的利器。它能根据业务负载自动调整 Pod 副本数，让你的服务「能屈能伸」。
+
+## 工作原理
+
+HPA 控制器会周期性地从 Metrics Server（或其他指标源）获取 Pod 的资源使用数据，然后根据算法计算目标副本数。
+
+```bash
+kubectl autoscale deployment order-service \
+  --cpu-percent=80 \
+  --min=2 \
+  --max=10
+```
+
+这条命令创建了一个 HPA，要求 order-service 的平均 CPU 使用率维持在 80%，副本数在 2-10 之间。
+
+## 核心算法
+
+HPA 的扩缩容逻辑可以用一个简单的公式表达：
+
+```
+desiredReplicas = ceil[currentReplicas * (currentMetricValue / desiredMetricValue)]
+```
+
+以 CPU 为例：
+
+- 当前副本数：3
+- 当前 CPU 使用率：60%
+- 目标 CPU 使用率：80%
+- 计算：`desiredReplicas = ceil(3 * (60% / 80%)) = ceil(2.25) = 3`
+
+副本数不变，因为当前负载完全在目标范围内。
+
+再来看一个需要扩容的场景：
+
+- 当前副本数：3
+- 当前 CPU 使用率：160%
+- 目标 CPU 使用率：80%
+- 计算：`desiredReplicas = ceil(3 * (160% / 80%)) = ceil(6) = 6`
+
+需要扩容到 6 个副本才能将 CPU 使用率降到 80%。
+
+:::tip 算法细节
+HPA 使用 `ceil` 函数向上取整，这意味着即使计算出 2.1 个副本，也需要至少 3 个。这保证了即使有一点超载，也能通过增加副本数来缓解。
+:::
+
+## 指标类型
+
+HPA 支持多种指标来源，不同版本的 Kubernetes 支持的指标类型有所不同。
+
+### Resource Metrics
+
+最常用的指标是 CPU 和内存，它们通过 Metrics API 获取：
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: order-service
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: order-service
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 80
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: AverageValue
+        averageValue: 500Mi
+```
+
+:::warning 内存指标注意
+内存是二值指标：Pod 要么正常要么 OOM。内存的扩缩容策略通常比 CPU 更保守，因为频繁的扩缩容可能导致不必要的 Pod 重建。建议将内存指标作为一个补充条件，而非主要触发条件。
+:::
+
+### Custom Metrics
+
+自定义指标允许你基于业务指标进行扩缩容，比如队列深度、请求延迟、错误率等。
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: order-service
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: order-service
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Pods
+    pods:
+      metric:
+        name: http_requests_per_second
+      target:
+        type: AverageValue
+        averageValue: "1000"
+```
+
+要使用自定义指标，需要部署 Prometheus + KEDA 或类似的适配器。
+
+### External Metrics
+
+外部指标允许基于集群外部服务的指标进行扩缩容，比如基于云服务队列的深度：
+
+```yaml
+metrics:
+- type: External
+  external:
+    metric:
+      name: queue_depth
+      selector:
+        matchLabels:
+          queue_name: order-queue
+    target:
+      type: AverageValue
+      averageValue: "100"
+```
+
+## 扩缩容行为
+
+在 HPA v2 中，你可以精细控制扩缩容的行为：
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: order-service
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: order-service
+  minReplicas: 2
+  maxReplicas: 10
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 15
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 10
+        periodSeconds: 60
+```
+
+### 扩容策略
+
+`scaleUp.stabilizationWindowSeconds` 控制扩容的稳定窗口期。设为 0 表示立即响应，没有延迟。
+
+`policies` 定义了扩容速率限制：
+
+- `Percent`：每次扩容增加的百分比
+- `Pods`：每次扩容增加的 Pod 数量
+- `periodSeconds`：策略生效的时间窗口
+
+上面的配置允许每 15 秒内 Pod 数量翻倍（100% 增长）。
+
+### 缩容策略
+
+`scaleDown.stabilizationWindowSeconds: 300` 意味着缩容前会等待 5 分钟的稳定期，防止因为短暂的负载下降而误缩容。
+
+```yaml
+scaleDown:
+  policies:
+  - type: Percent
+    value: 10
+    periodSeconds: 60
+  - type: Pods
+    value: 2
+    periodSeconds: 60
+  selectPolicy: Min
+```
+
+`selectPolicy: Min` 表示选择最保守的策略（增量最小的）。如果设为 `Max`，会选择增量最大的策略。
+
+:::tip 生产环境建议
+缩容窗口期建议设为 5-15 分钟，给业务负载足够的时间恢复正常。扩容则建议快速响应，但也可以通过限制增长率防止抖动。
+:::
+
+## VPA vs HPA
+
+VerticalPodAutoscaler（VPA）和 HPA 解决的是不同维度的问题：
+
+| 特性 | HPA | VPA |
+|---|---|---|
+| 调整方向 | 副本数（水平） | 资源配额（垂直） |
+| Pod 数量 | 变化 | 不变 |
+| 资源请求 | 不变 | 变化 |
+| Pod 重建 | 否 | 是（部分场景） |
+| 典型场景 | 流量波动 | 资源估算不准 |
+
+```yaml
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: order-service-vpa
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: order-service
+  updatePolicy:
+    updateMode: "Auto"
+```
+
+VPA 会自动调整 Pod 的资源请求，在资源不足时重新调度。`updateMode` 可以设为 `Off`（仅推荐）、`Initial`（仅在创建时）、`Auto`（自动更新）。
+
+:::warning VPA 与 HPA 互斥
+VPA 和 HPA 不能同时作用于同一个 Deployment，因为 VPA 需要修改 Pod 的资源请求，这会触发 Pod 重建，与 HPA 的水平扩缩容逻辑冲突。
+:::
+
+## CronJob + KEDA 实现定时扩缩容
+
+对于可预期的流量波动（如每天的业务高峰期），可以使用 CronJob 定时调整 HPA 的副本数。但更优雅的方式是使用 KEDA。
+
+KEDA（Kubernetes Event-driven Autoscaling）允许基于事件源进行扩缩容：
+
+```yaml
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: order-service-scaler
+spec:
+  scaleTargetRef:
+    name: order-service
+  minReplicaCount: 2
+  maxReplicaCount: 10
+  triggers:
+  - type: cron
+    metadata:
+      timezone: Asia/Shanghai
+      start: 0 9 * * 1-5
+      end: 0 11 * * 1-5
+      desiredReplicas: "5"
+```
+
+这个配置在工作日早上 9 点到 11 点将副本数扩展到 5 个，对应业务高峰期。
+
+## 监控与调试
+
+HPA 的状态可以通过 kubectl 查看：
+
+```bash
+kubectl describe hpa order-service
+```
+
+```
+Name:               order-service
+Namespace:          production
+References:         Deployment/order-service
+Metrics:            ( current / target )
+  Resource cpu:
+    Utilization:    45% / 80%
+Min replicas:       2
+Max replicas:       10
+Events:
+  Normal  Scheduled  2m ago   horizontal-pod-autoscaler  Successfully scaled up replica set order-service-7d8b to 3
+  Normal  ScalingReplicaSet   2m ago   horizontal-pod-autoscaler  Scaled up replica set order-service-7d8b from 2 to 3
+```
+
+## 总结
+
+HPA 是 Kubernetes 实现弹性伸缩的核心组件。掌握它的算法原理、指标类型和行为配置，能够帮助你在保证服务稳定性的同时优化资源成本。
+
+**面试追问方向：**
+
+- HPA 的控制器是如何工作的？它多久检查一次指标？
+- 如果 Metrics Server 不可用，HPA 会怎样？
+- 如何防止 HPA 抖动（Thrashing）？
+- HPA 与 Pod Disruption Budget 如何配合使用？
+- 缩容时，哪些 Pod 会被优先选择？

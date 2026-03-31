@@ -1,0 +1,511 @@
+# 服务弹性降级
+
+系统高峰期，商品详情页加载慢，是等待还是降级？如果降级，如何保证用户体验？
+
+这就是**弹性降级**要解决的问题。今天我们深入剖析服务降级的设计与实现。
+
+## 一、为什么要降级
+
+### 1.1 降级的本质
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        降级 vs 熔断                                  │
+│                                                                         │
+│   熔断：保护被调用方                                                  │
+│   ┌─────────────────────────────────────────────────────────────────┐ │
+│   │  服务A ──▶ 服务B                                               │ │
+│   │  服务B 频繁超时/失败 ──▶ 熔断器打开 ──▶ 快速失败              │ │
+│   └─────────────────────────────────────────────────────────────────┘ │
+│                                                                         │
+│   降级：保护调用方                                                    │
+│   ┌─────────────────────────────────────────────────────────────────┐ │
+│   │  用户 ──▶ 服务A                                                │ │
+│   │  服务A 降级返回 ──▶ 返回默认值/缓存数据                        │ │
+│   └─────────────────────────────────────────────────────────────────┘ │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 1.2 降级策略
+
+| 策略 | 说明 | 示例 |
+|---|---|---|
+| 返回默认值 | 返回预设的默认值 | 返回空列表 |
+| 返回缓存 | 返回历史缓存数据 | 返回 5 分钟前的数据 |
+| 熔断降级 | 服务不可用时快速失败 | 返回友好提示 |
+| 功能降级 | 关闭非核心功能 | 关闭推荐、评论 |
+
+## 二、Sentinel 降级实现
+
+### 2.1 引入依赖
+
+```xml title="pom.xml"
+<dependency>
+    <groupId>com.alibaba.csp</groupId>
+    <artifactId>sentinel-core</artifactId>
+    <version>1.8.6</version>
+</dependency>
+<dependency>
+    <groupId>com.alibaba.csp</groupId>
+    <artifactId>sentinel-annotation-aspectj</artifactId>
+    <version>1.8.6</version>
+</dependency>
+```
+
+### 2.2 降级规则配置
+
+```java title="降级规则")
+@Configuration
+public class DegradeConfig {
+    @PostConstruct
+    public void init() {
+        List<DegradeRule> rules = new ArrayList<>();
+
+        // 慢调用降级
+        DegradeRule slowRule = new DegradeRule();
+        slowRule.setResource("getProductDetail");
+        slowRule.setGrade(RuleConstant.DEGRADE_GRADE_RT);
+        slowRule.setCount(1000); // 慢调用阈值 1000ms
+        slowRule.setSlowRatioThreshold(0.5); // 50% 慢调用比例
+        slowRule.setMinRequestAmount(5); // 最小请求数
+        slowRule.setStatIntervalMs(10000); // 统计时间窗口
+        slowRule.setTimeWindow(10); // 降级时间窗口
+        rules.add(slowRule);
+
+        // 异常比例降级
+        DegradeRule errorRule = new DegradeRule();
+        errorRule.setResource("createOrder");
+        errorRule.setGrade(RuleConstant.DEGRADE_GRADE_EXCEPTION_RATIO);
+        errorRule.setCount(0.3); // 30% 异常比例
+        errorRule.setMinRequestAmount(10);
+        errorRule.setTimeWindow(30);
+        rules.add(errorRule);
+
+        DegradeRuleManager.loadRules(rules);
+    }
+}
+```
+
+### 2.3 降级处理
+
+```java title="降级注解")
+@Service
+@Slf4j
+public class ProductService {
+    @SentinelResource(value = "getProductDetail",
+            blockHandler = "getProductDetailBlock",
+            fallback = "getProductDetailFallback")
+    public ProductDetail getProductDetail(Long productId) {
+        // 正常业务逻辑
+        return productRepository.findById(productId);
+    }
+
+    /**
+     * 限流/熔断处理
+     */
+    public ProductDetail getProductDetailBlock(Long productId, BlockException e) {
+        log.warn("商品详情被限流: productId={}, cause={}",
+                productId, e.getClass().getSimpleName());
+
+        // 返回缓存数据
+        return getCachedProductDetail(productId);
+    }
+
+    /**
+     * 降级处理
+     */
+    public ProductDetail getProductDetailFallback(Long productId, Throwable t) {
+        log.error("商品详情获取失败，降级处理: productId={}", productId, t);
+
+        // 返回默认商品
+        return ProductDetail.defaultProduct(productId);
+    }
+}
+```
+
+## 三、降级策略实现
+
+### 3.1 返回缓存
+
+```java title="缓存降级")
+@Service
+@Slf4j
+public class CacheFallbackService {
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    /**
+     * 获取缓存数据（降级时使用）
+     */
+    public Product getCachedProduct(Long productId) {
+        String key = "product:" + productId;
+        Product cached = redisTemplate.opsForValue().get(key);
+
+        if (cached != null) {
+            log.info("使用缓存数据: productId={}", productId);
+            return cached;
+        }
+
+        // 缓存也没有，返回默认数据
+        return Product.defaultProduct(productId);
+    }
+
+    /**
+     * 异步回填缓存
+     */
+    @Async
+    public void asyncFillCache(Long productId) {
+        try {
+            Product product = productRepository.findById(productId);
+            if (product != null) {
+                redisTemplate.opsForValue().set(
+                        "product:" + productId,
+                        product,
+                        5, TimeUnit.MINUTES
+                );
+            }
+        } catch (Exception e) {
+            log.error("回填缓存失败", e);
+        }
+    }
+}
+```
+
+### 3.2 返回默认值
+
+```java title="默认值降级")
+@Service
+public class DefaultValueFallback {
+    /**
+     * 获取默认商品
+     */
+    public Product getDefaultProduct(Long productId) {
+        return Product.builder()
+                .id(productId)
+                .name("商品已下架")
+                .price(BigDecimal.ZERO)
+                .status("UNAVAILABLE")
+                .message("商品暂时不可用，请稍后重试")
+                .build();
+    }
+
+    /**
+     * 获取默认列表
+     */
+    public List<Product> getDefaultProductList() {
+        return Collections.emptyList();
+    }
+
+    /**
+     * 获取默认推荐
+     */
+    public List<Product> getDefaultRecommend(Long userId) {
+        return getHotProducts(); // 返回热销商品
+    }
+}
+```
+
+### 3.3 功能降级
+
+```java title="功能降级")
+@Service
+@Slf4j
+public class FeatureDegradationService {
+    private volatile boolean recommendationEnabled = true;
+    private volatile boolean commentEnabled = true;
+    private volatile boolean searchEnabled = true;
+
+    /**
+     * 检查功能是否启用
+     */
+    public boolean isFeatureEnabled(String feature) {
+        switch (feature) {
+            case "recommendation":
+                return recommendationEnabled;
+            case "comment":
+                return commentEnabled;
+            case "search":
+                return searchEnabled;
+            default:
+                return true;
+        }
+    }
+
+    /**
+     * 关闭功能
+     */
+    public void disableFeature(String feature) {
+        log.warn("关闭功能: {}", feature);
+        switch (feature) {
+            case "recommendation":
+                recommendationEnabled = false;
+                break;
+            case "comment":
+                commentEnabled = false;
+                break;
+            case "search":
+                searchEnabled = false;
+                break;
+        }
+    }
+
+    /**
+     * 获取推荐（带降级）
+     */
+    public List<Product> getRecommend(Long userId) {
+        if (!recommendationEnabled) {
+            return getDefaultRecommend(userId);
+        }
+
+        try {
+            return recommendationService.getRecommend(userId);
+        } catch (Exception e) {
+            log.error("推荐服务异常，降级", e);
+            recommendationEnabled = false; // 自动降级
+            return getDefaultRecommend(userId);
+        }
+    }
+}
+```
+
+## 四、熔断器模式
+
+### 4.1 熔断器实现
+
+```java title="熔断器")
+@Service
+@Slf4j
+public class CircuitBreaker {
+    private final AtomicReference<State> state = new AtomicReference<>(State.CLOSED);
+    private final AtomicInteger failureCount = new AtomicInteger(0);
+    private volatile long lastFailureTime = 0;
+
+    private static final int FAILURE_THRESHOLD = 5;
+    private static final long RECOVERY_TIMEOUT = 60000; // 1 分钟
+
+    public enum State {
+        CLOSED,     // 正常
+        OPEN,       // 熔断
+        HALF_OPEN   // 半开
+    }
+
+    /**
+     * 调用
+     */
+    public <T> T call(Supplier<T> supplier, Supplier<T> fallback) {
+        // 检查熔断状态
+        if (state.get() == State.OPEN) {
+            if (shouldAttemptReset()) {
+                // 尝试半开
+                state.compareAndSet(State.OPEN, State.HALF_OPEN);
+            } else {
+                // 直接降级
+                return fallback.get();
+            }
+        }
+
+        try {
+            T result = supplier.get();
+
+            // 成功，重置
+            onSuccess();
+            return result;
+
+        } catch (Exception e) {
+            // 失败，记录
+            onFailure();
+            return fallback.get();
+        }
+    }
+
+    private void onSuccess() {
+        failureCount.set(0);
+        state.set(State.CLOSED);
+    }
+
+    private void onFailure() {
+        lastFailureTime = System.currentTimeMillis();
+
+        if (failureCount.incrementAndGet() >= FAILURE_THRESHOLD) {
+            state.set(State.OPEN);
+            log.warn("熔断器打开");
+        }
+    }
+
+    private boolean shouldAttemptReset() {
+        return System.currentTimeMillis() - lastFailureTime > RECOVERY_TIMEOUT;
+    }
+}
+```
+
+### 4.2 使用示例
+
+```java title="熔断使用")
+@Service
+@Slf4j
+public class ProductService {
+    @Autowired
+    private CircuitBreaker circuitBreaker;
+
+    public Product getProduct(Long productId) {
+        return circuitBreaker.call(
+                // 正常调用
+                () -> productRepository.findById(productId),
+
+                // 降级处理
+                () -> {
+                    log.warn("降级返回: productId={}", productId);
+                    return Product.defaultProduct(productId);
+                }
+        );
+    }
+}
+```
+
+## 五、自动降级策略
+
+### 5.1 基于指标降级
+
+```java title="自动降级")
+@Service
+@Slf4j
+public class AutoDegradationService {
+    @Autowired
+    private MeterRegistry meterRegistry;
+
+    private volatile boolean degraded = false;
+
+    @Scheduled(fixedRate = 10000)
+    public void checkAndDegrade() {
+        // 检查 CPU
+        double cpuUsage = getCpuUsage();
+        if (cpuUsage > 0.9) {
+            degrade("CPU 过高: " + cpuUsage);
+            return;
+        }
+
+        // 检查内存
+        double memoryUsage = getMemoryUsage();
+        if (memoryUsage > 0.9) {
+            degrade("内存过高: " + memoryUsage);
+            return;
+        }
+
+        // 检查响应时间
+        double avgResponseTime = getAvgResponseTime();
+        if (avgResponseTime > 5000) {
+            degrade("响应时间过高: " + avgResponseTime);
+            return;
+        }
+
+        // 恢复正常
+        if (degraded && cpuUsage < 0.7 && memoryUsage < 0.7) {
+            recover();
+        }
+    }
+
+    private void degrade(String reason) {
+        if (!degraded) {
+            degraded = true;
+            log.error("触发自动降级: {}", reason);
+            featureDegradationService.disableFeature("recommendation");
+            featureDegradationService.disableFeature("search");
+        }
+    }
+
+    private void recover() {
+        degraded = false;
+        log.info("系统恢复正常，关闭降级");
+        featureDegradationService.enableAll();
+    }
+}
+```
+
+### 5.2 分级降级
+
+```java title="分级降级")
+@Service
+public class TieredDegradationService {
+    /**
+     * L0 正常：所有功能可用
+     */
+    public void level0() {
+        enableAll();
+    }
+
+    /**
+     * L1 轻度降级：关闭推荐、搜索
+     */
+    public void level1() {
+        disable("recommendation");
+        disable("search");
+    }
+
+    /**
+     * L2 中度降级：关闭非核心功能
+     */
+    public void level2() {
+        disable("recommendation");
+        disable("search");
+        disable("comment");
+        disable("like");
+    }
+
+    /**
+     * L3 重度降级：只保留核心功能
+     */
+    public void level3() {
+        disable("recommendation");
+        disable("search");
+        disable("comment");
+        disable("like");
+        disable("history");
+        disable("notification");
+    }
+
+    /**
+     * 根据负载选择降级级别
+     */
+    public void selectLevel() {
+        double cpu = getCpuUsage();
+        double memory = getMemoryUsage();
+        int activeConnections = getActiveConnections();
+
+        if (cpu > 0.95 || memory > 0.95) {
+            level3();
+        } else if (cpu > 0.9 || memory > 0.9) {
+            level2();
+        } else if (cpu > 0.8 || activeConnections > 1000) {
+            level1();
+        } else {
+            level0();
+        }
+    }
+}
+```
+
+## 六、总结
+
+| 降级策略 | 适用场景 | 用户体验 |
+|---|---|---|
+| 返回缓存 | 数据展示类 | 稍旧但可用 |
+| 返回默认值 | 核心流程 | 基本可用 |
+| 功能降级 | 非核心功能 | 功能减少但可用 |
+| 熔断降级 | 服务不可用 | 友好提示 |
+
+:::tip 实战建议
+1. **降级要有预案**：提前规划好降级策略
+2. **降级要可逆**：系统恢复后能自动恢复
+3. **降级要监控**：降级时要能感知到
+:::
+
+## 结尾
+
+降级是系统在极端情况下的「保命手段」。记住三个要点：
+
+1. **降级是主动的**：不是被系统压垮才降级
+2. **降级要有预案**：提前规划好降级策略
+3. **降级要可恢复**：系统好了要能恢复
+
+下一节，我们来看超时重试风暴治理——当重试策略不当，会引发什么灾难。

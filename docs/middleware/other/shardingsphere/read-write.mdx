@@ -1,0 +1,386 @@
+# ShardingSphere 读写分离
+
+读写分离是数据库提升性能的经典方案——主库处理写请求，从库处理读请求。ShardingSphere 提供了透明的读写分离能力。
+
+## 读写分离原理
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         读写分离架构                                 │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│                         写请求                                      │
+│                            │                                        │
+│                            ▼                                        │
+│              ┌─────────────────────────┐                           │
+│              │      主库 (Master)       │                           │
+│              │   写入数据 + 同步 binlog│                           │
+│              └────────────┬────────────┘                           │
+│                           │                                        │
+│                           │ binlog 同步                             │
+│                    ┌──────┴──────┐                                 │
+│                    ▼             ▼                                  │
+│         ┌───────────────┐ ┌───────────────┐                       │
+│         │   从库 1      │ │   从库 2      │                       │
+│         │   (Slave 1)   │ │   (Slave 2)   │                       │
+│         │   读请求       │ │   读请求       │                       │
+│         └───────────────┘ └───────────────┘                       │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+## ShardingSphere 读写分离配置
+
+### 基本配置
+
+```yaml title="application.yml"
+spring:
+  shardingsphere:
+    datasource:
+      # 主库
+      master_ds:
+        data-source-class-name: com.zaxxer.hikari.HikariDataSource
+        jdbc-url: jdbc:mysql://master:3306/ds_0
+        username: root
+        password: 
+      # 从库 1
+      slave_ds_0:
+        data-source-class-name: com.zaxxer.hikari.HikariDataSource
+        jdbc-url: jdbc:mysql://slave1:3306/ds_0
+        username: root
+        password: 
+      # 从库 2
+      slave_ds_1:
+        data-source-class-name: com.zaxxer.hikari.HikariDataSource
+        jdbc-url: jdbc:mysql://slave2:3306/ds_0
+        username: root
+        password: 
+
+    rules:
+      read-write-splitting:
+        data-sources:
+          ds_master_slave:
+            type: Static
+            props:
+              write-data-source-name: master_ds
+              read-data-source-names: slave_ds_0, slave_ds_1
+            load-balancer-name: round_robin
+
+        load-balancers:
+          round_robin:
+            type: ROUND_ROBIN
+```
+
+### Spring Boot 配置
+
+```yaml title="application.yml"
+spring:
+  shardingsphere:
+    rules:
+      read-write-splitting:
+        data-sources:
+          ds:
+            type: Static
+            props:
+              write-data-source-name: master
+              read-data-source-names: slave0, slave1
+            load-balancer-name: round_robin
+
+        load-balancers:
+          round_robin:
+            type: ROUND_ROBIN
+```
+
+## 路由策略
+
+### 强制路由到主库
+
+某些场景下必须读取主库（如写后立即读）：
+
+```java
+@Test
+public void testReadFromMaster() {
+    HintManager hintManager = HintManager.getInstance();
+
+    // 强制路由到主库
+    hintManager.setMasterRouteOnly(true);
+
+    // 读取数据（会路由到主库）
+    List<Order> orders = orderRepository.findAll();
+
+    hintManager.close();
+}
+```
+
+### 读写分离 + 数据分片
+
+```yaml title="application.yml"
+spring:
+  shardingsphere:
+    rules:
+      # 数据分片
+      sharding:
+        tables:
+          t_order:
+            actual-data-nodes: ds_${0..1}.t_order_${0..1}
+            table-strategy:
+              standard:
+                sharding-column: order_id
+                sharding-algorithm-name: order_inline
+
+      # 读写分离
+      read-write-splitting:
+        data-sources:
+          ds_0:
+            type: Static
+            props:
+              write-data-source-name: ds_0_master
+              read-data-source-names: ds_0_slave_0, ds_0_slave_1
+            load-balancer-name: round_robin
+          ds_1:
+            type: Static
+            props:
+              write-data-source-name: ds_1_master
+              read-data-source-names: ds_1_slave_0, ds_1_slave_1
+            load-balancer-name: round_robin
+
+    datasource:
+      ds_0_master:
+        data-source-class-name: com.zaxxer.hikari.HikariDataSource
+        jdbc-url: jdbc:mysql://master0:3306/ds_0
+        username: root
+        password: 
+      ds_0_slave_0:
+        data-source-class-name: com.zaxxer.hikari.HikariDataSource
+        jdbc-url: jdbc:mysql://slave0:3306/ds_0
+        username: root
+        password: 
+      # ... 更多数据源
+```
+
+## 负载均衡策略
+
+### 轮询策略（RoundRobin）
+
+```yaml
+load-balancers:
+  round_robin:
+    type: ROUND_ROBIN
+```
+
+请求均匀分配到各个从库。
+
+### 随机策略（Random）
+
+```yaml
+load-balancers:
+  random:
+    type: RANDOM
+```
+
+随机选择一个从库。
+
+### 权重策略（Weight）
+
+```yaml
+load-balancers:
+  weight_ds_0:
+    type: WEIGHT
+    props:
+      ds_0_slave_0: 2
+      ds_0_slave_1: 1
+```
+
+根据权重分配请求，适合从库配置不一致的场景。
+
+### 最少连接策略（LeastConnection）
+
+```yaml
+load-balancers:
+  least_connection:
+    type: LEASE_CONNECTION
+```
+
+选择当前连接数最少的从库。
+
+## 读写分离的坑
+
+### 1. 主从延迟
+
+主从同步有延迟，写后立即读可能读到旧数据：
+
+```java
+// 问题：写完后立即查询，可能读不到刚写入的数据
+orderRepository.save(order);
+List<Order> orders = orderRepository.findByUserId(userId);  // 可能查不到
+
+// 解决方案：写后强制读主库
+HintManager hintManager = HintManager.getInstance();
+hintManager.setMasterRouteOnly(true);
+List<Order> orders = orderRepository.findByUserId(userId);
+hintManager.close();
+```
+
+### 2. 事务内读写分离
+
+```java
+@Transactional  // 问题：事务内所有操作都在主库
+public void processOrder() {
+    // 写操作（主库）
+    orderRepository.save(order);
+
+    // 读操作（默认路由到从库，但在事务内会保持同一连接）
+    List<Order> orders = orderRepository.findAll();  // 实际在主库
+}
+```
+
+### 3. 跨分片查询
+
+```sql
+-- 跨分片的聚合查询需要扫描所有分片
+SELECT COUNT(*), SUM(amount) FROM t_order
+WHERE user_id IN (1, 2, 3)
+
+-- 优化：先在应用层聚合，再合并
+List<Order> orders = orderRepository.findByUserIds(Arrays.asList(1, 2, 3));
+Map<Long, OrderStats> stats = orders.stream()
+    .collect(Collectors.groupingBy(
+        Order::getUserId,
+        Collectors.collectingAndThen(
+            Collectors.toList(),
+            list -> new OrderStats(list.size(), list.stream().mapToLong(Order::getAmount).sum())
+        )
+    ));
+```
+
+## 最佳实践
+
+### 场景一：读多写少
+
+适合读写分离：
+
+```yaml
+# 配置
+spring:
+  shardingsphere:
+    rules:
+      read-write-splitting:
+        data-sources:
+          ds:
+            type: Static
+            props:
+              write-data-source-name: master
+              read-data-source-names: slave1, slave2
+```
+
+### 场景二：写多读少
+
+不适合读写分离，主库压力更大：
+
+```yaml
+# 建议：考虑分库分表
+spring:
+  shardingsphere:
+    rules:
+      sharding:
+        tables:
+          t_order:
+            actual-data-nodes: ds_${0..3}.t_order_${0..3}
+```
+
+### 场景三：写后读
+
+强制读主库：
+
+```java
+// 订单创建后立即查询
+public Order createAndGet(Long userId) {
+    Order order = new Order();
+    order.setUserId(userId);
+    order = orderRepository.save(order);
+
+    // 强制读主库，避免主从延迟问题
+    HintManager hintManager = HintManager.getInstance();
+    hintManager.setMasterRouteOnly(true);
+
+    try {
+        return orderRepository.findById(order.getId()).orElse(null);
+    } finally {
+        hintManager.close();
+    }
+}
+```
+
+## 配置完整示例
+
+```yaml title="application.yml"
+spring:
+  shardingsphere:
+    datasource:
+      names: master, slave0, slave1
+
+      master:
+        data-source-class-name: com.zaxxer.hikari.HikariDataSource
+        jdbc-url: jdbc:mysql://master:3306/ds
+        username: root
+        password: 
+
+      slave0:
+        data-source-class-name: com.zaxxer.hikari.HikariDataSource
+        jdbc-url: jdbc:mysql://slave0:3306/ds
+        username: root
+        password: 
+
+      slave1:
+        data-source-class-name: com.zaxxer.hikari.HikariDataSource
+        jdbc-url: jdbc:mysql://slave1:3306/ds
+        username: root
+        password: 
+
+    rules:
+      read-write-splitting:
+        data-sources:
+          ds:
+            type: Static
+            props:
+              write-data-source-name: master
+              read-data-source-names: slave0, slave1
+            load-balancer-name: round_robin
+
+        load-balancers:
+          round_robin:
+            type: ROUND_ROBIN
+
+      sharding:
+        tables:
+          t_order:
+            actual-data-nodes: ds.t_order_${0..15}
+            table-strategy:
+              standard:
+                sharding-column: order_id
+                sharding-algorithm-name: order_inline
+
+        sharding-algorithms:
+          order_inline:
+            type: INLINE
+            props:
+              algorithm-expression: t_order_${order_id % 16}
+```
+
+## 总结
+
+读写分离核心配置：
+
+| 配置项 | 说明 |
+|---|---|
+| `write-data-source-name` | 主库名称 |
+| `read-data-source-names` | 从库列表 |
+| `load-balancer-name` | 负载均衡策略 |
+
+使用注意：
+
+- 注意主从延迟问题
+- 事务内读写分离会保持同一连接
+- 写后立即读建议强制路由主库
+
+> 下一步：了解了读写分离后，让我们学习分布式事务。

@@ -1,0 +1,426 @@
+# 多级缓存架构设计与实践
+
+双十一零点，商品详情页打不开，Redis 被打满，MySQL 濒临崩溃——这是很多公司经历过的噩梦。问题出在哪？
+
+**单级缓存不够用。**
+
+今天我们来聊一聊多级缓存架构，如何用「本地缓存 + 分布式缓存 + CDN」三层防线，让你的系统在峰值流量下依然稳如老狗。
+
+## 一、为什么需要多级缓存
+
+### 1.1 单级缓存的困境
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         单级 Redis 缓存                                 │
+│                                                                         │
+│    用户请求 ──▶ Redis ──▶ 命中返回                                     │
+│                   │                                                   │
+│              未命中？                                                   │
+│                   │                                                   │
+│                   ▼                                                   │
+│                MySQL ──▶ 回填 Redis ──▶ 返回                          │
+│                                                                         │
+│    问题：Redis 成为瓶颈，所有请求都打在一个点上                           │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+| 问题 | 表现 | 原因 |
+|---|---|---|
+| Redis 被打满 | 大量请求超时 | 热点数据集中在同一个 key |
+| 缓存雪崩 | 大量缓存同时过期 | 批量设置过期时间 |
+| 热点 key | 单节点扛不住 | 明星商品/秒杀 |
+| 网络延迟 | 跨机房访问慢 | Redis 不在同机房 |
+
+### 1.2 多级缓存的核心思想
+
+**用本地缓存扛住热点，用分布式缓存保证一致，用 CDN 扛住静态。**
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         多级缓存架构                                     │
+│                                                                         │
+│   用户请求 ──▶ CDN（静态资源）                                          │
+│                  │                                                     │
+│            未命中？                                                     │
+│                  ▼                                                     │
+│         本地缓存（L1 Cache）                                            │
+│         Caffeine/Guava/ConcurrentHashMap                                │
+│                  │                                                     │
+│            未命中？                                                     │
+│                  ▼                                                     │
+│         分布式缓存（L2 Cache）                                          │
+│         Redis/Memcached                                                 │
+│                  │                                                     │
+│            未命中？                                                     │
+│                  ▼                                                     │
+│            数据库（MySQL）                                              │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+每层的职责：
+
+- **L1 本地缓存**：扛住热点访问，毫秒级响应，容量小
+- **L2 分布式缓存**：保证多实例一致性，容量大
+- **CDN**：扛住静态资源，边缘节点就近访问
+
+## 二、本地缓存（L1 Cache）设计
+
+### 2.1 为什么用本地缓存
+
+```
+请求1 ──▶ Redis ──▶ 耗时 5ms
+请求2 ──▶ Redis ──▶ 耗时 5ms
+请求3 ──▶ Redis ──▶ 耗时 5ms
+...
+10000 QPS × 5ms = 50 秒/秒的 Redis 处理时间
+```
+
+使用本地缓存后：
+
+```
+请求1 ──▶ 本地缓存命中 ──▶ 耗时 0.1ms ──▶ 结果
+请求2 ──▶ 本地缓存命中 ──▶ 耗时 0.1ms ──▶ 结果
+请求3 ──▶ 本地缓存未命中 ──▶ Redis ──▶ 回填 ──▶ 耗时 5ms
+```
+
+热点数据 99% 在本地命中，Redis 压力降低 100 倍。
+
+### 2.2 Caffeine 配置与使用
+
+```java title="Caffeine 本地缓存配置"
+@Configuration
+public class LocalCacheConfig {
+    @Bean
+    public Cache<String, ProductDetail> productLocalCache() {
+        return Caffeine.newBuilder()
+                // 容量：最多缓存 10000 个商品
+                .maximumSize(10000)
+                // 写后过期时间：5 分钟（保证数据最终一致）
+                .expireAfterWrite(5, TimeUnit.MINUTES)
+                // 访问后刷新：5 分钟内未访问则刷新
+                .refreshAfterWrite(5, TimeUnit.MINUTES)
+                // 监听器
+                .listener((key, value, cause) -> {
+                    if (cause.wasEvicted()) {
+                        log.info("缓存被驱逐: key={}, cause={}", key, cause);
+                    }
+                })
+                // 统计
+                .recordStats()
+                .build();
+    }
+
+    @Bean
+    public Cache<String, UserSession> sessionLocalCache() {
+        return Caffeine.newBuilder()
+                .maximumSize(50000)
+                // Session 30 分钟过期
+                .expireAfterAccess(30, TimeUnit.MINUTES)
+                .recordStats()
+                .build();
+    }
+}
+```
+
+### 2.3 热点数据识别
+
+不是所有数据都值得放本地缓存。本地缓存应该只存储**热点数据**。
+
+```java title="热点数据自动识别"
+@Service
+public class HotKeyDetector {
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    // 滑动窗口计数器
+    private ConcurrentHashMap<String, LongAdder> counters = new ConcurrentHashMap<>();
+
+    @Scheduled(fixedRate = 1000)
+    public void detectHotKeys() {
+        counters.forEach((key, counter) -> {
+            long count = counter.sumThenReset();
+            if (count > HOT_KEY_THRESHOLD) {
+                log.warn("检测到热点 key: {}, QPS: {}", key, count);
+                // 通知缓存服务将该 key 加载到本地缓存
+                notifyLocalCache(key);
+            }
+        });
+    }
+
+    public void recordAccess(String key) {
+        counters.computeIfAbsent(key, k -> new LongAdder()).increment();
+    }
+
+    private void notifyLocalCache(String key) {
+        // 异步加载到本地缓存
+        CompletableFuture.runAsync(() -> {
+            Object value = redisTemplate.opsForValue().get(key);
+            if (value != null) {
+                localCache.put(key, value);
+            }
+        });
+    }
+}
+```
+
+## 三、分布式缓存（L2 Cache）设计
+
+### 3.1 Redis Cluster vs 主从
+
+| 方案 | 特点 | 适用场景 |
+|---|---|---|
+| Redis Cluster | 去中心化，16384 个槽 | 数据量大，需要分片 |
+| 主从 + Sentinel | 简单，主从自动切换 | 数据量中等，高可用 |
+
+### 3.2 序列化选择
+
+```java title="JSON 序列化配置"
+@Configuration
+public class RedisConfig {
+    @Bean
+    public RedisTemplate<String, Object> redisTemplate(RedisConnectionFactory factory) {
+        RedisTemplate<String, Object> template = new RedisTemplate<>();
+        template.setConnectionFactory(factory);
+
+        Jackson2JsonRedisSerializer<Object> serializer = new Jackson2JsonRedisSerializer<>(Object.class);
+        ObjectMapper mapper = new ObjectMapper();
+        mapper.activateDefaultTyping(
+                mapper.getPolymorphicTypeValidator(),
+                ObjectMapper.DefaultTyping.NON_FINAL
+        );
+        serializer.setObjectMapper(mapper);
+
+        template.setKeySerializer(new StringRedisSerializer());
+        template.setHashKeySerializer(new StringRedisSerializer());
+        template.setValueSerializer(serializer);
+        template.setHashValueSerializer(serializer);
+        template.afterPropertiesSet();
+        return template;
+    }
+}
+```
+
+### 3.3 缓存注解封装
+
+```java title="自定义缓存注解"
+@Target({ElementType.METHOD})
+@Retention(RetentionPolicy.RUNTIME)
+public @interface Cacheable {
+    String key();
+    long expireSeconds() default 3600;
+}
+
+@Aspect
+@Component
+public class CacheAspect {
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    @Around("@annotation(cacheable)")
+    public Object around(ProceedingJoinPoint pjp, Cacheable cacheable) throws Throwable {
+        String key = cacheable.key();
+        if (key.contains("#")) {
+            key = evaluateExpression(key, pjp);
+        }
+        key = "cache:" + key;
+
+        // 1. 查缓存
+        Object value = redisTemplate.opsForValue().get(key);
+        if (value != null) {
+            log.debug("缓存命中: {}", key);
+            return value;
+        }
+
+        // 2. 执行方法
+        value = pjp.proceed();
+
+        // 3. 写缓存
+        redisTemplate.opsForValue().set(key, value, cacheable.expireSeconds(), TimeUnit.SECONDS);
+        log.debug("缓存写入: {}", key);
+
+        return value;
+    }
+}
+```
+
+## 四、多级缓存一致性
+
+### 4.1 Cache Aside 模式
+
+```
+读：
+应用 ──▶ 查缓存 ──▶ 命中？ ──▶ 返回
+              │         │
+              │      未命中
+              │         │
+              └─────▶ 查数据库 ──▶ 写缓存 ──▶ 返回
+
+写：
+应用 ──▶ 写数据库 ──▶ 删除缓存（不是更新！）
+```
+
+### 4.2 两级缓存读写
+
+```java title="两级缓存读写"
+@Service
+public class TwoLevelCacheService {
+    @Autowired
+    private Cache<String, Product> localCache;
+    @Autowired
+    private RedisTemplate<String, Product> redisTemplate;
+
+    public Product getProduct(Long productId) {
+        String key = CACHE_KEY_PREFIX + productId;
+
+        // L1: 查本地缓存
+        Product product = localCache.getIfPresent(key);
+        if (product != null) {
+            return product;
+        }
+
+        // L2: 查 Redis
+        product = redisTemplate.opsForValue().get(key);
+        if (product != null) {
+            localCache.put(key, product);
+            return product;
+        }
+
+        // L3: 查数据库
+        product = productMapper.selectById(productId);
+        if (product != null) {
+            localCache.put(key, product);
+            redisTemplate.opsForValue().set(key, product, 1, TimeUnit.HOURS);
+        }
+        return product;
+    }
+
+    public void updateProduct(Product product) {
+        productMapper.updateById(product);
+        String key = CACHE_KEY_PREFIX + product.getId();
+
+        // 删除缓存，不是更新！
+        localCache.invalidate(key);
+        redisTemplate.delete(key);
+    }
+}
+```
+
+:::warning 重要原则
+**读用缓存，写用删除。** 永远不要「更新缓存」，而是「删除缓存」。
+:::
+
+## 五、完整架构示例
+
+### 5.1 整体架构图
+
+```
+用户请求 → Nginx/LVS → CDN（静态） → 应用服务器集群（L1 Cache）
+                                        ↓
+                               Redis Cluster（L2 Cache）
+                                        ↓
+                               MySQL 主从库
+```
+
+### 5.2 完整代码示例
+
+```java title="多级缓存服务实现"
+@Service
+@Slf4j
+public class MultiLevelCacheService {
+    @Autowired
+    private Cache<String, ProductDetail> localCache;
+    @Autowired
+    private RedisTemplate<String, ProductDetail> redisTemplate;
+    @Autowired
+    private ProductMapper productMapper;
+
+    private static final String REDIS_KEY_PREFIX = "product:detail:";
+    private static final long LOCAL_CACHE_TTL = 60;
+    private static final long REDIS_CACHE_TTL = 300;
+
+    public ProductDetail getProductDetail(Long productId) {
+        String redisKey = REDIS_KEY_PREFIX + productId;
+
+        // L1: 本地缓存
+        ProductDetail cached = localCache.getIfPresent(redisKey);
+        if (cached != null) {
+            log.debug("L1 缓存命中: {}", productId);
+            return cached;
+        }
+
+        // L2: Redis 缓存
+        ProductDetail redisCached = redisTemplate.opsForValue().get(redisKey);
+        if (redisCached != null) {
+            log.debug("L2 缓存命中: {}", productId);
+            localCache.put(redisKey, redisCached);
+            return redisCached;
+        }
+
+        // L3: 数据库
+        log.debug("L3 数据库查询: {}", productId);
+        ProductDetail product = productMapper.selectById(productId);
+        if (product == null) {
+            return null;
+        }
+
+        localCache.put(redisKey, product);
+        redisTemplate.opsForValue().set(redisKey, product, REDIS_CACHE_TTL, TimeUnit.SECONDS);
+        return product;
+    }
+
+    public void preloadHotProducts(List<Long> productIds) {
+        for (Long productId : productIds) {
+            String redisKey = REDIS_KEY_PREFIX + productId;
+            ProductDetail product = productMapper.selectById(productId);
+            if (product != null) {
+                localCache.put(redisKey, product);
+                redisTemplate.opsForValue().set(redisKey, product, REDIS_CACHE_TTL, TimeUnit.SECONDS);
+            }
+        }
+    }
+}
+```
+
+## 六、性能监控
+
+```java title="缓存监控指标"
+@Service
+public class CacheMonitorService {
+    @Scheduled(fixedRate = 60000)
+    public void reportCacheStats() {
+        for (String cacheName : cacheManager.getCacheNames()) {
+            Cache<Object, Object> cache = cacheManager.getCache(cacheName);
+            if (cache instanceof CaffeineCache) {
+                CaffeineCache caffeineCache = (CaffeineCache) cache;
+                CacheStats stats = caffeineCache.getNativeCache().stats();
+                log.info("缓存 {}: 命中率={}, 驱逐数={}",
+                    cacheName, stats.hitRate(), stats.evictionCount());
+            }
+        }
+    }
+}
+```
+
+## 七、总结对比
+
+| 缓存层 | 响应时间 | 容量 | 适用场景 |
+|---|---|---|---|
+| L1 本地缓存 | 0.1ms | 小（MB 级） | 热点数据、高频访问 |
+| L2 Redis | 1-5ms | 大（GB 级） | 通用缓存、跨节点共享 |
+| CDN | 10-50ms | 极大 | 静态资源、就近访问 |
+
+:::tip 最佳实践
+多级缓存不是越多越好，一般两级就够了（L1 + L2）。记住三个原则：
+
+1. **读用缓存**：Cache Aside，读优先本地缓存
+2. **写用删除**：永远删除缓存，不要更新
+3. **分层监控**：每层都要有命中率监控
+:::
+
+## 结尾
+
+多级缓存的核心是**分层抗压**。用本地缓存扛住热点，用 Redis 保证一致性，用 CDN 扛住静态。每一层都有它存在的价值，缺一不可。
+
+下一节，我们来看多级缓存中最容易出问题的地方——缓存与数据库的一致性问题，这是面试和实战中的高频考点。

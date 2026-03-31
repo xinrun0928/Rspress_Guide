@@ -1,0 +1,267 @@
+# RocketMQ 事务消息：半消息与事务状态回查
+
+## 场景切入：分布式事务的难题
+
+你下单后，需要扣库存、扣余额、发短信……这些操作分布在不同的服务中。如何保证它们要么全部成功，要么全部失败？
+
+RocketMQ 的事务消息就是为了解决这个问题。
+
+## 一、事务消息原理
+
+### 1.1 核心概念
+
+| 概念 | 说明 |
+|---|---|
+| **半消息** | 消息对消费者不可见 |
+| **本地事务** | 在发送半消息后执行 |
+| **回查机制** | 未收到事务结果时，定时回查 |
+
+```
+事务消息流程：
+
+Producer                         Broker                    Consumer
+   │                               │                          │
+   │──发送半消息───────────────────>│                          │
+   │<─返回 OK ────────────────────│                          │
+   │                               │                          │
+   │执行本地事务                     │                          │
+   │   ├─ 创建订单 ──────────────>成功                        │
+   │   ├─ 扣减库存 ──────────────>成功                        │
+   │   └─ 扣减余额 ──────────────>成功                        │
+   │                               │                          │
+   │──提交事务结果───────────────>│                          │
+   │   (COMMIT_MESSAGE)           │                          │
+   │                               │                          │
+   │                               │──消息可见───────────────>│
+```
+
+---
+
+## 二、半消息
+
+### 2.1 什么是半消息
+
+半消息（Half Message）是事务消息的中间状态：
+
+| 状态 | 对消费者可见 | 说明 |
+|---|---|---|
+| **半消息** | ❌ | 发送成功，但本地事务未提交 |
+| **已提交** | ✅ | 事务提交，消息对消费者可见 |
+| **已回滚** | ❌ | 事务回滚，消息被删除 |
+
+### 2.2 半消息的特点
+
+| 特点 | 说明 |
+|---|---|
+| **可查询** | 可以通过消息 ID 查询半消息状态 |
+| **不可消费** | 消费者无法看到半消息 |
+| **持久化** | 半消息持久化到磁盘 |
+
+---
+
+## 三、事务状态回查
+
+### 3.1 回查触发条件
+
+事务状态回查在以下情况触发：
+
+| 条件 | 说明 |
+|---|---|
+| **提交超时** | 发送半消息后未收到提交结果 |
+| **Broker 重启** | Broker 重启后恢复未提交的事务 |
+| **网络异常** | 网络异常导致提交失败 |
+
+### 3.2 回查流程
+
+```
+回查流程：
+
+1. Broker 定时扫描未提交的事务消息
+   │
+2. 调用 Producer 的 checkLocalTransaction 方法
+   │
+3. Producer 查询本地事务状态
+   │
+4. 根据本地事务状态，提交或回滚消息
+```
+
+### 3.3 回查代码实现
+
+```java
+// 事务监听器实现
+TransactionListener transactionListener = new TransactionListener() {
+
+    // 执行本地事务
+    @Override
+    public LocalTransactionState executeLocalTransaction(Message msg, Object arg) {
+        String orderId = (String) arg;
+
+        try {
+            // 1. 创建订单
+            orderService.createOrder(orderId);
+
+            // 2. 扣减库存
+            inventoryService.decrease(orderId);
+
+            // 3. 扣减余额
+            accountService.decrease(orderId);
+
+            // 4. 提交事务消息
+            return LocalTransactionState.COMMIT_MESSAGE;
+
+        } catch (Exception e) {
+            // 事务失败，回滚消息
+            return LocalTransactionState.ROLLBACK_MESSAGE;
+        }
+    }
+
+    // 回查本地事务状态
+    @Override
+    public LocalTransactionState checkLocalTransaction(MessageExt msg) {
+        String orderId = msg.getKeys();
+
+        // 查询本地事务状态
+        TransactionState state = transactionLogService.getState(orderId);
+
+        if (state == TransactionState.COMMITTED) {
+            return LocalTransactionState.COMMIT_MESSAGE;
+        } else if (state == TransactionState.ROLLBACK) {
+            return LocalTransactionState.ROLLBACK_MESSAGE;
+        } else {
+            // 状态未知，可能是本地事务正在执行
+            // 返回 UNKNOW，Broker 会继续回查
+            return LocalTransactionState.UNKNOW;
+        }
+    }
+};
+```
+
+---
+
+## 四、完整代码示例
+
+### 4.1 生产者配置
+
+```java
+// 事务消息生产者配置
+TransactionMQProducer producer = new TransactionMQProducer("order-producer-group");
+producer.setNamesrvAddr("127.0.0.1:9876");
+
+// 设置事务监听器
+producer.setTransactionListener(new TransactionListener() {
+    @Override
+    public LocalTransactionState executeLocalTransaction(Message msg, Object arg) {
+        return doExecuteLocalTransaction(msg, arg);
+    }
+
+    @Override
+    public LocalTransactionState checkLocalTransaction(MessageExt msg) {
+        return doCheckLocalTransaction(msg);
+    }
+});
+
+producer.start();
+```
+
+### 4.2 发送事务消息
+
+```java
+// 发送事务消息
+public TransactionSendResult placeOrder(Order order) {
+    Message msg = new Message(
+        "order-topic",
+        order.getOrderId(),
+        order.toString().getBytes()
+    );
+
+    // 发送事务消息
+    TransactionSendResult result = producer.sendMessageInTransaction(msg, order.getOrderId());
+
+    return result;
+}
+```
+
+### 4.3 消费者配置
+
+```java
+// 消费者配置
+DefaultMQPushConsumer consumer = new DefaultMQPushConsumer("order-consumer-group");
+consumer.setNamesrvAddr("127.0.0.1:9876");
+consumer.subscribe("order-topic", "*");
+
+consumer.registerMessageListener(new MessageListenerConcurrently() {
+    @Override
+    public ConsumeConcurrentlyStatus consumeMessage(List<MessageExt> msgs,
+                                                    ConsumeConcurrentlyContext context) {
+        for (MessageExt msg : msgs) {
+            System.out.println("收到订单消息：" + new String(msg.getBody()));
+            // 处理订单逻辑
+        }
+        return ConsumeConcurrentlyStatus.CONSUME_SUCCESS;
+    }
+});
+
+consumer.start();
+```
+
+---
+
+## 五、事务消息注意事项
+
+### 5.1 事务超时
+
+```properties
+# 事务消息超时配置
+transactionTimeout=3000  # 事务超时时间（毫秒）
+transactionCheckInterval=3000  # 回查间隔（毫秒）
+transactionCheckMax=15  # 最大回查次数
+```
+
+### 5.2 幂等性
+
+事务消息可能发送多次，需要保证幂等：
+
+```java
+// 幂等处理
+public LocalTransactionState executeLocalTransaction(Message msg, Object arg) {
+    String orderId = (String) arg;
+
+    // 检查订单是否已存在
+    if (orderService.exists(orderId)) {
+        // 订单已存在，可能是重复发送
+        return LocalTransactionState.COMMIT_MESSAGE;
+    }
+
+    // 创建订单
+    orderService.createOrder(orderId);
+    return LocalTransactionState.COMMIT_MESSAGE;
+}
+```
+
+---
+
+## 六、面试追问预判
+
+### 追问一：事务消息的原理是什么？
+
+事务消息通过**半消息**和**回查机制**实现：
+
+1. 发送半消息（对消费者不可见）
+2. 执行本地事务
+3. 提交或回滚消息
+4. 如果未收到结果，定时回查本地事务状态
+
+### 追问二：回查机制是如何工作的？
+
+1. Broker 定时扫描未提交的事务消息
+2. 调用 Producer 的 `checkLocalTransaction` 方法
+3. Producer 查询本地事务状态
+4. 根据状态提交或回滚消息
+
+### 追问三：事务消息有什么限制？
+
+| 限制 | 说明 |
+|---|---|
+| **单向消息** | 不支持双向事务 |
+| **延迟有限** | 不支持长事务 |
+| **性能影响** | 事务消息性能较低 |

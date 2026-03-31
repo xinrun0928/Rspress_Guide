@@ -1,0 +1,477 @@
+# Redisson 可重入锁原理
+
+Redis 分布式锁不能重入？那是你不了解 Redisson 怎么实现的。
+
+很多人知道 Redis 可以实现分布式锁，但不知道 Redisson 的锁是可以重入的。同一个线程可以多次获取同一把锁，锁的计数器会累加。
+
+这个特性在实际应用中非常重要。比如在一个方法内部调用另一个也需要加锁的方法，重入锁可以避免死锁。
+
+本文深入剖析 Redisson 可重入锁的实现原理。
+
+## 一、可重入锁的概念
+
+### 1.1 什么是可重入
+
+可重入（Reentrant）是指同一个线程在持有锁的情况下，可以再次获取该锁而不会阻塞。
+
+```java
+// 可重入示例
+ReentrantLock lock = new ReentrantLock();
+
+public void methodA() {
+    lock.lock();
+    try {
+        // do something
+        methodB();  // 同一个线程再次获取锁
+    } finally {
+        lock.unlock();
+    }
+}
+
+public void methodB() {
+    lock.lock();
+    try {
+        // do something
+    } finally {
+        lock.unlock();
+    }
+}
+```
+
+### 1.2 可重入的意义
+
+在分布式场景中，可重入锁解决了以下问题：
+
+1. **避免死锁**：递归调用时不会因为重复加锁而阻塞
+2. **简化业务逻辑**：方法内部调用无需考虑锁的状态
+3. **支持嵌套调用**：A 方法加锁后调用 B，B 也可以加锁
+
+### 1.3 Redis 原始锁的问题
+
+Redis 原生的 `SETNX` + `EXPIRE` 方式实现的锁是不可重入的：
+
+```java
+// 不可重入的 Redis 锁
+public class SimpleRedisLock {
+
+    public boolean tryLock(String key, String value, long expireTime) {
+        Boolean result = redisTemplate.opsForValue()
+            .setIfAbsent(key, value, expireTime, TimeUnit.SECONDS);
+        return Boolean.TRUE.equals(result);
+    }
+
+    public void unlock(String key, String value) {
+        // 删除锁（但无法判断是否是同一线程）
+        redisTemplate.delete(key);
+    }
+}
+```
+
+问题：如果同一个线程多次调用 `tryLock`，计数器不会累加，`unlock` 一次就释放了。
+
+## 二、Redisson 可重入锁实现
+
+### 2.1 RLock 接口
+
+Redisson 实现了 `java.util.concurrent.locks.Lock` 接口：
+
+```java
+// Redisson RLock
+public interface RLock extends Lock, Lockable<Long> {
+
+    /**
+     * 尝试获取锁，等待直到获取成功或被中断
+     */
+    void lockInterruptibly() throws InterruptedException;
+
+    /**
+     * 尝试获取锁
+     */
+    boolean tryLock();
+
+    /**
+     * 尝试获取锁，带等待时间
+     */
+    boolean tryLock(long time, TimeUnit unit) throws InterruptedException;
+
+    /**
+     * 解锁
+     */
+    void unlock();
+
+    /**
+     * 判断是否被当前线程持有
+     */
+    boolean isHeldByCurrentThread();
+
+    /**
+     * 获取持有锁的线程
+     */
+    Thread getOwner();
+
+    /**
+     * 判断是否被任意线程持有
+     */
+    boolean isLocked();
+}
+```
+
+### 2.2 获取锁的 Lua 脚本
+
+Redisson 使用 Lua 脚本来保证操作的原子性：
+
+```lua
+-- tryLock 的 Lua 脚本
+-- KEYS[1] = 锁的 key
+-- ARGV[1] = 线程标识（UUID + Thread ID）
+-- ARGV[2] = 过期时间（毫秒）
+
+if (redis.call('exists', KEYS[1]) == 0) then
+    -- 锁不存在，直接加锁
+    redis.call('hset', KEYS[1], ARGV[1], 1);
+    redis.call('pexpire', KEYS[1], ARGV[2]);
+    return 1;
+end;
+
+if (redis.call('hexists', KEYS[1], ARGV[1]) == 1) then
+    -- 锁已被当前线程持有，计数器 +1
+    redis.call('hincrby', KEYS[1], ARGV[1], 1);
+    redis.call('pexpire', KEYS[1], ARGV[2]);
+    return 1;
+end;
+
+-- 锁被其他线程持有，获取失败
+return 0;
+```
+
+关键点：
+- 使用 **Hash** 结构存储锁：`key -> {threadId: count}`
+- 同一线程重复加锁，计数器 `hincrby` 加 1
+- 每次加锁都重置过期时间
+
+### 2.3 释放锁的 Lua 脚本
+
+```lua
+-- unlock 的 Lua 脚本
+-- KEYS[1] = 锁的 key
+-- ARGV[1] = 线程标识
+
+if (redis.call('hexists', KEYS[1], ARGV[1]) == 0) then
+    -- 当前线程不持有锁，不能释放
+    return nil;
+end;
+
+-- 计数器 -1
+local current = redis.call('hincrby', KEYS[1], ARGV[1], -1);
+
+if (current > 0) then
+    -- 还有计数，锁不能完全释放
+    redis.call('pexpire', KEYS[1], ARGV[2]);
+    return 0;
+else
+    -- 计数为 0，删除锁
+    redis.call('del', KEYS[1]);
+    return 1;
+end;
+```
+
+关键点：
+- 检查当前线程是否持有锁（防止误释放）
+- 计数器递减，而不是直接删除
+- 只有计数归零时才删除锁
+
+## 三、线程标识设计
+
+### 3.1 为什么需要唯一标识
+
+分布式环境中，多个 JVM 实例可能运行在同一台机器上。单纯的 Thread ID 可能在不同 JVM 中冲突。
+
+Redisson 使用 **UUID + Thread ID** 的组合：
+
+```java
+// Redisson 的线程标识
+public class RedissonLock {
+
+    private final String id;
+
+    // 构造时生成唯一 ID
+    public RedissonLock(RedissonClient redisson, String name) {
+        this.id = redisson.getId();  // Redisson 实例的唯一 ID
+    }
+
+    // 获取线程标识
+    private String getLockName() {
+        return id + ":" + Thread.currentThread().getId();
+    }
+}
+```
+
+### 3.2 锁的存储结构
+
+```
+锁 key: my-lock
+    │
+    └── Hash 结构
+          │
+          ├── "uuid-1:thread-1" -> 1  (计数器)
+          ├── "uuid-1:thread-2" -> 2  (另一线程持有 2 次)
+          └── "uuid-2:thread-1" -> 1  (另一 JVM 的线程)
+```
+
+## 四、WatchDog 自动续期
+
+### 4.1 为什么要续期
+
+如果锁的持有者执行时间超过 TTL（过期时间），锁会自动释放，可能导致其他线程获取锁。
+
+```
+时间线：
+T1: 线程 A 获取锁（TTL = 30s）
+T2: 线程 A 开始执行业务（预计 60s）
+T3: T1 + 30s，锁自动释放
+T4: 线程 B 获取锁（同一把锁）
+T5: 线程 A 业务执行完成，释放锁（释放的是线程 B 的锁！）
+```
+
+### 4.2 WatchDog 机制
+
+Redisson 通过定时任务自动续期锁：
+
+```java
+// 锁续期调度
+private void scheduleExpirationRenewal(long threadId) {
+    // 为当前线程添加续期任务
+    Timeout task = expirationRenewalMap.computeIfAbsent(
+        threadId,
+        id -> new Timeout(
+            scheduledService.schedule(
+                () -> renewExpiration(),
+                internalLockLeaseTime / 3,  // 每 1/3 TTL 执行一次
+                TimeUnit.MILLISECONDS
+            )
+        )
+    );
+}
+
+// 续期逻辑
+private void renewExpiration() {
+    // 更新过期时间
+    String luaScript = """
+        if (redis.call('hexists', KEYS[1], ARGV[2]) == 1) then
+            redis.call('pexpire', KEYS[1], ARGV[1]);
+            return 1;
+        end;
+        return 0;
+        """;
+
+    redis.eval(
+        luaScript,
+        Collections.singletonList(getName()),
+        String.valueOf(internalLockLeaseTime),
+        getLockName()
+    );
+}
+```
+
+### 4.3 续期参数
+
+```java
+// 默认参数
+// internalLockLeaseTime = 30 秒
+// 续期间隔 = 30 / 3 = 10 秒
+
+// 即：每 10 秒续期一次，每次续期到 30 秒后
+```
+
+### 4.4 续期触发条件
+
+WatchDog 在以下情况会工作：
+- 线程持有锁
+- 锁未被显式释放
+- 使用的是 `lock()` 方法（不带时间参数）
+
+如果使用 `tryLock(time, unit)` 设置了具体等待时间，WatchDog **不会工作**。
+
+## 五、重入流程详解
+
+### 5.1 首次获取锁
+
+```
+线程 A 首次获取锁 "order-lock"
+    │
+    ▼
+Redis 不存在该 key
+    │
+    ▼
+执行 hset "order-lock" "uuid:thread-1" 1
+    │
+    ▼
+设置过期时间 30 秒
+    │
+    ▼
+返回成功，计数器 = 1
+    │
+    ▼
+启动 WatchDog，每 10 秒续期
+```
+
+### 5.2 再次获取同一把锁
+
+```
+线程 A 再次获取锁 "order-lock"（在持有中）
+    │
+    ▼
+Redis 存在该 key
+    │
+    ▼
+检查 hset "order-lock" "uuid:thread-1" 是否存在
+    │
+    ▼
+存在！执行 hincrby，计数器 +1
+    │
+    ▼
+计数器 = 2
+    │
+    ▼
+重置过期时间 30 秒
+    │
+    ▼
+返回成功，WatchDog 继续工作
+```
+
+### 5.3 释放锁
+
+```
+线程 A 释放锁 "order-lock"
+    │
+    ▼
+检查 "uuid:thread-1" 是否存在
+    │
+    ▼
+存在！执行 hincrby，计数器 -1
+    │
+    ▼
+计数器 = 1（仍 > 0）
+    │
+    ▼
+重置过期时间 30 秒
+    │
+    ▼
+锁未被删除，线程 A 仍持有锁
+```
+
+### 5.4 完全释放
+
+```
+线程 A 再次释放锁 "order-lock"
+    │
+    ▼
+检查 "uuid:thread-1" 是否存在
+    │
+    ▼
+存在！计数器 -1
+    │
+    ▼
+计数器 = 0
+    │
+    ▼
+执行 del "order-lock"
+    │
+    ▼
+锁完全释放
+    │
+    ▼
+停止 WatchDog
+```
+
+## 六、代码示例
+
+### 6.1 基本使用
+
+```java
+@Service
+public class OrderService {
+
+    @Autowired
+    private RedissonClient redissonClient;
+
+    public void createOrder(Order order) {
+        // 获取锁
+        RLock lock = redissonClient.getLock("order:" + order.getUserId());
+
+        try {
+            // 加锁（阻塞等待）
+            lock.lock();
+
+            // 业务逻辑
+            doCreateOrder(order);
+
+        } finally {
+            // 释放锁
+            if (lock.isHeldByCurrentThread()) {
+                lock.unlock();
+            }
+        }
+    }
+
+    private void doCreateOrder(Order order) {
+        // 同一个线程内调用，无需担心死锁
+        checkInventory(order);
+        saveOrder(order);
+    }
+}
+```
+
+### 6.2 尝试获取
+
+```java
+public boolean createOrderWithTryLock(Order order) {
+    RLock lock = redissonClient.getLock("order:" + order.getUserId());
+
+    try {
+        // 尝试获取锁，等待 5 秒，持有 30 秒
+        if (lock.tryLock(5, 30, TimeUnit.SECONDS)) {
+            doCreateOrder(order);
+            return true;
+        }
+        return false;
+    } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        return false;
+    } finally {
+        if (lock.isHeldByCurrentThread()) {
+            lock.unlock();
+        }
+    }
+}
+```
+
+## 七、面试高频问题
+
+**Q：Redisson 可重入锁的实现原理是什么？**
+
+A：使用 Redis 的 Hash 结构存储锁，key 是锁名，field 是线程标识（UUID + Thread ID），value 是计数器。同一线程重复加锁时计数器累加，释放时计数器递减，只有归零时才删除锁。
+
+**Q：WatchDog 机制是什么？**
+
+A：Redisson 启动一个定时任务，每隔 TTL/3 时间（如 30s/3 = 10s）检查锁是否仍被持有，如果是则重置过期时间。确保锁持有时间可以自动延长，避免业务执行时间超过 TTL 导致锁自动释放。
+
+**Q：为什么需要 UUID + Thread ID 作为线程标识？**
+
+A：单纯的 Thread ID 在多 JVM 环境中可能重复。UUID 确保 Redisson 实例唯一，Thread ID 确保线程唯一，两者组合在分布式环境中全局唯一。
+
+## 总结
+
+Redisson 可重入锁的核心设计：
+
+1. **Hash 结构存储**：`key -> {threadId: count}`
+2. **计数器机制**：同一线程重复加锁，计数器累加
+3. **原子性保证**：通过 Lua 脚本保证 get + set 的原子性
+4. **WatchDog 续期**：自动延长锁的持有时间
+5. **UUID + Thread ID**：确保分布式环境下线程标识唯一
+
+理解这些原理，你就能在面试中自信地回答任何关于 Redisson 可重入锁的问题。
+
+> 下一步探索：
+> - 想了解更多锁类型？阅读《Redisson 公平锁 vs 非公平锁》
+> - 想了解分布式信号量？阅读《Redisson 信号量与 CountDownLatch》

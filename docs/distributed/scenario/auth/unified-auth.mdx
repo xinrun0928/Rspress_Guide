@@ -1,0 +1,451 @@
+# 微服务统一认证方案
+
+凌晨 2 点，你刚完成微服务拆分，把单体应用拆成了十几个独立服务。第二天早上，用户反馈：「登录一次还不够，每个服务都要重新登录」。这不是 bug，是分布式系统的经典挑战——**Session 状态分散在各个服务中，彼此不认识**。
+
+本文带你从零设计一套完整的微服务统一认证体系，覆盖 Token 流转、网关鉴权、服务间调用三大核心场景。
+
+## 一、为什么需要统一认证
+
+单体架构下，用户登录后 Session 存在单机内存或黏性 Session 的负载均衡中，请求无论如何路由，都能找到对应的 Session。但微服务拆分的本质是**进程边界拆分**——每个服务都是独立进程、独立部署，Session 无法跨进程共享。
+
+### 1.1 拆分的代价
+
+| 方案 | 问题 |
+|---|---|
+| 每个服务独立维护 Session | 用户需要在每个服务重复登录，体验灾难 |
+| Session 同步（广播式） | N² 问题，服务越多广播越多，网络风暴 |
+| 黏性 Session | 服务重启或扩缩容时，用户被迫重新登录 |
+
+### 1.2 统一认证的核心目标
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        用户请求                                  │
+└─────────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     API Gateway                                 │
+│                  (统一鉴权入口)                                   │
+└─────────────────────────────────────────────────────────────────┘
+                                  │
+                    ┌─────────────┼─────────────┐
+                    ▼             ▼             ▼
+              ┌─────────┐  ┌─────────┐  ┌─────────┐
+              │ Service A│  │ Service B│  │ Service C│
+              └─────────┘  └─────────┘  └─────────┘
+```
+
+统一认证方案需要解决三个问题：
+
+1. **用户身份统一**：一次登录，处处通行
+2. **权限统一管理**：权限变更实时生效
+3. **服务间互信**：服务 A 调用服务 B 时，无需再次验证用户身份
+
+## 二、认证方案演进
+
+### 2.1 方案一：网关集中 Session
+
+最早期的做法是所有请求先到网关，网关维护全局 Session，服务间通信携带 Session ID。
+
+```yaml title="网关配置示例"
+spring:
+  session:
+    store-type: redis
+    redis:
+      namespace: gateway:session
+```
+
+**优点**：改动最小，适合过渡期
+**缺点**：网关成为性能瓶颈，所有请求都绕不过网关
+
+### 2.2 方案二：无状态 Token（JWT）
+
+Token 的核心理念是**把身份信息存在客户端**，服务端只做验证。
+
+```
+用户登录 → 服务端签发 Token → 客户端携带 Token → 每个服务验证 Token
+```
+
+```java title="JWT Token 生成示例"
+public String generateToken(UserPrincipal user) {
+    Map<String, Object> claims = new HashMap<>();
+    claims.put("userId", user.getId());
+    claims.put("username", user.getUsername());
+    claims.put("roles", user.getRoles());
+    claims.put("permissions", user.getPermissions());
+
+    return Jwts.builder()
+            .setClaims(claims)
+            .setSubject(user.getId().toString())
+            .setIssuedAt(new Date())
+            .setExpiration(new Date(System.currentTimeMillis() + 3600000))
+            .signWith(Keys.hmacShaKeyFor(SECRET_KEY.getBytes()), SignatureAlgorithm.HS256)
+            .compact();
+}
+```
+
+**优点**：水平扩展容易，服务无状态
+**缺点**：Token 一旦签发，无法主动失效（需配合黑名单）
+
+### 2.3 方案三：Token + 网关鉴权（生产推荐）
+
+这是目前主流方案：用户登录后获取 Token，后续所有请求携带 Token，网关统一校验。
+
+```java title="网关鉴权过滤器"
+@Component
+public class AuthFilter implements GlobalFilter {
+    @Autowired
+    private JwtUtil jwtUtil;
+    @Autowired
+    private AuthService authService;
+
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        String path = exchange.getRequest().getURI().getPath();
+
+        // 白名单路径跳过鉴权
+        if (isWhiteList(path)) {
+            return chain.filter(exchange);
+        }
+
+        String token = extractToken(exchange.getRequest());
+        if (token == null) {
+            return unauthorized(exchange, "Missing token");
+        }
+
+        try {
+            Claims claims = jwtUtil.parseToken(token);
+
+            // 验证黑名单
+            if (authService.isTokenBlacklisted(token)) {
+                return unauthorized(exchange, "Token revoked");
+            }
+
+            // 权限校验
+            String requiredPermission = getRequiredPermission(path);
+            if (requiredPermission != null && !hasPermission(claims, requiredPermission)) {
+                return forbidden(exchange, "Insufficient permission");
+            }
+
+            // 将用户信息传递给下游服务
+            ServerWebExchange mutatedExchange = exchange.mutate()
+                    .request(builder -> builder
+                            .header("X-User-Id", claims.get("userId").toString())
+                            .header("X-Username", claims.get("username").toString())
+                            .header("X-Token", token))
+                    .build();
+
+            return chain.filter(mutatedExchange);
+
+        } catch (ExpiredJwtException e) {
+            return unauthorized(exchange, "Token expired");
+        } catch (JwtException e) {
+            return unauthorized(exchange, "Invalid token");
+        }
+    }
+}
+```
+
+## 三、Token 刷新与续期机制
+
+### 3.1 双 Token 机制
+
+Access Token 有效期短（15 分钟），Refresh Token 有效期长（7 天）。Access Token 过期后，用 Refresh Token 换取新的 Access Token。
+
+```
+登录 → 返回 Access Token + Refresh Token
+     ↓
+请求携带 Access Token
+     ↓
+Access Token 过期？
+  ├─ 否 → 继续请求
+  └─ 是 → 用 Refresh Token 换取新的 Access Token
+             ↓
+        Refresh Token 也过期？
+          ├─ 否 → 返回新的 Access Token
+          └─ 是 → 重新登录
+```
+
+### 3.2 实现代码
+
+```java title="Token 刷新服务"
+@Service
+public class TokenRefreshService {
+    @Autowired
+    private JwtUtil jwtUtil;
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+
+    private static final String REFRESH_TOKEN_PREFIX = "refresh:token:";
+    private static final String ACCESS_TOKEN_BLACKLIST_PREFIX = "blacklist:access:";
+
+    public TokenResponse refreshToken(String refreshToken) {
+        // 验证 Refresh Token
+        Claims claims = jwtUtil.parseToken(refreshToken);
+        String userId = claims.getSubject();
+
+        // 检查 Refresh Token 是否在黑名单
+        if (Boolean.TRUE.equals(redisTemplate.hasKey(REFRESH_TOKEN_PREFIX + userId))) {
+            String storedToken = redisTemplate.opsForValue().get(REFRESH_TOKEN_PREFIX + userId);
+            if (!refreshToken.equals(storedToken)) {
+                throw new AuthException("Refresh token reuse detected");
+            }
+        }
+
+        // 生成新的 Access Token
+        UserPrincipal user = userService.getUserPrincipal(userId);
+        String newAccessToken = jwtUtil.generateAccessToken(user);
+        String newRefreshToken = jwtUtil.generateRefreshToken(user);
+
+        // 存储新的 Refresh Token
+        redisTemplate.opsForValue().set(
+                REFRESH_TOKEN_PREFIX + userId,
+                newRefreshToken,
+                7, TimeUnit.DAYS
+        );
+
+        // 旧 Refresh Token 加入黑名单（防止重放攻击）
+        redisTemplate.opsForValue().set(
+                REFRESH_TOKEN_PREFIX + "old:" + userId,
+                refreshToken,
+                1, TimeUnit.HOURS
+        );
+
+        return new TokenResponse(newAccessToken, newRefreshToken);
+    }
+}
+```
+
+:::warning 安全性注意
+Refresh Token 只能使用一次。每次刷新后，旧 Refresh Token 应立即失效，这是防止 Token 泄露后被恶意重放的关键措施。
+:::
+
+## 四、服务间调用认证
+
+微服务架构中，服务 A 调用服务 B 时，B 需要知道这个请求是经过 A 验证的，而不是伪造的。
+
+### 4.1 方案一：Gateway Token 透传
+
+网关鉴权通过后，将用户信息以请求头形式传递给下游服务。
+
+```java
+// 下游服务获取当前用户
+@RestController
+public class UserController {
+    @GetMapping("/api/users/me")
+    public User getCurrentUser(@RequestHeader("X-User-Id") String userId) {
+        return userService.getUserById(userId);
+    }
+}
+```
+
+### 4.2 方案二：服务间 AK/SK 认证
+
+对于服务间内部调用，使用独立的密钥体系，不依赖用户 Token。
+
+```java title="服务间调用签名"
+@Component
+public class ServiceAuthUtil {
+    private static final String AK = "your-access-key";
+    private static final String SK = "your-secret-key";
+
+    public void signRequest(HttpRequest<?> request) {
+        long timestamp = System.currentTimeMillis();
+        String nonce = UUID.randomUUID().toString();
+
+        // 签名内容：方法 + 路径 + 时间戳 + 随机数
+        String signContent = request.getMethod() + "\n" +
+                            request.getPath() + "\n" +
+                            timestamp + "\n" +
+                            nonce;
+
+        String signature = HMAC_SHA256(signContent, SK);
+
+        request.setHeader("X-AK", AK);
+        request.setHeader("X-Timestamp", String.valueOf(timestamp));
+        request.setHeader("X-Nonce", nonce);
+        request.setHeader("X-Signature", signature);
+    }
+}
+```
+
+### 4.3 方案三：mTLS 双向认证
+
+最高安全级别，服务间使用双向 TLS 证书认证，物理层面保证调用安全。
+
+```yaml title="服务网格配置示例"
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: istio-system
+spec:
+  mtls:
+    mode: STRICT
+```
+
+## 五、权限模型设计
+
+### 5.1 RBAC 权限模型
+
+```
+用户 → 角色 → 权限
+         ↓
+      角色可继承（角色 A 继承角色 B，获得 B 的所有权限）
+```
+
+```java title="权限校验注解"
+@Target(ElementType.METHOD)
+@Retention(RetentionPolicy.RUNTIME)
+public @interface RequirePermission {
+    String value();
+}
+
+@Override
+public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+    // ... Token 校验逻辑 ...
+
+    Method method = findTargetMethod(exchange.getRequest().getPath());
+    if (method != null && method.isAnnotationPresent(RequirePermission.class)) {
+        RequirePermission annotation = method.getAnnotation(RequirePermission.class);
+        String requiredPermission = annotation.value();
+
+        if (!hasPermission(claims, requiredPermission)) {
+            return forbidden(exchange, "Permission denied: " + requiredPermission);
+        }
+    }
+
+    return chain.filter(mutatedExchange);
+}
+```
+
+### 5.2 权限数据存储
+
+```sql
+-- 用户表
+CREATE TABLE users (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    username VARCHAR(50) NOT NULL UNIQUE,
+    password_hash VARCHAR(255) NOT NULL,
+    status TINYINT DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 角色表
+CREATE TABLE roles (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    code VARCHAR(50) NOT NULL UNIQUE,
+    name VARCHAR(100) NOT NULL,
+    parent_id BIGINT,
+    FOREIGN KEY (parent_id) REFERENCES roles(id)
+);
+
+-- 用户角色关联
+CREATE TABLE user_roles (
+    user_id BIGINT NOT NULL,
+    role_id BIGINT NOT NULL,
+    PRIMARY KEY (user_id, role_id)
+);
+
+-- 权限表
+CREATE TABLE permissions (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    code VARCHAR(100) NOT NULL UNIQUE,
+    name VARCHAR(100) NOT NULL,
+    resource_type VARCHAR(50),
+    description VARCHAR(255)
+);
+
+-- 角色权限关联
+CREATE TABLE role_permissions (
+    role_id BIGINT NOT NULL,
+    permission_id BIGINT NOT NULL,
+    PRIMARY KEY (role_id, permission_id)
+);
+```
+
+## 六、完整认证流程图
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                              用户端                                       │
+│   ┌─────────┐     ┌─────────┐     ┌─────────┐                            │
+│   │ Browser │────▶│  App    │────▶│   H5    │                            │
+│   └─────────┘     └─────────┘     └─────────┘                            │
+└──────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    │ HTTPS
+                                    ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│                           API Gateway                                     │
+│   ┌─────────────────────────────────────────────────────────────────┐    │
+│   │  1. Token 校验（JWT 解析、签名验证、黑名单检查）                      │    │
+│   │  2. 权限校验（基于 Path、方法、用户角色）                             │    │
+│   │  3. 请求路由（Path → 目标服务）                                    │    │
+│   │  4. 用户信息透传（X-User-Id, X-Username 等 Header）                 │    │
+│   └─────────────────────────────────────────────────────────────────┘    │
+└──────────────────────────────────────────────────────────────────────────┘
+                                    │
+                    ┌───────────────┼───────────────┐
+                    ▼               ▼               ▼
+              ┌─────────┐    ┌─────────┐    ┌─────────┐
+              │ Auth    │    │  Order  │    │  User   │
+              │ Service │    │ Service │    │ Service │
+              └─────────┘    └─────────┘    └─────────┘
+                    │               │               │
+                    ▼               ▼               ▼
+              ┌─────────────────────────────────────────┐
+              │              Redis Cluster              │
+              │   - Token 黑名单                         │
+              │   - Refresh Token 存储                   │
+              │   - 用户 Session                         │
+              └─────────────────────────────────────────┘
+                    │
+                    ▼
+              ┌─────────┐
+              │   MySQL │
+              │ (用户/角色/权限) │
+              └─────────┘
+```
+
+## 七、常见问题与解决方案
+
+### 7.1 Token 泄露怎么办
+
+1. **网关层面**：维护 Token 黑名单，泄露后立即加入黑名单
+2. **用户层面**：提供「强制下线」功能，清除该用户所有 Token
+3. **监控层面**：异常 IP 登录检测，异地登录告警
+
+### 7.2 多设备登录如何处理
+
+| 策略 | 实现 | 适用场景 |
+|---|---|---|
+| 单设备登录 | 只保留最新 Token | 安全性要求高 |
+| 多设备登录 | 允许多个有效 Token | 用户体验优先 |
+| 设备管理 | 限制登录设备数量 | 平衡方案 |
+
+### 7.3 权限变更如何实时生效
+
+1. **Token 短期化**：Access Token 有效期 15 分钟，权限变更最多延迟 15 分钟生效
+2. **主动推送**：权限变更时，主动清理对应用户的 Token 缓存
+3. **实时校验**：关键操作走权限服务实时校验，不依赖 Token 内权限数据
+
+## 八、方案对比与选型建议
+
+| 方案 | 优点 | 缺点 | 适用规模 |
+|---|---|---|---|
+| Session 集中式 | 改动最小 | 网关压力大 | 小型系统 |
+| JWT 无状态 | 水平扩展好 | 无法主动失效 | 中型系统 |
+| JWT + Redis 黑名单 | 灵活控制 | 多一次 Redis 查询 | 大型系统 |
+| JWT + 短 Token | 安全性高 | 刷新逻辑复杂 | 金融级系统 |
+
+:::tip 选型建议
+如果你的系统用户量在百万级别，JWT + Redis 黑名单是最佳平衡点。如果需要金融级安全，加密存储敏感信息 + mTLS 服务认证。
+:::
+
+## 结尾
+
+微服务统一认证不是一次性设计好的，而是在业务发展中不断演进。记住三个核心原则：**Token 是事实**，谁持有有效 Token，谁就是合法用户；**网关是守门员**，所有流量必须经过网关鉴权；**服务间用独立认证**，不要把用户 Token 直接透传给其他服务。
+
+下一节，我们来看在多系统场景下，用户一次登录后如何在多个关联系统间自动通行——这就是 SSO 单点登录要解决的问题。

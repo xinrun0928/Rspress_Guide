@@ -1,0 +1,206 @@
+# SLS 日志服务
+
+日志，是排查问题的第一手资料。但当系统规模从 1 台服务器扩展到 100 台、从单机部署变成 Kubernetes 集群，日志管理就从一个「随手 cat」变成系统工程。
+
+阿里云 SLS（Log Service）就是解决这个问题的云服务——它提供日志采集、存储、查询、分析、可视化的一站式能力。
+
+## 痛点驱动：为什么需要日志服务？
+
+想象一个场景：用户反馈「订单支付失败」，但你的日志分散在 5 台服务器上，你需要登录每台机器、grep 关键字、拼凑时间线……等找到原因，半小时过去了。
+
+传统日志管理的困境：
+
+| 问题 | 表现 |
+|---|---|
+| 日志分散 | 需要 SSH 到每台机器查看 |
+| 难以检索 | grep + awk 效率低下 |
+| 存储成本 | 大日志量占用磁盘，清理不及时 |
+| 无实时性 | 问题发生后才知道，事后分析慢 |
+| 缺少关联 | 无法把用户请求、SQL、异常串起来 |
+
+SLS 的核心思路：**把日志从「本地文件」变成「云端流」**，让日志采集、存储、查询全部在线化。
+
+## 核心概念
+
+SLS 的数据模型分为几层：
+
+```
+Project（项目）
+  └── Logstore（日志库）
+        └── Shard（数据分片）
+```
+
+### Logstore
+
+Logstore 是日志存储的基本单元，类似于数据库中的「表」。每个 Logstore 有以下特性：
+
+- **存储时长**：可配置 1~365 天，超过自动删除
+- **Shard 数量**：决定写入吞吐，1 个 Shard 支持 5MB/s 写入、10 次/秒写入
+- **索引类型**：全文索引（分词）、字段索引（Key-Value）
+
+### Logtail
+
+Logtail 是 SLS 提供的日志采集 Agent，支持多种数据源：
+
+- 服务器日志文件
+- Docker 容器日志
+- MySQL、Redis 等数据库审计日志
+- Syslog、Kafka 等流式数据
+
+```json title="logtail.json 采集配置"
+{
+  "logstore": "app-log",
+  "logPath": "/var/log/myapp",
+  "filePattern": "*.log",
+  "timeKey": "time",
+  "timeFormat": "%Y-%m-%d %H:%M:%S"
+}
+```
+
+:::tip 采集配置建议
+生产环境中，建议按「应用名 + 环境」设置 Logstore 名称，如 `order-service-prod`，便于按业务隔离和成本分摊。
+:::
+
+## 查询语法
+
+SLS 提供类似 SQL 的查询语言（Log Analytics），支持全文检索、字段过滤、聚合分析。
+
+### 基础查询
+
+```sql
+-- 全文检索
+* | SELECT * FROM mylogstore WHERE content LIKE '%error%'
+
+-- 字段过滤
+level: ERROR | SELECT time, message FROM mylogstore
+
+-- 时间范围（自动带上 __time__ 字段）
+__time__ > 1709337600 AND level: ERROR
+```
+
+### 聚合分析
+
+```sql
+-- 统计每分钟错误数量
+* | SELECT DATE_TRUNC('minute', __time__) AS minute, COUNT(*) AS error_count
+  WHERE level: ERROR
+  GROUP BY DATE_TRUNC('minute', __time__)
+  ORDER BY minute
+
+-- 统计 Top 10 慢 SQL
+* | SELECT sql, COUNT(*) AS count, AVG(duration_ms) AS avg_duration
+  FROM mylogstore
+  WHERE type: SLOW_SQL
+  GROUP BY sql
+  ORDER BY avg_duration DESC
+  LIMIT 10
+```
+
+### 关联查询
+
+```sql
+-- 关联 User 服务和 Order 服务的日志
+logstore://user-service:app-log | SELECT u.user_id, u.action
+JOIN logstore://order-service:app-log | SELECT o.order_id, o.status
+ON u.trace_id = o.trace_id
+WHERE u.__time__ - o.__time__ < 60
+```
+
+## 场景实战
+
+### 场景一：Nginx 访问日志分析
+
+```json title="nginx log format"
+"$remote_addr - $remote_user [$time_local] \"$request\" "
+"$status $body_bytes_sent \"$http_referer\" "
+"\"$http_user_agent\" $request_time"
+```
+
+通过 Logtail 采集后，可以分析：
+
+- **PV/UV 统计**：`SELECT COUNT(*) FROM nginx-log`
+- **慢请求**：`SELECT * FROM nginx-log WHERE request_time > 1`
+- **Top IP**：`SELECT remote_addr, COUNT(*) GROUP BY remote_addr ORDER BY COUNT(*) DESC LIMIT 10`
+- **错误率**：`SELECT status, COUNT(*) GROUP BY status`
+
+### 场景二：Java 应用日志结构化
+
+在 Logback 中配置 JSON 格式输出：
+
+```xml title="logback-spring.xml"
+<encoder class="ch.qos.logback.core.encoder.LayoutWrappingEncoder">
+  <layout class="ch.qos.logback.contrib.json.classic.JsonLayout">
+    <timestampFormat>yyyy-MM-dd'T'HH:mm:ss.SSSZ</timestampFormat>
+    <appendLineSeparator>true</appendLineSeparator>
+    <jsonFormatter class="ch.qos.logback.contrib.jackson.JacksonJsonFormatter">
+      <prettyPrint>false</prettyPrint>
+    </jsonFormatter>
+  </layout>
+</encoder>
+```
+
+输出的 JSON 日志包含：时间戳、日志级别、类名、线程名、堆栈信息、MDC 链路追踪 ID。
+
+### 场景三：Kubernetes 容器日志
+
+```yaml title="aliyun-log-collector.yaml"
+apiVersion: log.alibabacloud.com/v1alpha1
+kind: AliyunLogConfig
+metadata:
+  name: myapp-config
+spec:
+  logstore: myapp-container-log
+  project: my-project
+  machineGroup:
+    groupName: k8s-group
+  config:
+    inputType: plugin
+    inputDetail:
+      plugin:
+        inputs:
+          - type: service_docker_stdout
+            includeLabel:
+              k8s-container-name: myapp
+```
+
+## 成本优化
+
+SLS 按写入量收费，成本控制是关键：
+
+| 优化手段 | 效果 |
+|---|---|
+| 日志级别控制 | 生产环境只写 WARN+，DEBUG 本地保留 |
+| 采样率 | 高频日志按比例采样 |
+| 压缩传输 | Logtail 开启 GZIP 压缩 |
+| 索引优化 | 只对必要字段建索引，减少索引量 |
+| 存储分级 | 热数据用高性能存储，超过 30 天转低频 |
+
+```sql
+-- 查询存储量
+* | SELECT date, storage, ingestion, index_storage
+  FROM internal_operation_log
+  WHERE __time__ > NOW() - 7d
+```
+
+## 对比自建 ELK
+
+| 维度 | SLS | ELK（自建） |
+|---|---|---|
+| 部署成本 | 零运维，开箱即用 | 需要维护 ES 集群 |
+| 扩展性 | 自动扩容，无需干预 | 需要手动扩容 |
+| 查询性能 | 海量数据秒级响应 | 大数据量依赖 ES 配置 |
+| 成本 | 按量付费，可能较高 | 固定服务器成本 |
+| 功能 | 与阿里云生态深度集成 | 更灵活，可私有化部署 |
+
+## 总结
+
+SLS 解决了日志「采、存、查、用」的全链路问题，是云原生时代日志管理的标配选择。
+
+核心要点：
+
+- Logstore 是存储单元，Logtail 是采集 Agent
+- 查询语法支持全文、字段、聚合、关联
+- 成本控制靠日志级别、采样率、存储分级
+- 与 ELK 相比，优势在于免运维；与 ELK 相比，优势在于灵活可控
+
+> 下一步：如果你需要更强大的日志分析能力，可以考虑 ELK；如果只需要基础的日志查询和告警，SLS 足够用了。

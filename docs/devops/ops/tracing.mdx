@@ -1,0 +1,424 @@
+# 链路追踪实践
+
+想象一下，用户说「下单失败了」。你登录服务器，查日志，查了 5 分钟，发现是库存服务超时。但为什么超时？数据库慢？网络抖动？还是 Redis 堵了？
+
+如果是单体应用，你翻日志就够了。但微服务架构下，一个请求跨越十几个服务，手动串日志简直是噩梦。
+
+这就是链路追踪要解决的问题。
+
+## 链路追踪基础
+
+### 基本概念
+
+```
+一个用户请求 = 一个 Trace
+请求经过的每个服务 = 一个 Span
+每个 Span 包含：
+- 开始时间、结束时间
+- 服务名称、操作名称
+- 标签（Tags）
+- 日志（Logs）
+- Span ID、Parent Span ID
+```
+
+### 为什么需要链路追踪
+
+| 场景 | 没有链路追踪 | 有链路追踪 |
+|---|---|---|
+| 定位问题 | 查 10 个服务的日志 | 一个 Trace ID 串联所有 |
+| 性能分析 | 靠经验猜 | 明确看到哪个 Span 慢 |
+| 依赖分析 | 文档 + 人工维护 | 自动发现服务依赖 |
+| 错误追踪 | 手动关联 | 自动关联完整调用栈 |
+
+## OpenTelemetry：可观测性标准
+
+### 核心组件
+
+| 组件 | 说明 |
+|---|---|
+| **Collector** | 接收、处理、导出数据 |
+| **SDK** | 应用埋点 |
+| **OTLP** | 传输协议 |
+
+### 架构
+
+```
+应用（SDK 埋点）
+    │
+    ▼
+OTLP（gRPC/HTTP）
+    │
+    ▼
+OTel Collector
+    │
+    ├──→ Jaeger（Trace）
+    ├──→ Prometheus（Metrics）
+    └──→ 日志系统（Logs）
+```
+
+### Java 埋点示例
+
+```java
+// 手动埋点
+Tracer tracer = OpenTelemetry.getTracer("order-service");
+
+Span span = tracer.spanBuilder("create-order")
+    .setSpanKind(SpanKind.SERVER)
+    .startSpan();
+
+try (Scope scope = span.makeCurrent()) {
+    span.setAttribute("order.id", orderId);
+    span.setAttribute("customer.id", customerId);
+    
+    // 业务逻辑
+    Order order = orderService.create(request);
+    
+    span.setAttribute("order.status", order.getStatus());
+    
+} catch (Exception e) {
+    span.recordException(e);
+    throw e;
+} finally {
+    span.end();
+}
+```
+
+### Spring Boot 自动埋点
+
+```xml title="pom.xml"
+<dependency>
+    <groupId>io.opentelemetry.instrumentation</groupId>
+    <artifactId>opentelemetry-spring-boot-starter</artifactId>
+</dependency>
+```
+
+```yaml title="application.yml"
+otel:
+  exporter:
+    otlp:
+      endpoint: http://otel-collector:4317
+  
+  service:
+    name: order-service
+  
+  traces:
+    exporter: otlp
+```
+
+## Jaeger 分布式追踪
+
+### 部署架构
+
+```
+应用（Jaeger Client）
+    │
+    ├── Agent（每台机器）→ Jaeger Collector → Elasticsearch
+                                                        │
+                                                       Jaeger UI
+```
+
+### Kubernetes 部署
+
+```yaml title="jaeger-operator.yaml"
+apiVersion: jaegertracing.io/v1
+kind: Jaeger
+metadata:
+  name: production
+spec:
+  strategy: production
+  
+  collector:
+    replicas: 3
+    maxReplicas: 10
+    resources:
+      requests:
+        memory: 1Gi
+        cpu: 500m
+      limits:
+        memory: 2Gi
+  
+  storage:
+    type: elasticsearch
+    elasticsearch:
+      nodeCount: 3
+      resources:
+        requests:
+          memory: 4Gi
+        limits:
+          memory: 8Gi
+  
+  ui:
+    options:
+      persistToken: true
+```
+
+### 服务端点采集
+
+```yaml title="endpoint-scrape.yaml"
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: jaeger-endpoints
+spec:
+  podMetricsEndpoints:
+  - port: admin-http
+    path: /metrics
+    interval: 30s
+```
+
+## Zipkin 分布式追踪
+
+### 轻量选择
+
+Zipkin 更加轻量，适合小规模部署：
+
+```yaml title="docker-compose.yml"
+version: '3'
+services:
+  zipkin:
+    image: openzipkin/zipkin:2.24
+    ports:
+      - "9411:9411"
+    environment:
+      STORAGE_TYPE: mem
+      JAVA_OPTS: -Xmx512m
+```
+
+### Spring Boot 集成
+
+```xml title="pom.xml"
+<dependency>
+    <groupId>org.springframework.cloud</groupId>
+    <artifactId>spring-cloud-starter-sleuth</artifactId>
+</dependency>
+
+<dependency>
+    <groupId>org.springframework.cloud</groupId>
+    <artifactId>spring-cloud-sleuth-zipkin</artifactId>
+</dependency>
+```
+
+```yaml title="application.yml"
+spring:
+  zipkin:
+    base-url: http://zipkin:9411
+    sender:
+      type: web
+  
+  sleuth:
+    sampler:
+      probability: 1.0  # 100% 采样
+```
+
+## 采样策略
+
+### 为什么要采样
+
+高流量服务不可能记录所有请求的 Trace：
+
+```
+QPS: 10,000
+每分钟请求: 600,000
+每个 Trace 平均 Span: 10
+每分钟 Span: 6,000,000
+```
+
+### 采样策略
+
+| 策略 | 说明 | 适用场景 |
+|---|---|---|
+| 固定采样 | 按比例采样，如 10% | 低流量服务 |
+| 速率限制 | 每秒固定数量，如 100 | 高流量服务 |
+| 优先采样 | 错误请求优先 | 关注问题排查 |
+| 自适应采样 | 动态调整采样率 | 平衡精度与成本 |
+
+### 配置示例
+
+```yaml title="otel-collector-config.yaml"
+processors:
+  tail_sampling:
+    decision_wait: 10s
+    policies:
+      # 错误请求 100% 采样
+      - name: errors-policy
+        type: status_code
+        status_code: { status_codes: [ERROR] }
+      
+      # 延迟超过 1 秒的请求 100% 采样
+      - name: latency-policy
+        type: latency
+        latency: { threshold_ms: 1000 }
+      
+      # 其他请求 1% 采样
+      - name: probabilistic-policy
+        type: probabilistic
+        probabilistic: { sampling_percentage: 1 }
+```
+
+## 链路追踪与日志关联
+
+### 注入 Trace ID
+
+让日志自动携带 Trace ID：
+
+```java
+// MDC 设置
+MDC.put("traceId", Span.current().getSpanContext().getTraceId());
+
+// 日志输出
+log.info("Creating order for customer {}", customerId);
+// 输出: [traceId=abc123] Creating order for customer CUST-001
+```
+
+### Filebeat 配置
+
+```yaml title="filebeat-config.yaml"
+processors:
+- add_fields:
+    fields:
+      trace_id: ""
+  
+- script:
+    lang: javascript
+    source: |
+      function process(event) {
+        var log = event.Get("log") || "";
+        var match = /\[traceId=([^\]]+)\]/.exec(log);
+        if (match) {
+          event.Put("trace_id", match[1]);
+        }
+        return event;
+      }
+```
+
+### Kibana 关联查询
+
+```
+# 通过 Trace ID 查询完整链路
+trace.id: "abc123-xyz789"
+```
+
+## 服务依赖分析
+
+### 自动发现依赖
+
+链路数据可以用来分析服务依赖关系：
+
+```yaml title="jaeger-dependencies.yaml"
+apiVersion: jaegertracing.io/v1
+kind: Jaeger
+metadata:
+  name: production
+spec:
+  strategy: production
+  collector:
+    resources:
+      memory: 2Gi
+  
+  # 依赖图存储
+  storage:
+    type: elasticsearch
+    elasticsearch:
+      nodeCount: 3
+```
+
+### 依赖可视化
+
+```
+┌─────────┐
+│  Gateway │
+└────┬────┘
+     │
+┌────▼────┐     ┌──────────┐
+│  Auth   │────▶│  User    │
+└─────────┘     └──────────┘
+                      │
+┌─────────┐     ┌─────▼─────┐     ┌──────────┐
+│  Order  │◀────│ Inventory │────▶│  Payment │
+└─────────┘     └───────────┘     └──────────┘
+```
+
+## 性能分析
+
+### 火焰图
+
+Jaeger 内置的 Trace 视图可以转换为火焰图：
+
+```
+Trace: create-order (2.5s)
+│
+├─ validate-request (50ms)
+│  └─ auth-check (30ms)
+│
+├─ check-inventory (800ms)  ◀── 这里慢！
+│  ├─ query-stock (600ms)   ◀── 数据库慢
+│  └─ reserve-stock (200ms)
+│
+├─ process-payment (1.2s)
+│  ├─ call-payment-gateway (1s)
+│  └─ update-balance (200ms)
+│
+└─ save-order (450ms)
+   └─ insert-database (400ms)
+```
+
+### 常见性能问题
+
+| 问题 | 表现 | 解决方案 |
+|---|---|---|
+| 数据库慢查询 | 某个 Span 耗时长 | 添加索引、优化查询 |
+| 串行调用 | 链路长度 = Σ(Span) | 改为并行调用 |
+| 依赖超时 | 大量 timeout | 降级/熔断 |
+| 连接池耗尽 | 阻塞 | 调整连接池大小 |
+
+## 常见问题与解决
+
+### 1. Trace ID 不传递
+
+**症状**：链路在某些服务处断开。
+
+**排查**：检查 HTTP Header 是否正确传递。
+
+```java
+// 确保 Trace 信息在 Header 中传播
+Tracer tracer = OpenTelemetry.getTracer("service");
+Span currentSpan = tracer.currentSpan();
+Context context = Context.current().with(currentSpan);
+
+// 在 HTTP 请求中注入
+try (Scope ignored = context.makeCurrent()) {
+    // 自动传播到子调用
+}
+```
+
+### 2. 采样率太低
+
+**症状**：很多请求没有 Trace 数据。
+
+**解决**：提高采样率或使用自适应采样。
+
+### 3. Span 数据丢失
+
+**症状**：链路不完整，中间的 Span 缺失。
+
+**解决**：检查 Collector 是否正常工作，增加缓冲区。
+
+## 总结
+
+链路追踪是微服务可观测性的核心：
+
+| 能力 | 工具 | 说明 |
+|---|---|---|
+| 请求链路 | Jaeger、Zipkin | 追踪完整调用链 |
+| 性能分析 | 火焰图、延迟分布 | 定位性能瓶颈 |
+| 错误追踪 | 异常栈追踪 | 快速定位问题 |
+| 依赖分析 | 服务拓扑图 | 了解系统结构 |
+
+核心原则：
+
+1. **全链路埋点**：每个服务都要接入
+2. **正确传递**：确保 Trace ID 在服务间传递
+3. **合理采样**：平衡精度与成本
+4. **日志关联**：让 Trace ID 贯穿日志
+
+下次用户再说「下单失败了」，一个 Trace ID 就能快速定位问题。

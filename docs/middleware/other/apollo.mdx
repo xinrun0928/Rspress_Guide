@@ -1,0 +1,323 @@
+# Apollo 配置中心
+
+配置，是应用程序运行时的「外部变量」。数据库连接串、Redis 地址、开关标志、限流阈值……这些参数在开发和生产环境中往往不同。
+
+传统的「配置文件 + 重启生效」模式，在分布式环境下是一场灾难——你有多少台服务器，就要改多少次。
+
+Apollo，就是来解决这个问题的。
+
+## 痛点：为什么需要配置中心？
+
+### 场景一：紧急开关
+
+凌晨 2 点，线上出现 bug，用户无法下单。你紧急修复了代码，但生产环境有 100 台服务器……
+
+- 手动登录每台机器改配置？等改完天都亮了
+- 发布新版本？测试流程走完，用户早跑了
+
+### 场景二：灰度发布
+
+你想让 10% 的用户试用新功能，90% 的用户继续用旧功能。没有配置中心，怎么做？
+
+- 改代码加 if-else？每次改完都要重新发布
+- 运维在每台机器上单独配置？配置漂移、服务雪崩
+
+### 场景三：多环境管理
+
+开发、测试、预发、生产……每个环境一套配置，手动维护容易出错：
+
+- 开发连上了生产数据库
+- 测试环境改了生产才有的配置
+- 某个环境的配置漏改了
+
+Apollo 解决了这些问题：**配置集中管理、环境隔离、热更新、权限控制**。
+
+## 核心概念
+
+### 应用（App）
+
+Apollo 的核心管理单元是「应用」，每个微服务对应一个 App：
+
+```
+App ID: order-service
+App Name: 订单服务
+Owner: zhangsan
+```
+
+### 环境（Env）
+
+Apollo 支持多环境隔离：
+
+| 环境 | 标识 | 用途 |
+|---|---|---|
+| FAT | 测试环境 | 开发人员自测 |
+| UAT | 预发环境 | 贴近生产 |
+| PRO | 生产环境 | 线上 |
+| DEV | 开发环境 | 本地开发 |
+
+### 集群（Cluster）
+
+同一个环境下的不同「机房」或「区域」可以有不同配置：
+
+```
+PRO 环境
+  ├── 集群：华东机房
+  │     └── 配置：数据库连接指向华东机房
+  └── 集群：华北机房
+        └── 配置：数据库连接指向华北机房
+```
+
+### Namespace
+
+一个应用可以有多套配置，按用途分类：
+
+| Namespace | 用途 |
+|---|---|
+| application | 应用自己的配置 |
+| application.yaml | YAML 格式的应用配置 |
+| dtx.properties | 分布式事务配置 |
+
+Namespace 支持两种类型：
+
+- **私有**：只有当前应用能读取
+- **公共**：多个应用共享（如 Redis 配置、开关配置）
+
+### 灰度发布
+
+Apollo 支持「灰度配置」——让部分实例使用新配置：
+
+```
+实例列表：
+☐ Instance 1 (192.168.1.1) - 使用旧配置
+☐ Instance 2 (192.168.1.2) - 使用旧配置
+☐ Instance 3 (192.168.1.3) - 使用新配置 ← 灰度中
+☐ Instance 4 (192.168.1.4) - 使用旧配置
+
+[全量发布] [放弃灰度]
+```
+
+## 架构解析
+
+Apollo 采用「两层架构」：
+
+```
+┌──────────────────────────────────────────────────────────┐
+│                      Config Service                       │
+│                   （配置读取服务）                         │
+│  ┌────────────┐  ┌────────────┐  ┌────────────┐           │
+│  │ Eureka     │  │ Meta Server│  │  Admin API │           │
+│  │ (注册发现)  │  │ (环境路由)  │  │ (配置管理)  │           │
+│  └────────────┘  └────────────┘  └────────────┘           │
+└──────────────────────────────────────────────────────────┘
+                          ↑
+                          │
+        ┌─────────────────┼─────────────────┐
+        ↓                 ↓                 ↓
+   ┌─────────┐       ┌─────────┐       ┌─────────┐
+   │ Client  │       │ Client  │       │ Client  │
+   │ (Java)  │       │ (Go)    │       │ (.NET)  │
+   └─────────┘       └─────────┘       └─────────┘
+```
+
+### 核心组件
+
+| 组件 | 职责 |
+|---|---|
+| Config Service | 配置读取服务，支持长轮询 + Apollo Long Polling HTTP |
+| Admin Service | 配置管理服务，提供增删改查 API |
+| Portal | Web 管理界面，管理配置和权限 |
+| Eureka | 服务注册与发现（Meta Server） |
+| Client SDK | 各语言客户端，负责配置获取和热更新 |
+
+### 配置获取流程
+
+```
+1. Client 启动
+   ├── 连接 Meta Server，获取 Config Service 地址
+   ├── 连接 Config Service，拉取初始配置
+   └── 本地缓存配置文件
+
+2. 配置变更
+   ├── Portal 管理员修改配置
+   ├── Admin Service 持久化配置到数据库
+   ├── Config Service 收到通知（通过消息队列或轮询）
+   └── Client 长轮询感知变更，拉取新配置
+```
+
+### 长轮询机制
+
+Apollo Client 不使用 Zookeeper 的 Watch，而是使用 HTTP 长轮询：
+
+```java title="Apollo Client 长轮询伪代码"
+while (true) {
+    try {
+        // 发送 HTTP 长轮询请求，30 秒超时
+        Response<List<ConfigChange>> response = httpClient.poll(url, 30000);
+
+        if (response.isModified()) {
+            // 配置有变化，触发监听器
+            notifyListeners(response.getChanges());
+        }
+    } catch (Exception e) {
+        // 网络抖动，等待后重试
+        Thread.sleep(1000);
+    }
+}
+```
+
+:::tip 长轮询 vs Zookeeper Watch
+Zookeeper Watch 在节点变更时只通知「有变更」，客户端需要主动再获取一次数据。Apollo 的长轮询直接把变更数据带回来，减少一次网络往返。
+:::
+
+## Java 客户端使用
+
+### Spring Boot 集成
+
+```xml title="pom.xml"
+<dependency>
+    <groupId>com.ctrip.framework.apollo</groupId>
+    <artifactId>apollo-client</artifactId>
+    <version>2.2.0</version>
+</dependency>
+```
+
+```yaml title="application.yml"
+apollo:
+  meta: http://apollo-config-service:8080
+  app:
+    id: order-service
+  cluster: default
+  namespace: application
+  # 本地缓存路径
+  cacheDir: /opt/data/apollo-config
+  # 热更新：无需重启
+  auto-update-in-memory: true
+```
+
+### 配置注入
+
+```java
+import com.ctrip.framework.apollo.Config;
+import com.ctrip.framework.apollo.ConfigChangeListener;
+import org.springframework.beans.factory.annotation.Value;
+
+public class OrderConfig {
+
+    // 方式一：@Value 注入
+    @Value("${order.timeout:30}")
+    private int orderTimeout;
+
+    // 方式二：Config API
+    private static Config config = Config.get();
+
+    public void getConfig() {
+        String dbUrl = config.getProperty("db.url", "localhost:3306");
+        int maxRetry = config.getIntProperty("order.maxRetry", 3);
+    }
+
+    // 监听配置变更
+    @ApolloConfigChangeListener
+    public void onChange(ConfigChangeEvent event) {
+        for (String key : event.changedKeys()) {
+            System.out.println("配置变更: " + key + " = " + event.getChange(key).getNewValue());
+        }
+        // 重新加载配置
+        refresh();
+    }
+}
+```
+
+### 启动参数配置
+
+Apollo 支持通过 JVM 参数覆盖配置文件：
+
+```bash
+java -jar order-service.jar \
+    -Dapollo.meta=http://apollo-prod:8080 \
+    -Dapp.id=order-service \
+    -Dapollo.cluster=PRO \
+    -Dapollo.cacheDir=/opt/apollo-config
+```
+
+## 配置热更新原理
+
+Apollo 实现热更新的关键在于「**不改代码，只改配置**」：
+
+```
+配置变更 → Config Service 通知 Client → Client 回调监听器 → 重新获取配置 → 应用新值
+```
+
+### @ApolloConfigChangeListener
+
+通过监听器感知配置变化：
+
+```java
+@Component
+public class ApolloConfigRefresher {
+
+    @ApolloConfigChangeListener
+    public void onConfigChange(ConfigChangeEvent event) {
+        // 判断哪些 key 变了
+        if (event.changedKeys().contains("order.timeout")) {
+            // 刷新 @Value 注入的值
+            ((ConfigurableEnvironment) event.getSource())
+                .mergeSystemProperties(
+                    config.getPropertySource()
+                );
+        }
+    }
+}
+```
+
+### Spring Cloud Bus 集成
+
+结合 Spring Cloud Bus 实现广播式配置刷新：
+
+```yaml title="application.yml"
+spring:
+  cloud:
+    bus:
+      trace:
+        enabled: true
+  rabbitmq:
+    host: rabbitmq-server
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: bus-refresh
+```
+
+通过 `/actuator/bus-refresh` 端点，可以触发所有节点的配置刷新。
+
+## 权限控制
+
+Apollo 提供细粒度的权限管理：
+
+| 角色 | 权限 |
+|---|---|
+| App Owner | 管理应用、分配权限 |
+| Developer | 编辑配置、发布配置 |
+| Viewer | 只读配置 |
+
+```
+授权配置：
+├── App: order-service
+│   ├── Env: PRO
+│   │   ├── Namespace: application
+│   │   │   ├── User: zhangsan (管理员)
+│   │   │   └── User: lisi (开发者)
+```
+
+## 总结
+
+Apollo 是企业级配置中心的成熟方案，核心能力：
+
+- **多环境隔离**：DEV / FAT / UAT / PRO
+- **热更新**：配置变更实时推送到客户端，无需重启
+- **灰度发布**：先灰度验证，再全量发布
+- **权限控制**：细粒度的角色和权限管理
+- **高可用**：Config Service 集群部署，客户端本地缓存
+
+> 下一步：如果你需要更轻量的配置中心，可以考虑 Nacos；如果你已经在使用 Kubernetes，可以考虑 ConfigMap + Spring Cloud Config。

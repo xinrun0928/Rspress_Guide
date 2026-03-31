@@ -1,0 +1,344 @@
+# Swarm 架构
+
+Docker Swarm 的架构设计看似简单，但背后包含了分布式系统的核心概念：状态一致性、故障检测、服务发现、负载均衡。
+
+理解这些架构原理，是正确使用 Swarm 的基础。
+
+## 集群节点
+
+### 节点类型
+
+| 类型 | 职责 | 数量建议 |
+|---|---|---|
+| **Manager** | 集群管理、调度、服务编排 | 奇数（1/3/5） |
+| **Worker** | 运行容器 | 按需 |
+
+### Manager 职责
+
+- **调度器**：决定容器部署到哪个节点
+- **状态同步**：维护集群状态，提供一致性保证
+- **API**：提供 Docker API 扩展
+- **Raft 日志**：记录集群状态变更
+
+### Worker 职责
+
+- **运行容器**：接收 Manager 指令，启动/停止容器
+- **报告状态**：定期向 Manager 报告节点和容器状态
+- **执行任务**：执行 Manager 分发的任务
+
+```bash
+# 查看节点类型
+docker node ls
+
+# 输出示例
+ID                            HOSTNAME   STATUS    AVAILABILITY   MANAGER STATUS   ENGINE VERSION
+abc123def456 *               node-1     Ready     Active        Leader           24.0.0
+def456ghi789                 node-2     Ready     Active                          24.0.0
+ghi789jkl012                 node-3     Ready     Active        Reachable        24.0.0
+```
+
+## Raft 一致性协议
+
+Swarm Manager 使用 **Raft 共识协议**保证分布式一致性。
+
+### Raft 核心概念
+
+| 概念 | 说明 |
+|---|---|
+| **Leader** | 集群唯一主节点，处理所有写请求 |
+| **Follower** | 跟随者，接收 Leader 的日志复制 |
+| **Candidate** | 候选者，参与 Leader 选举 |
+| **Term** | 任期，递增的逻辑时钟 |
+| **日志复制** | Leader 将操作日志同步给 Follower |
+
+### Raft 工作流程
+
+```
+1. Leader 选举
+   ┌─────────────────────────────────────┐
+   │  Follower 超时未收到心跳              │
+   │  成为 Candidate                      │
+   │  请求投票                            │
+   │  获得多数票 → 成为 Leader             │
+   └─────────────────────────────────────┘
+
+2. 客户端写入
+   客户端 ──▶ Leader ──▶ 写入本地日志
+                       │
+                       ▼
+              复制给 Followers
+                       │
+                       ▼
+              收到多数确认 ──▶ 应用到状态机
+                       │
+                       ▼
+              返回客户端
+
+3. 故障转移
+   Leader 宕机 ──▶ 新选举 ──▶ 新 Leader 上任
+```
+
+### 奇数原则
+
+Raft 需要多数节点（n/2+1）才能达成共识：
+
+| 节点数 | 容错能力 | 建议 |
+|---|---|---|
+| 1 | 0 | 仅开发环境 |
+| 3 | 1 | 小规模生产 |
+| 5 | 2 | 中等规模生产 |
+| 7 | 3 | 大规模生产 |
+
+:::warning 不要用 2 个 Manager
+2 个 Manager 无法提供更好的容错能力，任何一个宕机都无法达成共识。
+:::
+
+## 状态存储
+
+Swarm 将集群状态存储在分布式键值存储中（嵌入 Raft 日志）。
+
+### 状态内容
+
+- **服务定义**：镜像、副本数、环境变量
+- **网络配置**：overlay 网络、子网
+- **密钥和配置**：加密存储的密钥
+- **节点信息**：节点状态、标签
+
+```bash
+# 查看 Swarm 配置
+docker info | grep Swarm
+
+# 查看 Raft 日志（调试用）
+docker inspect swarm
+```
+
+## 调度器
+
+调度器决定容器应该部署到哪个节点。
+
+### 调度策略
+
+| 策略 | 说明 |
+|---|---|
+| **spread** | 优先将容器分散到不同节点（默认） |
+| **binpack** | 优先填满一个节点再使用下一个 |
+| **random** | 随机选择节点 |
+
+### 约束条件
+
+```yaml
+deploy:
+  placement:
+    constraints:
+      - "node.role==worker"      # 必须是 Worker 节点
+      - "engine.labels.zone==us-east"  # 特定标签
+      - "node.hostname==node-1"  # 指定主机
+      - "node.labels.memory>8g"  # 标签匹配
+```
+
+### 偏好
+
+```yaml
+deploy:
+  placement:
+    preferences:
+      - spread: "node.labels.zone"  # 尽量分散到不同 zone
+```
+
+### 污点和容忍
+
+```yaml
+deploy:
+  placement:
+    constraints:
+      - "node.role!=manager"  # 排除 Manager
+    tolerations:
+      - key: "node.kubernetes.io/unreachable"
+        operator: "Exists"
+        effect: "NoExecute"
+```
+
+## 服务发现
+
+Swarm 内置 DNS，为每个服务自动分配 DNS 名称。
+
+### DNS 解析
+
+```
+服务名: myapi
+    │
+    ▼
+DNS 查询
+    │
+    ▼
+Swarm 内置 DNS (127.0.0.11)
+    │
+    ▼
+返回服务 VIP 或容器 IP
+```
+
+### 服务 VIP
+
+默认情况下，每个服务有一个 **Virtual IP (VIP)**：
+
+```bash
+# 查看服务的 VIP
+docker service inspect --format '{{json .Endpoint.VirtualIPs}}' myapi
+```
+
+```yaml
+services:
+  api:
+    image: myapi:latest
+    deploy:
+      endpoint_mode: vip  # VIP 模式
+```
+
+### DNSRR 模式
+
+DNS 轮询模式直接解析到容器 IP：
+
+```yaml
+services:
+  api:
+    image: myapi:latest
+    deploy:
+      endpoint_mode: dnsrr  # DNS 轮询
+```
+
+## 负载均衡
+
+Swarm 提供多层负载均衡。
+
+### Ingress 网络
+
+Ingress 网络是特殊的 overlay 网络，用于外部访问：
+
+```
+外部请求 (客户端)
+    │
+    ▼
+Ingress Network (IPVS/LVS)
+    │
+    ▼
+┌───────────────────────────────────┐
+│  mesh routing (Swarm 路由网格)     │
+│  端口发布自动路由到对应服务          │
+└───────────────────────────────────┘
+    │
+    ▼
+┌─────────┬─────────┬─────────┐
+│ Container│ Container│ Container│
+│  (svc-1) │  (svc-2) │  (svc-3) │
+└─────────┴─────────┴─────────┘
+```
+
+### 端口发布
+
+```yaml
+services:
+  web:
+    image: nginx:alpine
+    ports:
+      - "80:80"          # 发布到所有节点 80
+      - "8080:80"        # 8080 映射到容器 80
+```
+
+### 路由网格
+
+Swarm 的路由网格（Routing Mesh）确保流量正确路由：
+
+1. **端口发布到所有节点**：任意节点访问 `host:port` 都能到达服务
+2. **IPVS 负载均衡**：在 Ingress 网络层进行负载均衡
+3. **容器级路由**：流量最终分发到具体容器
+
+## 节点标签
+
+为节点添加标签用于调度：
+
+```bash
+# 添加标签
+docker node update --label-add zone=us-east node-1
+docker node update --label-add memory=32g node-1
+
+# 查看标签
+docker node inspect node-1
+
+# 使用标签调度
+docker service create \
+  --constraint "node.labels.zone==us-east" \
+  --name web \
+  nginx:alpine
+```
+
+## 高可用配置
+
+### Manager 高可用
+
+```
+正常状态：
+┌─────────┐
+│ Manager │
+│ (Leader) │
+└────┬────┘
+     │ 同步
+┌────┴────┐  ┌─────────┐
+│ Manager │  │ Manager │
+│(Follower)│  │(Follower)│
+└─────────┘  └─────────┘
+
+故障状态（1 个 Manager 宕机）：
+┌─────────┐
+│ Manager │
+│ (Leader) │  ┌─────────┐
+└────┬────┘  │ Manager │ (不可用)
+     │       └─────────┘
+     │
+┌────┴────┐
+│ Manager │
+│(Leader) │
+└─────────┘
+```
+
+### 备份和恢复
+
+```bash
+# 备份
+docker swarm init --force-new-cluster
+
+# 或使用 raft snapshot
+docker service ls --format '{{.Name}}' > services.txt
+```
+
+## 监控和诊断
+
+```bash
+# 查看节点状态
+docker node ls
+
+# 查看服务分布
+docker service ps myservice
+
+# 查看服务详情
+docker service inspect myservice
+
+# 查看集群事件
+docker events --filter 'type=swarm'
+
+# 查看日志
+docker service logs myservice
+```
+
+## 总结
+
+Swarm 架构的核心要点：
+
+| 组件 | 原理 |
+|---|---|
+| **Manager/Worker** | 分层管理，Worker 执行任务，Manager 调度 |
+| **Raft 共识** | 多数派投票选 Leader，日志复制保证一致 |
+| **调度器** | spread/binpack/random 策略，约束条件 |
+| **服务发现** | 内置 DNS，VIP 或 DNSRR 模式 |
+| **负载均衡** | Ingress 网络 + IPVS，路由网格 |
+
+理解这些架构原理，有助于设计高可用的 Swarm 集群，并正确排查问题。

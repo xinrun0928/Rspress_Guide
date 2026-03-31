@@ -1,0 +1,293 @@
+# Sentinel 熔断降级
+
+熔断降级是保护系统的第二道防线——当下游服务持续超时或异常时，主动「熔断」拒绝请求，避免雪崩。
+
+## 为什么需要熔断？
+
+没有熔断时，下游服务故障会导致上游服务资源耗尽：
+
+```
+没有熔断：
+请求 → 服务A → 服务B(超时) → 线程阻塞
+请求 → 服务A → 服务B(超时) → 线程阻塞
+请求 → 服务A → 服务B(超时) → 线程阻塞
+...
+服务A 线程池耗尽 → 服务A 崩溃 → 整个系统崩溃
+
+有熔断：
+请求 → 检查熔断器 → [开启] → 返回降级响应
+请求 → 检查熔断器 → [开启] → 返回降级响应
+请求 → 检查熔断器 → [开启] → 返回降级响应
+→ 下游服务恢复 → 熔断器半开 → 通过 → 熔断器关闭
+```
+
+## 熔断器三状态
+
+Sentinel 使用熔断器模式，有三个状态：
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         熔断器状态机                                 │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│   ┌──────────┐                                                    │
+│   │  Closed  │ ←───(成功)────┐                                    │
+│   │   关闭    │                │                                    │
+│   └────┬─────┘                │                                    │
+│        │                      │                                    │
+│        │ [失败次数超限]        │ [探测成功]                         │
+│        ▼                      ▼                                    │
+│   ┌──────────┐      ┌──────────┐                                  │
+│   │  Open    │ ←──→ │ Half-Open│                                  │
+│   │   开启    │      │   半开   │                                  │
+│   └──────────┘      └────┬─────┘                                  │
+│                           │                                        │
+│                           │ [探测失败]                              │
+│                           ▼                                        │
+│                       ┌──────────┐                                  │
+│                       │  Open    │                                  │
+│                       │   开启    │                                  │
+│                       └──────────┘                                  │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+| 状态 | 说明 | 行为 |
+|---|---|---|
+| Closed | 熔断器关闭 | 正常请求通过，失败计数 |
+| Open | 熔断器开启 | 所有请求被拒绝，返回降级 |
+| Half-Open | 熔断器半开 | 放行部分请求探测服务是否恢复 |
+
+## 熔断策略
+
+### 1. 按平均响应时间（RT）
+
+当平均响应时间超过阈值时触发熔断：
+
+```java
+DegradeRule rule = new DegradeRule("createOrder")
+    .setGrade(RuleConstant.DEGRADE_GRADE_RT)   // 按平均 RT
+    .setCount(2000)                             // 阈值 2000ms
+    .setTimeWindow(10);                          // 熔断窗口 10 秒
+
+DegradeRuleManager.loadRules(Collections.singletonList(rule));
+```
+
+```
+RT 熔断效果：
+
+正常情况：
+请求1: 100ms → 通过
+请求2: 150ms → 通过
+请求3: 200ms → 通过
+平均 RT: 150ms
+
+触发熔断：
+请求N: 3000ms → 记录异常
+请求N+1: 2500ms → 记录异常
+请求N+2: 2800ms → 记录异常
+→ 连续 3 个请求 RT > 阈值 → 熔断器打开
+```
+
+### 2. 按异常比例
+
+当异常比例超过阈值时触发熔断：
+
+```java
+DegradeRule rule = new DegradeRule("createOrder")
+    .setGrade(RuleConstant.DEGRADE_GRADE_EXCEPTION_RATIO)  // 按异常比例
+    .setCount(0.3)                                         // 30% 异常比例
+    .setTimeWindow(10);                                     // 熔断窗口 10 秒
+
+DegradeRuleManager.loadRules(Collections.singletonList(rule));
+```
+
+```
+异常比例熔断效果：
+
+请求总数: 100
+异常数量: 35
+异常比例: 35%
+
+→ 35% > 30% → 触发熔断
+```
+
+### 3. 按异常数
+
+当异常数量超过阈值时触发熔断：
+
+```java
+DegradeRule rule = new DegradeRule("createOrder")
+    .setGrade(RuleConstant.DEGRADE_GRADE_EXCEPTION_COUNT)  // 按异常数
+    .setCount(10)                                          // 10 次异常
+    .setTimeWindow(60);                                    // 熔断窗口 60 秒
+
+DegradeRuleManager.loadRules(Collections.singletonList(rule));
+```
+
+```
+异常数熔断效果：
+
+60 秒内异常数: 11
+→ 11 > 10 → 触发熔断
+```
+
+## 熔断恢复
+
+### 半开状态
+
+熔断窗口结束后，熔断器进入半开状态：
+
+```java
+// 配置半开探测请求数
+DegradeRule rule = new DegradeRule("createOrder")
+    .setGrade(RuleConstant.DEGRADE_GRADE_RT)
+    .setCount(2000)
+    .setTimeWindow(10)
+    .setMinRequestAmount(5);  // 半开前最小请求数
+```
+
+```
+熔断恢复流程：
+
+1. Closed 状态
+   → 连续失败 3 次
+2. Open 状态（熔断中）
+   → 等待 10 秒
+3. Half-Open 状态（探测）
+   → 放行 1 个探测请求
+4. 探测结果
+   ├─ 成功 → Closed 状态
+   └─ 失败 → Open 状态
+```
+
+### 探测成功与失败
+
+```java
+// 探测成功
+try (Entry entry = SphU.entry("createOrder")) {
+    // 业务逻辑
+    return orderService.create();
+} catch (BlockException e) {
+    // 被熔断拒绝
+    return Result.fail("服务暂时不可用");
+}
+
+// 探测失败（超时或异常）
+try (Entry entry = SphU.entry("createOrder")) {
+    return orderService.create();  // 抛出异常
+} catch (BlockException e) {
+    return Result.fail("服务暂时不可用");
+} catch (Exception e) {
+    // 记录异常，重新熔断
+    Tracer.trace(e);
+    throw e;
+}
+```
+
+## 熔断配置
+
+### Dashboard 配置
+
+在 Sentinel Dashboard 中配置熔断规则：
+
+```
+资源名: createOrder
+熔断策略: 平均响应时间
+熔断阈值: 2000ms
+熔断时长: 10秒
+最小请求数: 5
+```
+
+### API 配置
+
+```java
+List<DegradeRule> rules = Arrays.asList(
+    // RT 熔断
+    new DegradeRule("createOrder")
+        .setGrade(RuleConstant.DEGRADE_GRADE_RT)
+        .setCount(2000)
+        .setTimeWindow(10)
+        .setMinRequestAmount(5),
+
+    // 异常比例熔断
+    new DegradeRule("getOrder")
+        .setGrade(RuleConstant.DEGRADE_GRADE_EXCEPTION_RATIO)
+        .setCount(0.3)
+        .setTimeWindow(10)
+        .setMinRequestAmount(10),
+
+    // 异常数熔断
+    new DegradeRule("payment")
+        .setGrade(RuleConstant.DEGRADE_GRADE_EXCEPTION_COUNT)
+        .setCount(10)
+        .setTimeWindow(60)
+);
+
+DegradeRuleManager.loadRules(rules);
+```
+
+## 降级处理
+
+### 注解方式
+
+```java
+@SentinelResource(value = "createOrder",
+    fallback = "createOrderFallback",
+    blockHandler = "createOrderBlockHandler")
+public Result createOrder() {
+    return orderService.create();
+}
+
+// 业务异常降级
+public Result createOrderFallback(Throwable t) {
+    log.error("业务异常", t);
+    return Result.fail("服务暂时不可用，请稍后重试");
+}
+
+// 限流/熔断处理
+public Result createOrderBlockHandler(BlockException e) {
+    return Result.fail("系统繁忙");
+}
+```
+
+### 全局降级
+
+```java
+@Component
+public class SentinelFallback implements FallbackHandler {
+
+    @Override
+    public ClientHandler fallback(String resource, Throwable t) {
+        if (t instanceof DegradeException) {
+            return () -> Result.fail("服务降级中，请稍后重试");
+        }
+        if (t instanceof BlockException) {
+            return () -> Result.fail("请求被限流");
+        }
+        return () -> Result.fail("服务暂时不可用");
+    }
+}
+```
+
+## 熔断与限流的区别
+
+| 维度 | 限流 | 熔断 |
+|---|---|---|
+| 保护对象 | 自身系统 | 下游系统 |
+| 触发条件 | QPS 或并发数超限 | 下游响应异常 |
+| 恢复方式 | 自动恢复 | 半开探测后恢复 |
+| 作用 | 防止被冲垮 | 防止雪崩 |
+
+## 总结
+
+熔断核心配置：
+
+| 配置项 | 说明 |
+|---|---|
+| `grade` | 熔断策略：RT / 异常比例 / 异常数 |
+| `count` | 阈值 |
+| `timeWindow` | 熔断窗口时间 |
+| `minRequestAmount` | 最小请求数 |
+
+> 下一步：了解了熔断降级后，让我们学习系统自适应限流。

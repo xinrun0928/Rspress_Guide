@@ -1,0 +1,355 @@
+# 容器安全加固：Security Context 与 Pod 安全标准
+
+想象一下这个场景：攻击者通过 Web 漏洞拿到了容器内的 Shell，接下来他想做什么？答案取决于容器运行时的权限有多大。如果容器以 root 运行、有特权模式、文件系统可写——那他可以做的事情就太多了：逃逸到宿主机、修改集群配置、甚至横向移动到其他 Pod。
+
+Security Context 就是解决这个问题的关键——它在容器级别和 Pod 级别设置安全约束，把「攻击者的权限」压缩到最小。
+
+## Security Context 是什么
+
+Security Context 是 K8s 提供的安全配置机制，允许你设置容器运行时的特权级别、文件系统权限、用户ID等。配置分为两个层次：
+
+| 层次 | 配置项 | 作用域 |
+|---|---|---|
+| Pod Security Context | 整个 Pod 内所有容器共享 | Pod 级别 |
+| Container Security Context | 单个容器 | 容器级别 |
+
+:::tip 继承与覆盖
+Pod Security Context 的设置会自动应用到所有容器，除非容器级别显式覆盖。例如，Pod 设置了 `runAsUser: 1000`，所有容器默认以 UID 1000 运行，但如果某个容器需要在 Security Context 中单独设置 `runAsUser`，则覆盖 Pod 级别设置。
+:::
+
+## Pod Security Context
+
+Pod Security Context 配置在 Pod spec 的 `securityContext` 字段下：
+
+```yaml title="Pod Security Context 示例"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: secure-pod
+spec:
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 3000
+    fsGroup: 2000
+    supplementalGroups: [1001, 1002]
+    seLinuxOptions:
+      level: "s0:c123,c456"
+      role: "system_r"
+      type: "container_t"
+      user: "system_u"
+    sysctls:
+    - name: net.core.somaxconn
+      value: "1024"
+```
+
+### 核心配置项
+
+**runAsUser 和 runAsGroup**：指定容器内进程运行的用户 UID 和主组 GID。
+
+```yaml
+securityContext:
+  runAsUser: 1000      # 容器进程以 UID 1000 运行
+  runAsGroup: 3000     # 容器进程主组 GID 为 3000
+```
+
+**fsGroup**：设置 Pod 内容器对 Volume 的组权限。挂载的 Volume 会自动 chgrp 到 fsGroup 指定的 GID：
+
+```yaml
+securityContext:
+  fsGroup: 2000
+```
+
+这意味着以 fsGroup 成员身份运行的容器进程可以读写挂载的 Volume。
+
+**supplementalGroups**：为容器内进程添加额外的辅助组 GID：
+
+```yaml
+securityContext:
+  supplementalGroups: [1001, 1002]
+```
+
+**seLinuxOptions**：设置 SELinux 标签，用于强制访问控制（MAC）。生产环境中，如果集群启用了 SELinux，这是必须配置的安全上下文。
+
+### sysctls
+
+`sysctls` 允许你设置 Pod 的内核参数。有两类 sysctl：
+
+| 类型 | 说明 | 示例 |
+|---|---|---|
+| 安全 sysctl | 默认允许在 Pod 中设置 | `net.core.somaxconn`、`net.ipv4.tcp_syncookies` |
+| 非安全 sysctl | 需要节点级别显式启用 | `net.ipv4.ping_group_range` |
+
+```yaml
+securityContext:
+  sysctls:
+  - name: net.core.somaxconn
+    value: "1024"
+```
+
+:::warning 非安全 sysctl 的风险
+非安全 sysctl 可能影响节点上其他 Pod 的运行。如果必须使用，需要在 kubelet 配置中启用 `--allowed-unsafe-sysctls`。
+:::
+
+## Container Security Context
+
+Container Security Context 设置单个容器的安全参数：
+
+```yaml title="Container Security Context 示例"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: container-security-demo
+spec:
+  containers:
+  - name: app
+    image: nginx:1.25
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 1000
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      privileged: false
+      capabilities:
+        drop: ["ALL"]
+        add: ["NET_BIND_SERVICE"]
+```
+
+### 核心配置项详解
+
+**allowPrivilegeEscalation**：禁止容器内的进程获取比父进程更多的特权。设为 `false` 时，进程无法通过 `setuid` 文件提升权限。
+
+```yaml
+securityContext:
+  allowPrivilegeEscalation: false
+```
+
+:::tip 推荐配置
+`allowPrivilegeEscalation: false` 应该作为所有容器的基础配置。如果应用确实需要特权操作，应该添加特定 capabilities，而不是开启特权模式。
+:::
+
+**readOnlyRootFilesystem**：将容器根文件系统设为只读。容器无法写入任何文件，强制应用将日志和数据写入挂载的 Volume：
+
+```yaml
+securityContext:
+  readOnlyRootFilesystem: true
+```
+
+对于需要写入临时文件的场景，可以使用 emptyDir Volume：
+
+```yaml
+spec:
+  containers:
+  - name: app
+    image: nginx:1.25
+    securityContext:
+      readOnlyRootFilesystem: true
+    volumeMounts:
+    - name: tmp
+      mountPath: /tmp
+  volumes:
+  - name: tmp
+    emptyDir: {}
+```
+
+**privileged**：特权容器拥有宿主机的所有权限，可以访问所有设备。这是极其危险的配置：
+
+```yaml
+securityContext:
+  privileged: false  # 强烈建议保持 false
+```
+
+:::danger 特权容器的风险
+特权容器可以：
+- 挂载宿主机的文件系统
+- 修改 iptables 规则
+- 访问宿主机的所有设备
+- 几乎等同于在宿主机上以 root 运行
+
+**永远不要在生产环境中使用特权容器**。
+:::
+
+### Linux Capabilities
+
+Linux capabilities 将传统的 root 权限分解为多个独立单元。K8s 允许你精细控制容器可以拥有的 capabilities：
+
+| Capability | 说明 |
+|---|---|
+| `CHOWN` | 修改文件所有权 |
+| `NET_BIND_SERVICE` | 绑定低于 1024 的端口 |
+| `NET_ADMIN` | 网络管理（危险） |
+| `SYS_ADMIN` | 系统管理（危险） |
+| `ALL` | 所有 capabilities |
+
+最佳实践是删除所有 capabilities，只添加必要的：
+
+```yaml
+securityContext:
+  capabilities:
+    drop: ["ALL"]
+    add: ["NET_BIND_SERVICE"]
+```
+
+## Pod Security Standards（PSS）
+
+K8s 1.25 将 Pod Security Policy（PSP）标记为废弃，引入 Pod Security Standards（PSS）作为新的标准。PSS 定义了三个级别的安全策略：
+
+| 级别 | 说明 | 目标 |
+|---|---|---|
+| `Privileged` | 完全不受限制 | 系统级应用、日志收集器 |
+| `Baseline` | 最小限制，防止常见风险 | 多数应用可直接使用 |
+| `Restricted` | 严格限制，符合最佳实践 | 安全敏感型应用 |
+
+### 在 Namespace 上启用 PSS
+
+使用标签在 Namespace 上强制执行 PSS：
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: production
+  labels:
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
+```
+
+这个配置强制 `production` Namespace 执行 Baseline 级别的安全策略，同时在审计和警告中使用 Restricted 级别。
+
+### Baseline vs Restricted 对比
+
+| 检查项 | Baseline | Restricted |
+|---|---|---|
+| 特权容器 | 不允许 | 不允许 |
+| 权能提升 | 不允许 | 不允许 |
+| 以 root 运行 | 允许（警告） | 不允许 |
+| 只读根文件系统 | 不强制 | 强制 |
+| HostPath 卷 | 限制 | 禁止 |
+| Seccomp 配置文件 | 不强制 | 强制 |
+| Capabilities | 限制 | 禁止非默认 |
+
+:::tip 从 Baseline 迁移到 Restricted
+迁移到 Restricted 级别需要确保应用满足：
+- 不以 root 用户运行
+- 使用非 root 用户运行
+- 使用只读根文件系统
+- 不使用 hostPath Volume
+- 不使用特权容器
+
+建议逐步迁移：先在开发环境测试，再在生产环境逐步切换。
+:::
+
+## OPA Gatekeeper 集成
+
+对于更复杂的安全策略，可以使用 OPA Gatekeeper。Gatekeeper 允许你定义 CRD 形式的策略，并强制执行：
+
+```yaml title="Gatekeeper ConstraintTemplate 示例"
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sPSPAllowedUsers
+metadata:
+  name: pods-must-run-as-user
+spec:
+  match:
+    kinds:
+    - apiGroups: [""]
+      kinds: ["Pod"]
+  parameters:
+    rule: RunAsAny
+    ruleMetadata:
+      description: Ensure pods run as specified user.
+      matchConstraints:
+        objectSelector:
+          matchLabels:
+            environment: production
+```
+
+Gatekeeper 可以实现 PSP 无法实现的复杂逻辑，如基于 Label 的差异化策略、跨资源类型的关联检查等。
+
+## PSP 到 PSS 迁移
+
+Pod Security Policy 在 K8s 1.21 废弃，1.25 完全移除。如果你的集群仍在使用 PSP，需要迁移到 PSS 或 Gatekeeper。
+
+### 迁移步骤
+
+1. **盘点现有 PSP 策略**
+```bash
+kubectl get psp -A
+```
+
+2. **分析每个 PSP 的功能**
+   - 哪些是 K8s 内置 PSS 可以覆盖的？
+   - 哪些需要 Gatekeeper 实现？
+
+3. **在测试环境启用 PSS**
+```bash
+kubectl label namespace testing pod-security.kubernetes.io/enforce=restricted
+```
+
+4. **验证应用兼容性**
+```bash
+kubectl get pod -n testing | grep -v Running
+```
+
+5. **逐步应用到生产环境**
+
+### 常见 PSP 到 PSS 映射
+
+| PSP 策略 | PSS 等效 |
+|---|---|
+| `runAsUser.MustRunAsNonRoot` | `runAsNonRoot: true` |
+| `allowPrivilegeEscalation: false` | 默认 Baseline 级别 |
+| `volumes: !hostPath` | Baseline 级别禁止 hostPath |
+| `hostNetwork: false` | Baseline 级别禁止 hostNetwork |
+
+## 安全配置检查清单
+
+部署应用前，确保以下安全配置到位：
+
+```yaml
+spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    fsGroup: 1000
+    seLinuxOptions:
+      level: "s0:c123,c456"
+  containers:
+  - name: app
+    securityContext:
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      privileged: false
+      capabilities:
+        drop: ["ALL"]
+```
+
+:::tip 完整性检查
+使用 Kubesec 或 kube-bench 工具扫描现有 Pod 的安全配置：
+
+```bash
+kubectl exec -it <pod> -- kube-bench
+```
+
+确保所有容器满足 Baseline 级别，敏感 Namespace 满足 Restricted 级别。
+:::
+
+## 总结
+
+Security Context 是容器安全的第一道防线。通过合理的配置，可以将攻击者的「破坏半径」压缩到最小：
+
+- **最小化运行用户**：使用非 root 用户运行应用
+- **禁止权限提升**：`allowPrivilegeEscalation: false`
+- **只读根文件系统**：防止恶意修改
+- **最小化 capabilities**：只添加业务必需的权限
+- **执行 PSS 策略**：在 Namespace 级别强制安全基线
+
+安全不是一次性的配置，而是持续的过程。定期审计集群中的 Security Context 配置，发现并修复违规的 Pod。
+
+**面试追问方向**：
+- Pod Security Policy 和 Pod Security Standards 的区别是什么？
+- 如何在不停机的情况下迁移 PSP 到 PSS？
+- Linux capabilities 和特权模式的区别是什么？
+- 如何审计集群中的 Security Context 合规性？

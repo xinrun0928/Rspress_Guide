@@ -1,0 +1,392 @@
+# 服务注册与健康检查
+
+你遇到过这种情况吗？服务明明在注册中心还「活着」，但实际上已经无法正常响应请求了——可能是死锁了，可能是数据库连接池耗尽了，也可能是 Full GC 导致停顿超过 10 秒。
+
+这就是「无效实例」的问题。服务注册只是告诉注册中心「我来了」，但「我还能不能干活」，那是健康检查要回答的问题。
+
+## 健康检查的本质
+
+健康检查（Health Check）的本质是**对服务可用性的持续探测**。它不是一次性验证，而是在服务运行期间持续进行，确保注册中心始终掌握每个实例的真实状态。
+
+一个完善的服务健康检查机制，需要回答三个问题：
+
+```yaml
+# 三个核心问题
+1. 什么时候检查？—— 检查时机
+2. 检查什么？—— 检查内容
+3. 检查结果是什么？—— 处理策略
+```
+
+## 健康检查的三种模式
+
+### 1. 主动探测（Active Check）
+
+注册中心主动向服务实例发送探测请求，根据响应判断实例是否健康。这是一种「拉」（Pull）模式。
+
+```java
+// 主动探测实现示例
+public class HealthProbe {
+
+    private final RestTemplate restTemplate = new RestTemplate();
+
+    public boolean probe(Instance instance, int timeoutMs) {
+        String url = String.format("http://%s:%d/health",
+                                   instance.getIp(),
+                                   instance.getPort());
+
+        try {
+            ResponseEntity<Map> response = restTemplate.getForEntity(url, Map.class);
+            // 检查 HTTP 状态码
+            if (response.getStatusCode().is2xxSuccessful()) {
+                Map body = response.getBody();
+                // 检查业务定义的健康状态
+                return "UP".equals(body.get("status"));
+            }
+            return false;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+}
+```
+
+```yaml
+# Kubernetes 的主动探测配置
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service
+spec:
+  template:
+    spec:
+      containers:
+        - name: order-service
+          image: order-service:v1
+          # HTTP 探测
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 8080
+            initialDelaySeconds: 30      # 启动后多久开始探测
+            periodSeconds: 10            # 探测间隔
+            timeoutSeconds: 5            # 探测超时
+            failureThreshold: 3         # 连续失败次数触发重启
+
+          # 就绪探测（决定是否接收流量）
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 3
+```
+
+:::tip 主动探测的优缺点
+**优点**：注册中心掌控主动权，不依赖服务配合，能发现「假死」实例。
+
+**缺点**：探测请求增加网络开销，如果实例数量庞大，探测本身可能成为瓶颈。
+:::
+
+### 2. 心跳上报（Passive Check / Heartbeat）
+
+服务实例主动向注册中心发送心跳，注册中心根据心跳状态判断实例健康状况。这是一种「推」（Push）模式。
+
+```java
+// 心跳上报实现示例
+@Service
+public class HeartbeatService {
+
+    @NacosInjected
+    private NamingService namingService;
+
+    // 模拟心跳上报
+    public void startHeartbeat(String serviceName, String ip, int port) {
+        // 每 5 秒上报一次心跳
+        Executors.newSingleThreadScheduledExecutor().scheduleAtFixedRate(() -> {
+            try {
+                // Nacos SDK 内部处理心跳发送
+                namingService.sendBeat(serviceName, ip, port, 5000);
+            } catch (NacosException e) {
+                log.error("心跳上报失败", e);
+            }
+        }, 0, 5, TimeUnit.SECONDS);
+    }
+}
+```
+
+```yaml
+# Eureka 的心跳配置
+eureka:
+  instance:
+    lease-renewal-interval-in-seconds: 30    # 心跳间隔
+    lease-expiration-duration-in-seconds: 90  # 多久没心跳则剔除
+  client:
+    healthcheck:
+      enabled: true
+```
+
+:::warning 心跳上报的盲区
+心跳上报只能证明实例「还活着」，但不能证明实例「能正常工作」。如果实例死锁或 CPU 100%，心跳可能依然正常发送，但请求已经无法处理。这就是为什么实际生产中，**主动探测和心跳上报通常配合使用**。
+:::
+
+### 3. 第三方探测（Third-Party Check）
+
+引入独立的健康检查服务或组件，由第三方负责探测所有实例。这种方式常用于大型分布式系统。
+
+```yaml
+# 第三方探测架构
+┌─────────────────────────────────────────────────────┐
+│                  第三方健康检查                       │
+├─────────────────────────────────────────────────────┤
+│                                                     │
+│   ┌───────────────┐                                 │
+│   │ 健康检查服务   │◄──── 定时探测所有实例            │
+│   │ (独立部署)    │                                 │
+│   └───────┬───────┘                                 │
+│           │                                         │
+│           ▼                                         │
+│   ┌─────────────────────────────────────────┐       │
+│   │            注册中心                      │       │
+│   │                                         │       │
+│   │  当健康检查服务报告实例不健康时，         │       │
+│   │  注册中心自动剔除该实例                   │       │
+│   └─────────────────────────────────────────┘       │
+│                                                     │
+└─────────────────────────────────────────────────────┘
+```
+
+## 健康检查的层级
+
+一个完整的健康检查应该覆盖多个层级：
+
+```yaml
+# 健康检查层级金字塔
+┌─────────────────────────────────────────┐
+│           业务层健康检查                  │  # 依赖外部服务是否可用
+│   检查数据库连接、Redis 连接、外部 API 调用 │
+├─────────────────────────────────────────┤
+│           应用层健康检查                  │  # 应用内部状态
+│   检查线程池队列、内存使用、GC 情况        │
+├─────────────────────────────────────────┤
+│           基础设施层健康检查               │  # 系统级指标
+│   检查进程存活、端口监听、磁盘空间          │
+├─────────────────────────────────────────┤
+│           存活探针（Liveness）            │  # 进程是否存活
+│   检查进程是否还在运行                     │
+└─────────────────────────────────────────┘
+```
+
+### 业务层健康检查示例
+
+```java
+// Spring Boot Actuator 健康检查端点
+@RestController
+@RequestMapping("/health")
+public class HealthController {
+
+    @Autowired
+    private DataSource dataSource;
+
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+
+    @Autowired
+    private RestTemplate restTemplate;
+
+    @GetMapping("/live")
+    public Map<String, Object> liveness() {
+        // Liveness：进程是否存活
+        // 只要能响应就认为存活
+        return Map.of("status", "UP");
+    }
+
+    @GetMapping("/ready")
+    public Map<String, Object> readiness() {
+        // Readiness：是否准备好接收流量
+        Map<String, Object> health = new HashMap<>();
+        List<String> errors = new ArrayList<>();
+
+        // 检查数据库
+        if (!checkDatabase()) {
+            errors.add("Database connection failed");
+        }
+
+        // 检查 Redis
+        if (!checkRedis()) {
+            errors.add("Redis connection failed");
+        }
+
+        // 检查外部依赖（假设订单服务依赖支付服务）
+        if (!checkPaymentService()) {
+            errors.add("Payment service unavailable");
+        }
+
+        if (errors.isEmpty()) {
+            health.put("status", "UP");
+            return health;
+        } else {
+            health.put("status", "DOWN");
+            health.put("errors", errors);
+            return health;
+        }
+    }
+
+    private boolean checkDatabase() {
+        try (Connection conn = dataSource.getConnection()) {
+            return conn.isValid(5);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private boolean checkRedis() {
+        try {
+            return "PONG".equals(redisTemplate.getConnectionFactory()
+                    .getConnection().ping());
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private boolean checkPaymentService() {
+        try {
+            restTemplate.getForObject("http://payment-service/health", String.class);
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+}
+```
+
+## 健康检查与注册中心的联动
+
+健康检查结果会实时同步到注册中心，触发实例状态的变更：
+
+```java
+// 健康检查结果处理
+public class HealthCheckHandler {
+
+    private final NamingService namingService;
+
+    // 当实例被判定为不健康时的处理
+    public void handleUnhealthy(Instance instance) {
+        // 方案一：直接剔除
+        namingService.deregisterInstance(instance);
+
+        // 方案二：标记为不健康，但保留实例信息
+        instance.setEnabled(false);
+
+        // 方案三：降低权重，逐步摘流量
+        instance.setWeight(instance.getWeight() * 0.5);
+
+        log.warn("实例 {}:{} 被标记为不健康，触发流量摘除",
+                 instance.getIp(), instance.getPort());
+    }
+
+    // 当实例恢复健康时的处理
+    public void handleHealthy(Instance instance) {
+        instance.setEnabled(true);
+        instance.setWeight(1.0);  // 恢复权重
+
+        log.info("实例 {}:{} 恢复健康，重新加入服务池",
+                 instance.getIp(), instance.getPort());
+    }
+}
+```
+
+## 健康检查的配置策略
+
+在实际生产中，需要根据服务特点配置不同的健康检查策略：
+
+```yaml
+# 不同服务的健康检查策略
+
+# 无状态 HTTP 服务：快速探测
+http-service:
+  checkType: http
+  path: /health/ready
+  interval: 5s
+  timeout: 3s
+  failureThreshold: 3
+
+# 有状态服务（如数据库）：更宽松的策略
+database-service:
+  checkType: http
+  path: /health/ready
+  interval: 10s
+  timeout: 5s
+  failureThreshold: 2
+  # 数据库启动慢，允许更长的预热时间
+  initialDelaySeconds: 60
+
+# 依赖外部 API 的服务：检查所有依赖
+gateway-service:
+  checkType: http
+  path: /health/ready
+  interval: 5s
+  timeout: 3s
+  failureThreshold: 3
+  # 依赖多个外部服务，任一不可用都标记为不健康
+  requiredDependencies:
+    - payment-service
+    - user-service
+    - order-service
+```
+
+## 常见问题与解决方案
+
+### 问题一：健康检查本身导致服务不可用
+
+```yaml
+# 问题：健康检查端点压力过大，影响正常服务
+# 解决：
+# 1. 健康检查端点独立部署，不占用业务线程
+# 2. 使用轻量级探测（TCP 端口检测而非 HTTP）
+# 3. 合理设置探测间隔，避免过于频繁
+```
+
+### 问题二：服务预热期间被误判
+
+```yaml
+# 问题：服务刚启动时还在初始化，就被健康检查判定为失败
+# 解决：
+# 1. 设置 initialDelaySeconds，给服务充足的预热时间
+# 2. 区分「存活探针」和「就绪探针」：刚启动的实例 Liveness 通过，
+#    但 Readiness 等待初始化完成后才通过
+# 3. 启动期间实例不上线，直到完全就绪
+```
+
+### 问题三：健康状态不一致
+
+```yaml
+# 问题：注册中心说实例健康，但实际无法处理请求
+# 原因：
+# 1. 探测路径不正确，未覆盖关键依赖
+# 2. 探测超时时间过短，正常请求被误判为失败
+# 3. 探测频率过低，故障发现滞后
+#
+# 解决：
+# 1. 探测端点覆盖核心依赖
+# 2. 超时时间 > 99% 请求的处理时间
+# 3. 使用主动探测 + 心跳上报的双重保障
+```
+
+## 总结
+
+健康检查是服务治理的重要一环，它确保注册中心掌握每个实例的真实状态，避免请求被发送到「假死」的实例上。
+
+**核心要点回顾：**
+
+- 主动探测是注册中心「拉」取状态，心跳上报是服务「推」送状态
+- 健康检查应该覆盖多个层级：基础设施、应用、业务
+- Liveness 探针决定是否重启，Readiness 探针决定是否接收流量
+- 健康检查策略需要根据服务特点灵活配置
+- 健康检查结果与注册中心实时联动，触发流量调度
+
+---
+
+**下一章预告：**
+
+知道了服务在哪、实例是否健康，下一个问题就是：**当有多个健康实例时，应该选择哪一个？** 这就是负载均衡要解决的问题。下一章，我们将深入探讨各种负载均衡策略。

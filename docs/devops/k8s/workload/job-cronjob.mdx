@@ -1,0 +1,309 @@
+# Job 与 CronJob 任务执行
+
+凌晨 2 点，你收到告警：数据库中有一批一个月前的临时数据需要清理。这是一个一次性的任务，不需要长期运行，更不需要高可用。
+
+又或者，每天早上 6 点，系统需要生成一份前一天的运营报表。这是个定时任务，但执行时间和频率都是可预测的。
+
+Job 和 CronJob 正是为这类场景设计的：它们专门处理 **不期望持续运行** 的工作负载。
+
+## Job 的核心概念
+
+Job 会创建一个或多个 Pod，并确保指定数量的 Pod 成功完成。它的目标是 **完成特定任务**，而不是保持服务在线。
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: data-cleanup
+  namespace: default
+spec:
+  ttlSecondsAfterFinished: 100  # 完成后 100 秒自动清理
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+      - name: cleanup
+        image: cleanup-tool:v1.0
+        command: ["./cleanup.sh", "--days", "30"]
+        resources:
+          limits:
+            memory: "128Mi"
+            cpu: "100m"
+```
+
+:::warning 重要限制
+Job 的 Pod 模板必须设置 `restartPolicy`，只能是 `OnFailure` 或 `Never`，**不能是 Always**。因为如果使用 `Always`，容器重启会被视为成功，Job 会不断创建新的 Pod。
+:::
+
+## 任务模式
+
+Job 有三种执行模式，适用于不同的业务场景。
+
+### 非并行 Job
+
+最简单的模式：创建一个 Pod，Pod 成功则 Job 完成。
+
+```yaml
+spec:
+  completions: 1    # 只需要 1 个 Pod 成功
+  parallelism: 1    # 同时最多 1 个 Pod
+```
+
+适用于：一次性数据初始化、配置迁移等。
+
+### 固定完成数 Job
+
+需要运行固定次数，成功才算完成：
+
+```yaml
+spec:
+  completions: 5    # 需要 5 个 Pod 成功
+  parallelism: 2    # 同时最多 2 个 Pod
+```
+
+这会按顺序运行 5 个 Pod（每批 2 个，最后一批 1 个），所有 Pod 都成功后 Job 才完成。
+
+适用于：批量处理多个独立任务，每个 Pod 处理一个任务。
+
+### 工作队列 Job
+
+Pod 并行处理，由应用程序协调何时完成：
+
+```yaml
+spec:
+  completions: 1
+  parallelism: 5     # 同时最多 5 个 Pod
+  activeDeadlineSeconds: 600  # 超时时间
+  backoffLimit: 3   # 失败重试次数
+```
+
+Worker Pod 从队列获取任务，处理完成后更新队列状态。当队列为空或所有任务完成时，某个 Pod 负责标记 Job 完成。
+
+适用于：分布式计算、MapReduce 类任务。
+
+## 并行控制参数
+
+```yaml
+spec:
+  completions: 10      # 总共需要成功 10 个 Pod
+  parallelism: 3       # 同时运行最多 3 个 Pod
+  backoffLimit: 6      # 失败重试上限（默认 6）
+  activeDeadlineSeconds: 300  # Job 超时时间
+```
+
+| 参数 | 说明 | 默认值 |
+|---|---|---|
+| `completions` | 成功完成的 Pod 数量 | 1（非并行） |
+| `parallelism` | 并行运行的 Pod 数量 | 1 |
+| `backoffLimit` | 失败重试次数上限 | 6 |
+| `activeDeadlineSeconds` | Job 运行的超时时间 | 无限制 |
+
+:::tip backoffLimit vs activeDeadlineSeconds
+- `backoffLimit`：Pod 失败后重试的次数。达到上限后，Job 会标记为 Failed。
+- `activeDeadlineSeconds`：整个 Job 的运行时间上限。超过后所有 Pod 都会被终止。
+:::
+
+## CronJob 定时任务
+
+CronJob 基于 Unix cron 格式，在指定时间触发 Job 的创建：
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: daily-report
+  namespace: default
+spec:
+  schedule: "0 6 * * *"      # 每天早上 6:00
+  timeZone: "Asia/Shanghai"  # 时区
+  concurrencyPolicy: Forbid  # 并发策略
+  successfulJobsHistoryLimit: 3  # 保留成功 Job 历史
+  failedJobsHistoryLimit: 1     # 保留失败 Job 历史
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+          - name: report
+            image: report-generator:v2.1
+            command: ["./generate_report.sh"]
+            env:
+            - name: REPORT_DATE
+              value: "$(date +\%Y-\%m-\%d -d 'yesterday')"
+```
+
+### Schedule 语法
+
+```
+┌───────────── 分钟 (0-59)
+│ ┌─────────── 小时 (0-23)
+│ │ ┌───────── 日 (1-31)
+│ │ │ ┌─────── 月 (1-12)
+│ │ │ │ ┌───── 星期 (0-6, 0 为周日)
+│ │ │ │ │
+* * * * *
+```
+
+常见配置示例：
+
+```yaml
+schedule: "0 * * * *"          # 每小时整点
+schedule: "0 0 * * *"          # 每天午夜
+schedule: "0 0 * * 0"          # 每周日午夜
+schedule: "0 6 * * MON-FRI"    # 工作日早上 6 点
+schedule: "*/15 * * * *"       # 每 15 分钟
+schedule: "0 6 1 * *"          # 每月 1 日早上 6 点
+```
+
+### 并发策略
+
+```yaml
+spec:
+  concurrencyPolicy: Allow  # 允许并发运行（默认）
+```
+
+| 策略 | 说明 | 场景 |
+|---|---|---|
+| `Allow` | 允许并发运行多个 Job | 任务执行时间短，允许重叠 |
+| `Forbid` | 如果上一个 Job 还在运行，跳过本次执行 | 任务耗时长，不允许重叠 |
+| `Replace` | 如果上一个 Job 还在运行，终止它并启动新的 | 任务必须按时执行 |
+
+:::warning Forbid 和时区
+使用 `Forbid` 策略时，如果一个 Job 执行时间超过下次调度的间隔，这次调度会被跳过。这可能导致任务漏执行，需要结合监控告警。
+:::
+
+### 时区支持
+
+```yaml
+spec:
+  schedule: "0 9 * * *"
+  timeZone: "Asia/Shanghai"  # 指定时区
+```
+
+从 Kubernetes 1.27 开始，CronJob 支持 `timeZone` 字段。在此之前，时区由集群节点的系统时区决定，可能导致意外的执行时间。
+
+:::tip 推荐实践
+始终显式指定 `timeZone`，避免依赖集群节点配置。如果你的集群跨越多个时区，考虑使用 UTC 时区作为基准。
+:::
+
+## 任务历史记录
+
+```yaml
+spec:
+  successfulJobsHistoryLimit: 3   # 保留最近 3 个成功的 Job
+  failedJobsHistoryLimit: 1      # 保留最近 1 个失败的 Job
+```
+
+过多的历史记录会占用 etcd 存储，建议根据实际需要设置合理的值。
+
+```bash
+# 查看 CronJob 及其历史
+kubectl get cronjob
+```
+
+```
+NAME          SCHEDULE    SUSPEND   ACTIVE   LAST SCHEDULE   AGE
+daily-report  0 6 * * *   False     0        6h ago          10d
+```
+
+```bash
+# 查看由 CronJob 创建的 Job
+kubectl get jobs
+```
+
+```
+NAME                        COMPLETIONS   DURATION   AGE
+daily-report-28156080        1/1           5m         6h
+daily-report-28156620        1/1           4m         5h
+daily-report-28157160        0/1           1m         2h
+```
+
+## 高级用法
+
+### 手动触发 Job
+
+有时需要手动触发一个 Job 而不等待调度时间：
+
+```bash
+# 从 CronJob 创建即时 Job
+kubectl create job daily-report-manual \
+  --from=cronjob/daily-report
+```
+
+### 传递时间参数
+
+很多定时任务需要知道「什么时候该执行」，可以通过环境变量传递：
+
+```yaml
+jobTemplate:
+  spec:
+    template:
+      spec:
+        containers:
+        - name: report
+          image: report-generator:v2.1
+          env:
+          - name: TARGET_DATE
+            value: "$(date +\%Y-\%m-\%d -d 'yesterday')"
+```
+
+:::warning 命令注入风险
+在 command 中使用 `$(date ...)` 可能导致命令注入漏洞。如果镜像来源不可信，使用 ConfigMap 注入会更安全。
+:::
+
+### 暂停和恢复 CronJob
+
+```bash
+# 暂停
+kubectl patch cronjob daily-report \
+  -p '{"spec":{"suspend":true}}'
+
+# 恢复
+kubectl patch cronjob daily-report \
+  -p '{"spec":{"suspend":false}}}'
+```
+
+暂停后，CronJob 不会创建新的 Job，已运行的 Job 不受影响。
+
+## 清理策略
+
+Job 执行完成后，如果不需要保留历史记录，可以使用 TTL 控制器自动清理：
+
+```yaml
+spec:
+  ttlSecondsAfterFinished: 3600  # 完成后 1 小时自动清理
+```
+
+或者通过 CronJob 的历史记录限制：
+
+```yaml
+spec:
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+```
+
+:::details TTL vs 历史限制
+| 策略 | TTL | 历史限制 |
+|---|---|---|
+| 清理时机 | Job 完成后固定时间 | 保留最近 N 个 |
+| 适用场景 | 临时测试任务 | 生产环境审计 |
+| 存储影响 | 完全清理 | 保留部分记录 |
+:::
+
+## 总结
+
+Job 和 CronJob 解决了 Kubernetes 中非持续性工作负载的编排问题：
+
+- **Job**：确保任务成功完成，支持并行处理
+- **CronJob**：基于 cron 语法定时触发任务执行
+
+掌握它们的配置选项和调度策略，能够有效处理日常运维中的各种批处理场景。
+
+**面试追问方向：**
+
+- Job 的 Pod 失败后会怎样？重试机制是什么？
+- 如果 Job 的 parallel pod 全部失败，会触发重试吗？
+- CronJob 漏执行的可能原因有哪些？
+- 如何实现 CronJob 的幂等性？
+- Job 和 CronJob 能否使用 HPA 进行扩缩容？
