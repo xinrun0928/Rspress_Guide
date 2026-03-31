@@ -1,250 +1,466 @@
-# CNI 网络插件详解
+# CNI 网络插件对比
 
-Flannel、Calico、Cilium——Kubernetes 集群安装时，你必须选择其中一个。但它们有什么区别？为什么 Kubernetes 不自带网络功能，而是依赖这些插件？
+你有没有想过——Kubernetes 的 Pod 网络到底是怎么实现的？Flannel 说它用 VXLAN，Calico 说它用 BGP，Cilium 说它用 eBPF。这些技术听起来都很厉害，但到底该怎么选？
 
-要理解 CNI，首先要理解它解决的问题：让集群中的 Pod 能够相互通信，同时保持网络隔离和安全性。
+CNI（Container Network Interface）是 Kubernetes 网络的标准接口。所有网络插件都通过 CNI 与 Kubernetes 交互，实现 Pod 网络、Service 网络和网络策略。
 
-## CNI 是什么
+## CNI 基础
 
-CNI（Container Network Interface）是一个标准规范，定义了容器网络配置的统一接口。
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                      kubelet                            │
-│  ┌─────────────────────────────────────────────────────┐ │
-│  │                  CNI Plugin                         │ │
-│  │   ADD   │   DEL   │   CHECK   │   VERSION         │ │
-│  └─────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────┘
-                          │
-              ┌───────────┼───────────┐
-              ↓           ↓           ↓
-        ┌─────────┐ ┌─────────┐ ┌─────────┐
-        │ Flannel │ │ Calico  │ │ Cilium  │
-        └─────────┘ └─────────┘ └─────────┘
-```
-
-### CNI 插件职责
-
-| 职责 | 说明 |
-|---|---|
-| IP 分配 | 从预设 CIDR 为 Pod 分配唯一 IP |
-| 网络配置 | 创建网桥、veth pair、路由等 |
-| 策略执行 | 实现 NetworkPolicy（部分插件） |
-| 观测能力 | 提供网络流量可见性（部分插件） |
-
-## Flannel
-
-Flannel 是最简单的 CNI 插件之一，由 CoreOS 开发。它的设计理念是「简单够用」。
-
-### 架构
+### CNI 工作流程
 
 ```
-┌─────────────┐              ┌─────────────┐
-│   Node 1    │   VXLAN      │   Node 2    │
-│ ┌─────────┐ │◀────────────▶│ ┌─────────┐ │
-│ │  Pod A  │ │              │ │  Pod B  │ │
-│ │ 10.244.1.5│ │              │ │ 10.244.2.8│ │
-│ └─────────┘ │              │ └─────────┘ │
-│      │      │              │      │      │
-│      └──────┼──────────────┼──────┘      │
-│             ↓              ↓              │
-│        ┌─────────────────────────┐        │
-│        │       flannel.1        │ (VXLAN) │
-│        │    (Overlay Interface) │         │
-│        └─────────────────────────┘        │
-└───────────────────────────────────────────┘
+Pod 创建时
+    │
+    ▼
+┌─────────────────────────────────┐
+│         kubelet                 │
+│                                  │
+│  1. 调用 CNI ADD                │
+│     - 分配 IP 地址              │
+│     - 创建网络命名空间          │
+│     - 配置 veth pair            │
+│     - 调用 CNI 配置网络          │
+│                                  │
+└─────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────┐
+│         CNI Plugin              │
+│                                  │
+│  - Flannel / Calico / Cilium   │
+│  - 决定如何与外部网络通信       │
+│  - 设置路由规则                  │
+└─────────────────────────────────┘
 ```
 
-### 网络模型
+### CNI 插件分类
+
+| 类型 | 代表插件 | 特点 |
+|---|---|---|
+| **Overlay 网络** | Flannel (VXLAN)、Weave | 不依赖物理网络，隧道封装 |
+| **路由网络** | Calico (BGP) | 依赖物理网络，直接路由 |
+| **透明代理** | Cilium (eBPF) | 内核级数据面，性能最佳 |
+
+---
+
+## Flannel：简单够用
+
+Flannel 是 CoreOS（现 Red Hat）开发的 CNI 插件，以简单著称。
+
+### 工作原理
+
+Flannel 在每个节点上创建一个 `cni0` 网桥，为该节点的 Pod 分配一个子网。
 
 ```bash
-# 节点网络配置
-ip addr show flannel.1
+# 查看节点子网分配
+kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.podCIDR}{"\n"}{end}'
+
+# 节点 Pod 子网示例：
+# node-1  → 10.244.0.0/24
+# node-2  → 10.244.1.0/24
+# node-3  → 10.244.2.0/24
 ```
 
+**跨节点通信**：Flannel 使用 **VXLAN** 隧道封装数据包。
+
 ```
-5: flannel.1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1450 qdisc noqueue
-    inet 10.244.1.0/32 scope global flannel.1
-    peer inet 10.244.2.0/32
+Pod-A (Node-1)                          Pod-B (Node-2)
+  │                                        ▲
+  │ 原始数据包:                             │
+  │   src: 10.244.0.2                      │
+  │   dst: 10.244.1.3                      │
+  ▼                                        │
+┌─────────────────────────────────────────┐
+│           Node-1                         │
+│                                          │
+│  cni0 (10.244.0.0/24)                   │
+│       │                                  │
+│       │ 封装为 VXLAN 包                  │
+│       │   外层 src: 192.168.1.10         │
+│       │   外层 dst: 192.168.1.20         │
+│       ▼                                  │
+│  eth0 (物理网卡) ──────────────────────► │
+└─────────────────────────────────────────┘
+                    │
+                    │ VXLAN 隧道
+                    ▼
+┌─────────────────────────────────────────┐
+│           Node-2                         │
+│  eth0 (物理网卡) ◄──────────────────────│
+│       │                                  │
+│       │ 解封装                            │
+│       ▼                                  │
+│  cni0 (10.244.1.0/24)                   │
+│       │                                  │
+│       ▼                                  │
+│  Pod-B (10.244.1.3)                     │
+└─────────────────────────────────────────┘
 ```
 
-Flannel 使用 **VXLAN** 隧道协议，将 Pod 网络封装在节点网络中：
+### Flannel 后端对比
 
-| 层级 | 网络 |
-|---|---|
-| Pod Network | 10.244.0.0/16 |
-| Node Network | 192.168.1.0/24 |
-| Overlay | VXLAN |
+| 后端 | 协议 | 适用场景 |
+|---|---|---|
+| **vxlan** | VXLAN | 生产环境默认，性能好 |
+| **host-gw** | 路由 | 同二层网络，性能最优 |
+| **udp** | UDP | 已废弃，仅用于调试 |
+
+```yaml title="flannel-config.yaml"
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kube-flannel-cfg
+  namespace: kube-flannel
+data:
+  cni-conf.json: |
+    {
+      "name": "cbr0",
+      "cniVersion": "0.3.1",
+      "plugins": [
+        {
+          "type": "flannel",
+          "delegate": {
+            "hairpinMode": true,
+            "isDefaultGateway": true
+          }
+        },
+        {
+          "type": "portmap",
+          "capabilities": {
+            "portMappings": true
+          }
+        }
+      ]
+    }
+  net-conf.json: |
+    {
+      "Network": "10.244.0.0/16",
+      "Backend": {
+        "Type": "vxlan"
+      }
+    }
+```
 
 ### 优缺点
 
 | 优点 | 缺点 |
 |---|---|
-| 简单易部署 | 不支持网络策略 |
-| 资源占用低 | 性能开销较大（VXLAN） |
-| 社区成熟 | 功能相对单一 |
+| 部署简单 | 性能开销（VXLAN 封装） |
+| 社区活跃 | 不支持网络策略 |
+| 与 Kubernetes 原生集成 | 不支持细粒度的网络隔离 |
 
-### 适用场景
+---
 
-- 小型集群
-- 对网络策略没有需求
-- 快速部署演示环境
+## Calico：功能全面
 
-## Calico
+Calico 是 Tigera 开发的 CNI 插件，支持网络策略和安全，是生产环境的热门选择。
 
-Calico 是一个功能丰富的网络解决方案，提供了高性能的数据平面和强大的网络策略。
+### 工作原理
 
-### 架构
+Calico 使用 **BGP 协议**在节点之间分发路由表，实现 Pod 的三层可达。
 
-Calico 支持两种数据平面：
+```bash
+# 查看 Calico 路由表
+ip route
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                     Calico Node                         │
-│  ┌─────────────┐                                       │
-│  │ Felix       │  ← 配置路由、网络策略                  │
-│  └─────────────┘                                       │
-│        │                                                │
-│  ┌─────┴─────┐                                         │
-│  ↓           ↓                                          │
-│ ┌─────────┐ ┌─────────┐                                │
-│ │ Bird     │ │  CNI    │                                │
-│ │ (BGP)    │ │ Plugin  │                                │
-│ └─────────┘ └─────────┘                                │
-└─────────────────────────────────────────────────────────┘
+# 示例输出：
+# 10.244.1.0/24 via 192.168.1.20 dev eth0 proto bird
+# 10.244.2.0/24 via 192.168.1.30 dev eth0 proto bird
 ```
 
-### 两种模式
-
-#### 直连模式（BGP）
-
-节点之间通过 BGP 协议直接交换路由，效率最高：
+**BGP（Border Gateway Protocol）** 是互联网骨干网使用的路由协议，Calico 将其引入 Kubernetes 集群内部。
 
 ```
-Node 1: 10.244.1.0/24 via 192.168.1.1
-Node 2: 10.244.2.0/24 via 192.168.1.2
+┌──────────────────────────────────────────────────────────────────┐
+│                    Calico BGP 架构                                │
+│                                                                   │
+│   Node-1 (192.168.1.10)    Node-2 (192.168.1.20)              │
+│   ┌─────────────────┐        ┌─────────────────┐                │
+│   │ Pod 子网:       │◄──────►│ Pod 子网:        │                │
+│   │ 10.244.0.0/24  │  BGP   │ 10.244.1.0/24   │                │
+│   │                 │◄──────►│                 │                │
+│   │ BGP Speaker:    │        │ BGP Speaker:    │                │
+│   │ bird           │        │ bird           │                │
+│   └─────────────────┘        └─────────────────┘                │
+│                                                                   │
+│   每个节点通过 BGP 将自己的 Pod 子网通告给其他节点                │
+│   其他节点学习到路由后，直接路由到对应节点                         │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-适合大二层网络或节点间可以直接通信的环境。
+### 两种运行模式
 
-#### VXLAN 模式
+| 模式 | 说明 | 适用场景 |
+|---|---|---|
+| **BGP Full Mesh** | 每个节点与其他所有节点建立 BGP 连接 | 小规模集群（< 100 节点） |
+| **Route Reflector** | 节点与 Route Reflector 建立连接 | 大规模集群 |
 
-与 Flannel 类似，使用 VXLAN 封装：
-
-```yaml
+```yaml title="calico-bgp-config.yaml"
 apiVersion: projectcalico.org/v3
-kind: FelixConfiguration
+kind: BGPConfiguration
 metadata:
   name: default
 spec:
-  vxlanEnabled: true
-  ipipEnabled: false
+  logSeverityScreen: Info
+  nodeToNodeMeshEnabled: true  # Full Mesh 模式
+  asNumber: 64512
+---
+# 大规模集群使用 Route Reflector
+apiVersion: projectcalico.org/v3
+kind: BGPPeer
+metadata:
+  name: route-reflector-peer
+spec:
+  peerIP: 192.168.1.10
+  asNumber: 64512
+  nodeSelector: role == "route-reflector"
+```
+
+### 网络策略
+
+Calico 最强大的功能之一是**网络策略**——可以精细控制 Pod 之间的流量。
+
+```yaml title="network-policy.yaml"
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-network-policy
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      app: api
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  # 允许来自 frontend 的流量
+  - from:
+    - podSelector:
+        matchLabels:
+          app: frontend
+    ports:
+    - protocol: TCP
+      port: 8080
+  # 允许来自 ingress controller 的流量
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: ingress-nginx
+    ports:
+    - protocol: TCP
+      port: 8080
+  egress:
+  # 只允许访问数据库
+  - to:
+    - podSelector:
+        matchLabels:
+          app: database
+    ports:
+    - protocol: TCP
+      port: 5432
+  # 只允许访问 DNS
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - protocol: UDP
+      port: 53
 ```
 
 ### 优缺点
 
 | 优点 | 缺点 |
 |---|---|
-| 高性能（直连模式） | 配置相对复杂 |
-| 强大的网络策略 | BGP 模式需要网络支持 |
-| 支持大规模集群 | 资源占用高于 Flannel |
+| 高性能（纯三层路由） | 配置相对复杂 |
+| 强大的网络策略 | Full Mesh 不适合大规模集群 |
+| 支持网络隔离 | 需要物理网络支持（BGP） |
 
-### 适用场景
+---
 
-- 中大型集群
-- 需要网络策略
-- 对性能有要求
-- 多云或混合云环境
+## Cilium：面向未来
 
-## Cilium
+Cilium 是 CNCF 孵化的项目，利用 **eBPF（Extended Berkeley Packet Filter）** 在 Linux 内核中实现网络功能。
 
-Cilium 是新一代的 CNI 插件，基于 eBPF（extended Berkeley Packet Filter）技术，提供了前所未有的网络可观测性和安全性。
+### eBPF 是什么
 
-### eBPF 架构
+eBPF 是 Linux 内核的一项革命性技术，允许在内核中运行沙箱程序来处理网络包、追踪系统调用等。
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                     Cilium Agent                        │
-│  ┌─────────────┐                                       │
-│  │  eBPF Maps   │  ← 存储网络状态                       │
-│  └─────────────┘                                       │
-│        │                                                │
-│  ┌─────┴─────┐                                         │
-│  ↓           ↓                                          │
-│ ┌─────────┐ ┌─────────┐                                │
-│ │ XDP     │ │ TC      │  ← eBPF 程序入口                 │
-│ └─────────┘ └─────────┘                                │
-└─────────────────────────────────────────────────────────┘
+传统网络路径：
+  应用程序 → 用户态 → 内核协议栈 → 网卡
+              ▲         ▲
+              │         │
+           慢 (上下文切换)
+
+Cilium/eBPF 路径：
+  应用程序 → 用户态 → eBPF (内核中) → 网卡
+                            ▲
+                            │
+                       直接在内核中处理
 ```
 
-### 优势
+### Cilium 的优势
 
-| 特性 | 说明 |
+**1. 零包处理（Zero-Packet Processing）**：
+
+```bash
+# Cilium 可以直接通过 eBPF 将流量从 Pod A 转发到 Pod B
+# 完全绕过 iptables/ipvs
+# 延迟降低 50% 以上
+```
+
+**2. 透明的可见性**：
+
+```bash
+# Cilium 支持在不修改应用的情况下
+# 追踪服务间的通信
+cilium status
+
+# 查看服务依赖图
+cilium service list
+```
+
+**3. 身份安全（Identity-Based Security）**：
+
+Cilium 使用 **BPF Maps** 追踪每个 Pod 的网络身份，不再依赖 IP 地址。
+
+```yaml title="cilium-network-policy.yaml"
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: api-policy
+spec:
+  endpointSelector:
+    matchLabels:
+      app: api
+  ingress:
+  - fromEndpoints:
+    - matchLabels:
+        app: frontend
+    toPorts:
+    - ports:
+      - port: "8080"
+        protocol: TCP
+      rules:
+        http:
+        - method: GET
+          path: "/api/.*"
+```
+
+**4. L7 网络策略**：
+
+```yaml
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: l7-http-policy
+spec:
+  endpointSelector:
+    matchLabels:
+      app: backend
+  ingress:
+  - toPorts:
+    - ports:
+      - port: "8080"
+        protocol: TCP
+      rules:
+        http:
+        - method: "GET"
+          path: "/health"
+        - method: "POST"
+          path: "/api/users"
+          headers:
+          - "Authorization:.*"
+```
+
+### 优缺点
+
+| 优点 | 缺点 |
 |---|---|
-| L7 策略 | 支持 HTTP、gRPC、Kafka 等应用层协议过滤 |
-| 身份感知 | 基于工作负载身份而非 IP 做策略 |
-| Hubble | 提供了 Kubernetes 原生的可观测性 |
-| 高性能 | 内核级处理，无需 iptables |
+| 极高性能（内核级数据面） | 需要较新的内核版本 |
+| L3-L7 网络策略 | 文档相对较少 |
+| 零依赖（不需要额外的 DaemonSet） | 社区相对较小 |
+| 透明的观测能力 | eBPF 学习曲线 |
 
-### 适用场景
+---
 
-- 需要 L7 网络策略
-- 对网络安全要求高
-- 需要网络流量可观测性
-- 大规模高性能场景
+## 三者对比
 
-## 横向对比
-
-| 特性 | Flannel | Calico | Cilium |
+| 维度 | Flannel | Calico | Cilium |
 |---|---|---|---|
-| IP 分配 | etcd/kube-router | etcd/BGP | kvstore/BGP |
-| 数据平面 | VXLAN | BGP/VXLAN | eBPF |
-| 网络策略 | ✗ | ✓ (L3/L4) | ✓ (L3-L7) |
-| 性能 | 中等 | 高 | 最高 |
-| 复杂度 | 低 | 中 | 中高 |
-| 观测能力 | 基础 | 中等 | 强大 |
-| 最小资源占用 | ✓ | 中 | 中 |
-| 生产就绪 | ✓ | ✓ | ✓ |
+| **网络模型** | Overlay (VXLAN) | BGP 路由 / Overlay | eBPF |
+| **性能** | 中等 | 高 | 最高 |
+| **网络策略** | 不支持 | L3/L4 | L3-L7 |
+| **复杂度** | 低 | 中 | 中高 |
+| **依赖** | etcd | etcd / BGP RR | 无（可选 Hubble） |
+| **最小内核版本** | 无 | 无 | 4.19+ |
+| **适合规模** | 任意 | 大规模 | 任意 |
+| **学习曲线** | 平缓 | 较陡 | 较陡 |
 
-## 选择建议
+---
 
-### 选择 Flannel 如果：
+## 选择指南
 
-- 你是 Kubernetes 新手
-- 集群规模小于 100 节点
+### 选 Flannel 如果：
+
+- 你是 K8s 新手，想要快速上手
+- 小规模集群（几十个节点）
 - 不需要网络策略
-- 快速搭建开发/测试环境
+- 追求简单，够用就好
 
-### 选择 Calico 如果：
+### 选 Calico 如果：
 
-- 需要网络策略
-- 集群规模中等
-- 需要较好的性能
-- 多云环境
+- 生产环境，需要网络策略
+- 需要将 Kubernetes 网络与物理网络集成
+- 大规模集群
+- 需要 BGP 路由控制
 
-### 选择 Cilium 如果：
+### 选 Cilium 如果：
 
-- 需要 L7 网络策略
-- 对网络安全要求极高
-- 需要网络可观测性
-- 大规模高性能集群
-- 已经使用 Hubble 进行监控
+- 对网络性能有极致要求
+- 需要 L7 网络策略（HTTP 方法/路径控制）
+- 已经使用 Istio 或 Linkerd
+- 希望获得透明的观测能力
+
+---
+
+## 迁移与混用
+
+### 从 Flannel 迁移到 Calico
+
+```bash
+# 1. 安装 Calico
+kubectl apply -f https://docs.projectcalico.org/manifests/calico.yaml
+
+# 2. 等待 Calico 启动
+kubectl get pods -n calico-system
+
+# 3. 移除 Flannel
+kubectl delete -f kube-flannel.yml
+
+# 4. 验证
+kubectl get nodes -o wide  # 确认 Pod CIDR 未变
+ip route  # 确认路由表已更新为 Calico 模式
+```
+
+### 注意事项
+
+:::warning 迁移有风险
+生产环境迁移 CNI 插件有服务中断风险，建议：
+1. 在测试环境先验证
+2. 预留足够的维护窗口
+3. 准备好回滚方案
+:::
+
+---
 
 ## 总结
 
-CNI 插件是 Kubernetes 网络的基础：
+CNI 插件是 Kubernetes 网络的基础。选择合适的 CNI 插件，需要考虑：
 
-- **Flannel**：简单够用，适合小型集群
-- **Calico**：功能丰富，适合中大型集群
-- **Cilium**：eBPF 驱动，适合高安全要求场景
+1. **性能需求**：eBPF > BGP > VXLAN
+2. **安全需求**：是否需要网络策略
+3. **规模需求**：集群规模影响架构选择
+4. **运维能力**：学习曲线和维护成本
 
-选择合适的 CNI 插件，需要根据集群规模、安全需求和运维能力综合考虑。
-
-**面试追问方向：**
-
-- CNI 插件的调用流程是什么？
-- VXLAN 和 BGP 的区别是什么？
-- 为什么 eBPF 比 iptables 性能更好？
-- 如何排查 CNI 相关的网络问题？
-- Calico 的 BGP Route Reflector 是解决什么问题的？
+无论选择哪个插件，都要确保与 Kubernetes 版本兼容，并做好充分的测试。

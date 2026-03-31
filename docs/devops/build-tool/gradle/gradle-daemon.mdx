@@ -1,254 +1,407 @@
-# Gradle Daemon 原理与优化
+# Gradle 守护进程与缓存
 
-你有没有注意到，每次运行 `./gradlew build` 时，都有一个 Java 进程在后台默默工作？这就是 Gradle Daemon——一个让你「秒开」构建的秘密武器。
+你有没有想过——为什么第一次运行 Gradle 较慢，但之后每次都很快？
 
-## 什么是 Gradle Daemon
+Gradle 守护进程（Daemon）和构建缓存是 Gradle 快速构建的两大秘密武器。守护进程避免重复启动 JVM，缓存避免重复计算和执行。两者配合，可以让构建时间从分钟级降到秒级。
 
-### 工作原理
+## Gradle 守护进程（Daemon）
 
-Daemon 是 Gradle 的常驻进程。它避免了每次构建都要重新启动 JVM 的开销：
+### 什么是 Daemon
+
+Daemon 是一个长期运行的 JVM 进程，复用 JVM 实例，避免每次构建都重新启动。
 
 ```
-无 Daemon：每次构建
-├── 启动 JVM（~3-5秒）
-├── 加载 Gradle 核心（~2-3秒）
-├── 执行构建（~10秒）
-└── JVM 退出（~0.5秒）
-总计：约 15 秒
+Without Daemon:
+$ gradle build
+  启动 JVM (2s) → 加载 Gradle (3s) → 执行任务 (5s) → 关闭 JVM
+  总计：10s
 
-有 Daemon：后续构建
-├── 连接现有 Daemon（~0.1秒）
-├── 执行构建（~10秒）
-└── 释放连接（~0.1秒）
-总计：约 10 秒
+With Daemon:
+$ gradle build  (第一次)
+  启动 JVM (2s) → 加载 Gradle (3s) → 执行任务 (5s) → 保持 JVM 存活
+
+$ gradle build  (后续)
+  ← 从 Daemon 恢复 (0.1s) → 执行任务 (5s)
+  总计：5.1s
 ```
 
-看起来只省了几秒，但如果你每天构建 50 次，就是 4 分钟的差距。
+### 启用/禁用 Daemon
 
-### Daemon 日志位置
+```properties
+# gradle.properties
+org.gradle.daemon=true   # 启用（默认）
+org.gradle.daemon=false  # 禁用
+```
 
 ```bash
+# 命令行临时禁用
+gradle build --no-daemon
+```
+
+### Daemon 管理命令
+
+```bash
+# 查看运行中的 Daemon
+gradle --status
+
+# 示例输出：
+#   PID   USER   ADDR     PORT  STATUS
+#  12345  user   localhost  57342 IDLE
+#  12346  user   localhost  57343 BUSY
+#
+# Gradle 8.0 will stop supporting less than Java 11.
+# Gradle 8.5 will stop supporting less than Java 17.
+# There are 2 Daemon processes running for this command.
+# 1 was stopped. The Daemon will restart automatically if
+# it is shut down cleanly.
+
+# 停止所有 Daemon
+gradle --stop
+
 # 查看 Daemon 日志
-~/.gradle/daemon/<version>/
-├── daemon.out.log      # 标准输出
-├── daemon.err.log      # 标准错误
-└── daemon-<pid>.log    # 进程日志
+cat ~/.gradle/daemon/8.5/daemon-*.log
 ```
 
-## Daemon 配置
+### Daemon 配置参数
 
-### 启用与禁用
+```properties
+# gradle.properties
 
-```groovy title="gradle.properties"
-# 启用 Daemon（默认开启）
-org.gradle.daemon=true
+# JVM 参数
+org.gradle.jvmargs=-Xmx4g -XX:+HeapDumpOnOutOfMemoryError \
+  -Dfile.encoding=UTF-8 \
+  -XX:+UseParallelGC \
+  -XX:+HeapDumpOnOutOfMemoryError
 
-# 禁用 Daemon
-org.gradle.daemon=false
-```
+# Daemon idle 时间（默认 3 小时）
+org.gradle.daemon.idletimeout=1800000  # 30 分钟
 
-命令行覆盖：
-
-```bash
-# 临时禁用 Daemon
-./gradlew build --no-daemon
-
-# 强制启动新的 Daemon
-./gradlew build --foreground
-```
-
-### 内存配置
-
-```groovy title="gradle.properties"
-# Daemon 堆内存
-org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
-
-# Daemon 堆内存（Gradle 8+ 推荐）
-org.gradle.heap.size.default=2g
-```
-
-:::tip
-Gradle 8+ 使用 `org.gradle.heap.size.default` 代替 JVM args 中的 `-Xmx`，可以避免 Daemon 和子进程的混淆。
-:::
-
-### 并行构建
-
-```groovy title="gradle.properties"
-# 允许多个项目并行构建
+# 并行构建
 org.gradle.parallel=true
 
-# 并行构建时的线程数
-org.gradle.workers.max=8
+# Daemon 数量（默认 1）
+org.gradle.daemon.max.workers=4
 ```
 
-## Daemon 状态管理
+### Daemon 的生命周期
 
-### 查看 Daemon 状态
+```
+Daemon 状态机：
+
+IDLE ──► BUSY ──► IDLE
+ │              │
+ │              │
+ └── 空闲超时 ──┘
+       │
+       └── STOPPED
+```
+
+- **IDLE**：等待构建请求
+- **BUSY**：正在执行构建
+- **STOPPED**：空闲超时或被手动停止
+
+---
+
+## 配置缓存（Configuration Cache）
+
+### 配置缓存是什么
+
+配置缓存将 Task 图的配置结果缓存起来，避免每次构建都重新配置。
+
+```properties
+# gradle.properties
+org.gradle.configuration-cache=true
+```
+
+### 配置缓存的效果
+
+```
+Without Configuration Cache:
+  配置阶段：3.0s
+  执行阶段：5.0s
+  总计：8.0s
+
+With Configuration Cache:
+  配置阶段：0.1s (从缓存恢复)
+  执行阶段：5.0s
+  总计：5.1s
+```
+
+### 配置缓存的限制
+
+```groovy
+// 不支持的写法
+def value = System.getenv("BUILD_NUMBER")  // 非确定性
+def value = new File(".").canonicalPath     // 非确定性
+def value = Math.random()                    // 非确定性
+def value = URL.newInstance("https://...")   // 网络访问
+```
+
+### 调试配置缓存
 
 ```bash
-./gradlew --status
+# 启用并显示问题
+org.gradle.configuration-cache.problems=warn
 
-# 输出示例
-   PID | Status   | Kind     | JDK | Daemon addr
- 12345 | Busy     | Gradle 8 | 17  | 127.0.0.1:56321
- 12346 | Idle     | Gradle 8 | 17  | 127.0.0.1:56322
+# 忽略配置缓存（用于调试）
+gradle build --no-configuration-cache
+
+# 清除配置缓存
+rm -rf ~/.gradle/configuration-cache/
 ```
 
-### 停止 Daemon
+---
 
-```bash
-# 停止所有 Daemon
-./gradlew --stop
+## 构建缓存（Build Cache）
 
-# 或
-gradle --stop
-```
+### 本地构建缓存
 
-## Daemon 内存调优
-
-### 分析 Daemon 内存使用
-
-```groovy title="build.gradle"
-tasks.register('diagnoseMemory') {
-    doLast {
-        def runtime = Runtime.runtime
-        println "Max Memory: ${runtime.maxMemory() / 1024 / 1024} MB"
-        println "Total Memory: ${runtime.totalMemory() / 1024 / 1024} MB"
-        println "Free Memory: ${runtime.freeMemory() / 1024 / 1024} MB"
-        println "Available Processors: ${runtime.availableProcessors()}"
-    }
-}
-```
-
-### 内存泄漏排查
-
-```groovy title="gradle.properties"
-# 开启 GC 日志
-org.gradle.jvmargs=-Xmx4g -XX:+HeapDumpOnOutOfMemoryError \
-  -XX:HeapDumpPath=$HOME/gradle-oom.hprof \
-  -XX:+PrintGCDetails -XX:+PrintGCDateStamps \
-  -Xloggc:$HOME/gradle-gc.log
-```
-
-## Daemon 与 CI/CD
-
-### CI 环境中禁用 Daemon
-
-CI 环境通常每次构建都是新进程，Daemons 可能无法有效复用：
-
-```groovy title="gradle.properties"
-# CI 环境检测
-org.gradle.daemon=${CI:-false}
-```
-
-```yaml title=".gitlab-ci.yml"
-build:
-  variables:
-    CI: "true"
-  script:
-    - ./gradlew build
-```
-
-### 容器环境优化
-
-Docker 容器中运行 Gradle：
-
-```dockerfile title="Dockerfile"
-FROM eclipse-temurin:17-jdk
-
-# 设置 Gradle 堆内存
-ENV GRADLE_OPTS="-Xmx2g -Dorg.gradle.daemon=false"
-
-WORKDIR /app
-COPY . .
-RUN ./gradlew dependencies --no-daemon
-```
-
-:::warning
-在容器环境中，内存限制更严格。如果不设置合理的堆内存，OOM 会频繁发生。
-:::
-
-## Daemon 启动优化
-
-### 预热 Daemon
-
-```groovy title="build.gradle"
-tasks.register('warmUp') {
-    doLast {
-        // 预编译所有配置
-        tasks.configureEach { task ->
-            task.enabled = false
-        }
-        
-        // 执行基础任务预热
-        project(":").tasks.named("help").get()
-    }
-}
-```
-
-### 构建缓存
-
-```groovy title="gradle.properties"
-# 启用构建缓存
+```properties
+# gradle.properties
 org.gradle.caching=true
 
-# 缓存目录
-org.gradle.caches.dir=/path/to/shared/cache
+# 缓存目录（默认 ~/.gradle/caches/build-cache-1/）
+org.gradle.cachedir=~/.gradle/caches/build-cache-1/
 ```
 
 ```bash
-# 导出缓存到 CI artifact
-./gradlew --build-cache --parallel assemble
+# 启用构建缓存
+gradle build --build-cache
 
-# 导入缓存
-./gradlew --build-cache
+# 清除构建缓存
+rm -rf ~/.gradle/caches/build-cache-1/
 ```
 
-## Daemon 故障排查
+### 远程构建缓存
 
-### Daemon 启动失败
+```kotlin
+// build.gradle.kts
+buildCache {
+    remote(HttpBuildCache::class) {
+        url = uri("https://buildcache.example.com/cache/")
+        isEnabled = true
+        push = true  // 推送缓存到远程
+
+        credentials {
+            username = "cacheuser"
+            password = System.getenv("BUILDCACHE_PASSWORD") ?: ""
+        }
+    }
+}
+```
+
+### 构建缓存键
+
+缓存键由以下因素计算：
+
+1. Task 类名
+2. Task 输入的哈希（文件内容、属性值）
+3. Gradle 版本
+4. 构建环境标识（JVM 版本、操作系统）
+
+```
+Cache Key = Hash(TaskClass + InputHash + GradleVersion + EnvironmentId)
+```
+
+---
+
+## 增量构建
+
+### Task Inputs 和 Outputs
+
+```groovy
+// 定义 Task 的输入和输出
+task processData {
+    inputs.file "src/data/input.json"
+    inputs.dir "src/data/raw"
+    inputs.property "version", project.version
+
+    outputs.file "build/processed/data.json"
+    outputs.dir "build/processed"
+
+    doLast {
+        // 业务逻辑
+    }
+}
+```
+
+### Task 状态
+
+| 状态 | 说明 |
+|---|---|
+| **EXECUTED** | Task 必须执行 |
+| **UP-TO-DATE** | Task 跳过，输入输出无变化 |
+| **FROM-CACHE** | 从缓存恢复 |
 
 ```bash
-# 查看详细错误
-./gradlew build --stacktrace
+$ gradle build
+> Task :compileJava
+  UP-TO-DATE          ← 源码未变，跳过
+
+> Task :processData
+  FROM-CACHE          ← 从构建缓存恢复
+```
+
+---
+
+## 并行构建
+
+### 启用并行构建
+
+```properties
+# gradle.properties
+org.gradle.parallel=true
+org.gradle.workers.max=4
+```
+
+### 并行构建原理
+
+```
+Without Parallel:
+Task A ──► Task B ──► Task C ──► Task D
+时间线：|──A──|──B──|──C──|──D──|
+
+With Parallel:
+Task A ──► Task B ──► Task C ──► Task D
+  Task A ────────────────────────────►
+  Task A ──────────────────────────►
+时间线：|──A──|──B──|──C──|──D──|  (部分并行)
+```
+
+### 并行构建注意事项
+
+```groovy
+// 任务间无依赖，可以并行
+task taskA {
+    doLast { Thread.sleep(1000) }
+}
+
+task taskB {
+    doLast { Thread.sleep(1000) }
+}
+
+// 任务间有依赖，必须顺序执行
+taskB.mustRunAfter(taskA)
+```
+
+---
+
+## 常用优化配置
+
+### 推荐的 gradle.properties
+
+```properties
+# gradle.properties
+
+# JVM 配置
+org.gradle.jvmargs=-Xmx4g -XX:+HeapDumpOnOutOfMemoryError -XX:+UseParallelGC -Dfile.encoding=UTF-8
+
+# 守护进程
+org.gradle.daemon=true
+org.gradle.daemon.idletimeout=3600000  # 1 小时
+
+# 并行构建
+org.gradle.parallel=true
+org.gradle.workers.max=4
+
+# 构建缓存
+org.gradle.caching=true
+
+# 配置缓存
+org.gradle.configuration-cache=true
+org.gradle.configuration-cache.problems=warn
+
+# 文件系统监控（增量构建优化）
+org.gradle.fs.inotify=true
+```
+
+### 按需配置
+
+```bash
+# 禁用守护进程
+gradle build --no-daemon
+
+# 禁用并行
+gradle build --no-parallel
+
+# 禁用缓存
+gradle build --no-build-cache
+
+# 禁用配置缓存
+gradle build --no-configuration-cache
+
+# 全部禁用（用于调试）
+gradle build --no-daemon --no-parallel --no-build-cache --no-configuration-cache
+```
+
+---
+
+## 常见问题排查
+
+### Daemon 无法启动
+
+```bash
+# 检查 Java 版本
+java -version
+
+# 手动启动 Daemon
+gradle --daemon
 
 # 查看 Daemon 日志
-cat ~/.gradle/daemon/8.5/daemon.out.log
+tail -f ~/.gradle/daemon/*/daemon-*.log
 ```
 
-### 端口冲突
+### 缓存不命中
 
-```groovy title="gradle.properties"
-# 指定 Daemon 端口
-org.gradle.daemon.port=54321
+```bash
+# 查看 Task 缓存状态
+gradle build --info | grep -E "(UP-TO-DATE|FROM-CACHE|EXECUTED)"
 
-# 或禁用端口绑定（仅支持单 Daemon）
-org.gradle.daemon.permanent=false
+# 强制重新执行所有 Task
+gradle build --rerun-tasks
+
+# 检查输入哈希
+gradle :module:dependencies --configuration runtimeClasspath --info
 ```
 
-### JDK 版本不匹配
+### 配置缓存问题
 
-```groovy title="gradle.properties"
-# 强制使用特定 JDK
-org.gradle.java.home=/path/to/jdk-17
+```bash
+# 显示配置缓存问题
+org.gradle.configuration-cache.problems=verbose
+
+# 查看具体错误
+gradle build --stacktrace
+
+# 忽略配置缓存问题
+gradle build --no-configuration-cache
 ```
+
+---
 
 ## 性能对比
 
-| 场景 | 无 Daemon | 有 Daemon | 节省 |
+### 不同配置的构建时间
+
+| 配置 | 首次构建 | 后续构建 | 说明 |
 |---|---|---|---|
-| 增量构建（无变化） | 8.2s | 1.1s | 87% |
-| 增量构建（单文件变更） | 12.5s | 4.8s | 62% |
-| Clean 构建（缓存冷） | 45s | 38s | 16% |
-| Clean 构建（缓存热） | 45s | 28s | 38% |
+| 无优化 | 15s | 15s | 每次都完整执行 |
+| + Daemon | 15s | 10s | 复用 JVM |
+| + 并行构建 | 15s | 8s | 多任务并行 |
+| + 构建缓存 | 15s | 3s | 复用 Task 输出 |
+| + 配置缓存 | 12s | 2s | 跳过配置阶段 |
+| 全部启用 | 12s | 1s | 综合优化 |
+
+---
 
 ## 总结
 
-Daemon 是 Gradle 性能优化的基础：
+Gradle 守护进程和缓存是构建性能优化的关键：
 
-- **开发时**：始终启用 Daemon，享受「秒开」体验
-- **CI 环境**：根据实际情况选择是否启用
-- **内存配置**：根据项目规模调整堆内存
-- **缓存配合**：配合构建缓存，效果翻倍
+1. **Daemon**：复用 JVM，避免重复启动，节省 2-3 秒
+2. **配置缓存**：缓存配置阶段，节省 1-2 秒
+3. **构建缓存**：复用 Task 输出，节省 50% 以上时间
+4. **增量构建**：跳过 UP-TO-DATE 的 Task
+5. **并行构建**：多任务同时执行
 
-下次觉得 Gradle 慢的时候，先检查一下 Daemon 状态。
+合理的配置可以将构建时间从分钟级降到秒级，大幅提升开发效率。

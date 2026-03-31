@@ -1,223 +1,109 @@
-# StatefulSet 有状态副本集
+# StatefulSet 有状态应用管理
 
-数据库、消息队列、分布式存储——这些服务都有一个共同点：**每个实例都不是等价的**。
+你部署了一个 MySQL 集群，三个节点分别是 mysql-0、mysql-1、mysql-2。突然 mysql-1 所在的节点宕机了，Kubernetes 重新创建了 Pod——但新 Pod 的名字变成了 mysql-3，而不是 mysql-1。这意味着新 Pod 无法加入原来的集群，因为它使用了不同的身份。
 
-MySQL 主从集群中，主库和从库承担不同的角色，数据必须按顺序同步。Kafka 的 Broker 有自己的 ID，Topic 的 Partition 分布在特定的 Broker 上。Redis Cluster 的每个节点维护着不同的槽位。
+这就是 Deployment 无法管理有状态应用的原因——它不关心 Pod 的身份，只关心数量。StatefulSet 的出现，就是为了解决这个问题。
 
-对于这类有状态应用，Deployment 的「Pod 都是相同的」这一假设不再成立。StatefulSet 正是 Kubernetes 为有状态工作负载设计的解决方案。
+## StatefulSet 解决了什么问题
 
-## 核心特性
+### Deployment 的问题
 
-StatefulSet 为每个 Pod 维护一个稳定的、唯一的身份标识。这个标识在整个 Pod 生命周期中保持不变，即使 Pod 被重建。
+```yaml
+# Deployment 的 Pod 名称
+# 每次重建，名称随机
+# web-7d9b6f5c8-xk4pw
+# web-7d9b6f5c8-mk7pq  ← 新建的可能是这个名字
+```
+
+- Pod 名称随机，无法预测
+- Pod IP 变化，无法稳定访问
+- PVC 随机分配，无法保证数据持久
+- 启动顺序不确定，可能主从没准备好就接入请求
+
+### StatefulSet 的设计目标
+
+| 目标 | 说明 |
+|---|---|
+| **稳定的网络标识** | Pod 名称固定，hostname 固定 |
+| **稳定的存储** | 每个 Pod 有独立的 PVC，Pod 重建后仍挂载相同 PVC |
+| **有序部署/扩缩容** | Pod 按序号顺序创建和删除 |
+| **有序更新** | Pod 按逆序号顺序更新 |
+
+---
+
+## 核心概念
 
 ### 稳定的网络标识
 
-StatefulSet 的 Pod 名称遵循固定的模式：`$(statefulset-name)-$(ordinal)`。
+StatefulSet 的 Pod 名称遵循固定的命名模式：`$(statefulset-name)-$(ordinal)`。
 
 ```bash
-# 创建名为 web 的 StatefulSet，有 3 个副本
-kubectl get pods -l app=web
+# StatefulSet: mysql
+# Pod 名称永远是：mysql-0, mysql-1, mysql-2
+kubectl get pods -l app=mysql
+
+# NAME    READY   STATUS    RESTARTS   AGE
+# mysql-0 1/1     Running   0          10d
+# mysql-1 1/1     Running   0          10d
+# mysql-2 1/1     Running   0          10d
 ```
 
-```
-NAME    READY   STATUS    RESTARTS   AGE
-web-0   1/1     Running   0          10m
-web-1   1/1     Running   0          10m
-web-2   1/1     Running   0          10m
-```
+### 稳定的存储
 
-即使 web-1 被重启或重新调度，它的名称始终是 web-1，网络标识 `web-1.statefulset.svc.cluster.local` 也不会改变。
-
-:::tip 网络标识的意义
-稳定的网络标识对于服务发现至关重要。ConfigMap 或其他 Pod 可以通过固定的域名访问特定序号的 Pod，比如 web-0 作为主节点接收写请求，web-1 和 web-2 作为从节点处理读请求。
-:::
-
-### 稳定的存储卷
-
-StatefulSet 使用 VolumeClaimTemplate 为每个 Pod 创建独立的持久化存储：
-
-```yaml
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: mysql
-spec:
-  serviceName: "mysql"
-  replicas: 3
-  selector:
-    matchLabels:
-      app: mysql
-  template:
-    metadata:
-      labels:
-        app: mysql
-    spec:
-      containers:
-      - name: mysql
-        image: mysql:8.0
-        volumeMounts:
-        - name: data
-          mountPath: /var/lib/mysql
-  volumeClaimTemplates:
-  - metadata:
-      name: data
-    spec:
-      accessModes: ["ReadWriteOnce"]
-      resources:
-        requests:
-          storage: 10Gi
-```
-
-当 StatefulSet 扩展到 3 个副本时，会自动创建 3 个 PVC：
-
-```bash
-kubectl get pvc
-```
+每个 Pod 有独立的 PVC，Pod 重建后仍挂载相同存储：
 
 ```
-NAME             STATUS   VOLUME                                     CAPACITY
-data-mysql-0     Bound    pvc-xxxxx                                  10Gi
-data-mysql-1     Bound    pvc-yyyyy                                  10Gi
-data-mysql-2     Bound    pvc-zzzzz                                  10Gi
+mysql-0 ──► data-mysql-0 (PVC)
+mysql-1 ──► data-mysql-1 (PVC)
+mysql-2 ──► data-mysql-2 (PVC)
 ```
 
-每个 PVC 与对应的 Pod 绑定：mysql-0 使用 data-mysql-0，mysql-1 使用 data-mysql-1，以此类推。当 Pod 被重建时，其数据不会丢失。
+即使 mysql-0 重新调度，新 Pod 仍然会挂载 data-mysql-0，存储内容不变。
 
-:::warning PVC 的生命周期
-VolumeClaimTemplate 创建的 PVC 不会随着 StatefulSet 的删除而自动删除，除非设置了 `persistentVolumeClaimRetentionPolicy`。
-:::
-
-## 有序部署与扩缩容
-
-StatefulSet 保证了 Pod 的部署和扩缩容顺序：**只有前一个 Pod 变为 Running 和 Ready 后，才会启动下一个 Pod**。
-
-### 部署顺序
-
-创建 3 副本的 StatefulSet 时：
+### 有序的部署和扩缩容
 
 ```
-web-0: Running ✓ → web-1: Starting... → web-2: Pending
+部署 (OrderedReady)：
+mysql-0 Running → mysql-1 Starting → mysql-2 Starting
+
+扩缩容 (OrderedReady)：
+扩容：mysql-3 Starting → Running
+缩容：mysql-2 Terminating → mysql-1 Terminating → mysql-0 Terminating
 ```
 
-web-0 必须完全 Ready 后，web-1 才开始启动。这种顺序保证了有状态服务的初始化依赖，比如主库必须先就绪，从库才能开始同步。
+---
 
-### 扩缩容顺序
+## 完整示例：MySQL 主从集群
 
-扩容时从序号小的开始：
+### Headless Service
 
-```
-web-0 → web-1 → web-2 → web-3
-```
+StatefulSet 必须搭配一个 **Headless Service**（没有 ClusterIP 的 Service）：
 
-缩容时从序号大的开始：
-
-```
-web-3 → web-2 → web-1 → web-0
-```
-
-为什么要反向缩容？因为序号大的 Pod 可能依赖序号小的 Pod 的数据或服务。反向缩容确保依赖关系不会被破坏。
-
-```yaml
-spec:
-  podManagementPolicy: OrderedReady  # 默认策略
-```
-
-### Parallel 模式
-
-如果你的应用可以并行启动和停止，可以将 `podManagementPolicy` 设为 `Parallel`：
-
-```yaml
-spec:
-  podManagementPolicy: Parallel
-  updateStrategy:
-    type: RollingUpdate
-```
-
-这样 StatefulSet 会同时启动和停止所有 Pod，不再等待前一个 Pod Ready。
-
-## 有序的终止过程
-
-当删除 StatefulSet 或进行缩容时，Kubernetes 会按照从大到小的顺序终止 Pod：
-
-1. 终止 web-2（序号最大）
-2. 等待 web-2 完全终止
-3. 终止 web-1
-4. 等待 web-1 完全终止
-5. 终止 web-0
-
-更重要的是，在终止 Pod 之前，StatefulSet 会确保 Pod 的数据已经安全地写入持久化存储。这对于数据库等需要保证数据一致性的服务至关重要。
-
-## 更新策略
-
-StatefulSet 支持两种更新策略：
-
-### OnDelete
-
-手动控制更新。只有在你手动删除 Pod 时，StatefulSet 才会重建它：
-
-```yaml
-spec:
-  updateStrategy:
-    type: OnDelete
-```
-
-这允许你精确控制更新的时机，比如在删除前执行数据同步。
-
-### RollingUpdate
-
-滚动更新，自动重建 Pod。更新顺序也是有序的：从序号大的开始，逐步向序号小的推进。
-
-```yaml
-spec:
-  updateStrategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxUnavailable: 1
-```
-
-`maxUnavailable` 控制同时不可用的 Pod 数量。
-
-## 使用场景
-
-StatefulSet 适用于以下场景：
-
-| 场景 | 示例 | 为什么需要 StatefulSet |
-|---|---|---|
-| 有主从关系 | MySQL 主从 | 稳定的网络标识区分主从 |
-| 有状态数据 | Kafka Broker | 持久化存储保留数据 |
-| 有序启动 | ZooKeeper 集群 | 保证 quorum 选举 |
-| 稳定的身份 | 命名服务 | Pod 名称不变，服务发现稳定 |
-
-### 不适合 StatefulSet 的场景
-
-- 无状态微服务：使用 Deployment 即可
-- 临时任务：使用 Job
-- 定时任务：使用 CronJob
-- 需要共享存储的应用：考虑其他方案
-
-## 完整的 MySQL StatefulSet 示例
-
-```yaml
+```yaml title="mysql-service.yaml"
 apiVersion: v1
 kind: Service
 metadata:
-  name: mysql
+  name: mysql-headless
   labels:
     app: mysql
 spec:
-  ports:
-  - port: 3306
-    name: mysql
-  clusterIP: None  # Headless Service
+  clusterIP: None  # Headless Service 的关键：clusterIP: None
   selector:
     app: mysql
----
+  ports:
+  - name: mysql
+    port: 3306
+```
+
+### StatefulSet 定义
+
+```yaml title="mysql-statefulset.yaml"
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: mysql
 spec:
-  serviceName: "mysql"
+  serviceName: mysql-headless  # 必须匹配 Headless Service 名称
   replicas: 3
   selector:
     matchLabels:
@@ -234,14 +120,13 @@ spec:
         - bash
         - "-c"
         - |
-          set -ex
+          # 在 /mnt/config-map 中准备配置文件
+          # 根据 ordinal 设置 server-id 和 binlog 配置
           [[ $HOSTNAME =~ -([0-9]+)$ ]] || exit 1
           ordinal=${BASH_REMATCH[1]}
-          echo [mysqld] > /mnt/conf.d/server-id.cnf
-          echo server-id=$((100 + $ordinal)) >> /mnt/conf.d/server-id.cnf
+          echo "server-id=$((100 + $ordinal))" > /mnt/conf.d/server-id.cnf
           if [[ $ordinal -eq 0 ]]; then
-            echo [mysqld] > /mnt/conf.d/replication.cnf
-            echo log-bin >> /mnt/conf.d/replication.cnf
+            echo "log-bin=mysql-bin" >> /mnt/conf.d/server-id.cnf
           fi
         volumeMounts:
         - name: conf
@@ -253,38 +138,296 @@ spec:
         - name: MYSQL_ROOT_PASSWORD
           value: "password"
         ports:
-        - containerPort: 3306
-          name: mysql
+        - name: mysql
+          containerPort: 3306
         volumeMounts:
         - name: data
           mountPath: /var/lib/mysql
         - name: conf
           mountPath: /etc/mysql/conf.d
-  volumeClaimTemplates:
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+          limits:
+            cpu: "1"
+            memory: 2Gi
+        readinessProbe:
+          exec:
+            command: ["mysqladmin", "ping", "-h", "localhost"]
+          initialDelaySeconds: 30
+          periodSeconds: 10
+      volumes:
+      - name: conf
+        emptyDir: {}
+  volumeClaimTemplates:  # 为每个 Pod 创建独立 PVC
   - metadata:
       name: data
     spec:
       accessModes: ["ReadWriteOnce"]
+      storageClassName: "fast-storage"
       resources:
         requests:
-          storage: 10Gi
+          storage: 20Gi
 ```
 
-这个示例展示了一个完整的 MySQL 主从集群配置：
+---
 
-- Headless Service 提供稳定的 DNS 入口
-- Init Container 设置 server-id 和复制配置
-- VolumeClaimTemplate 为每个 Pod 提供独立存储
-- 主从角色通过 Pod 序号区分
+## Pod 管理策略
+
+### OrderedReady（默认）
+
+Pod 按序号顺序创建，删除也是逆序号顺序。
+
+```yaml
+spec:
+  podManagementPolicy: OrderedReady
+```
+
+```
+创建：0 → 1 → 2
+删除：2 → 1 → 0
+```
+
+### Parallel
+
+Pod 同时创建和删除，不保证顺序。
+
+```yaml
+spec:
+  podManagementPolicy: Parallel
+```
+
+**适用场景**：Pod 之间没有依赖，可以并行启动和停止。
+
+---
+
+## 更新策略
+
+### RollingUpdate（默认）
+
+逆序号顺序更新 Pod。
+
+```yaml
+spec:
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1  # 最多不可用 Pod 数
+      partition: 2       # 保留前 2 个 Pod 不更新（灰度发布）
+```
+
+### OnDelete
+
+只更新被手动删除的 Pod。
+
+```yaml
+spec:
+  updateStrategy:
+    type: OnDelete
+```
+
+### 灰度发布示例
+
+利用 `partition` 实现金丝雀发布：
+
+```yaml
+spec:
+  replicas: 5
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      partition: 3  # 只更新 mysql-3 和 mysql-4，前 3 个保持不变
+```
+
+---
+
+## 扩缩容
+
+### 扩容
+
+```bash
+# 扩容到 5 个副本
+kubectl scale statefulset mysql --replicas=5
+
+# StatefulSet 会按顺序创建新 Pod：
+# mysql-0, mysql-1, mysql-2 已存在
+# mysql-3 Starting → Running
+# mysql-4 Starting → Running
+```
+
+### 缩容
+
+```bash
+# 缩容到 2 个副本
+kubectl scale statefulset mysql --replicas=2
+
+# StatefulSet 会按逆顺序终止 Pod：
+# mysql-4 Terminating
+# mysql-3 Terminating
+# mysql-0, mysql-1, mysql-2 保持不变
+```
+
+:::warning 缩容风险
+StatefulSet 缩容时，**不会自动删除 PVC**。如果有数据，需要先备份再缩容。
+:::
+
+```bash
+# 缩容前检查 PVC
+kubectl get pvc | grep mysql-data
+
+# 缩容后 PVC 仍然存在
+# 如果确认不需要，手动删除
+kubectl delete pvc data-mysql-4
+kubectl delete pvc data-mysql-3
+```
+
+---
+
+## 就绪检测与探针
+
+### 就绪探针（Readiness Probe）
+
+StatefulSet 需要配置就绪探针，确保 Pod 真正可用后再接收流量：
+
+```yaml
+readinessProbe:
+  exec:
+    command:
+    - mysqladmin
+    - ping
+    - "-h"
+    - localhost
+  initialDelaySeconds: 30
+  failureThreshold: 3
+  successThreshold: 1
+  periodSeconds: 10
+```
+
+### 健康探针（Liveness Probe）
+
+```yaml
+livenessProbe:
+  exec:
+    command:
+    - mysqladmin
+    - ping
+    - "-h"
+    - localhost
+  initialDelaySeconds: 60
+  failureThreshold: 3
+  periodSeconds: 20
+```
+
+---
+
+## 数据持久化策略
+
+### VolumeClaimTemplate vs 静态 PVC
+
+**VolumeClaimTemplate（推荐）**：动态创建 PVC，每个 Pod 独立存储。
+
+```yaml
+volumeClaimTemplates:
+- metadata:
+    name: data
+  spec:
+    accessModes: ["ReadWriteOnce"]
+    storageClassName: "fast-storage"
+    resources:
+      requests:
+        storage: 20Gi
+```
+
+**静态 PVC**：手动创建 PVC，在 Pod spec 中引用。
+
+```yaml
+# 先手动创建 PVC
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: data-mysql-0
+spec:
+  selector:
+    matchLabels:
+      app: mysql
+      ordinal: "0"
+  ...
+```
+
+### 数据备份策略
+
+```bash
+# 1. 缩容前先备份数据
+kubectl exec mysql-0 -- mysqldump -A > backup.sql
+
+# 2. 缩容（PVC 保留）
+kubectl scale statefulset mysql --replicas=2
+
+# 3. 检查 PVC 是否保留
+kubectl get pvc | grep mysql-data
+
+# 4. 扩容回来
+kubectl scale statefulset mysql --replicas=3
+```
+
+---
+
+## 常见问题排查
+
+### Pod 一直处于 Pending
+
+```bash
+kubectl describe pod mysql-2
+
+# 常见原因：
+# - 没有匹配的 StorageClass
+# - 存储资源不足
+# - Pod 被调度到无法访问 PV 的节点（WaitForFirstConsumer）
+```
+
+### Pod 一直处于 Terminating
+
+```bash
+# 检查是否有 finalizers 阻止删除
+kubectl get pod mysql-2 -o yaml | grep finalizers
+
+# 如果是 NFS 存储，NFS 客户端可能未正确卸载
+kubectl delete pod mysql-2 --grace-period=0 --force
+
+# 检查是否有未正确清理的挂载
+kubectl describe node <node-name> | grep -A 10 "Volumes:"
+```
+
+### PVC 一直处于 Pending
+
+```bash
+# 检查 StorageClass 是否存在
+kubectl get storageclass
+
+# 检查 PV 是否可用
+kubectl get pv | grep Available
+
+# 检查延迟绑定问题
+kubectl describe pvc data-mysql-2
+```
+
+---
 
 ## 总结
 
-StatefulSet 是 Kubernetes 处理有状态工作负载的核心资源。它的三个核心特性——稳定的网络标识、稳定的存储、有序的部署和扩缩容——为有状态应用提供了必要的保障。
+StatefulSet 的核心价值：
 
-**面试追问方向：**
+1. **稳定的网络标识**：Pod 名称固定，hostname 固定
+2. **稳定的存储**：每个 Pod 有独立 PVC，Pod 重建后数据不丢失
+3. **有序的生命周期**：按序号顺序创建和删除
+4. **有序的更新**：支持灰度发布和回滚
+5. **Headless Service**：配合实现稳定的 Pod 发现
 
-- StatefulSet 和 Deployment 的本质区别是什么？
-- 什么是 Headless Service？为什么 StatefulSet 需要它？
-- VolumeClaimTemplate 和普通 PVC 有什么区别？
-- StatefulSet 的 `persistentVolumeClaimRetentionPolicy` 是如何工作的？
-- 如果一个 Pod 一直处于 Pending 状态，可能的原因有哪些？
+StatefulSet 适用于：
+- 数据库（MySQL、PostgreSQL、MongoDB）
+- 消息队列（Kafka、RabbitMQ）
+- 分布式存储（Cassandra、Ceph）
+- 有状态的服务，需要固定身份和持久存储
+
+理解 StatefulSet 的设计理念，才能正确管理有状态应用的生命周期。
