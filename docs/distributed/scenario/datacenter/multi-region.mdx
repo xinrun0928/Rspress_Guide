@@ -1,125 +1,756 @@
 # 异地多活架构：单元化部署与数据同步方案
 
-"我的系统能扛住整个城市断电吗？"
+2015 年，携程遭遇了一次大规模服务中断，整个系统瘫痪了近 12 小时。这次事故的教训是：**单机房部署，无法应对区域级的灾难**。
 
-2021 年郑州特大暴雨，导致整个城市大面积停电、断网。无数互联网公司的服务中断，有的甚至停摆了好几天。而那些实现了异地多活架构的公司，几乎没有受到影响。这就是异地多活的价值——在更大的灾难面前，保证业务连续性。
+异地多活，成了大型互联网系统的标配。
 
 ## 什么是异地多活？
 
-异地多活是同城双活的升级版：将业务部署在**地理上相隔较远的多个机房**，每个机房都能独立提供服务。与同城双活相比，异地多活可以应对城市级甚至地区级的灾难。
+### 架构演进
 
-### 异地多活 vs 同城双活
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                      架构演进历程                                 │
+├──────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  【冷备方案】                                                    │
+│  ┌─────────┐          ┌─────────┐                               │
+│  │ 主机房   │ ──────> │ 备份机房 │  (正常时不提供服务)           │
+│  │ Active  │          │ Standby │                               │
+│  └─────────┘          └─────────┘                               │
+│                                                                   │
+│  【同城双活】                                                    │
+│  ┌─────────┐          ┌─────────┐                               │
+│  │ 机房 A   │◄────────►│ 机房 B   │  (同时提供服务)              │
+│  │ Active  │  数据同步 │ Active  │                               │
+│  └─────────┘          └─────────┘                               │
+│  优点：容灾能力强，延迟低                                        │
+│  缺点：无法应对城市级灾难                                        │
+│                                                                   │
+│  【异地多活】                                                    │
+│  ┌─────────┐     ┌─────────┐     ┌─────────┐                    │
+│  │ 华东机房 │◄───►│ 华北机房 │◄───►│ 华南机房 │                  │
+│  │ Unit 1  │ 同步 │ Unit 2  │ 同步 │ Unit 3  │                  │
+│  └─────────┘     └─────────┘     └─────────┘                    │
+│  优点：区域级容灾，用户就近访问                                  │
+│  缺点：复杂度高，数据一致性挑战大                                │
+│                                                                   │
+└──────────────────────────────────────────────────────────────────┘
+```
 
-| 维度 | 同城双活 | 异地多活 |
+### 多活的关键指标
+
+| 指标 | 说明 | 目标值 |
 |---|---|---|
-| 机房距离 | 通常 `<` 100km | 通常 `>=` 500km |
-| 延迟 | 跨机房延迟 1-5ms | 跨机房延迟 10-100ms |
-| 成本 | 较高 | 非常高 |
-| 能应对的灾难级别 | 单机房断电/网络故障 | 城市级灾难 |
-| 数据一致性挑战 | 较小 | 非常大 |
+| RTO（Recovery Time Objective） | 故障恢复时间 | < 30 分钟 |
+| RPO（Recovery Point Objective） | 数据恢复点 | < 5 分钟 |
+| 单元独立性 | 单个单元故障不影响其他单元 | 100% |
+| 流量切换时间 | 故障时切换流量耗时 | < 5 分钟 |
 
-异地多活的跨机房延迟是不可忽视的。1000km 的物理距离，光速传播也需要约 3.3ms 往返，加上网络设备转发延迟，实际延迟可能在 20-50ms。这意味着：异地多活下，任何跨机房的同步操作都会明显变慢。
+## 单元化架构设计
 
-## 单元化部署：异地多活的核心架构
+### 单元的定义
 
-异地多活的核心架构思想是**单元化（Cell-based）**：把整个系统拆成多个独立的"单元"，每个单元内包含完整的业务逻辑和数据。
+单元（Unit）是能够独立运行、业务闭环的最小部署单元。每个单元包含：
 
-### 单元化的设计原则
+- **完整的应用层**：所有业务服务都在单元内
+- **完整的数据层**：独立的数据库实例
+- **完整的中间件**：消息队列、缓存等
+- **独立的入口**：独立的 VIP 或 DNS
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                   全局路由层                        │
-│  (根据用户 ID / 请求特征，路由到对应单元)            │
-└───────────────────────┬─────────────────────────────┘
-                        │
-    ┌───────────────────┼───────────────────┐
-    ▼                   ▼                   ▼
-┌─────────┐        ┌─────────┐        ┌─────────┐
-│ 单元 A  │        │ 单元 B  │        │ 单元 C  │
-│ 北京    │        │ 上海    │        │ 广州    │
-│ 1000万  │        │ 800万   │        │ 600万   │
-│ 用户    │        │ 用户    │        │ 用户    │
-└────┬────┘        └────┬────┘        └────┬────┘
-     │                  │                  │
-     ▼                  ▼                  ▼
-  本地 MySQL         本地 MySQL         本地 MySQL
-  (该单元独享)       (该单元独享)       (该单元独享)
+┌────────────────────────────────────────────────────────────────────┐
+│                         单元化架构                                  │
+├────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│   ┌─────────────────────┐    ┌─────────────────────┐              │
+│   │      单元 1         │    │      单元 2         │              │
+│   │  (服务华东用户)      │    │  (服务华北用户)      │              │
+│   │                     │    │                     │              │
+│   │  ┌───────────────┐  │    │  ┌───────────────┐  │              │
+│   │  │  应用服务集群  │  │    │  │  应用服务集群  │  │              │
+│   │  │  Service A    │  │    │  │  Service A    │  │              │
+│   │  │  Service B    │  │    │  │  Service B    │  │              │
+│   │  │  Service C    │  │    │  │  Service C    │  │              │
+│   │  └───────────────┘  │    │  └───────────────┘  │              │
+│   │                     │    │                     │              │
+│   │  ┌───────────────┐  │    │  ┌───────────────┐  │              │
+│   │  │  数据层        │  │    │  │  数据层        │  │              │
+│   │  │  MySQL 集群    │  │    │  │  MySQL 集群    │  │              │
+│   │  │  Redis 集群    │  │    │  │  Redis 集群    │  │              │
+│   │  │  Kafka 集群    │  │    │  │  Kafka 集群    │  │              │
+│   │  └───────────────┘  │    │  └───────────────┘  │              │
+│   └─────────────────────┘    └─────────────────────┘              │
+│                              │                                      │
+│                              │ 同步                                │
+│                              ▼                                      │
+│                        ┌───────────────┐                          │
+│                        │  数据同步层    │                          │
+│                        │  (只读流量)   │                           │
+│                        └───────────────┘                          │
+│                                                                     │
+└────────────────────────────────────────────────────────────────────┘
 ```
 
-**单元化的铁律**：流量在哪里，数据就在哪里。用户的请求必须在同一个单元内完成闭环，不能跨单元读写数据。
-
-### 用户如何路由到单元？
-
-通常使用**全局负载均衡器（GSLB）** 或 **一致性哈希**：
+### 单元划分规则
 
 ```java
-public class CellRouter {
-    // 根据用户 ID 的哈希值，决定用户属于哪个单元
-    public Cell route(long userId) {
-        // 取用户 ID 的 CRC32 哈希值
-        long hash = Math.abs(CRC32.of(userId));
-        
-        // 根据哈希值路由到对应单元
-        if (hash % 100 < 40) {
-            return Cell.BEIJING;  // 40% 用户
-        } else if (hash % 100 < 75) {
-            return Cell.SHANGHAI;  // 35% 用户
-        } else {
-            return Cell.GUANGZHOU;  // 25% 用户
+/**
+ * 用户单元归属计算
+ * 核心原则：同一用户的读写操作必须在同一单元内
+ */
+public class UnitRouter {
+
+    private static final int UNIT_COUNT = 3;  // 单元数量
+
+    /**
+     * 根据用户 ID 计算归属单元
+     */
+    public static int calculateUnit(String userId) {
+        // 方法一：哈希取模
+        int hash = Math.abs(userId.hashCode());
+        return hash % UNIT_COUNT;
+
+        // 方法二：城市代码分区
+        // String cityCode = getCityCode(userId);
+        // return CITY_TO_UNIT_MAPPING.get(cityCode);
+    }
+
+    /**
+     * 判断请求是否在正确单元
+     */
+    public static boolean isInCorrectUnit(String userId, String currentUnit) {
+        int correctUnit = calculateUnit(userId);
+        return currentUnit.equals("unit-" + correctUnit);
+    }
+
+    /**
+     * 获取单元名称
+     */
+    public static String getUnitName(int unitIndex) {
+        return "unit-" + unitIndex;
+    }
+}
+```
+
+### 网关路由层
+
+```java
+@Component
+public class UnitAwareRouteFilter extends ZuulFilter {
+
+    private final UnitRouter unitRouter;
+
+    @Override
+    public String filterType() {
+        return "route";
+    }
+
+    @Override
+    public int filterOrder() {
+        return 10;
+    }
+
+    @Override
+    public boolean shouldFilter() {
+        return true;
+    }
+
+    @Override
+    public Object run() {
+        RequestContext ctx = RequestContext.getCurrentContext();
+        HttpServletRequest request = ctx.getRequest();
+
+        // 1. 获取用户 ID（从 Token 或 Cookie）
+        String userId = extractUserId(request);
+        String requestUnit = extractUnit(request);
+
+        // 2. 计算用户应该在哪一单元
+        int correctUnitIndex = unitRouter.calculateUnit(userId);
+        String correctUnit = unitRouter.getUnitName(correctUnitIndex);
+
+        // 3. 如果请求不在正确单元，重定向
+        if (!correctUnit.equals(requestUnit)) {
+            String targetUrl = buildTargetUrl(correctUnit, request);
+            ctx.setSendZuulResponse(false);
+            ctx.setResponseStatusCode(302);
+            ctx.addOriginResponseHeader("Location", targetUrl);
+            return null;
+        }
+
+        // 4. 记录单元信息到请求上下文
+        ctx.addZuulRequestHeader("X-Unit-Id", correctUnit);
+        return null;
+    }
+
+    private String extractUserId(HttpServletRequest request) {
+        // 从 JWT Token 中获取用户 ID
+        String token = request.getHeader("Authorization");
+        if (token != null && token.startsWith("Bearer ")) {
+            String userId = JwtUtil.getUserId(token.substring(7));
+            return userId;
+        }
+
+        // 或从 Cookie 中获取
+        Cookie userIdCookie = findCookie(request, "user_id");
+        return userIdCookie != null ? userIdCookie.getValue() : null;
+    }
+
+    private String extractUnit(HttpServletRequest request) {
+        Cookie unitCookie = findCookie(request, "unit_id");
+        if (unitCookie != null) {
+            return unitCookie.getValue();
+        }
+
+        // 从域名解析
+        String host = request.getHeader("Host");
+        return parseUnitFromHost(host);
+    }
+}
+```
+
+## 数据同步方案
+
+### 主从复制架构
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│                         数据同步架构                                │
+├────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│   Unit 1 (华东)          Unit 2 (华北)          Unit 3 (华南)      │
+│   ┌──────────┐           ┌──────────┐           ┌──────────┐       │
+│   │  Master  │ ────────────────────────────>  │  Slave   │       │
+│   │          │  Binlog  │           │           │          │       │
+│   │          │  同步     │           │           │  只读     │       │
+│   └──────────┘           └──────────┘           └──────────┘       │
+│                                                                     │
+│   【读写分离】                                                      │
+│   - 写操作：Master                                                  │
+│   - 读操作：本地 Slave（延迟可接受）或 Master                        │
+│                                                                     │
+│   【数据同步】                                                      │
+│   - 同步内容：用户基础数据、配置数据                                │
+│   - 不同步内容：实时交易数据（按单元隔离）                          │
+│                                                                     │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+### 基于 Canal 的数据同步
+
+```java
+/**
+ * Canal 客户端：订阅 MySQL Binlog，实现数据同步
+ */
+@Service
+public class CanalDataSyncService {
+
+    private final CanalConnector connector;
+    private final DataSyncService dataSyncService;
+    private final ElasticsearchTemplate esTemplate;
+    private final RedisTemplate<String, Object> redisTemplate;
+
+    /**
+     * 启动数据同步
+     */
+    @PostConstruct
+    public void startSync() {
+        // 1. 连接 Canal Server
+        connector = CanalConnectors.newClusterConnector(
+            "canal-server:11111",  // Canal 集群地址
+            "destination",          // 目的地名称
+            "",                    // 用户名
+            ""                     // 密码
+        );
+
+        connector.connect();
+        connector.subscribe(".*\\..*");  // 订阅所有表
+
+        // 2. 启动同步线程
+        new Thread(this::syncLoop).start();
+    }
+
+    /**
+     * 同步循环
+     */
+    private void syncLoop() {
+        while (true) {
+            try {
+                // 1. 获取批量消息
+                Message message = connector.get(batchSize);
+
+                if (message.getEntries().isEmpty()) {
+                    Thread.sleep(1000);  // 没有数据，等待
+                    continue;
+                }
+
+                // 2. 处理每个 Entry
+                for (Entry entry : message.getEntries()) {
+                    if (entry.getEntryType() == EntryType.ROWDATA) {
+                        processRowData(entry);
+                    }
+                }
+
+                // 3. 确认已消费
+                connector.ack();
+
+            } catch (Exception e) {
+                log.error("同步异常", e);
+                connector.rollback();
+
+                try {
+                    Thread.sleep(5000);  // 失败后等待重试
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }
+    }
+
+    /**
+     * 处理行数据变化
+     */
+    private void processRowData(Entry entry) {
+        try {
+            RowChange rowChange = RowChange.parseFrom(entry.getStoreValue());
+
+            for (RowData rowData : rowChange.getRowDatasList()) {
+                String tableName = entry.getHeader().getTableName();
+
+                switch (rowChange.getEventType()) {
+                    case INSERT:
+                        handleInsert(tableName, rowData);
+                        break;
+                    case UPDATE:
+                        handleUpdate(tableName, rowData);
+                        break;
+                    case DELETE:
+                        handleDelete(tableName, rowData);
+                        break;
+                }
+            }
+
+        } catch (Exception e) {
+            log.error("处理行数据失败", e);
+        }
+    }
+
+    private void handleInsert(String tableName, RowData rowData) {
+        Map<String, String> data = parseRow(rowData.getAfterColumnsList());
+
+        switch (tableName) {
+            case "user":
+                // 同步到 ES
+                User user = convertToUser(data);
+                esTemplate.save(user);
+                // 更新 Redis 缓存
+                redisTemplate.opsForValue().set("user:" + user.getId(), user);
+                break;
+            case "product":
+                // 同步商品数据
+                break;
+        }
+    }
+
+    private void handleUpdate(String tableName, RowData rowData) {
+        Map<String, String> before = parseRow(rowData.getBeforeColumnsList());
+        Map<String, String> after = parseRow(rowData.getAfterColumnsList());
+
+        String id = after.getOrDefault("id", before.get("id"));
+
+        switch (tableName) {
+            case "user":
+                User user = convertToUser(after);
+                esTemplate.save(user);
+                redisTemplate.opsForValue().set("user:" + id, user);
+                break;
+        }
+    }
+
+    private void handleDelete(String tableName, RowData rowData) {
+        Map<String, String> data = parseRow(rowData.getBeforeColumnsList());
+        String id = data.get("id");
+
+        switch (tableName) {
+            case "user":
+                esTemplate.delete("user", id);
+                redisTemplate.delete("user:" + id);
+                break;
         }
     }
 }
 ```
 
-## 异地多活的数据同步方案
+### 单元间数据同步
 
-单元化的关键约束：**每个单元只能读写本单元的数据。** 那么，当用户跨城市迁移时（比如从北京出差到广州），他的数据怎么迁移？
+```java
+/**
+ * 单元间数据同步服务
+ * 用于跨单元的账户变更、余额同步等
+ */
+@Service
+public class UnitDataSyncService {
 
-### 方案一：热迁移（推荐）
+    private final KafkaTemplate<String, UnitDataMessage> kafkaTemplate;
+    private final RedisTemplate<String, Object> redisTemplate;
 
-用户进入新城市时，通过 GSLB 将流量路由到新单元，但数据仍然在原单元——只有当用户在新城市产生新数据积累到一定程度后，才触发数据迁移。
+    /**
+     * 发送跨单元同步消息
+     */
+    public void syncToAllUnits(String dataType, Object data) {
+        UnitDataMessage message = new UnitDataMessage()
+            .setId(UUID.randomUUID().toString())
+            .setDataType(dataType)
+            .setData(data)
+            .setTimestamp(System.currentTimeMillis())
+            .setSourceUnit(getCurrentUnit());
 
-```bash
-# 热迁移流程
-1. 用户从北京出差到广州
-2. GSLB 检测到用户地理位置变化，将流量切到广州单元
-3. 广州单元需要读取北京单元的数据（跨单元读，通过 HTTP/gRPC）
-4. 用户写操作写入广州单元，通过同步服务异步同步到北京
-5. 当用户在广州的数据量超过阈值（比如 1000 条），触发正式迁移
-6. 迁移期间写双份，迁移完成后只写广州
+        // 发送到所有单元（除本单元外）
+        List<String> targetUnits = getAllUnitsExceptCurrent();
+        for (String targetUnit : targetUnits) {
+            kafkaTemplate.send(
+                "unit-sync-" + targetUnit,
+                message.getId(),
+                message
+            );
+        }
+    }
+
+    /**
+     * 处理跨单元同步消息
+     */
+    @KafkaListener(topics = "unit-sync-*", groupId = "unit-sync-consumer")
+    public void handleSyncMessage(UnitDataMessage message) {
+        // 幂等处理：检查是否已处理
+        String key = "sync:processed:" + message.getId();
+        Boolean processed = redisTemplate.hasKey(key);
+        if (Boolean.TRUE.equals(processed)) {
+            return;
+        }
+
+        // 处理数据
+        switch (message.getDataType()) {
+            case "USER_UPDATE":
+                handleUserUpdate(message.getData());
+                break;
+            case "ACCOUNT_CHANGE":
+                handleAccountChange(message.getData());
+                break;
+            case "CONFIG_CHANGE":
+                handleConfigChange(message.getData());
+                break;
+        }
+
+        // 标记已处理
+        redisTemplate.opsForValue().set(key, "1", Duration.ofDays(7));
+    }
+}
 ```
 
-热迁移的核心思想是：**先路由再迁移，不要求数据立即同步。**
+## 流量切换与故障恢复
 
-### 方案二：基于数据库 CDC 的实时同步
+### 流量切换流程
 
-使用 Change Data Capture（CDC）技术，监听数据库的 binlog，实时将数据变化同步到其他机房。
+```java
+/**
+ * 单元故障切换服务
+ */
+@Service
+public class UnitFailoverService {
 
+    private final LoadBalancer loadBalancer;
+    private final RedisTemplate<String, Object> redisTemplate;
+    private final NamingService namingService;  // Nacos 等服务发现
+
+    /**
+     * 执行单元切换
+     */
+    public void switchUnit(String fromUnit, String toUnit) {
+        // 1. 更新路由配置
+        updateRouteConfig(fromUnit, toUnit);
+
+        // 2. 更新 DNS 解析
+        updateDnsRouting(fromUnit, toUnit);
+
+        // 3. 通知所有服务
+        notifyServicesUnitSwitch(fromUnit, toUnit);
+
+        // 4. 记录切换事件
+        recordFailoverEvent(fromUnit, toUnit);
+    }
+
+    /**
+     * 更新路由配置
+     */
+    private void updateRouteConfig(String fromUnit, String toUnit) {
+        // 1. 更新本单元的路由规则：故障单元的用户路由到目标单元
+        String routingKey = "unit:routing:" + fromUnit;
+        Map<String, Object> routing = new HashMap<>();
+        routing.put("redirectTo", toUnit);
+        routing.put("updatedAt", System.currentTimeMillis());
+        redisTemplate.opsForHash().putAll("global:routing", routing);
+
+        // 2. 发布路由变更事件
+        publishRouteChangeEvent(fromUnit, toUnit);
+    }
+
+    /**
+     * DNS 切换
+     */
+    private void updateDnsRouting(String fromUnit, String toUnit) {
+        // 获取故障单元的域名
+        String fromDomain = fromUnit + ".yourdomain.com";
+
+        // 解析到目标单元的 IP
+        String toIp = namingService.getHealthyInstance(
+            "api-service",
+            toUnit
+        ).getIp();
+
+        // 更新 DNS 记录（使用 DNSPod 或阿里云 DNS API）
+        dnsClient.updateRecord(
+            UpdateRecordRequest.builder()
+                .DomainName("yourdomain.com")
+                .RR(fromUnit)
+                .Type("A")
+                .Value(toIp)
+                .TTL(60)  // 短 TTL，加快生效
+                .build()
+        );
+    }
+
+    /**
+     * 自动故障检测与切换
+     */
+    @Scheduled(fixedRate = 5000)  // 每 5 秒检测一次
+    public void healthCheck() {
+        for (String unit : getAllUnits()) {
+            if (!isUnitHealthy(unit)) {
+                log.error("检测到单元 {} 不可用", unit);
+
+                // 选择目标单元（选择健康且容量充足的）
+                String targetUnit = selectTargetUnit(unit);
+
+                // 执行切换
+                switchUnit(unit, targetUnit);
+            }
+        }
+    }
+
+    /**
+     * 检查单元健康状态
+     */
+    private boolean isUnitHealthy(String unit) {
+        // 1. 检查服务发现是否正常
+        try {
+            List<Instance> instances = namingService.selectInstances(
+                "api-service",
+                unit,
+                true  // 只选择健康实例
+            );
+            if (instances.isEmpty()) {
+                return false;
+            }
+        } catch (Exception e) {
+            return false;
+        }
+
+        // 2. 检查数据库连接
+        // ...
+
+        // 3. 检查网络延迟
+        // ...
+
+        return true;
+    }
+}
 ```
-MySQL binlog → Canal → Kafka → 跨城专线 → 目标机房 Kafka → 写入目标 MySQL
+
+### 单元回滚
+
+```java
+/**
+ * 单元故障恢复后的回滚
+ */
+@Service
+public class UnitRollbackService {
+
+    /**
+     * 回滚到原单元
+     */
+    public void rollbackToOriginal(String originalUnit, String currentUnit) {
+        // 1. 确认原单元已恢复
+        if (!isUnitHealthy(originalUnit)) {
+            throw new IllegalStateException("原单元尚未恢复，不能回滚");
+        }
+
+        // 2. 逐步切回流量（灰度）
+        int percentage = 10;
+        while (percentage <= 100) {
+            // 按百分比逐步将流量切回原单元
+            gradualSwitch(originalUnit, percentage);
+            percentage += 10;
+
+            // 等待并监控
+            monitorMetrics(originalUnit);
+            sleep(30000);  // 每步等待 30 秒
+        }
+
+        // 3. 恢复 DNS
+        restoreDns(originalUnit);
+    }
+
+    /**
+     * 逐步切换流量
+     */
+    private void gradualSwitch(String targetUnit, int percentage) {
+        String key = "unit:traffic:ratio:" + targetUnit;
+        redisTemplate.opsForValue().set(key, percentage);
+
+        log.info("流量切换到 {}: {}%", targetUnit, percentage);
+    }
+}
 ```
 
-:::tip 推荐
-阿里开源的 Canal + RocketMQ 是比较成熟的 MySQL CDC 方案，很多头部互联网公司都在用。
-:::
+## 数据一致性保障
 
-## 异地多活的最大挑战：RPO vs RTO
+### 最终一致性策略
 
-异地多活面临的最核心矛盾：
+```java
+/**
+ * 单元化数据一致性处理
+ */
+@Service
+public class UnitConsistencyService {
 
-- **RPO（Recovery Point Objective）**：能容忍丢失多少数据？
-- **RTO（Recovery Time Objective）**：故障后多久能恢复服务？
+    /**
+     * 处理分布式事务
+     * 使用 TCC（Try-Confirm-Cancel）模式
+     */
+    @Transactional
+    public void transferBetweenUnits(String fromUserId, String toUserId, BigDecimal amount) {
+        // 本地单元：扣减余额
+        String fromUnit = UnitRouter.getUnitName(UnitRouter.calculateUnit(fromUserId));
+        deductBalance(fromUserId, amount);
 
-跨城市同步延迟在 10-100ms 之间，任何同步操作都会增加延迟。如果要求 RPO `=` 0（零数据丢失），意味着所有写操作必须等所有机房都确认，数据写入延迟会非常高。
+        // 远程单元：增加余额
+        String toUnit = UnitRouter.getUnitName(UnitRouter.calculateUnit(toUserId));
 
-实际工程中，通常允许一定的 RPO（如 1 秒），通过**异步同步 + 对账机制**来保证最终一致性。
+        if (!fromUnit.equals(toUnit)) {
+            // 发送跨单元消息
+            CompletableFuture<Boolean> future = sendAddBalanceMessage(toUserId, amount);
+
+            // 如果发送失败，回滚本地
+            if (!future.join()) {
+                throw new BusinessException("转账失败");
+            }
+        } else {
+            addBalance(toUserId, amount);
+        }
+    }
+
+    /**
+     * 补偿机制
+     */
+    @Scheduled(fixedRate = 60000)  // 每分钟检查
+    public void checkAndCompensate() {
+        // 1. 查询未完成的分布式事务
+        List<PendingTransaction> pendingTxns = transactionRepository.findPending();
+
+        for (PendingTransaction txn : pendingTxns) {
+            // 2. 根据事务状态执行补偿
+            switch (txn.getStatus()) {
+                case PENDING:
+                    // 超时未完成，查询实际状态
+                    checkTransactionStatus(txn);
+                    break;
+                case CONFIRM_FAILED:
+                    // 确认失败，重试确认
+                    retryConfirm(txn);
+                    break;
+                case CANCEL_FAILED:
+                    // 取消失败，重试取消
+                    retryCancel(txn);
+                    break;
+            }
+        }
+    }
+}
+```
+
+## 常见问题与解决
+
+### 问题一：单元划分不均匀
+
+```java
+// 使用一致性哈希减少数据倾斜
+public class ConsistentHashUnitRouter {
+
+    private final TreeMap<Long, String> ring = new TreeMap<>();
+    private final int virtualNodes;
+
+    public ConsistentHashUnitRouter(List<String> units, int virtualNodes) {
+        this.virtualNodes = virtualNodes;
+        for (String unit : units) {
+            addUnit(unit);
+        }
+    }
+
+    public void addUnit(String unit) {
+        for (int i = 0; i < virtualNodes; i++) {
+            long hash = hash(unit + ":" + i);
+            ring.put(hash, unit);
+        }
+    }
+
+    public String route(String userId) {
+        long hash = hash(userId);
+        Map.Entry<Long, String> entry = ring.ceilingEntry(hash);
+        return entry != null ? entry.getValue() : ring.firstEntry().getValue();
+    }
+
+    private long hash(String key) {
+        return MD5.hash(key).getLong();
+    }
+}
+```
+
+### 问题二：跨单元调用延迟
+
+```java
+// 跨单元调用时添加超时补偿
+@Service
+public class CrossUnitCallService {
+
+    public <T> T callUnit(String targetUnit, Supplier<T> callable) {
+        try {
+            // 设置较长的超时时间
+            return CompletableFuture.supplyAsync(callable)
+                .get(10, TimeUnit.SECONDS);
+        } catch (TimeoutException e) {
+            log.warn("跨单元 {} 调用超时，尝试本地降级", targetUnit);
+            return fallback();
+        }
+    }
+}
+```
 
 ## 总结
 
-异地多活的核心挑战不是技术，而是**业务改造**。单元化要求每个业务模块都能独立部署、独立数据存储。这对业务架构的改造是伤筋动骨的。
+异地多活的核心是**单元化 + 数据同步**：
 
-典型的成功案例：
-- 阿里：单元化改造 + DRC 数据同步，支撑了双十一的流量洪峰
-- 蚂蚁金服：SOFA 单元化 + LDC（Logical Data Center）架构
+| 组件 | 作用 |
+|---|---|
+| 单元化部署 | 业务闭环，独立运行 |
+| 用户路由 | 确保用户访问正确单元 |
+| 数据同步 | 保持数据最终一致 |
+| 故障切换 | 快速恢复服务 |
 
-异地多活不是银弹，只有对业务连续性有极端要求的核心系统才值得投入。
+实施异地多活的三个阶段：
+
+1. **同城双活**：先验证架构可行性
+2. **单元化改造**：业务代码按单元改造
+3. **异地多活**：逐步扩展到多个城市
+
+记住：**不是所有系统都需要异地多活**。它的复杂度很高，只有当业务规模达到一定程度、数据可靠性要求极高时，才值得投入。
+

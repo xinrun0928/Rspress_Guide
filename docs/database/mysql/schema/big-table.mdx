@@ -1,547 +1,294 @@
-import { Badge } from '@rspress/core/theme';
-
 # 大表优化：分库分表、分区表、历史数据归档
 
-「单表数据量过亿，查询慢得像蜗牛，怎么办？」
+凌晨两点，监控告警弹出：数据库 CPU 99%，查询响应时间超过 10 秒。
 
-大表是数据库性能的天花板。当你的表数据量突破千万级甚至亿级时，常规优化手段已经不够用了。本文深入讲解大表的优化策略，包括分区表、分库分表、历史数据归档等实战方案。
+你登录数据库一看，数据量已经突破 5000 万——这张表是什么时候长这么大的？
 
-## 大表问题诊断
+「我们当初的设计明明够用三年啊。」
 
-### 大表的性能瓶颈
+问题是：数据永远比预期增长得快。当单表数据量超过千万级，索引的效率会急剧下降；当突破亿级，连分页查询都会超时。
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    大表性能问题                                   │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │  单表数据量与性能影响：                                 │   │
-│  │                                                         │   │
-│  │  100 万行：性能良好，索引高效                          │   │
-│  │  500 万行：性能开始下降，索引仍有效                    │   │
-│  │  1000 万行：性能明显下降，索引维护成本增加             │   │
-│  │  5000 万行：性能严重下降，DDL 操作耗时增加             │   │
-│  │  1 亿行+：基本无法接受全表扫描                        │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │  具体问题表现：                                        │   │
-│  │                                                         │   │
-│  │  - 查询变慢（秒级甚至分钟级）                         │   │
-│  │  - 写入变慢（索引维护开销大）                         │   │
-│  │  - 备份恢复时间长                                     │   │
-│  │  - DDL 操作阻塞（ALTER TABLE 耗时）                   │   │
-│  │  - 磁盘空间消耗大                                     │   │
-│  │  - 数据库连接数可能耗尽                               │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
+大表优化不是一道选择题，而是必答题。今天我们从三个方向来拆解这个问题：分区表、分库分表、历史数据归档。
 
-### 大表诊断方法
+## 分区表：让大表变「小表」
+
+分区表是 MySQL 5.1 引入的特性，本质是把一张表物理上拆成多个「区」（Partition），但对应用层来说还是一张表。
 
 ```sql
--- 查看表大小
-SELECT
-    table_name,
-    table_rows,
-    data_length / 1024 / 1024 AS data_mb,
-    index_length / 1024 / 1024 AS index_mb,
-    (data_length + index_length) / 1024 / 1024 AS total_mb
-FROM information_schema.tables
-WHERE table_schema = 'your_database'
-ORDER BY (data_length + index_length) DESC;
-
--- 查看表的索引
-SHOW INDEX FROM large_table;
-
--- 查看慢查询
-SHOW FULL PROCESSLIST;
-SELECT * FROM performance_schema.events_statements_summary_by_digest
-ORDER BY SUM_TIMER_WAIT DESC LIMIT 10;
-```
-
-## 优化手段优先级
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    大表优化手段优先级                              │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │  优化优先级（从高到低）：                               │   │
-│  │                                                         │   │
-│  │  1. SQL 优化 ──────────────── 效果明显，成本低        │   │
-│  │     - 检查执行计划                                    │   │
-│  │     - 添加合适索引                                    │   │
-│  │     - 优化查询语句                                    │   │
-│  │                                                         │   │
-│  │  2. 表结构优化 ────────────── 效果明显，成本中        │   │
-│  │     - 分区表                                          │   │
-│  │     - 字段精简                                        │   │
-│  │     - 冷热数据分离                                    │   │
-│  │                                                         │   │
-│  │  3. 历史数据归档 ──────────── 效果明显，成本中        │   │
-│  │     - 归档冷数据                                      │   │
-│  │     - 减少主表数据量                                  │   │
-│  │                                                         │   │
-│  │  4. 分库分表 ──────────────── 效果最强，成本最高      │   │
-│  │     - 水平拆分                                        │   │
-│  │     - 分布式架构                                      │   │
-│  │                                                         │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-│  优先尝试前 3 种手段，分库分表是最后的解决方案！               │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-## 分区表
-
-### 什么是分区表？
-
-分区表是将一个表物理拆分成多个小表，但逻辑上仍然是一个表。
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    分区表原理                                    │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │  普通表：                                              │   │
-│  │  ┌─────────────────────────────────────────────────┐  │   │
-│  │  │               orders 表                           │  │   │
-│  │  │          1 亿条数据                              │  │   │
-│  │  └─────────────────────────────────────────────────┘  │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │  分区表：                                              │   │
-│  │  ┌─────────────────────────────────────────────────┐  │   │
-│  │  │              orders 表（逻辑）                    │  │   │
-│  │  │  ┌─────────┬─────────┬─────────┬─────────┐      │  │   │
-│  │  │  │p_202401 │p_202402│p_202403│p_202404│      │  │   │
-│  │  │  │1000万行 │1000万行 │1000万行 │1000万行 │      │  │   │
-│  │  │  └─────────┴─────────┴─────────┴─────────┘      │  │   │
-│  │  └─────────────────────────────────────────────────┘  │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-│  优点：查询只扫描需要的分区，减少 IO                           │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### 分区类型
-
-#### 1. 范围分区（Range）
-
-```sql
--- 按时间范围分区
+-- 按时间分区（最常见场景）
 CREATE TABLE orders (
-    order_id BIGINT PRIMARY KEY,
+    id BIGINT PRIMARY KEY,
+    order_no VARCHAR(64) NOT NULL,
     user_id BIGINT NOT NULL,
-    amount DECIMAL(10,2) NOT NULL,
-    created_at DATETIME NOT NULL,
+    amount DECIMAL(10,2),
+    status TINYINT,
+    create_time DATETIME,
     INDEX idx_user_id (user_id),
-    INDEX idx_created_at (created_at)
+    INDEX idx_create_time (create_time)
 )
-PARTITION BY RANGE (YEAR(created_at)) (
-    PARTITION p_2023 VALUES LESS THAN (2024),
-    PARTITION p_2024 VALUES LESS THAN (2025),
-    PARTITION p_2025 VALUES LESS THAN (2026),
-    PARTITION p_future VALUES LESS THAN MAXVALUE
-);
-
--- 按 ID 范围分区
-CREATE TABLE logs (
-    id BIGINT PRIMARY KEY,
-    content TEXT,
-    created_at DATETIME NOT NULL
-)
-PARTITION BY RANGE (id) (
-    PARTITION p0 VALUES LESS THAN (1000000),
-    PARTITION p1 VALUES LESS THAN (2000000),
-    PARTITION p2 VALUES LESS THAN (3000000),
-    PARTITION p3 VALUES LESS THAN MAXVALUE
+PARTITION BY RANGE (YEAR(create_time)) (
+    PARTITION p2022 VALUES LESS THAN (2023),
+    PARTITION p2023 VALUES LESS THAN (2024),
+    PARTITION p2024 VALUES LESS THAN (2025),
+    PARTITION p2025 VALUES LESS THAN (2026),
+    PARTITION pmax VALUES LESS THAN MAXVALUE
 );
 ```
 
-#### 2. 列表分区（List）
+### 分区表的工作原理
+
+查询 `2024` 年的订单：
 
 ```sql
--- 按地区分区
-CREATE TABLE customers (
-    customer_id BIGINT PRIMARY KEY,
-    name VARCHAR(50) NOT NULL,
-    region_id INT NOT NULL,
-    created_at DATETIME NOT NULL
+SELECT * FROM orders WHERE create_time BETWEEN '2024-01-01' AND '2024-12-31';
+```
+
+MySQL 只会扫描 `p2024` 这一个分区，而不是全表 5000 万行。这就是分区裁剪（Partition Pruning）。
+
+### 分区表的适用场景
+
+| 场景 | 说明 |
+|---|---|
+| 时间序列数据 | 订单、日志、访问记录，按时间分区最自然 |
+| 需要定期清理历史数据 | `ALTER TABLE orders TRUNCATE PARTITION p2022` 比 `DELETE` 快 100 倍 |
+| 大表需要在线DDL | `ALTER TABLE ... REORGANIZE PARTITION` 可以在不锁表的情况下调整分区 |
+
+### 分区表的坑
+
+分区表不是银弹，它有几个天然的局限：
+
+1. **主键必须包含分区列**。如果按 `create_time` 分区，主键必须包含 `create_time`，否则无法创建。
+
+```sql
+-- 错误：主键不包含分区列
+CREATE TABLE orders (
+    id BIGINT PRIMARY KEY,  -- 主键不包含 create_time
+    create_time DATETIME,
+    ...
 )
-PARTITION BY LIST (region_id) (
-    PARTITION p_north VALUES IN (1, 2, 3),
-    PARTITION p_south VALUES IN (4, 5, 6),
-    PARTITION p_east VALUES IN (7, 8, 9),
-    PARTITION p_west VALUES IN (10, 11, 12),
-    PARTITION p_other VALUES IN (NULL)
-);
-```
+PARTITION BY RANGE (YEAR(create_time)) ( ... );
 
-#### 3. 哈希分区（Hash）
-
-```sql
--- 按哈希分区（自动均匀分布）
-CREATE TABLE user_events (
-    event_id BIGINT PRIMARY KEY,
-    user_id BIGINT NOT NULL,
-    event_type VARCHAR(50) NOT NULL,
-    created_at DATETIME NOT NULL
+-- 正确：主键包含分区列
+CREATE TABLE orders (
+    id BIGINT NOT NULL,
+    create_time DATETIME,
+    PRIMARY KEY (id, create_time)  -- 主键包含 create_time
 )
-PARTITION BY HASH (user_id)
-PARTITIONS 16;
+PARTITION BY RANGE (YEAR(create_time)) ( ... );
 ```
 
-#### 4. 键值分区（Key）
+2. **分区列必须是表的一部分**，无法按任意列分区。
+3. **跨分区查询性能差**。如果查询不带分区条件，MySQL 要扫描所有分区。
+
+## 分库分表：横向扩展的艺术
+
+当分区表也无法承载时，就要考虑分库分表了。
+
+分库分表的核心思想是：**把数据分散到多个数据库实例或多张表中，每个实例/表只负责一部分数据**。
+
+### 分片策略
+
+#### 1. 按 ID 哈希分片
 
 ```sql
--- 按主键分区
-CREATE TABLE articles (
-    id BIGINT PRIMARY KEY,
-    title VARCHAR(200) NOT NULL,
-    content TEXT,
-    created_at DATETIME NOT NULL
-)
-PARTITION BY KEY(id)
-PARTITIONS 8;
+-- 按 user_id 哈希分表
+-- 假设分 4 张表：orders_0, orders_1, orders_2, orders_3
+-- 计算方式：user_id % 4
+
+function get_table_name(user_id):
+    return "orders_" + (user_id % 4)
 ```
 
-### 分区表的优势
+优点：数据分布均匀
+缺点：按时间查询困难，需要跨表聚合
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    分区表优势                                    │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │  1. 查询性能提升                                        │   │
-│  │     - 查询特定分区，避免全表扫描                        │   │
-│  │     - 减少 IO 操作                                     │   │
-│  │     - 典型场景：时间范围查询                          │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │  2. DDL 操作更快                                       │   │
-│  │     - 可单独操作某个分区                               │   │
-│  │     - ALTER TABLE 操作不会锁全表                      │   │
-│  │     - 可快速删除历史分区（DROP PARTITION）            │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │  3. 备份恢复更灵活                                     │   │
-│  │     - 可只备份特定分区                                │   │
-│  │     - 可只恢复特定分区                                │   │
-│  │     - 减少备份时间                                    │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │  4. 存储管理更灵活                                     │   │
-│  │     - 不同分区可放不同磁盘                            │   │
-│  │     - 历史分区可归档到慢存储                          │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### 分区表使用注意事项
+#### 2. 按时间分片
 
 ```sql
--- 查看分区信息
-SELECT
-    PARTITION_NAME,
-    TABLE_ROWS,
-    DATA_LENGTH / 1024 / 1024 AS data_mb
-FROM information_schema.partitions
-WHERE table_name = 'orders';
-
--- 查询特定分区（高效）
-SELECT * FROM orders PARTITION (p_2024)
-WHERE user_id = 1001;
-
--- 统计各分区数据量
-SELECT PARTITION_NAME, TABLE_ROWS
-FROM information_schema.partitions
-WHERE table_name = 'orders'
-ORDER BY PARTITION_NAME;
+-- 按月分表
+orders_202401
+orders_202402
+orders_202403
 ```
 
-## 历史数据归档
+优点：符合时间序数据访问模式（查近期多，查远期少）
+缺点：冷热数据分布不均
 
-### 归档策略
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    历史数据归档策略                               │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │  归档时机：                                            │   │
-│  │                                                         │   │
-│  │  - 定时归档：每天/每周/每月定时执行                    │   │
-│  │  - 阈值归档：数据量超过阈值时触发                     │   │
-│  │  - 实时归档：写入时判断，超过时间则写入归档表          │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │  归档字段选择：                                        │   │
-│  │                                                         │   │
-│  │  - 时间字段：created_at, updated_at                   │   │
-│  │  - 状态字段：status = '已完成'                       │   │
-│  │  - 复合条件：时间 + 状态                              │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### 归档实现方案
-
-#### 方案一：基于时间的归档
+#### 3. 按业务字段分片（推荐）
 
 ```sql
--- 创建归档表（与原表结构相同）
-CREATE TABLE orders_archive LIKE orders;
+-- 按租户分表（多租户 SaaS 场景）
+-- 同一个租户的数据在同一个分片，跨租户查询极少
 
--- 归档 1 年前的订单
-INSERT INTO orders_archive
-SELECT * FROM orders
-WHERE created_at < DATE_SUB(NOW(), INTERVAL 1 YEAR);
+orders_tenant_a
+orders_tenant_b
+```
 
--- 删除已归档的数据
-DELETE FROM orders
-WHERE created_at < DATE_SUB(NOW(), INTERVAL 1 YEAR);
+### 分库分表的实现方式
 
--- 添加归档任务调度（使用事件调度器）
+#### 方式一：应用层路由（简单场景）
+
+```java
+public class OrderDao {
+    // 根据 user_id 路由到不同的表
+    public Order findByUserId(Long userId, Long orderId) {
+        String tableName = "orders_" + (userId % 4);
+        String sql = "SELECT * FROM " + tableName + " WHERE id = ?";
+        return jdbcTemplate.queryForObject(sql, orderId);
+    }
+}
+```
+
+优点：简单直接，无额外依赖
+缺点：跨表查询困难，SQL 编写复杂
+
+#### 方式二：ShardingSphere（推荐）
+
+```yaml
+# application.yml
+spring:
+  datasource:
+    url: jdbc:mysql://localhost:3306/orders?useUnicode=true
+    driver-class-name: com.mysql.cj.jdbc.Driver
+
+shardingsphere:
+  rules:
+    sharding:
+      tables:
+        orders:
+          actual-data-nodes: ds_${0..1}.orders_${0..3}
+          table-strategy:
+            standard:
+              sharding-column: user_id
+              sharding-algorithm-name: orders_inline
+          key-generate-strategy:
+            column: id
+            key-generator-name: snowflake
+      sharding-algorithms:
+        orders_inline:
+          type: INLINE
+          props:
+            algorithm-expression: orders_${user_id % 4}
+```
+
+```java
+// 业务代码完全透明，不需要手动路由
+// ShardingSphere 自动处理分片
+public Order findById(Long orderId) {
+    return orderMapper.selectById(orderId);  // 自动路由到对应分片
+}
+```
+
+### 分库分表后的问题
+
+分库分表带来了新的复杂性：
+
+| 问题 | 解决方案 |
+|---|---|
+| 跨分片查询 | ES（Elasticsearch）做搜索层，MySQL 做主存储 |
+| 跨分片分页 | 禁止深分页，限制最多查前 N 条 |
+| 全局 ID 生成 | Snowflake、Leaf、ULID |
+| 数据迁移 | 双写 + 数据校验工具 |
+| 分布式事务 | Seata、TXC |
+
+## 历史数据归档：让热数据飞起来
+
+大表里 80% 的数据是从来不访问的「冷数据」，但它们占着空间、拖慢索引。
+
+归档策略：**把冷数据迁移到历史表或历史库，让热数据表保持轻盈**。
+
+### 方案一：定时归档到历史表
+
+```sql
+-- 创建历史表（按年分表）
+CREATE TABLE orders_history_2022 (...) PARTITION BY RANGE (YEAR(create_time)) ( ... );
+CREATE TABLE orders_history_2023 (...) PARTITION BY RANGE (YEAR(create_time)) ( ... );
+
+-- 归档存储过程：每天凌晨执行
 DELIMITER //
-CREATE EVENT evt_archive_orders
-ON SCHEDULE EVERY 1 DAY
-STARTS '2024-01-01 00:00:00'
-DO
+
+CREATE PROCEDURE archive_orders()
 BEGIN
-    -- 归档 1 年前数据到归档表
-    INSERT IGNORE INTO orders_archive
-    SELECT * FROM orders
-    WHERE created_at < DATE_SUB(NOW(), INTERVAL 1 YEAR);
-
-    -- 删除已归档数据
-    DELETE FROM orders
-    WHERE created_at < DATE_SUB(NOW(), INTERVAL 1 YEAR);
-END//
-DELIMITER ;
-```
-
-#### 方案二：批量归档（大数据量）
-
-```sql
--- 分批归档，避免锁表
-DELIMITER //
-CREATE PROCEDURE archive_orders(IN batch_size INT)
-BEGIN
+    DECLARE batch_size INT DEFAULT 1000;
     DECLARE done INT DEFAULT FALSE;
-    DECLARE v_max_id BIGINT;
-    DECLARE v_min_id BIGINT;
-    DECLARE v_cutoff_date DATETIME;
+    DECLARE start_date DATE;
+    DECLARE end_date DATE;
 
-    -- 设置归档截止日期（1年前）
-    SET v_cutoff_date = DATE_SUB(NOW(), INTERVAL 1 YEAR);
+    -- 归档一年前的数据
+    SET start_date = DATE_SUB(CURDATE(), INTERVAL 1 YEAR);
+    SET end_date = DATE_SUB(start_date, INTERVAL 1 YEAR);
 
-    -- 获取最小和最大 ID
-    SELECT MIN(id), MAX(id) INTO v_min_id, v_max_id
-    FROM orders
-    WHERE created_at < v_cutoff_date;
+    -- 分批迁移
+    INSERT IGNORE INTO orders_history_2023
+    SELECT * FROM orders
+    WHERE create_time >= start_date
+      AND create_time < end_date
+      AND status IN (3, 4, 5);  -- 只归档已完成的订单
 
-    -- 分批处理
-    WHILE v_min_id <= v_max_id DO
-        -- 归档当前批次
-        INSERT INTO orders_archive
-        SELECT * FROM orders
-        WHERE id >= v_min_id
-          AND id < v_min_id + batch_size
-          AND created_at < v_cutoff_date;
+    -- 删除已归档的数据
+    DELETE FROM orders
+    WHERE create_time >= start_date
+      AND create_time < end_date
+      AND status IN (3, 4, 5);
 
-        -- 删除已归档数据
-        DELETE FROM orders
-        WHERE id >= v_min_id
-          AND id < v_min_id + batch_size
-          AND created_at < v_cutoff_date;
+    -- 重建索引（归档后表数据量变化，统计信息可能不准）
+    ANALYZE TABLE orders;
+END //
 
-        -- 移动到下一批
-        SET v_min_id = v_min_id + batch_size;
-
-        -- 释放锁，允许其他操作
-        COMMIT;
-    END WHILE;
-END//
 DELIMITER ;
-
--- 调用存储过程，每次处理 1000 条
-CALL archive_orders(1000);
 ```
 
-#### 方案三：使用 pt-archiver（推荐）
-
-```bash
-#!/bin/bash
-# 使用 pt-archiver 归档历史数据
-
-pt-archiver \
-    --source h=localhost,u=root,p=password,D=your_db,t=orders \
-    --dest h=localhost,u=root,p=password,D=your_db,t=orders_archive \
-    --where "created_at < DATE_SUB(NOW(), INTERVAL 1 YEAR)" \
-    --limit 1000 \
-    --commit-every 1000 \
-    --progress 10000 \
-    --statistics \
-    --charset=utf8mb4
-```
-
-### 归档后的查询
+### 方案二：归档到 ClickHouse（分析场景）
 
 ```sql
--- 跨表查询（查询最近 2 年数据）
-(
-    SELECT * FROM orders
-    WHERE created_at >= DATE_SUB(NOW(), INTERVAL 1 YEAR)
-)
-UNION ALL
-(
-    SELECT * FROM orders_archive
-    WHERE created_at >= DATE_SUB(NOW(), INTERVAL 2 YEAR)
-      AND created_at < DATE_SUB(NOW(), INTERVAL 1 YEAR)
-)
-ORDER BY created_at DESC;
+-- MySQL 导出
+mysqldump -u root -p db_name orders_2022 > orders_2022.sql
 
--- 使用应用层封装
--- CREATE VIEW all_orders AS
--- SELECT * FROM orders
--- UNION ALL
--- SELECT * FROM orders_archive;
+-- ClickHouse 建表
+CREATE TABLE orders_2022 (
+    id Int64,
+    order_no String,
+    user_id Int64,
+    amount Decimal(10,2),
+    status Int8,
+    create_time DateTime
+) ENGINE = MergeTree()
+PARTITION BY toYYYYMM(create_time)
+ORDER BY (user_id, create_time);
 ```
 
-## 分库分表
+### 归档的执行时机
 
-### 分库分表时机
+| 时机 | 优点 | 缺点 |
+|---|---|---|
+| 定时任务（每天凌晨） | 避开业务高峰 | 可能影响备份窗口 |
+| 数据写入时异步归档 | 实时保持表轻盈 | 写入延迟增加 |
+| 手动触发 | 灵活可控 | 人工操作有风险 |
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    分库分表决策树                                 │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                                                         │   │
-│  │  单表数据量 < 1000 万？                                 │   │
-│  │       ↓ 是                                             │   │
-│  │  优化索引 + SQL 即可解决！                             │   │
-│  │                                                         │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                      ↓ 否                                      │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                                                         │   │
-│  │  单表数据量 1000 万 ~ 5000 万？                         │   │
-│  │       ↓ 是                                             │   │
-│  │  优先考虑分区表！                                      │   │
-│  │                                                         │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                      ↓ 否                                      │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                                                         │   │
-│  │  单表数据量 > 5000 万？                                 │   │
-│  │       ↓ 是                                             │   │
-│  │  考虑分库分表！                                        │   │
-│  │                                                         │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
+## 三种方案的对比与选择
 
-### 分库分表方案对比
+| 方案 | 数据量级 | 改造成本 | 适用场景 |
+|---|---|---|---|
+| 分区表 | `0 ~ 5000 万` | 低 | 单表太大，按时间访问的数据 |
+| 分库分表 | `5000 万 ~ 100 亿+` | 高 | 高并发，数据量持续增长 |
+| 历史数据归档 | 任意 | 中 | 冷数据占比高，分析场景 |
+
+### 选择建议
+
+- 数据量低于 5000 万，优先考虑分区表，改造成本最低
+- 数据量高于 5000 万，QPS 高于 1 万，考虑分库分表
+- 无论如何，先把历史数据归档做了，这是投入产出比最高的一步
+
+## 总结：大表优化的三层架构
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    分库分表方案对比                              │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │  方案            适用场景      复杂度    成本          │   │
-│  │  ──────────────────────────────────────────────────    │   │
-│  │  分区表          单表数据量大   低        低（单机）   │   │
-│  │  分库            多表总数据量大 中        中（多机）   │   │
-│  │  分表            单表数据量大   高        中（中间件） │   │
-│  │  分库分表        两者都大      最高      高（分布式） │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
+应用层
+    ↓
+MySQL 分区表（热数据）
+    ↓ 历史数据归档
+ClickHouse / Hive（温冷数据）
+    ↓ 归档
+对象存储 / 磁带库（冷数据）
 ```
 
-## 面试实战
-
-### 问题一：大表优化有哪些手段？
-
-**面试官问**：「大表优化有哪些方案？各自的优缺点？」
-
-**深入回答**：
-
-> **优化手段**：
->
-> 1. **SQL 优化**：检查执行计划，添加合适索引
-> 2. **表结构优化**：精简字段，冷热分离
-> 3. **分区表**：按时间/范围分区，减少查询范围
-> 4. **历史数据归档**：归档冷数据，减少主表数据量
-> 5. **分库分表**：水平拆分，分布式架构
->
-> **选择建议**：
-> - 优先尝试索引优化和分区表
-> - 分库分表是最后的选择
-
-### 问题二：分区表和分库分表的区别？
-
-**面试官问**：「分区表和分库分表有什么不同？分别适用什么场景？」
-
-**深入回答**：
-
-> **分区表**：
-> - 单实例内，逻辑一张表，物理多个分区
-> - 优点：实现简单，对应用透明
-> - 缺点：单服务器瓶颈
-> - 适用：单表数据量大，单机可以承受
->
-> **分库分表**：
-> - 物理多张表，多个数据库实例
-> - 优点：突破单机瓶颈
-> - 缺点：实现复杂，跨节点查询困难
-> - 适用：数据量极大，单机无法承受
-
-### 问题三：如何设计历史数据归档策略？
-
-**面试官问**：「如何设计历史数据归档？归档后如何查询？」
-
-**深入回答**：
-
-> **归档策略**：
->
-> 1. **确定归档条件**：时间（如 1 年前）+ 状态（如已完成）
-> 2. **选择归档时机**：定时任务或实时归档
-> 3. **批量操作**：分批归档，避免锁表
-> 4. **验证完整性**：归档后校验数据一致性
->
-> **归档后查询**：
-> - 应用层封装 UNION ALL 合并查询
-> - 或创建视图屏蔽底层细节
-
-## 总结
-
-大表优化需要循序渐进：
-
-- **第一步**：SQL 优化和索引优化
-- **第二步**：分区表（单表优化）
-- **第三步**：历史数据归档（减少数据量）
-- **第四步**：分库分表（最后手段）
-
-记住：不要过早优化，先用简单的手段解决问题。
+大表优化不是一蹴而就的，而是一个持续迭代的过程。先用分区表应急，再用归档腾空间，最后考虑分库分表。每一步都有明确的收益和代价。

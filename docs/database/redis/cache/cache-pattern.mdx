@@ -1,347 +1,330 @@
-import { Badge } from '@rspress/core/theme';
+# Cache Aside vs Read/Write Through vs Write Behind
 
-# 缓存模式：Cache Aside vs Read/Write Through vs Write Behind
+Redis 缓存有四种经典读写模式，但很多工程师分不清它们的区别，更不知道什么时候该用哪一种。
 
-上一讲讲了缓存一致性的问题，这一讲我们深入到缓存模式本身。
+今天我们把这四种模式从原理到实践彻底讲透。
 
-缓存模式决定了读写数据的流程，不同模式有不同的适用场景和权衡。
+## 四种模式全景图
 
-## 三种缓存模式概览
+```
+┌─────────────────────────────────────────────────────────┐
+│                      应用层                              │
+│                    (Application)                         │
+└───────────────────────┬─────────────────────────────────┘
+                        │
+         ┌──────────────┼──────────────┐
+         ▼              ▼              ▼
+┌─────────────┐  ┌─────────────┐  ┌─────────────┐
+│ Cache Aside │  │Read Through│  │Write Through│
+└─────────────┘  └─────────────┘  └─────────────┘
+         │              │              │
+         └──────────────┼──────────────┘
+                        ▼
+              ┌─────────────────┐
+              │   Read/Write    │
+              │    Through      │
+              └────────┬────────┘
+                       │
+                       ▼
+              ┌─────────────────┐
+              │    Database     │
+              └─────────────────┘
+```
 
-| 模式 | 读流程 | 写流程 | 一致性 | 性能 |
-| --- | --- | --- | --- | --- |
-| Cache Aside | 应用直连 DB | 应用直连 DB | 弱一致 | 中 |
-| Read Through | 应用连缓存，缓存查 DB | 应用连 DB | 弱一致 | 高 |
-| Write Through | 应用连缓存，缓存写 DB | 应用连缓存，缓存写 DB | 强一致 | 低 |
-| Write Behind | 应用连缓存，缓存异步写 DB | 应用连缓存，缓存异步写 DB | 最终一致 | 高 |
+## 模式一：Cache Aside（旁路缓存）
 
-## Cache Aside（旁路缓存）
+这是互联网公司最常用的模式，没有之一。
 
-### 原理
-
-应用同时操作缓存和数据库，但缓存是被动更新的。
+### 读写逻辑
 
 ```
 读：
-应用 -> 缓存（有？） -> 返回
-       缓存（无） -> 数据库 -> 缓存 -> 返回
+    应用 → 缓存 → 命中？→ 直接返回
+                ↓ 未命中
+           应用 → 数据库 → 获取数据
+                ↓
+           应用 → 缓存（写入）→ 返回
 
 写：
-应用 -> 数据库 -> 缓存（删除）
+    应用 → 数据库（更新）
+                ↓
+    应用 → 缓存（删除）
 ```
 
-### 实现
+### 代码实现
 
 ```java
-public class CacheAsideService {
-    
-    private StringRedisTemplate redisTemplate;
-    private JdbcTemplate jdbcTemplate;
-    
-    public String get(String key) {
+@Service
+public class ProductService {
+
+    @Autowired
+    private RedisTemplate<String, Product> redisTemplate;
+
+    @Autowired
+    private ProductMapper productMapper;
+
+    // 读操作
+    public Product getProduct(Long productId) {
+        String key = "product:" + productId;
+
         // 1. 查缓存
-        String value = redisTemplate.opsForValue().get(key);
-        if (value != null) {
-            return value;
+        Product product = redisTemplate.opsForValue().get(key);
+        if (product != null) {
+            return product;
         }
-        
+
         // 2. 缓存未命中，查数据库
-        value = jdbcTemplate.queryForObject(
-            "SELECT value FROM t_data WHERE key = ?",
-            new Object[]{key},
-            String.class
-        );
-        
-        // 3. 写入缓存
-        if (value != null) {
-            redisTemplate.opsForValue().set(key, value, 30, TimeUnit.MINUTES);
+        product = productMapper.selectById(productId);
+        if (product != null) {
+            // 3. 回填缓存（设置过期时间）
+            redisTemplate.opsForValue().set(key, product, 1, TimeUnit.HOURS);
         }
-        
-        return value;
+        return product;
     }
-    
-    public void update(String key, String value) {
+
+    // 写操作
+    public void updateProduct(Long productId, Product product) {
         // 1. 更新数据库
-        jdbcTemplate.update(
-            "UPDATE t_data SET value = ? WHERE key = ?",
-            value, key
-        );
-        
-        // 2. 删除缓存（不是更新）
-        redisTemplate.delete(key);
+        productMapper.updateById(product);
+
+        // 2. 删除缓存（不是更新！）
+        redisTemplate.delete("product:" + productId);
     }
 }
 ```
 
-### 优点
+### 适用场景
 
-1. **实现简单**：应用层逻辑清晰
-2. **通用性强**：任何缓存都适用
-3. **数据库可控**：写操作直接在数据库层
+| 适用 | 不适用 |
+|---|---|
+| 读多写少的数据 | 写非常频繁的数据 |
+| 对一致性要求不高的场景 | 需要强一致性的场景 |
+| 简单业务逻辑 | 复杂的关联查询 |
 
-### 缺点
+### 优缺点
 
-1. **数据一致性问题**：缓存删除失败时会导致不一致
-2. **缓存命中率低**：首次访问必然查数据库
+| 优点 | 缺点 |
+|---|---|
+| 实现简单 | 首次访问要查数据库（缓存穿透） |
+| 读性能高 | 更新和读取可能读到脏数据 |
+| 应用层完全可控 |  |
 
-## Read Through（读穿透）
+## 模式二：Read Through（读穿透）
 
-### 原理
+Cache Aside 是应用层「手动」写缓存，Read Through 则是把「读」的能力封装在缓存层。
 
-应用只操作缓存，缓存负责查询数据库。
+### 读写逻辑
 
 ```
 读：
-应用 -> 缓存（有？） -> 缓存查 DB -> 返回
-       缓存（无） -> 返回 null
+    应用 → 缓存 → 命中？→ 直接返回
+                ↓ 未命中
+           缓存层 → 数据库（自己加载）
+                ↓
+           缓存层 → 应用（返回数据，并自动回填）
 ```
 
-### 实现
+### 代码实现
 
 ```java
-public class ReadThroughService {
-    
-    private LoadingCache<String, String> cache;
-    
-    public ReadThroughService() {
-        cache = Caffeine.newBuilder()
-            .maximumSize(10000)
-            .expireAfterWrite(30, TimeUnit.MINUTES)
-            .build(this::loadFromDb);
+// 缓存层负责自动加载
+public class CachingProductService {
+
+    private LoadingCache<Long, Product> localCache;
+    private ProductMapper productMapper;
+
+    public CachingProductService() {
+        this.localCache = Caffeine.newBuilder()
+            .maximumSize(10_000)
+            .expireAfterWrite(60, TimeUnit.SECONDS)
+            .build(key -> {
+                // 这个 lambda 就是「读穿透」的核心
+                // 缓存未命中时，框架自动调用这个方法加载数据
+                return productMapper.selectById(key);
+            });
     }
-    
-    public String get(String key) {
-        return cache.get(key);  // 缓存自动从 DB 加载
-    }
-    
-    private String loadFromDb(String key) {
-        return jdbcTemplate.queryForObject(
-            "SELECT value FROM t_data WHERE key = ?",
-            new Object[]{key},
-            String.class
-        );
+
+    public Product getProduct(Long productId) {
+        // 应用层只需要调用 get，缓存层自动处理加载逻辑
+        return localCache.get(productId);
     }
 }
 ```
 
-### 优点
+### 适用场景
 
-1. **代码简洁**：应用只关心缓存
-2. **自动加载**：缓存负责数据加载
-3. **防止击穿**：多个并发请求只查一次数据库
+- 热点数据访问
+- 需要统一缓存加载逻辑
+- 对缓存一致性有一定要求的场景
 
-### 缺点
+## 模式三：Write Through（写穿透）
 
-1. **实现复杂**：需要缓存框架支持
-2. **数据库压力大**：缓存过期瞬间大量请求打到数据库
+Write Through 保证缓存和数据库的强一致性：写操作要么同时成功，要么同时失败。
 
-## Write Through（写穿透）
-
-### 原理
-
-应用只操作缓存，缓存负责同步写入数据库。
+### 读写逻辑
 
 ```
 写：
-应用 -> 缓存 -> 缓存同步写 DB -> 返回
+    应用 → 缓存 → 数据库（原子性更新）
+                ↓
+           返回成功
+
+读：
+    缓存命中 → 直接返回
+    缓存未命中 → 缓存 → 数据库加载 → 缓存 → 返回
 ```
 
-### 实现
+### 代码实现
 
 ```java
 public class WriteThroughService {
-    
-    private LoadingCache<String, String> cache;
-    private StringRedisTemplate redisTemplate;
-    private JdbcTemplate jdbcTemplate;
-    
-    public void update(String key, String value) {
-        // 1. 写数据库
-        jdbcTemplate.update(
-            "UPDATE t_data SET value = ? WHERE key = ?",
-            value, key
-        );
-        
-        // 2. 更新缓存
-        redisTemplate.opsForValue().set(key, value, 30, TimeUnit.MINUTES);
+
+    @Autowired
+    private ProductMapper productMapper;
+
+    // 需要一个同时支持缓存和数据库的存储层
+    @Autowired
+    private CacheStore<Product> cacheStore;
+
+    public void updateProduct(Long productId, Product product) {
+        // 写入时，同时更新缓存和数据库
+        TransactionTemplate.execute(() -> {
+            // 1. 更新数据库
+            productMapper.updateById(product);
+
+            // 2. 同步更新缓存
+            cacheStore.put(productId, product);
+            return null;
+        });
     }
 }
 ```
 
-### 优点
+### 适用场景
 
-1. **强一致性**：缓存和数据库同步更新
-2. **数据可靠**：写操作确保写入数据库
+| 适用 | 不适用 |
+|---|---|
+| 需要强一致性的数据 | 高并发写入场景 |
+| 金融、订单等核心业务 | 性能要求高的场景 |
 
-### 缺点
+### 优缺点
 
-1. **写性能差**：每次写都要同步数据库
-2. **数据库压力大**：写操作都必须落库
+| 优点 | 缺点 |
+|---|---|
+| 强一致性 | 写入延迟高 |
+| 数据不会丢失 | 实现复杂 |
+| 事务可保证原子性 |  |
 
-## Write Behind（写回/异步写入）
+## 模式四：Write Behind（异步写）
 
-### 原理
+Write Behind 的核心思想是：**先把数据写缓存，然后异步批量同步到数据库**。
 
-写操作直接更新缓存，异步批量同步到数据库。
+### 读写逻辑
 
 ```
 写：
-应用 -> 缓存 -> 返回（异步） -> 批量写 DB
+    应用 → 缓存（立即返回）
+                ↓
+           异步队列 → 数据库（批量写入）
+
+读：
+    缓存命中 → 直接返回
+    缓存未命中 → 缓存 → 数据库加载 → 缓存 → 返回
 ```
 
-### 实现
+### 代码实现
 
 ```java
+@Service
 public class WriteBehindService {
-    
-    private StringRedisTemplate redisTemplate;
-    private BlockingQueue<WriteRequest> queue;
-    
-    public void update(String key, String value) {
-        // 1. 直接写缓存
-        redisTemplate.opsForValue().set(key, value);
-        
-        // 2. 加入写队列
-        queue.offer(new WriteRequest(key, value));
+
+    private BlockingQueue<ProductUpdate> updateQueue;
+
+    @PostConstruct
+    public void init() {
+        // 启动异步写入线程
+        new Thread(this::asyncWriter).start();
     }
-    
-    @Scheduled(fixedDelay = 100)
-    public void flushToDb() {
-        List<WriteRequest> batch = new ArrayList<>();
-        queue.drainTo(batch, 1000);
-        
-        if (batch.isEmpty()) {
-            return;
+
+    // 写操作：写入缓存 + 放入队列
+    public void updateProduct(Long productId, Product product) {
+        // 1. 先更新缓存（立即返回）
+        redisTemplate.opsForValue().set("product:" + productId, product);
+
+        // 2. 放入异步队列
+        updateQueue.offer(new ProductUpdate(productId, product));
+    }
+
+    // 异步写入数据库
+    private void asyncWriter() {
+        List<ProductUpdate> batch = new ArrayList<>();
+
+        while (true) {
+            ProductUpdate update = updateQueue.poll(100, TimeUnit.MILLISECONDS);
+            if (update != null) {
+                batch.add(update);
+            }
+
+            // 批量写入：当队列攒够 100 条或超过 1 秒
+            if (batch.size() >= 100 ||
+                (!batch.isEmpty() && System.currentTimeMillis() - startTime > 1000)) {
+                productMapper.batchUpdate(batch);
+                batch.clear();
+                startTime = System.currentTimeMillis();
+            }
         }
-        
-        // 批量写入数据库
-        jdbcTemplate.batchUpdate(
-            "UPDATE t_data SET value = ? WHERE key = ?",
-            batch.stream()
-                .map(r -> new Object[]{r.value, r.key})
-                .toArray()
-        );
     }
 }
 ```
 
-### 优点
+### 适用场景
 
-1. **写性能高**：写操作立即返回
-2. **减少数据库压力**：批量写入
+| 适用 | 不适用 |
+|---|---|
+| 日志、统计类数据 | 需要立即读取的数据 |
+| 高并发写入 | 对一致性要求高的数据 |
 
-### 缺点
+### 优缺点
 
-1. **数据可能丢失**：缓存中的数据未落库前宕机会丢失
-2. **一致性差**：依赖异步任务的可靠性
+| 优点 | 缺点 |
+|---|---|
+| 写入性能极高 | 数据可能丢失（缓存挂了） |
+| 批量写入减少数据库压力 | 实现复杂 |
+| 削峰填谷 |  |
 
-## 模式对比
+## 四种模式对比
 
-| 模式 | 一致性 | 吞吐量 | 延迟 | 数据可靠性 |
-| --- | --- | --- | --- | --- |
-| Cache Aside | 弱一致 | 高 | 低 | 依赖 DB |
-| Read Through | 弱一致 | 高 | 低 | 依赖 DB |
-| Write Through | 强一致 | 低 | 高 | 高 |
-| Write Behind | 最终一致 | 最高 | 最低 | 低 |
+| 模式 | 一致性 | 性能 | 实现复杂度 | 适用场景 |
+|---|---|---|---|---|
+| Cache Aside | 最终一致 | 高 | 低 | 读多写少 |
+| Read Through | 最终一致 | 高 | 中 | 热点数据 |
+| Write Through | 强一致 | 中 | 中 | 核心业务 |
+| Write Behind | 弱一致 | 极高 | 高 | 日志/统计 |
 
-## 场景选择
+## 选择指南
 
-### Cache Aside：适合大多数场景
-
-```java
-// 典型应用：商品详情页
-public Product getProduct(Long productId) {
-    // 查缓存
-    Product product = getFromCache(productId);
-    if (product != null) {
-        return product;
-    }
-    
-    // 查数据库
-    product = productDao.selectById(productId);
-    
-    // 写缓存
-    putToCache(productId, product);
-    
-    return product;
-}
 ```
-
-### Write Through：适合写性能要求不高的场景
-
-```java
-// 典型应用：配置中心
-public void updateConfig(String key, String value) {
-    // 缓存和数据库同步更新
-    configCache.put(key, value);
-    configDao.update(key, value);
-}
+读多写少？
+    │
+    ├── 是 → Cache Aside / Read Through
+    │          │
+    │          ├── 简单场景 → Cache Aside
+    │          └── 热点数据 → Read Through
+    │
+    └── 否 → 写多读少？
+                 │
+                 ├── 是 → Write Behind
+                 │
+                 └── 需要强一致 → Write Through / Cache Aside + 延迟双删
 ```
-
-### Write Behind：适合写吞吐量高的场景
-
-```java
-// 典型应用：行为日志
-public void recordBehavior(String userId, String action) {
-    // 直接写缓存
-    behaviorCache.put(userId + ":" + action, System.currentTimeMillis());
-    
-    // 异步批量写数据库
-    // ...
-}
-```
-
-## 组合使用
-
-### Read Through + Write Behind
-
-```java
-public class HybridService {
-    
-    private LoadingCache<String, Object> cache;
-    private WriteBehindQueue writeQueue;
-    
-    public Object get(String key) {
-        return cache.get(key);  // Read Through
-    }
-    
-    public void update(String key, Object value) {
-        cache.put(key, value);  // 写入缓存
-        writeQueue.add(key, value);  // 异步写 DB
-    }
-}
-```
-
-### Cache Aside + 延迟双删
-
-```java
-public void update(String key, String value) {
-    // 1. 删除缓存
-    redisTemplate.delete(key);
-    
-    // 2. 写数据库
-    jdbcTemplate.update("UPDATE t_data SET value = ?", value);
-    
-    // 3. 延迟再删缓存
-    delay(() -> redisTemplate.delete(key), 500, TimeUnit.MILLISECONDS);
-}
-```
-
-## 面试追问方向
-
-- 三种缓存模式的区别是什么？
-- Cache Aside 和 Read Through 各适合什么场景？
-- Write Behind 有什么风险？
-- 如何选择缓存模式？
-- 组合使用的场景有哪些？
 
 ## 总结
 
-缓存模式的选择取决于业务需求：
+四种模式没有绝对的优劣，只有场景的匹配度：
 
-1. **Cache Aside**：通用方案，适合大多数场景
-2. **Read Through**：读多写少，代码简洁
-3. **Write Through**：写一致性要求高
-4. **Write Behind**：写吞吐量大，数据可靠性要求低
+- **Cache Aside**：互联网标配，简单实用
+- **Read Through**：封装缓存加载逻辑，适合热点场景
+- **Write Through**：强一致性的代价是性能
+- **Write Behind**：追求极致写入性能，但牺牲一定的可靠性
 
-记住：**没有银弹，只有根据业务特点选择合适的模式**。
+理解它们的本质区别，才能在具体业务场景中做出正确的技术选型。

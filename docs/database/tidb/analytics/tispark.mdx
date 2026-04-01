@@ -1,368 +1,395 @@
-# TiSpark
+# TiSpark 与 Spark on TiDB：HTAP 分析引擎深度解析
 
-TiSpark 是 TiDB 的 Spark 连接器，允许使用 Spark 执行复杂的数据分析和机器学习任务。
+当业务团队问你：「能不能跑个大查询分析一下这两个月的订单数据？」
 
-## TiSpark 概述
+你看了眼数据库，是 TiDB，几百 GB 的数据。直接跑？不堵死 OLTP 业务才怪。导出数据到 Hive 再分析？太慢，数据都凉了。
 
-### 什么是 TiSpark
+**TiSpark** 给出了答案：让 Spark 直接在 TiKV 上跑 SQL，把 OLAP 查询对 OLTP 业务的干扰降到最低。
 
-TiSpark 将 Spark 与 TiDB/TiKV 集成，提供了 Spark SQL 和 MLlib 的能力。
+## 为什么需要 TiSpark
+
+### 痛点分析
+
+传统架构中，分析型查询和事务型查询往往混在一起：
 
 ```
-TiSpark 架构：
-
-┌─────────────────────────────────────────────────────┐
-│                       Spark 生态                       │
-│                                                       │
-│   ┌──────────┐ ┌──────────┐ ┌──────────┐          │
-│   │ Spark SQL │ │ MLlib    │ │ GraphX   │          │
-│   └────┬─────┘ └────┬─────┘ └────┬─────┘          │
-│        └─────────────┴─────────────┘                │
-│                      │                               │
-│        ┌─────────────┴─────────────┐                │
-│        ▼                           ▼                │
-│   ┌─────────────────────────────────────────────┐  │
-│   │            TiSpark                              │  │
-│   │  - Spark SQL 与 TiDB 集成                        │  │
-│   │  - DataFrame 支持                              │  │
-│   │  - R斯卡尔 MLlib 集成                           │  │
-│   └─────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────┘
-                      │
-                      ▼
-┌─────────────────────────────────────────────────────┐
-│                    TiDB / TiKV                       │
-│                                                       │
-│   ┌─────────────┐           ┌─────────────┐       │
-│   │    TiKV      │           │   TiFlash   │       │
-│   │  (行存储)    │           │   (列存储)   │       │
-│   └─────────────┘           └─────────────┘       │
-└─────────────────────────────────────────────────────┘
+应用请求 ──┬──▶ TiDB (OLTP) ──▶ 业务响应慢
+          │
+          └──▶ Hadoop/Spark (OLAP) ──▶ ETL 延迟高，实时性差
 ```
 
-## 安装配置
+问题：
+- OLAP 查询拖慢 OLTP 业务
+- 数据同步到 Hadoop 有延迟
+- 两套系统维护成本高
 
-### Spark 配置
+### TiSpark 的解决思路
+
+```
+应用请求 ──┬──▶ TiDB (OLTP) ──▶ 业务响应快
+          │
+          └──▶ TiSpark ──▶ 直接读取 TiKV ──▶ 实时分析
+                    │
+                    └──▶ TiFlash ──▶ 列式存储优化
+```
+
+TiSpark 让 Spark 可以直接读取 TiKV/TiFlash 中的数据，不需要额外的数据同步。
+
+## TiSpark 架构解析
+
+### 架构图
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        TiSpark 架构                                  │
+│                                                                     │
+│  ┌─────────────┐                                                     │
+│  │  Spark App  │                                                     │
+│  │  (SQL Job)  │                                                     │
+│  └──────┬──────┘                                                     │
+│         │                                                           │
+│  ┌──────▼──────┐                                                     │
+│  │ Spark SQL   │                                                     │
+│  │  Optimizer  │                                                     │
+│  └──────┬──────┘                                                     │
+│         │                                                           │
+│  ┌──────▼──────┐     ┌──────────────┐                               │
+│  │ TiKV/Filsh  │◀───│   Coprocessor  │                               │
+│  │   Reader    │     │   (下推计算)   │                               │
+│  └──────┬──────┘     └──────────────┘                               │
+│         │                                                           │
+│  ┌──────▼──────┐     ┌──────────────┐     ┌──────────────┐          │
+│  │   TiKV Rst  │◀───│    PD        │───▶│    TiKV       │          │
+│  │   Reader     │     │ (Region路由) │     │   Cluster     │          │
+│  └─────────────┘     └──────────────┘     └──────────────┘          │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 核心组件
+
+| 组件 | 说明 |
+|---|---|
+| Spark SQL Optimizer | 解析 SQL，生成执行计划 |
+| TiKV Reader | 从 TiKV 读取行式数据 |
+| TiFlash Reader | 从 TiFlash 读取列式数据 |
+| Coprocessor | 下推过滤、聚合计算到存储层 |
+| PD Client | 获取 Region 路由信息 |
+
+### 工作原理
 
 ```scala
-// spark-defaults.conf
+// TiSpark 执行流程
+val df = spark.sql("""
+    SELECT date_trunc('month', created_at) as month,
+           SUM(amount) as total_amount,
+           COUNT(*) as order_count
+    FROM orders
+    WHERE created_at >= '2024-01-01'
+    GROUP BY 1
+""")
 
-// TiSpark 配置
-spark.tispark.pd.addresses "192.168.1.1:2379,192.168.1.2:2379,192.168.1.3:2379"
-
-// Spark 配置
-spark.sql.adaptive.enabled true
-spark.sql.adaptive.coalescePartitions.enabled true
-
-// 资源分配
-spark.executor.instances 4
-spark.executor.memory 8g
-spark.executor.cores 4
+// 1. Spark SQL 解析 SQL
+// 2. TiSpark 获取 Region 信息（从 PD）
+// 3. 生成并行执行计划（按 Region 分片）
+// 4. Coprocessor 下推过滤和聚合
+// 5. 汇总结果返回 Spark
+df.show()
 ```
 
-### 依赖配置
+## TiSpark 部署配置
 
-```scala
-// build.sbt 或 pom.xml
+### 部署方式
 
-// Maven 依赖
-libraryDependencies ++= Seq(
-  "org.apache.spark" %% "spark-sql" % "3.3.0",
-  "com.pingcap.tispark" %% "tispark-core" % "3.0.0"
-)
+TiSpark 可以通过两种方式部署：
+
+**方式一：通过 TiUP 部署（推荐）**
+
+```bash
+# 部署 TiSpark
+tiup cluster scale-out tidb-test -tispark.yml
+
+# tispark.yml
+tispark_masters:
+  - host: 192.168.1.10
+    port: 7077
+
+tispark_workers:
+  - host: 192.168.1.11
+    port: 8080
+  - host: 192.168.1.12
+    port: 8080
 ```
 
-## 基本使用
+**方式二：在现有 Spark 集群添加 TiSpark JAR**
 
-### Spark SQL
+```bash
+# 1. 下载 TiSpark JAR
+wget https://github.com/pingcap/tispark/releases/download/v3.1.0/tispark-assembly-3.1_2.12-3.1.0.jar
+
+# 2. 放入 Spark jars 目录
+cp tispark-assembly-3.1_2.12-3.1.0.jar $SPARK_HOME/jars/
+
+# 3. 配置 spark-defaults.conf
+cat >> $SPARK_HOME/conf/spark-defaults.conf << EOF
+spark.tispark.pd.addresses 192.168.1.10:2379
+spark.sql.extensions org.apache.spark.sql.TiExtensions
+EOF
+```
+
+### Spark 配置参数
+
+```bash
+# spark-defaults.conf
+spark.tispark.pd.addresses 192.168.1.10:2379
+spark.sql.extensions org.apache.spark.sql.TiExtensions
+
+# TiDB 连接配置
+spark.tispark.tidb.addr 192.168.1.10
+spark.tispark.tidb.port 4000
+spark.tispark.tidb.user root
+spark.tispark.tidb.password your-password
+
+# 并行度配置
+spark.sql.shuffle.partitions 200
+spark.default.parallelism 200
+
+# 内存配置
+spark.executor.memory 4g
+spark.executor.cores 2
+```
+
+## TiSpark SQL 使用
+
+### 基本查询
 
 ```scala
-import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.TiSpark
 
+// 方式一：直接使用 SparkSession
 val spark = SparkSession.builder()
-  .appName("TiSpark Demo")
-  .config("spark.tispark.pd.addresses", "192.168.1.1:2379")
-  .config("spark.sql.extensions", "org.apache.spark.sql.extensions.TiExtensions")
+  .config("spark.tispark.pd.addresses", "192.168.1.10:2379")
   .getOrCreate()
 
-// 读取 TiDB 表
-val orders = spark.sql("SELECT * FROM orders WHERE created_at >= '2024-01-01'")
+// 查询 TiDB 表
+val df = spark.sql("SELECT * FROM orders WHERE status = 'completed'")
+df.show()
 
-// 查看 Schema
-orders.printSchema()
-
-// 执行聚合
-val result = orders
-  .groupBy("customer_id")
-  .agg(
-    count("*").as("order_count"),
-    sum("amount").as("total_amount")
-  )
-
-// 显示结果
+// 聚合查询
+val result = spark.sql("""
+    SELECT customer_id,
+           COUNT(*) as order_count,
+           SUM(amount) as total_amount
+    FROM orders
+    GROUP BY customer_id
+    HAVING COUNT(*) > 10
+""")
 result.show()
 
-// 保存结果
-result.write
-  .format("tidb")
-  .option("tidb.addr", "192.168.1.1")
-  .option("tidb.port", "4000")
-  .option("tidb.user", "root")
-  .option("tidb.password", "password")
-  .option("database", "analytics")
-  .option("table", "customer_summary")
-  .mode("overwrite")
-  .save()
-```
-
-### DataFrame API
-
-```scala
-import org.apache.spark.sql.functions._
-
-// 读取表
-val orders = spark.read
-  .format("tidb")
-  .option("tidb.addr", "192.168.1.1")
-  .option("tidb.port", "4000")
-  .option("database", "shop")
-  .option("table", "orders")
-  .load()
-
-// DataFrame 转换
-val customerStats = orders
-  .filter(col("created_at") >= lit("2024-01-01"))
-  .groupBy("customer_id")
-  .agg(
-    count("*").as("order_count"),
-    sum("amount").as("total_amount"),
-    avg("amount").as("avg_amount"),
-    min("created_at").as("first_order"),
-    max("created_at").as("last_order")
-  )
-
-// 添加派生字段
-val withRetention = customerStats
-  .withColumn("days_active", datediff(lit("2024-12-31"), col("first_order")))
-  .withColumn("order_frequency", col("order_count") / col("days_active") * 30)
-
-// 保存到 TiDB
-withRetention.write
-  .mode("overwrite")
-  .saveAsTable("customer_analysis")
-```
-
-## 复杂分析
-
-### 多表关联
-
-```scala
-// 关联分析
+// TiSpark 自动选择 TiFlash 执行
 val analysis = spark.sql("""
-  SELECT
-    o.customer_id,
-    c.customer_name,
-    COUNT(DISTINCT o.id) as order_count,
-    SUM(o.amount) as total_amount,
-    SUM(oi.quantity) as total_items,
-    COUNT(DISTINCT p.category_id) as category_count
-  FROM orders o
-  JOIN customers c ON o.customer_id = c.id
-  JOIN order_items oi ON o.id = oi.order_id
-  JOIN products p ON oi.product_id = p.id
-  WHERE o.created_at >= '2024-01-01'
-  GROUP BY o.customer_id, c.customer_name
+    EXPLAIN SELECT * FROM orders
 """)
-
-// 进一步分析
-val topCustomers = analysis
-  .filter(col("order_count") > 10)
-  .orderBy(col("total_amount").desc)
-
-topCustomers.show()
+analysis.show()
 ```
 
-### 窗口函数
+### 数据写入
 
 ```scala
-// 使用窗口函数
-val withRank = spark.sql("""
-  SELECT
-    customer_id,
-    order_month,
-    order_count,
-    total_amount,
-    RANK() OVER (PARTITION BY order_month ORDER BY total_amount DESC) as monthly_rank,
-    SUM(total_amount) OVER (
-      PARTITION BY customer_id
-      ORDER BY order_month
-      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-    ) as cumulative_amount
-  FROM monthly_stats
-""")
+// 写入数据到 TiDB
+val data = Seq(
+  ("ORD1001", "user1", 299.00),
+  ("ORD1002", "user2", 599.00)
+).toDF("order_id", "user_id", "amount")
 
-withRank.show()
-```
-
-### 用户行为分析
-
-```scala
-import spark.implicits._
-
-// 用户行为序列分析
-val userEvents = spark.read
+// 写入模式
+data.write
   .format("tidb")
-  .option("table", "user_events")
-  .load()
+  .option("database", "app_db")
+  .option("table", "orders_new")
+  .mode("overwrite")  // overwrite, append, ignore, errorifexists
+  .save()
 
-// 计算用户路径
-val userPaths = userEvents
-  .groupBy("user_id")
-  .agg(collect_list(col("event")).as("event_sequence"))
-  .withColumn("path", concat_ws(" -> ", col("event_sequence")))
-
-// 统计路径分布
-val pathStats = userPaths
-  .groupBy("path")
-  .agg(count("*").as("user_count"))
-  .orderBy(col("user_count").desc)
-
-pathStats.show(20)
+// 使用 Spark SQL 写入
+spark.sql("""
+    INSERT INTO app_db.orders_new
+    VALUES ('ORD1001', 'user1', 299.00)
+""")
 ```
 
-## 机器学习
-
-### MLlib 集成
+### 与 Hive 集成
 
 ```scala
-import org.apache.spark.ml.clustering.KMeans
-import org.apache.spark.ml.feature.VectorAssembler
+// 读取 Hive 表，关联 TiDB 表
+val hiveTable = spark.sql("SELECT * FROM hive_db.user_profile")
+val tidbTable = spark.sql("SELECT * FROM app_db.orders")
 
-// 用户聚类分析
-val customerFeatures = spark.sql("""
-  SELECT
-    customer_id,
-    order_count,
-    total_amount,
-    avg_amount,
-    category_diversity,
-    days_since_first_order,
-    days_since_last_order
-  FROM customer_features
-""")
-
-// 特征向量化
-val assembler = new VectorAssembler()
-  .setInputCols(Array("order_count", "total_amount", "avg_amount",
-                      "category_diversity", "days_since_first_order", "days_since_last_order"))
-  .setOutputCol("features")
-
-val featureData = assembler.transform(customerFeatures)
-
-// K-Means 聚类
-val kmeans = new KMeans()
-  .setK(5)
-  .setSeed(42)
-  .setFeaturesCol("features")
-  .setPredictionCol("cluster")
-
-val model = kmeans.fit(featureData)
-
-// 保存模型结果
-val predictions = model.transform(featureData)
-predictions.select("customer_id", "cluster").write
+// 关联查询
+val joined = hiveTable.join(tidbTable, "user_id")
+joined.write
   .format("tidb")
-  .option("table", "customer_clusters")
+  .option("database", "app_db")
+  .option("table", "user_orders")
+  .mode("overwrite")
   .save()
 ```
 
-### 协同过滤
+## TiSpark 性能优化
+
+### 1. 开启 TiFlash 加速
 
 ```scala
-import org.apache.spark.ml.recommendation.ALS
+// 确保表有 TiFlash 副本
+// 方式一：SQL 创建副本
+spark.sql("ALTER TABLE orders SET TIFLASH REPLICA 1")
 
-// 商品推荐
-val ratings = spark.sql("""
-  SELECT
-    customer_id,
-    product_id,
-    rating
-  FROM user_product_ratings
+// 方式二：TiDB Dashboard 创建副本
+
+// TiSpark 自动识别 TiFlash 并路由查询
+val result = spark.sql("""
+    SELECT date, SUM(amount)
+    FROM orders
+    GROUP BY date
+""")
+// 执行计划会显示 TiFlash 扫描
+result.explain()
+```
+
+### 2. 下推优化
+
+```scala
+// 开启谓词下推（默认开启）
+spark.conf.set("spark.tispark.plan.source.enabled", "true")
+
+// 开启聚合下推
+spark.conf.set("spark.tispark.agg_pushdown.enabled", "true")
+
+// 关闭下推（调试用）
+spark.conf.set("spark.tispark.plan.source.enabled", "false")
+```
+
+### 3. 并行度调整
+
+```scala
+// 根据数据量调整分区数
+val result = spark.sql("SELECT * FROM large_table")
+
+// 方法一：repartition（增加并行度）
+val repartitioned = result.repartition(400)
+repartitioned.write.format("tidb").save()
+
+// 方法二：coalesce（减少并行度）
+val coalesced = result.coalesce(50)
+
+// 方法三：TiSpark 读取时的分区控制
+spark.conf.set("spark.tispark.table.scan分段", 100)
+```
+
+### 4. 索引利用
+
+```scala
+// TiSpark 支持利用 TiDB 索引
+// 确保查询字段上有索引
+
+// 查看执行计划
+spark.sql("EXPLAIN SELECT * FROM orders WHERE order_id = 'ORD001'").show()
+
+// 输出示例
+// TiKV Scan on orders (index: order_id_pk)
+//   Range: [ORD001, ORD001]
+//   Rows: 1
+```
+
+## 适用场景分析
+
+### 适合 TiSpark 的场景
+
+| 场景 | 说明 | 优势 |
+|---|---|---|
+| 实时报表 | 分钟级延迟的 OLAP 查询 | 不影响 OLTP 业务 |
+| 历史数据分析 | 大范围时间跨度的聚合 | Spark 分布式计算能力 |
+| 数据挖掘 | 复杂 ML 算法 | Spark MLlib 集成 |
+| ETL 清洗 | 数据转换和清洗 | 与 Hive/Parquet 互操作 |
+
+### TiSpark vs TiDB SQL 查询
+
+| 对比项 | TiSpark | TiDB SQL |
+|---|---|---|
+| 查询延迟 | 秒级到分钟级 | 毫秒级到秒级 |
+| 数据量 | TB 级 | GB 级 |
+| 资源消耗 | Spark 集群 | TiDB Server |
+| 适用场景 | 复杂分析 | 简单聚合 |
+| 开发方式 | Scala/Python | SQL |
+
+### 不适合 TiSpark 的场景
+
+- 简单点查（直接用 TiDB SQL）
+- 实时性要求极高的查询（毫秒级）
+- 小数据量查询（TiDB SQL 更高效）
+
+## 实战案例
+
+### 案例：用户行为分析
+
+```scala
+// 需求：分析用户购买行为，生成用户画像
+import spark.sql_
+
+// 1. 用户购买频次分析
+val userFrequency = spark.sql("""
+    SELECT user_id,
+           COUNT(*) as purchase_count,
+           SUM(amount) as total_spent,
+           AVG(amount) as avg_order_value
+    FROM orders
+    WHERE status = 'completed'
+    GROUP BY user_id
 """)
 
-// 训练推荐模型
-val als = new ALS()
-  .setMaxIter(10)
-  .setRegParam(0.01)
-  .setUserCol("customer_id")
-  .setItemCol("product_id")
-  .setRatingCol("rating")
+// 2. 用户活跃时间段分析
+val userActiveHours = spark.sql("""
+    SELECT user_id,
+           HOUR(created_at) as active_hour,
+           COUNT(*) as order_count
+    FROM orders
+    GROUP BY user_id, HOUR(created_at)
+""")
 
-val model = als.fit(ratings)
+// 3. 用户分类（RFM 模型）
+val rfmAnalysis = spark.sql("""
+    WITH user_stats AS (
+        SELECT user_id,
+               MAX(created_at) as last_purchase,
+               DATEDIFF(CURRENT_DATE, MAX(created_at)) as recency,
+               COUNT(*) as frequency,
+               SUM(amount) as monetary
+        FROM orders
+        GROUP BY user_id
+    )
+    SELECT user_id,
+           CASE
+               WHEN recency <= 7 THEN '高价值'
+               WHEN recency <= 30 THEN '潜力'
+               ELSE '流失风险'
+           END as user_level
+    FROM user_stats
+""")
 
-// 生成推荐
-val userRecs = model.recommendForAllUsers(10)
-userRecs.write
+// 4. 写入结果到 TiDB
+rfmAnalysis.write
   .format("tidb")
-  .option("table", "product_recommendations")
+  .option("database", "app_db")
+  .option("table", "user_segments")
+  .mode("overwrite")
   .save()
-```
-
-## 性能优化
-
-### Spark 优化
-
-```scala
-// 1. 数据本地性
-spark.conf.set("spark.speculation", "true")
-spark.conf.set("spark.locality.wait", "3s")
-
-// 2. Shuffle 优化
-spark.conf.set("spark.sql.shuffle.partitions", "200")
-spark.conf.set("spark.sql.adaptive.enabled", "true")
-
-// 3. 广播优化
-spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "10485760")
-
-// 4. 内存优化
-spark.conf.set("spark.executor.memory", "8g")
-spark.conf.set("spark.memory.fraction", "0.8")
-```
-
-### TiSpark 优化
-
-```scala
-// TiSpark 特定优化
-spark.conf.set("spark.tispark.grpc.frameSize", "8388608")
-spark.conf.set("spark.tispark.grpc.timeoutInSec", "300")
-spark.conf.set("spark.tispark.scanBatchSize", "1024")
-spark.conf.set("spark.tispark.scanConcurrency", "256")
-spark.conf.set("spark.tispark.getBundleTimeout", "600")
-```
-
-### 查询优化
-
-```scala
-// 1. 下推谓词
-val filtered = spark.sql("""
-  SELECT * FROM orders
-  WHERE created_at >= '2024-01-01'
-    AND created_at < '2024-02-01'
-""")
-
-// 2. 列裁剪
-val columns = orders.select("id", "customer_id", "amount", "created_at")
-
-// 3. 分区裁剪
-spark.conf.set("spark.sql.leafPartitions", "100")
 ```
 
 ## 总结
 
-TiSpark 要点：
+TiSpark 是 TiDB HTAP 能力的重要补充：
 
-- **Spark 集成**：使用 Spark SQL 和 DataFrame API
-- **复杂分析**：多表关联、窗口函数、用户行为分析
-- **机器学习**：MLlib 集成，聚类、推荐等
-- **性能优化**：Spark 配置和 TiSpark 特定优化
-- **使用场景**：大数据分析、机器学习、数据湖分析
+- **直接读取 TiKV/TiFlash**：无需数据同步，实时分析
+- **Spark 生态集成**：SQL、ML、GraphX 全部支持
+- **自动优化**：谓词下推、聚合下推、TiFlash 路由
+
+当你的分析需求超出 TiDB SQL 的能力时，TiSpark 就是你的下一选择。

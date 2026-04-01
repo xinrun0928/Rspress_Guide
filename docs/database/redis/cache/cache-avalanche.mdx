@@ -1,482 +1,324 @@
 # 缓存雪崩：过期时间随机化 + 多级缓存
 
-凌晨 12 点，你的系统准时「挂」了。不是被攻击，不是因为流量突增——只是因为你的 Redis 缓存在零点全部过期了。
+双十一零点，订单系统准时崩溃。
 
-这就是缓存雪崩。
+监控面板上，缓存命中率从 99% 瞬间跌到 0%，数据库 QPS 从 2000 飙升到 80000，然后——数据库拒绝连接。
+
+这不是 DBA 的噩梦，这是**缓存雪崩**。
 
 ## 什么是缓存雪崩
 
-缓存雪崩是指：**大量缓存 key 在同一时间失效，导致大量请求同时击穿到数据库**。
+缓存雪崩是指：**大量缓存 key 在同一时间过期，导致大量请求直接打到数据库，数据库被瞬间击垮**。
 
 ```
-时间 T: 大量 key 同时过期
-         |
-         v
-缓存集群 -> 大量 key 失效
-         |
-         v
-大量请求 -> 数据库
-         |
-         v
-数据库过载 -> 系统崩溃
+正常情况：
+    请求 → 缓存（命中）→ 直接返回
+             ↓ 未命中
+    请求 → 数据库
+
+雪崩情况：
+    大量 key 同时过期
+        ↓
+    请求 → 缓存（全部未命中）
+        ↓
+    请求 → 数据库（瞬间 10 万 QPS）
+        ↓
+    数据库崩溃
 ```
 
-### 雪崩的两种类型
+### 为什么会发生雪崩
 
-**类型一：大量 key 同时过期**
+| 原因 | 场景 |
+|---|---|
+| 缓存 key 批量过期 | 大量数据设置了相同的过期时间 |
+| Redis 宕机 | Redis 挂了，缓存全部失效 |
+| 系统重启 | 服务重启，缓存全部丢失 |
+| 热点数据集中过期 | 秒杀商品过期，刚好用户抢购 |
 
-```bash
-# 场景：系统在零点重启，所有缓存同时过期
+## 方案一：过期时间随机化
 
-# 用户请求 -> 缓存未命中 -> 数据库
-# 大量请求 -> 数据库崩溃
+这是最简单、最有效的预防方案。
 
-# 常见原因：
-# - 系统初始化时批量写入缓存，设置相同过期时间
-# - 运维在低峰期刷新了所有缓存
-# - 缓存服务 Redis 突然重启
+### 原始写法（危险）
+
+```java
+// 所有商品缓存都设置 1 小时过期
+public Product getProduct(Long productId) {
+    String key = "product:" + productId;
+    Product product = redis.get(key);
+
+    if (product == null) {
+        product = productMapper.selectById(productId);
+        redis.setex(key, 3600, product);  // 固定 1 小时
+    }
+    return product;
+}
 ```
 
-**类型二：Redis 宕机**
+### 改进写法：随机偏移量
 
-```bash
-# 场景：Redis 集群突然宕机
+```java
+// 在原有过基础上加随机偏移量：3600 + 0~600 秒
+public Product getProduct(Long productId) {
+    String key = "product:" + productId;
+    Product product = redis.get(key);
 
-# 所有请求 -> 直接打到数据库
-# 数据库无法承受 -> 系统崩溃
-
-# 常见原因：
-# - Redis 内存耗尽
-# - Redis 主从全部宕机
-# - 网络分区
+    if (product == null) {
+        product = productMapper.selectById(productId);
+        // 随机过期时间：基础时间 + 0~10 分钟
+        int expireSeconds = 3600 + ThreadLocalRandom.current().nextInt(600);
+        redis.setex(key, expireSeconds, product);
+    }
+    return product;
+}
 ```
 
-## 雪崩 vs 击穿 vs 穿透
+### 随机化公式
 
 ```
-缓存穿透：查询不存在的数据
-         ↓
-      数据不存在，绕过缓存
-      ↓
-      每次都查数据库
-
-缓存击穿：单个热点 key 过期
-         ↓
-      大量请求同时查一个 key
-      ↓
-      数据库压力集中在一点
-
-缓存雪崩：大量 key 同时过期
-         ↓
-      大量请求分散到多个 key
-      ↓
-      数据库压力分散但总量很大
+过期时间 = 基础过期时间 + Random(0, 基础过期时间 * 0.1)
 ```
 
-## 解决方案一：过期时间随机化
+| 基础过期时间 | 随机范围 | 最终过期时间 |
+|---|---|---|
+| 1 小时 | 0 ~ 10 分钟 | 1 小时 ~ 1 小时 10 分钟 |
+| 1 天 | 0 ~ 2.4 小时 | 1 天 ~ 1 天 2.4 小时 |
+| 1 周 | 0 ~ 16.8 小时 | 1 周 ~ 1 周 16.8 小时 |
 
-### 原理
+## 方案二：多级缓存架构
 
-给缓存过期时间加一个随机值，避免大量 key 同时过期：
-
-```python
-import random
-
-def set_cache(key, value, base_ttl=3600):
-    """
-    设置缓存，过期时间 = 基础时间 + 随机时间
-    """
-    # 基础过期时间：1 小时
-    # 随机偏移：0 ~ 30 分钟
-    ttl = base_ttl + random.randint(0, 1800)
-    
-    redis.setex(key, ttl, json.dumps(value))
-
-
-def set_cache_with_jitter(key, value, base_ttl=3600):
-    """
-    使用「过期时间 jitter」策略
-    过期时间 = base_ttl + random(0, base_ttl * 0.2)
-    """
-    jitter = random.uniform(0, base_ttl * 0.2)
-    ttl = int(base_ttl + jitter)
-    
-    redis.setex(key, ttl, json.dumps(value))
-```
-
-### 过期时间分布
+单纯依赖 Redis 是不够的，需要构建多级缓存。
 
 ```
-不使用随机化：
-缓存 key 过期时间
-key1: 3600 秒
-key2: 3600 秒
-key3: 3600 秒
-...
-所有 key 在同一秒过期！
-
-使用随机化：
-缓存 key 过期时间
-key1: 3600 秒
-key2: 3875 秒
-key3: 3421 秒
-key4: 3956 秒
-...
-过期时间分散开来
+请求 → L1 缓存（JVM 本地缓存 Caffeine/Guava）→ L2 缓存（Redis）→ 数据库
 ```
 
-### 实现代码
+### L1 缓存：Caffeine 本地缓存
 
-```python
-import random
-import json
-from typing import Any, Optional
-
-class CacheWithRandomExpire:
-    """带随机过期时间的缓存"""
-    
-    def __init__(self, redis_client, base_ttl: int = 3600):
-        self.redis = redis_client
-        self.base_ttl = base_ttl
-        self.jitter_ratio = 0.2  # 20% 的随机偏移
-    
-    def set(self, key: str, value: Any, ttl: Optional[int] = None):
-        """设置缓存"""
-        if ttl is None:
-            # 计算带随机偏移的过期时间
-            jitter = random.uniform(0, self.base_ttl * self.jitter_ratio)
-            ttl = int(self.base_ttl + jitter)
-        
-        self.redis.setex(key, ttl, json.dumps(value))
-    
-    def get(self, key: str) -> Optional[Any]:
-        """获取缓存"""
-        value = self.redis.get(key)
-        if value:
-            return json.loads(value)
-        return None
-
-
-# 使用示例
-cache = CacheWithRandomExpire(redis, base_ttl=3600)
-
-# 批量设置缓存（过期时间自动随机化）
-for item in items:
-    cache.set(f"item:{item['id']}", item)
+```xml
+<dependency>
+    <groupId>com.github.ben-manes.caffeine</groupId>
+    <artifactId>caffeine</artifactId>
+    <version>3.1.8</version>
+</dependency>
 ```
 
-## 解决方案二：多级缓存
+```java
+@Configuration
+public class CacheConfig {
 
-### 原理
-
-构建多级缓存架构，一级缓存失效时还有二级缓存：
-
-```
-请求 -> L1 缓存（本地缓存）
-            |
-            v
-      L1 未命中 -> L2 缓存（Redis）
-                        |
-                        v
-                  L2 未命中 -> 数据库
+    @Bean
+    public Cache<Long, Product> localCache() {
+        return Caffeine.newBuilder()
+            .maximumSize(10_000)           // 最多缓存 1 万条
+            .expireAfterWrite(60, TimeUnit.SECONDS)  // 写入后 60 秒过期
+            .build();
+    }
+}
 ```
 
-### 多级缓存实现
+```java
+@Service
+public class ProductService {
 
-```python
-import json
-from typing import Any, Optional
-from threading import Lock
+    @Autowired
+    private Cache<Long, Product> localCache;
 
-class LocalCache:
-    """本地缓存（LRU）"""
-    
-    def __init__(self, capacity=1000):
-        self.capacity = capacity
-        self.cache = {}
-        self.access_order = []
-        self.lock = Lock()
-    
-    def get(self, key: str) -> Optional[Any]:
-        """获取数据"""
-        with self.lock:
-            if key in self.cache:
-                # 更新访问顺序
-                self.access_order.remove(key)
-                self.access_order.append(key)
-                return self.cache[key]
-            return None
-    
-    def set(self, key: str, value: Any):
-        """设置数据"""
-        with self.lock:
-            if key in self.cache:
-                self.access_order.remove(key)
-            elif len(self.cache) >= self.capacity:
-                # LRU 淘汰
-                oldest = self.access_order.pop(0)
-                del self.cache[oldest]
-            
-            self.cache[key] = value
-            self.access_order.append(key)
+    @Autowired
+    private RedisTemplate<String, Product> redisTemplate;
 
+    @Autowired
+    private ProductMapper productMapper;
 
-class MultiLevelCache:
-    """多级缓存"""
-    
-    def __init__(self, redis_client, local_cache: LocalCache):
-        self.redis = redis_client
-        self.l1_cache = local_cache
-    
-    def get(self, key: str) -> Optional[Any]:
-        """从多级缓存获取数据"""
-        # 1. 查询 L1（本地缓存）
-        value = self.l1_cache.get(key)
-        if value:
-            return value
-        
-        # 2. 查询 L2（Redis）
-        value = self.redis.get(key)
-        if value:
-            # 回填 L1
-            self.l1_cache.set(key, value)
-            return json.loads(value)
-        
-        return None
-    
-    def set(self, key: str, value: Any, ttl: int = 3600):
-        """设置多级缓存"""
-        # 1. 设置 L1
-        self.l1_cache.set(key, value)
-        
-        # 2. 设置 L2
-        self.redis.setex(key, ttl, json.dumps(value))
-    
-    def invalidate(self, key: str):
-        """失效缓存"""
-        self.l1_cache.cache.pop(key, None)
-        self.redis.delete(key)
+    public Product getProduct(Long productId) {
+        // 1. 查 L1 本地缓存
+        Product product = localCache.getIfPresent(productId);
+        if (product != null) {
+            return product;
+        }
+
+        // 2. 查 L2 Redis
+        String key = "product:" + productId;
+        product = redisTemplate.opsForValue().get(key);
+        if (product != null) {
+            // 回填 L1
+            localCache.put(productId, product);
+            return product;
+        }
+
+        // 3. 查数据库
+        product = productMapper.selectById(productId);
+        if (product != null) {
+            // 写入 L1 和 L2
+            localCache.put(productId, product);
+            redisTemplate.opsForValue().set(key, product, 1, TimeUnit.HOURS);
+        }
+        return product;
+    }
+}
 ```
 
-### 缓存更新策略
+### 多级缓存的过期时间设计
 
-```python
-# 方案一：主动更新所有层级
-def update_all_levels(key, new_value):
-    # 更新 L1
-    l1_cache.set(key, new_value)
-    
-    # 更新 L2
-    redis.setex(key, ttl, json.dumps(new_value))
-    
-    # 更新 L3（如有）
-    if use_l3:
-        l3_cache.set(key, new_value)
+| 层级 | 介质 | 过期时间 | 容量 | 适用场景 |
+|---|---|---|---|---|
+| L1 | JVM 内存 | 30s ~ 2min | 小 | 热点数据 |
+| L2 | Redis | 1h ~ 2h | 大 | 通用数据 |
+| L3 | MySQL | 永久 | 无限 | 兜底 |
 
+## 方案三：热点数据永不过期
 
-# 方案二：只更新 L2，L1 自动过期
-def update_l2_only(key, new_value):
-    redis.setex(key, ttl, json.dumps(new_value))
-    # L1 会在下次访问时更新
+对于极端热点的数据，可以采用「主动更新」代替「被动过期」。
+
+### 原始方案（被动过期）
+
+```java
+// 被动过期：时间到了就删除，下次重新查
+redis.setex(key, 3600, product);
 ```
 
-## 解决方案三：服务熔断限流
+### 改进方案（主动更新 + 逻辑过期）
 
-### 熔断机制
+```java
+@Data
+public class CacheEntry<T> {
+    private T data;           // 实际数据
+    private long expireTime;  // 逻辑过期时间
+    private boolean isExpired() {
+        return System.currentTimeMillis() > expireTime;
+    }
+}
 
-```python
-import time
-from functools import wraps
+public Product getProduct(Long productId) {
+    String key = "product:" + productId;
+    CacheEntry<Product> entry = redis.get(key);
 
-class CircuitBreaker:
-    """熔断器"""
-    
-    def __init__(self, failure_threshold=5, timeout=60):
-        self.failure_count = 0
-        self.failure_threshold = failure_threshold
-        self.timeout = timeout
-        self.last_failure_time = None
-        self.state = 'CLOSED'  # CLOSED, OPEN, HALF_OPEN
-    
-    def call(self, func, *args, **kwargs):
-        """执行函数"""
-        if self.state == 'OPEN':
-            # 熔断开启，直接返回降级结果
-            if time.time() - self.last_failure_time > self.timeout:
-                self.state = 'HALF_OPEN'
-            else:
-                return self._fallback(*args, **kwargs)
-        
-        try:
-            result = func(*args, **kwargs)
-            self._on_success()
-            return result
-        except Exception as e:
-            self._on_failure()
-            raise e
-    
-    def _on_success(self):
-        """成功回调"""
-        self.failure_count = 0
-        self.state = 'CLOSED'
-    
-    def _on_failure(self):
-        """失败回调"""
-        self.failure_count += 1
-        self.last_failure_time = time.time()
-        
-        if self.failure_count >= self.failure_threshold:
-            self.state = 'OPEN'
-    
-    def _fallback(self, *args, **kwargs):
-        """降级方法"""
-        return {'status': 'degraded', 'data': None}
+    if (entry == null) {
+        // 缓存穿透：查数据库，回填缓存（过期时间设为 1 小时）
+        Product product = productMapper.selectById(productId);
+        entry = new CacheEntry<>(product, System.currentTimeMillis() + 3600000);
+        redis.set(key, entry);
+        return product;
+    }
+
+    if (entry.isExpired()) {
+        // 逻辑过期：开启异步线程重建缓存，当前请求直接返回旧数据
+        threadPool.execute(() -> {
+            Product newProduct = productMapper.selectById(productId);
+            CacheEntry<Product> newEntry = new CacheEntry<>(
+                newProduct,
+                System.currentTimeMillis() + 3600000
+            );
+            redis.set(key, newEntry);
+        });
+        // 返回旧数据（不阻塞）
+        return entry.getData();
+    }
+
+    return entry.getData();
+}
 ```
 
-### 限流策略
+### 热点数据保活机制
 
-```python
-import time
-import redis
+```java
+// 热点数据访问时自动续命
+public Product getProduct(Long productId) {
+    String key = "product:" + productId;
+    CacheEntry<Product> entry = redis.get(key);
 
-class RateLimiter:
-    """限流器"""
-    
-    def __init__(self, redis_client):
-        self.redis = redis_client
-    
-    def is_allowed(self, key: str, max_requests: int, window: int) -> bool:
-        """
-        滑动窗口限流
-        key: 限流 key
-        max_requests: 窗口内最大请求数
-        window: 时间窗口（秒）
-        """
-        now = time.time()
-        window_key = f"rate_limit:{key}"
-        
-        # 移除窗口外的请求
-        self.redis.zremrangebyscore(window_key, 0, now - window)
-        
-        # 获取当前请求数
-        current = self.redis.zcard(window_key)
-        
-        if current >= max_requests:
-            return False
-        
-        # 添加当前请求
-        self.redis.zadd(window_key, {str(now): now})
-        self.redis.expire(window_key, window)
-        
-        return True
+    if (entry != null && !entry.isExpired()) {
+        // 访问时检查是否快过期了
+        if (entry.getExpireTime() - System.currentTimeMillis() < 600000) {
+            // 少于 10 分钟就过期，续命
+            entry.setExpireTime(System.currentTimeMillis() + 3600000);
+            redis.set(key, entry);
+        }
+        return entry.getData();
+    }
 
-
-# 使用限流器
-def get_data_with_limit(key):
-    limiter = RateLimiter(redis)
-    
-    if not limiter.is_allowed(f'db:{key}', max_requests=100, window=60):
-        # 限流触发，返回降级数据或错误
-        return {'error': 'Too many requests', 'status': 429}
-    
-    return get_data(key)
+    // ... 常规逻辑
+}
 ```
 
-## 解决方案四：预热缓存
+## 方案四：Redis 集群高可用
 
-### 原理
+缓存雪崩的另一个诱因是 Redis 本身宕机。
 
-在缓存过期前，主动重建缓存：
+### 方案：Redis Cluster + 哨兵
 
-```python
-import asyncio
-from datetime import datetime, timedelta
-
-class CacheWarmer:
-    """缓存预热"""
-    
-    def __init__(self, redis_client, cache_service):
-        self.redis = redis_client
-        self.cache_service = cache_service
-    
-    def warm_cache(self, keys: list):
-        """预热缓存"""
-        for key in keys:
-            # 查询数据库
-            data = self.cache_service._query_db(key)
-            
-            if data:
-                # 设置缓存（带随机过期时间）
-                ttl = 3600 + random.randint(0, 1800)
-                self.redis.setex(f"cache:{key}", ttl, json.dumps(data))
-    
-    async def schedule_warm(self, keys: list, interval: int = 3600):
-        """定时预热"""
-        while True:
-            self.warm_cache(keys)
-            await asyncio.sleep(interval)
+```yaml
+# Redis Cluster 配置
+cluster-enabled yes
+cluster-config-file nodes.conf
+cluster-node-timeout 15000
+cluster-replica-validity-factor 10
 ```
 
-## 组合方案
+```java
+@Configuration
+public class RedisConfig {
 
-实际生产环境中，通常组合使用多种方案：
+    @Bean
+    public RedisTemplate<String, Object> redisTemplate(RedisConnectionFactory factory) {
+        RedisTemplate<String, Object> template = new RedisTemplate<>();
+        template.setConnectionFactory(factory);
 
-```python
-class AntiAvalancheCache:
-    """防雪崩缓存"""
-    
-    def __init__(self):
-        self.l1_cache = LocalCache(capacity=1000)
-        self.l2_cache = redis
-        self.breaker = CircuitBreaker()
-        self.limiter = RateLimiter(redis)
-    
-    def get(self, key):
-        """获取数据"""
-        # 1. L1 查询
-        value = self.l1_cache.get(key)
-        if value:
-            return value
-        
-        # 2. 限流检查
-        if not self.limiter.is_allowed(f'db:{key}', 100, 60):
-            return self._fallback(key)
-        
-        # 3. 熔断检查
-        try:
-            return self.breaker.call(self._get_from_db, key)
-        except Exception:
-            return self._fallback(key)
-    
-    def _get_from_db(self, key):
-        """从数据库获取"""
-        # L2 查询
-        value = self.l2_cache.get(f"cache:{key}")
-        if value:
-            self.l1_cache.set(key, value)
-            return json.loads(value)
-        
-        # 查数据库（带互斥锁）
-        data = self.cache_service.get_with_lock(key)
-        
-        if data:
-            # 回填缓存
-            ttl = 3600 + random.randint(0, 1800)
-            self.l2_cache.setex(f"cache:{key}", ttl, json.dumps(data))
-        
-        return data
-    
-    def _fallback(self, key):
-        """降级方法"""
-        return {'status': 'degraded', 'message': 'Service temporarily unavailable'}
+        // 开启集群模式下的多重路由
+        template.setEnableTransactionSupport(false);
+
+        // 序列化配置
+        template.setKeySerializer(new StringRedisSerializer());
+        template.setValueSerializer(new GenericJackson2JsonRedisSerializer());
+        template.setHashKeySerializer(new StringRedisSerializer());
+
+        return template;
+    }
+}
 ```
 
-## 面试追问方向
+### 本地缓存作为兜底
 
-- 什么是缓存雪崩？和击穿、穿透有什么区别？
-- 如何避免大量 key 同时过期？
-- 多级缓存架构有什么优缺点？
-- 熔断和限流的区别是什么？
-- 如何设计一个防雪崩的缓存系统？
+即使 Redis 全部宕机，本地缓存也能扛一阵子：
 
-理解缓存雪崩问题，展示了你对系统高可用性的理解。
+```java
+public Product getProduct(Long productId) {
+    // 1. 本地缓存优先
+    Product product = localCache.getIfPresent(productId);
+    if (product != null) {
+        return product;
+    }
+
+    // 2. Redis（可能不可用）
+    try {
+        String key = "product:" + productId;
+        product = redisTemplate.opsForValue().get(key);
+        if (product != null) {
+            localCache.put(productId, product);
+            return product;
+        }
+    } catch (RedisConnectionException e) {
+        // Redis 挂了，降级到数据库
+        log.warn("Redis unavailable, fallback to database", e);
+    }
+
+    // 3. 数据库兜底
+    product = productMapper.selectById(productId);
+    if (product != null) {
+        localCache.put(productId, product);
+    }
+    return product;
+}
+```
+
+## 总结：缓存雪崩的防御矩阵
+
+| 层级 | 手段 | 效果 |
+|---|---|---|
+| 预防 | 过期时间随机化 | 避免批量 key 同时过期 |
+| 预防 | 多级缓存（L1 + L2） | 单点故障不影响整体 |
+| 兜底 | 热点数据永不过期 | 极端热点有保护 |
+| 容灾 | 本地缓存降级 | Redis 宕机时保证可用 |
+| 扩容 | Redis Cluster | 提高可用性和吞吐量 |
+
+缓存雪崩的本质是「缓存失效后的连锁反应」。防御思路是：不让所有 key 一起过期，不让缓存成为单点，用本地缓存做最终兜底。

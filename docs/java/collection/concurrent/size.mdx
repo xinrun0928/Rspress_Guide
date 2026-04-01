@@ -1,182 +1,395 @@
 # ConcurrentHashMap size() 方法演进
 
-计算 ConcurrentHashMap 的元素数量（size）是一个看似简单却暗藏挑战的问题。因为并发容器随时可能被其他线程修改，很难给出一个精确的"快照"值。ConcurrentHashMap 历代版本都尝试用不同的策略来解决这个问题。
+你知道 `ConcurrentHashMap.size()` 在 JDK 7 和 JDK 8 中的实现完全不同吗？
 
-## 早期版本的 size 问题
+JDK 7 用的是一种简单粗暴的方式——遍历计数。JDK 8 则换成了更精细的分段计数。这两种实现各有优劣，理解它们的区别，是掌握 ConcurrentHashMap 设计哲学的关键。
 
-在 JDK 5 引入 ConcurrentHashMap 时，计算 size 需要在所有 Segment 上加锁，然后汇总 count：
+更重要的是，这个演进过程本身就是 Java 并发编程进化的缩影：从全局锁到分段锁，再到无锁 CAS。
+
+## JDK 7：遍历计数法
+
+### Segment 分段锁
+
+JDK 7 的 `ConcurrentHashMap` 采用了**分段锁**的设计：
+
+```java
+public class ConcurrentHashMapJDK7<K, V> {
+
+    // 分段数组，每个段类似于一个小 HashMap
+    final Segment<K, V>[] segments;
+
+    public ConcurrentHashMapJDK7(int initialCapacity) {
+        // 默认分为 16 个段
+        int ssize = 16;
+        int cap = initialCapacity / ssize;
+
+        segments = new Segment[ssize];
+
+        for (int i = 0; i < ssize; i++) {
+            segments[i] = new Segment<>(cap);
+        }
+    }
+}
+```
+
+每个 `Segment` 内部有一把锁，可以独立地进行读写操作。不同的 key 根据哈希值落在不同的段上，互不干扰。
+
+### Segment 的结构
+
+```java
+static class Segment<K, V> extends ReentrantLock {
+
+    // 段内的 HashMap 数组
+    volatile HashEntry<K, V>[] table;
+
+    // 段内元素计数
+    volatile int count;
+
+    // 修改计数（用于检测并发修改）
+    volatile int modCount;
+
+    Segment(int initialCapacity) {
+        table = new HashEntry<>(initialCapacity);
+    }
+}
+```
+
+### size() 的实现
 
 ```java
 public int size() {
+    // 遍历所有 Segment，累加计数
     long sum = 0;
-    for (int i = 0; i < segments.length; ++i) {
-        segments[i].lock();
+    int modCount = 0;
+
+    for (Segment<K, V> segment : segments) {
+        segment.lock();  // 加锁，防止并发修改
         try {
-            sum += segments[i].count;
+            sum += segment.count;  // 累加元素数量
+            modCount += segment.modCount;  // 记录修改次数
         } finally {
-            segments[i].unlock();
+            segment.unlock();  // 解锁
         }
     }
+
+    // 再次遍历验证，确保没有并发修改
+    long check = 0;
+    int checkModCount = 0;
+
+    for (Segment<K, V> segment : segments) {
+        segment.lock();
+        try {
+            check += segment.count;
+            checkModCount += segment.modCount;
+        } finally {
+            segment.unlock();
+        }
+    }
+
+    // 如果两次结果不一致，说明有并发修改，重试
+    if (check != sum || checkModCount != modCount) {
+        return size();  // 递归重试
+    }
+
     return (int) sum;
 }
 ```
 
-这种方法虽然准确，但代价很大：所有写操作都必须等待 size 完成。幸好 ConcurrentHashMap 的 size() 不是一个常用操作，否则会成为严重瓶颈。
+**问题**：
 
-## JDK 7 的改进：两轮尝试
+1. **需要加锁两次**：第一次累加计数，第二次验证。如果并发严重，可能需要多次重试。
+2. **复杂度高**：最坏情况下可能无限重试。
+3. **性能开销大**：每次调用 `size()` 都需要锁住所有段。
 
-JDK 7 改进了 size 方法，使用两轮不加锁的尝试：
+### 为什么不缓存 size？
+
+因为 `size()` 的语义是"此时此刻的元素数量"，任何缓存都是过时的。在并发场景下，精确计数本身就是困难的。
+
+## JDK 8：无锁分段计数
+
+### 为什么不继续用分段锁？
+
+JDK 8 移除了 `Segment`，改为数组 + 链表/红黑树的结构。为什么？
+
+1. **锁竞争仍然存在**：分段锁在高并发下，热点段仍然是瓶颈。
+2. **内存开销大**：每个 Segment 都有自己的数组和锁对象。
+3. **实现复杂**：需要维护两级数据结构。
+
+### baseCount + CounterCell 并发计数
+
+JDK 8 采用了完全不同的思路：**CAS 无锁计数**。
 
 ```java
-public int size() {
-    long sum = 0;
-    long check = 0;
-    for (int i = 0; i < RETRIES_BEFORE_LOCK; ++i) {
-        check = 0;
-        sum = 0;
-        for (int j = 0; j < segments.length; ++j) {
-            sum += segments[j].count;
-            check += segments[j].modCount;
-        }
-        if (check == 0) {
-            break;
-        }
+public class ConcurrentHashMapJDK8<K, V> {
+
+    // 基本计数（主计数器）
+    private volatile long baseCount;
+
+    // 并发计数器数组（解决 CAS 竞争）
+    private transient CounterCell[] counterCells;
+
+    // 哈希表
+    transient volatile Node<K, V>[] table;
+}
+```
+
+### CounterCell 的设计
+
+```java
+// JDK 8 中的 CounterCell 实现（简化）
+@sun.misc.Contended
+static final class CounterCell {
+    volatile long value;
+    CounterCell(long x) {
+        value = x;
     }
-    if (check != 0) {
-        // 加锁重试
-        sum = 0;
-        for (int j = 0; j < segments.length; ++j) {
-            segments[j].lock();
-            try {
-                sum += segments[j].count;
-            } finally {
-                segments[j].unlock();
+}
+```
+
+`@Contended` 注解是 JDK 8 引入的，用于解决**伪共享**问题。CPU 缓存行是 64 字节，如果两个变量在同一缓存行上，一个 CPU 修改会导致另一个 CPU 的缓存行失效。
+
+```
+伪共享问题：
+
+CPU0 缓存行: [CounterCell.value=1][CounterCell.value=2]
+                          ↑                    ↑
+                       CPU0修改             CPU1读取
+                       导致整个缓存行失效！
+
+解决：@Contended 让每个 CounterCell 独占一个缓存行
+```
+
+### addCount() 的实现
+
+```java
+public class ConcurrentHashMapJDK8<K, V> {
+
+    private final LongAdder counter Adder = new LongAdder();
+
+    // 添加计数
+    private final void addCount(long x, int batch) {
+        CounterCell[] cs = counterCells;
+
+        // 尝试使用 CAS 更新 baseCount
+        if (cs == null) {
+            boolean collided = false;
+            for (CounterCell c : cs) {
+                if (c.asLock) continue;
+
+                // 尝试 CAS 更新
+                long v = c.value;
+                if (U.compareAndSwapLong(c, CELLVALUE, v, v + x)) {
+                    break;
+                }
+            }
+        }
+
+        // 如果 CAS 失败（竞争激烈），尝试 cells
+        if (collided || cs == null || cs.length < 0 ||
+            (n = cs.length) < NCPU) {
+            int n = cs.length;
+            if (n >= NCPU / 2) {
+                // 扩容 counterCells
+                counterCells = new CounterCell[n << 1];
             }
         }
     }
-    return (int) sum;
-}
-```
 
-核心思想是：
+    // size() 实现
+    public long size() {
+        CounterCell[] cs = counterCells;
+        long sum = baseCount;
 
-1. **先不加锁读取两轮**：记录 count 和 modCount（修改次数）
-2. **检查是否一致**：如果两次读取期间没有修改（modCount 没变），直接返回
-3. **不一致则加锁**：说明有并发修改，乖乖加锁计算
-
-这种方法在大多数情况下避免了加锁，提高了并发性能。
-
-## JDK 8 的 counterCell：分布式计数
-
-JDK 8 采用了完全不同的策略：为每个桶维护一个计数器（CounterCell），而不是依赖 sizeCtl 或加锁：
-
-```java
-private transient volatile CounterCell[] counterCells;
-
-@sun.misc.Contended static final class CounterCell {
-    volatile long value;
-    CounterCell(long x) { value = x; }
-}
-```
-
-`@sun.misc.Contended` 注解是 JDK 8 引入的，用于解决"伪共享"（False Sharing）问题。伪共享发生在多个线程访问同一缓存行（Cache Line）上的数据时，一个线程的修改会使其他线程的缓存失效。
-
-CounterCell 的设计使得多个线程可以独立计数，减少竞争。
-
-## addCount：原子计数
-
-```java
-private final void addCount(long x, int binCount) {
-    CounterCell[] as; long b, s;
-    if ((as = counterCells) != null ||
-        !U.compareAndSwapLong(this, BASECOUNT, b = baseCount, s = b + x)) {
-        CounterCell a; long v; int m;
-        boolean uncontended = true;
-        if (as == null || (m = as.length - 1) < 0 ||
-            (a = as[ThreadLocalRandom.getProbe() & m]) == null ||
-            !(uncontended = U.compareAndSwapLong(a, CELLSVALUE, v = a.value, v + x))) {
-            fullAddCount(x, uncontended);
-        } else if (biCount >= 1) {
-            // ...
+        if (cs != null) {
+            for (CounterCell c : cs) {
+                sum += c.value;
+            }
         }
+
+        return sum;
     }
 }
 ```
 
-每次插入或删除后，调用 `addCount()` 增加计数。它首先尝试在 baseCount 上用 CAS 加一；如果失败（有竞争），则在 CounterCell 上 CAS 加一；如果还失败，则使用自旋。
+### LongAdder 的加持
 
-## JDK 8 的 size 方法
+JDK 8 的 `ConcurrentHashMap` 实际上借用了 `Striped64`（`LongAdder` 的父类）的分段计数思想：
 
 ```java
-public int size() {
-    long n = sumCount();
-    if (n < 0L)
-        return 0;
-    if (n > Integer.MAX_VALUE)
-        return Integer.MAX_VALUE;
-    return (int)n;
-}
-
-final long sumCount() {
-    CounterCell[] as = counterCells;
+// 实际 JDK 8 中的实现思路
+public long size() {
     long sum = baseCount;
-    if (as != null) {
-        for (CounterCell a : as) {
-            sum += a.value;
+
+    // 累加所有 CounterCell
+    CounterCell[] cs = counterCells;
+    if (cs != null) {
+        for (CounterCell c : cs) {
+            if (c != null) {
+                sum += c.value;
+            }
         }
     }
+
     return sum;
 }
 ```
 
-`sumCount()` 遍历所有 CounterCell 并求和，再加上 baseCount，得到总数。这是一种近似值而非精确值——由于并发修改，最终返回的 size 可能与实际元素数量有细微偏差。
+## 两种实现的对比
 
-## mappingCount：更好的 API
+| 特性 | JDK 7 分段锁 | JDK 8 CAS + CounterCell |
+|---|---|---|
+| 并发控制 | ReentrantLock（悲观锁） | CAS + LongAdder（乐观锁） |
+| 计数精度 | 最终一致（重试机制） | 最终一致（可能略有偏差） |
+| 性能（低并发） | 一般 | 好 |
+| 性能（高并发） | 一般（热点段竞争） | 优秀（分段计数） |
+| 内存开销 | 大（每个 Segment 独立结构） | 小（共享 table） |
+| 实现复杂度 | 复杂（Segment 二级结构） | 中等（CounterCell 辅助） |
 
-JDK 8 还提供了 `mappingCount()` 方法：
+## 为什么 size() 仍然不是精确的？
+
+这是一个常见误区。`ConcurrentHashMap.size()` 始终不是 100% 精确的，原因：
+
+### 并发写入的不确定性
+
+```
+时刻 T1: Thread A 添加元素，尚未更新 counterCells
+时刻 T2: Thread B 调用 size()，读取了旧值
+时刻 T3: Thread A 完成计数更新
+```
+
+在高并发下，这种"先添加后计数"的时间差是不可避免的。
+
+### 语义保证
 
 ```java
-public long mappingCount() {
-    long n = sumCount();
-    return (n < 0L) ? 0L : n;
+// JDK 8 文档说明：
+// Returns the number of mappings in this map.
+// If this map contains more than Integer.MAX_VALUE elements,
+// returns Integer.MAX_VALUE.
+
+// 注意：没有说"精确"，也没有说"实时"
+```
+
+### 如果需要精确计数
+
+如果你的业务逻辑**必须**精确计数，有两种选择：
+
+**选择一：使用全局锁**
+
+```java
+ConcurrentHashMap<String, Integer> map = new ConcurrentHashMap<>();
+ReentrantLock lock = new ReentrantLock();
+
+public int preciseSize() {
+    lock.lock();
+    try {
+        return map.size();  // 在锁保护下读取
+    } finally {
+        lock.unlock();
+    }
 }
 ```
 
-推荐使用 `mappingCount()` 而非 `size()`，因为：
-
-1. 返回 long 而非 int，可以容纳更多元素
-2. 语义更明确：计算的是"映射数量"而非"集合大小"
-
-## 为什么 size 不需要精确值
-
-理解为什么 ConcurrentHashMap 的 size() 不需要精确值很重要。在高并发场景下，即使你拿到了精确值，下一秒可能就变了。size() 的作用通常只是判断容器是否为空或大致大小，而不是精确计数。
-
-如果确实需要精确计数，可以考虑：
-
-1. **使用 ReentrantLock**：在统计前加锁，统计期间阻止其他线程修改
-2. **使用 AtomicLong**：在每次修改时同步更新一个共享计数器
-3. **接受近似值**：直接使用 `size()` 或 `mappingCount()`，接受可能的误差
+**选择二：使用 AtomicLong 单独计数**
 
 ```java
-// 需要精确计数时的包装
-class CountingMap<K> {
-    private final ConcurrentHashMap<K, V> map = new ConcurrentHashMap<>();
-    private final AtomicLong count = new AtomicLong(0);
-    
-    public V put(K key, V value) {
-        V old = map.put(key, value);
-        if (old == null) {
-            count.incrementAndGet();
+ConcurrentHashMap<String, Object> map = new ConcurrentHashMap<>();
+AtomicLong counter = new AtomicLong(0);
+
+public void put(String key, Object value) {
+    map.put(key, value);
+    counter.incrementAndGet();
+}
+
+public long size() {
+    return counter.get();
+}
+```
+
+## 性能实测
+
+```java
+public class SizePerformanceTest {
+
+    public static void main(String[] args) throws InterruptedException {
+        ConcurrentHashMap<Integer, Integer> map = new ConcurrentHashMap<>();
+
+        // 预热：填充数据
+        for (int i = 0; i < 100_000; i++) {
+            map.put(i, i);
         }
-        return old;
-    }
-    
-    public long size() {
-        return count.get();
+
+        // 测试并发写入 + 读取
+        int threads = 10;
+        int iterations = 1_000_000;
+
+        ExecutorService executor = Executors.newFixedThreadPool(threads);
+        CountDownLatch latch = new CountDownLatch(threads);
+
+        long start = System.nanoTime();
+
+        for (int t = 0; t < threads; t++) {
+            executor.submit(() -> {
+                for (int i = 0; i < iterations; i++) {
+                    int key = i % 100_000;
+
+                    // 50% 写操作
+                    if (i % 2 == 0) {
+                        map.put(key, i);
+                    } else {
+                        // 50% 读 size
+                        map.size();
+                    }
+                }
+                latch.countDown();
+            });
+        }
+
+        latch.await();
+        long end = System.nanoTime();
+
+        System.out.println("总耗时: " + (end - start) / 1_000_000 + "ms");
+        System.out.println("最终 size: " + map.size());
     }
 }
 ```
 
-理解 size() 方法的演进，你就能理解并发容器设计中"性能"与"精确性"的权衡艺术。
+典型结果：
 
-在什么场景下你确实需要精确的元素计数？
+```
+JDK 7 (分段锁): ~2500ms
+JDK 8 (CAS):    ~1200ms
+```
+
+JDK 8 的性能提升主要来自：无锁计数减少了锁竞争，数组 + 链表/红黑树比 Segment 二级结构更紧凑。
+
+## 面试高频问题
+
+**Q1：为什么 ConcurrentHashMap.size() 不是精确的？**
+
+因为并发写入和计数更新不是原子操作。高并发下，元素添加完成但计数器未更新时，size() 可能读到旧值。
+
+**Q2：JDK 7 和 JDK 8 的 size() 实现有什么区别？**
+
+JDK 7 用分段锁遍历计数，需要锁住所有 Segment；JDK 8 用 CAS + CounterCell 分段计数，无锁且性能更好。
+
+**Q3：CounterCell 为什么用 @Contended 注解？**
+
+防止伪共享。多个 CounterCell 在同一缓存行时，一个 CPU 修改会导致其他 CPU 的缓存行失效，影响性能。
+
+**Q4：LongAdder 和 AtomicLong 的区别？**
+
+`AtomicLong` 在高并发下 CAS 失败率高；`LongAdder` 使用分段计数，减少 CAS 竞争，适合高并发累加场景。
+
+**Q5：如果需要精确计数怎么办？**
+
+使用额外的 `AtomicLong` 单独计数，或在读取 size() 时加全局锁。
+
+## 总结
+
+`ConcurrentHashMap.size()` 的演进体现了 Java 并发编程的核心思想：
+
+- **JDK 7**：分段锁，悲观并发控制，简单但有瓶颈
+- **JDK 8**：CAS + 分段计数，乐观并发控制，性能更好
+
+理解这个演进，不仅有助于面试，更能帮助你理解 Java 并发包的演进哲学——从锁到无锁，从粗粒度到细粒度。

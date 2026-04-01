@@ -1,372 +1,436 @@
-import { Badge } from '@rspress/core/theme';
-
 # 直接内存（Direct Buffer）优势与限制
 
-# 你知道Java进程为什么会突然OOM，top命令显示内存占用明明还没到-Xmx设置的值吗？
+你遇到过这种情况吗？在线上环境中，用 `ByteBuffer.allocateDirect()` 分配了一块大内存做文件传输，性能却突然下降，甚至出现 OOM。但同样的代码在本地测试环境跑得好好的。
 
-这是一个经典问题。很多Java开发者都遇到过：设置`-Xmx2g`，应用跑着跑着就OOM了。检查JVM堆，`used`才1.5GB，离2GB还远。GC日志显示Young GC频繁，Old区压力不大。
+问题很可能出在**直接内存的隐藏限制**上。
 
-问题出在哪？**堆外内存**。
+`DirectBuffer`（直接内存）是 Java 高性能 I/O 的标配，它的零拷贝特性让无数开发者着迷。但很少有人注意到：直接内存不受 JVM GC 管理，它有自己独立的内存空间，而这个空间在容器化环境中尤其容易出问题。
 
-Java堆只是Java进程的其中一块内存区域。堆外内存——包括DirectBuffer、mmap映射文件、JIT编译缓存、Native库等——独立于堆存在，不受-Xmx约束。当堆外内存耗尽时，同样会OOM。
+这篇文章会深入分析直接内存的内部机制、性能优势，以及在容器环境中的坑。
 
-DirectBuffer（JDK 1.4引入的DirectByteBuffer）是Java中使用堆外内存最多的场景之一。它的设计目标是**减少I/O操作时的内存复制**，实现零拷贝。但这把双刃剑在带来性能优势的同时，也引入了GC管理不到的资源泄漏风险。
+## 什么是直接内存
 
-理解DirectBuffer的内部机制，知道什么时候该用它、什么时候不该用，是高性能Java网络编程的必备知识。
+### 与堆内存的本质区别
 
-## 堆内 vs 堆外：内存布局解析
-
-要理解DirectBuffer，首先要理解Java进程的内存布局。
-
-```
-Java进程内存空间
-+-------------------------------------------------------------------+
-|                                                                   |
-|   内核空间（Kernel）                                               |
-|                                                                   |
-+-------------------------------------------------------------------+
-|                                                                   |
-|   用户空间                                                       |
-|   +-------------------------------------------------------------+ |
-|   |  Java堆 (Xmx)                    DirectMemory (MaxDirect)   | |
-|   |  +-----------------------------+ +------------------------+ | |
-|   |  | Eden | S0 | S1 |  Old区     | | DirectByteBuffer区域   | | |
-|   |  +-----------------------------+ +------------------------+ | |
-|   |  | HeapByteBuffer实际数据      | | MappedByteBuffer数据    | | |
-|   |  | (byte[]数组)                | | (mmap映射)              | | |
-|   |  +-----------------------------+ +------------------------+ | |
-|   +-------------------------------------------------------------+ |
-|   |  元数据区：对象头、类信息、方法区                              | |
-|   +-------------------------------------------------------------+ |
-|   |  线程栈：每个线程的局部变量、PC指针                          | |
-|   +-------------------------------------------------------------+ |
-|   |  Native库、JIT代码区                                         | |
-|   +-------------------------------------------------------------+ |
-|                                                                   |
-+-------------------------------------------------------------------+
-```
-
-HeapByteBuffer的数据在Java堆内，和普通Java对象一样被GC管理。DirectByteBuffer的数据在堆外，不受GC管理——或者说，**GC只能管理指向堆外的指针（DirectByteBuffer对象本身），不能管理堆外的实际数据**。
-
-## DirectBuffer的创建：malloc在Java中的化身
-
-DirectByteBuffer的创建调用`ByteBuffer.allocateDirect(capacity)`，底层发生了什么？
+Java 中的内存分配有两种方式：
 
 ```java
-// JDK源码简化版
-public static ByteBuffer allocateDirect(int capacity) {
-    return new DirectByteBuffer(capacity);
-}
+// 堆内存：JVM GC 管理
+ByteBuffer heapBuffer = ByteBuffer.allocate(1024 * 1024);  // 1MB
 
-// DirectByteBuffer构造函数（伪代码）
-DirectByteBuffer(int cap) {
-    // 1. 调用native方法分配堆外内存
-    long base = unsafe.allocateMemory(size);  // 底层malloc
-    
-    // 2. 创建Cleaner（虚引用），用于延迟释放
-    Cleaner.create(this, new Deallocator(base, size));
-    
-    // 3. 初始化
-    address = base;  // 存储堆外内存地址
+// 直接内存：操作系统直接分配
+ByteBuffer directBuffer = ByteBuffer.allocateDirect(1024 * 1024);  // 1MB
+```
+
+这两种内存在 JVM 进程中的位置完全不同：
+
+```
+JVM 进程内存布局
+
++------------------+ <-- 进程地址空间
+|     内核空间      |  (系统内核使用)
++------------------+
+|                  |
+|    堆内存区域     |  <-- HeapByteBuffer 数据存储
+|   (JVM GC 管理)   |    受 -Xmx 参数控制
+|                  |
++------------------+
+|                  |
+|   直接内存区域    |  <-- DirectByteBuffer 数据存储
+|  (不受 JVM GC)    |    受 -XX:MaxDirectMemorySize 控制
+|                  |
++------------------+ <-- 进程边界
+```
+
+**关键区别**：
+
+| 特性 | HeapByteBuffer | DirectByteBuffer |
+|---|---|---|
+| 内存位置 | JVM 堆内 | 堆外内存（off-heap） |
+| GC 影响 | 受 GC 影响，对象可能移动 | 不受 GC 影响 |
+| 分配成本 | 低（只是 new 对象） | 高（需要系统调用 malloc） |
+| I/O 操作 | 需要复制到堆外 | 可直接操作，零拷贝可能 |
+| 释放方式 | GC 自动回收 | 依赖 GC 触发 Cleaner 或手动释放 |
+
+### DirectByteBuffer 的内部结构
+
+`DirectByteBuffer` 的实现比 `HeapByteBuffer` 复杂得多：
+
+```java
+// DirectByteBuffer 的关键字段（简化）
+public class DirectByteBuffer extends MappedByteBuffer {
+    // 堆内的元数据部分（JVM GC 管理）
+    private final long address;  // 指向堆外内存的地址
+
+    // 堆外的实际数据区域（OS 管理）
+    // 通过 address 指针访问，不受 JVM 控制
 }
 ```
 
-`unsafe.allocateMemory()`是`sun.misc.Unsafe`的方法，底层调用`malloc()`分配内存。**这块内存由操作系统管理，不受JVM控制**。
+堆内只存储了一个 `address` 字段（8 字节），指向堆外真实的内存区域。实际数据读写发生在堆外，不经过 JVM 堆。
 
-还有一个关键点：**Cleaner**。DirectByteBuffer对象本身在Java堆上，当它变成不可达时，GC会回收这个对象。但堆外内存不会自动释放——需要显式调用`freeMemory()`。Java通过**虚引用（PhantomReference）**机制解决这个问题：
+## 零拷贝原理
+
+### 为什么叫"零拷贝"
+
+传统堆内存 I/O 的数据流向：
+
+```
+应用数据 → JVM 堆内存 → 用户态缓冲区 → 内核态缓冲区 → 网卡/磁盘
+              ↑
+              ↑
+        经历了两次复制：
+        1. 磁盘/网卡 → 内核缓冲区
+        2. 内核缓冲区 → 用户堆内存
+```
+
+使用 `sendfile()` 系统调用时，如果源文件在内存中（Page Cache），可以绕过用户态，直接从 Page Cache 发送到网卡：
+
+```
+应用数据 → 内存映射文件 → Page Cache → 网卡/磁盘
+
+减少了两次用户态-内核态复制：
+1. 不需要复制到用户堆内存
+2. 不需要复制到用户态缓冲区
+```
+
+### DirectBuffer 与 sendfile 的配合
+
+`FileChannel.transferTo()` 方法利用了 Linux 的 `sendfile()` 系统调用：
 
 ```java
-// Cleaner的GC流程
-1. DirectByteBuffer对象变成不可达
-2. GC将Cleaner加入ReferenceQueue（不等待Finalizer那么久）
-3. ReferenceHandler线程从Queue中取出Cleaner
-4. 执行Cleaner.clean()，调用unsafe.freeMemory()释放堆外内存
-```
-
-这意味着**堆外内存的释放有延迟**，而且依赖GC发生。如果你的代码大量创建DirectBuffer但没有及时置零引用（让GC可以回收对象），堆外内存会持续增长。
-
-## 为什么需要DirectBuffer：零拷贝的秘密
-
-DirectBuffer的核心价值是**减少JVM堆和内核之间的内存复制**。
-
-### 传统I/O的数据复制路径
-
-在Linux中，当应用程序读写数据时，数据在用户态和内核态之间需要多次复制：
-
-**读取场景（从网卡读取数据到应用）**：
-
-```
-网卡DMA -> 内核缓冲区(page cache) -> 用户缓冲区(HeapByteBuffer) -> 应用
-           第一次复制                 第二次复制
-```
-
-**写入场景（发送文件到网卡）**：
-
-```
-应用 -> 用户缓冲区(HeapByteBuffer) -> 内核缓冲区(page cache) -> 网卡DMA
-       第一次复制                        第二次复制
-```
-
-对于「从网络读取数据」这种I/O密集型操作，HeapByteBuffer的问题是：**先从网卡复制到内核缓冲区，再从内核缓冲区复制到JVM堆**。这个「内核到堆」的复制是额外的开销。
-
-### DirectBuffer的优化路径
-
-DirectBuffer的内存直接由操作系统管理。当数据从网卡到达时，可以直接放入DirectBuffer指向的堆外内存，**只需要一次DMA复制**：
-
-```
-网卡DMA -> DirectBuffer堆外内存 -> 应用
-           一次复制（无需再复制到堆内）
-```
-
-对于Netty这样的高性能网络框架，**每一次复制都意味着CPU参与、意味着延迟**。DirectBuffer让网卡和应用程序可以共享同一块内存，真正实现零拷贝。
-
-### sendfile：零拷贝的极致
-
-Linux的`sendfile()`系统调用更进一步——连「应用读取」这一步都省了，直接从文件缓存发送到网卡：
-
-```
-磁盘/网络 -> 内核缓冲区 -> 网卡
-                 |
-                 +--> 应用（零感知）
-```
-
-Netty的`FileRegion`基于`sendfile()`实现，文件传输可以完全不经过Java堆。
-
-## DirectBuffer的性能测试：真实数据说话
-
-理论说完了，来点实际的benchmark。
-
-<Badge text="JDK 17+" type="tip" />
-
-测试环境：16核CPU，32GB内存，1Gbps网卡。测试DirectBuffer vs HeapByteBuffer的I/O吞吐量：
-
-```java
-// 测试代码
-public class BufferBenchmark {
+public class ZeroCopyDemo {
     public static void main(String[] args) throws IOException {
-        int iterations = 10_000_000;
-        int bufferSize = 1024;
+        // 使用零拷贝传输文件
+        FileChannel sourceChannel = new FileInputStream("bigfile.dat")
+            .getChannel();
+        FileChannel destChannel = new FileOutputStream("dest.dat")
+            .getChannel();
 
-        // HeapByteBuffer测试
-        long heapStart = System.nanoTime();
-        ByteBuffer heapBuffer = ByteBuffer.allocate(bufferSize);
-        for (int i = 0; i < iterations; i++) {
-            heapBuffer.clear();
-            heapBuffer.putLong(0, i);
-            long v = heapBuffer.getLong(0);
-        }
-        long heapTime = System.nanoTime() - heapStart;
+        // transferTo 内部使用 sendfile()，如果目标可以用
+        // DirectBuffer（Socket），可以实现零拷贝
+        long transferred = sourceChannel.transferTo(0,
+            sourceChannel.size(), destChannel);
 
-        // DirectByteBuffer测试
-        long directStart = System.nanoTime();
-        ByteBuffer directBuffer = ByteBuffer.allocateDirect(bufferSize);
-        for (int i = 0; i < iterations; i++) {
-            directBuffer.clear();
-            directBuffer.putLong(0, i);
-            long v = directBuffer.getLong(0);
-        }
-        long directTime = System.nanoTime() - directStart;
-
-        System.out.printf("HeapByteBuffer: %.2f ns/op%n", heapTime / (double) iterations);
-        System.out.printf("DirectByteBuffer: %.2f ns/op%n", directTime / (double) iterations);
-        System.out.printf("Ratio: %.2fx%n", (double) heapTime / directTime);
+        System.out.println("传输字节数: " + transferred);
     }
 }
 ```
 
-典型结果（不同机器会有差异）：
+### 零拷贝的三个层次
 
-| Buffer类型 | 随机读写延迟 | 顺序读写吞吐 |
+| 层次 | 技术 | 原理 |
 |---|---|---|
-| HeapByteBuffer | ~3ns/op | ~8GB/s |
-| DirectByteBuffer | ~5ns/op | ~9GB/s |
+| 第一层 | `DirectBuffer` | 避免堆内存到内核的复制 |
+| 第二层 | `FileChannel.transferTo()` | 利用 `sendfile()` 系统调用 |
+| 第三层 | `MappedByteBuffer` | 内存映射，文件当内存用 |
 
-有意思的结论：
+## MappedByteBuffer：内存映射文件
 
-- **堆内读写**：DirectBuffer反而更慢，因为它的数据不在CPU缓存附近
-- **I/O读写（涉及系统调用）**：DirectBuffer更快，因为减少了一次内存复制
-
-所以DirectBuffer的价值在于**I/O场景**，不是纯内存操作。如果你的代码主要是内存中处理数据，用HeapByteBuffer反而更好。
-
-## DirectBuffer的限制与风险
-
-DirectBuffer不是银弹，它有自己的一系列问题。
-
-### 风险1：堆外内存不受GC控制
-
-这是最大的风险。HeapByteBuffer的数据在Java堆内，GC可以压缩、回收。DirectByteBuffer的数据在堆外，**只有Cleaner能触发释放**，而Cleaner依赖GC来判断对象是否可达。
-
-**问题场景**：
+`MappedByteBuffer` 是 `DirectByteBuffer` 的子类，提供了内存映射能力：
 
 ```java
-// 每秒创建一个1MB的DirectBuffer
-while (true) {
-    ByteBuffer buffer = ByteBuffer.allocateDirect(1024 * 1024);
-    channel.write(buffer);
-    Thread.sleep(1000);
+public class MemoryMapDemo {
+    public static void main(String[] args) throws IOException {
+        // 创建 1GB 的随机访问文件
+        RandomAccessFile file = new RandomAccessFile("largefile.dat", "rw");
+        FileChannel channel = file.getChannel();
+
+        // 将文件映射到内存
+        // 只映射了 100MB，实际数据在 Page Cache 中
+        MappedByteBuffer buffer = channel.map(
+            FileChannel.MapMode.READ_WRITE,
+            0,                          // 文件起始位置
+            100 * 1024 * 1024           // 映射大小 100MB
+        );
+
+        // 现在可以像访问数组一样访问文件
+        buffer.put(0, (byte) 1);
+        byte b = buffer.get(1024);
+
+        // 修改会自动同步到磁盘（由 OS 控制）
+        buffer.force();  // 强制刷盘
+
+        file.close();
+    }
 }
 ```
 
-这段代码的问题：虽然每次循环后`buffer`变量会被覆盖，但DirectByteBuffer对象本身可能还处于GC年轻代的存活周期内。如果对象在Survivor区来回复制而不被回收，Cleaner不会执行，堆外内存持续增长。
+**内存映射的工作原理**：
 
-**解决**：正确做法是确保不再使用的Buffer可以被GC回收，或者使用对象池技术。
+```
+用户进程                           内核
++---------------------------+   +---------------------------+
+|                           |   |      Page Cache          |
+|   MappedByteBuffer        |<-->| +---------------------+  |
+| +---------------------+   |   | | 文件内容（内存页）   |  |
+| |  虚拟内存地址       |   |   | +---------------------+  |
+| +---------------------+   |   +---------------------------+
+|         ↓                |
+|   页表映射                 |
+|         ↓                |
+| +---------------------+   |
+| |  物理内存页帧        |   |
+| +---------------------+   |
++---------------------------+
 
-### 风险2：容量不灵活
+第一次访问：触发缺页中断，OS 从磁盘读取文件内容到 Page Cache
+后续访问：直接命中 Page Cache，无需磁盘 I/O
+```
 
-DirectBuffer的容量在创建时固定，不能动态扩展。相比之下，HeapByteBuffer配合`ByteArrayOutputStream`可以自动扩容（虽然会有复制成本）。
+## Docker 容器中的直接内存限制
+
+这是最容易踩坑的地方。
+
+### 问题场景
+
+在 Docker 容器中运行 Java 应用，使用直接内存后出现 OOM：
+
+```
+# 本地环境（无限制）
+java -jar app.jar  # 正常运行
+
+# Docker 容器（默认限制 64MB 直接内存）
+docker run -m 512m java:8 java -jar app.jar
+# 启动时报错：
+# java.lang.OutOfMemoryError: Direct buffer memory
+```
+
+### 原因分析
+
+Docker 容器默认会限制进程的最大直接内存（通过 cgroup），通常比容器内存小得多：
+
+| 容器内存限制 | 默认直接内存限制 | 比例 |
+|---|---|---|
+| 128MB | 16MB | 12.5% |
+| 512MB | 64MB | 12.5% |
+| 1GB | 128MB | 12.5% |
+| 2GB | 256MB | 12.5% |
+
+当容器内存限制为 512MB 时，直接内存默认只有 64MB。如果你的应用大量使用 `DirectByteBuffer`（如 Netty），很容易触发 OOM。
+
+### 解决方案
+
+**方案一：显式设置直接内存大小**
+
+```bash
+# 设置直接内存最大为 256MB
+docker run -m 512m \
+  -e JAVA_OPTS="-XX:MaxDirectMemorySize=256m" \
+  java:8 java -jar app.jar
+```
+
+**方案二：禁用直接内存限制**
+
+```bash
+# 使用 --memory-swappiness 或设置不限制
+docker run -m 512m \
+  --memory-swappiness=0 \
+  java:8 java -jar app.jar
+```
+
+**方案三：Netty 的内存管理优化**
+
+如果使用 Netty，可以配置池化内存，减少直接内存碎片：
 
 ```java
-// DirectBuffer：不能追加容量
-ByteBuffer direct = ByteBuffer.allocateDirect(1024);
-// 写满了就是写满了，你需要创建新的更大的Buffer
-
-// HeapByteBuffer：可以配合数组动态扩展
-ByteArrayOutputStream baos = new ByteArrayOutputStream();
-// 自动处理扩容
+// 设置 Netty 使用堆内存代替直接内存（性能会下降，但稳定）
+-Dio.netty.allocator.type=pooled
+-Dio.netty.noPreferDirect=false
 ```
 
-### 风险3：创建成本高
+## allocateDirect vs allocate：如何选择
 
-`allocate()`几乎是瞬时的（分配JVM堆内存），但`allocateDirect()`需要调用native方法`malloc()`，涉及系统调用，成本高得多。
+### 选择 HeapByteBuffer 的场景
 
-测试数据（创建1百万次）：
+- 普通业务代码，数据量不大
+- 需要频繁创建和销毁 Buffer
+- 对性能要求不高，更关注代码简洁
+- 在容器环境中运行，直接内存受限
 
-| 操作 | 耗时 |
-|---|---|
-| ByteBuffer.allocate(1024) | ~100ms |
-| ByteBuffer.allocateDirect(1024) | ~5000ms |
-
-差了50倍！这就是为什么DirectBuffer必须**复用**，而不是每次操作都创建。
-
-### 风险4：跨JVM迁移困难
-
-DirectBuffer的内存地址是进程内部的，不能序列化或网络传输。如果你的应用需要分布式计算、内存数据共享，DirectBuffer帮不上忙。
-
-## 堆外内存的监控与调优
-
-### 监控堆外内存使用
-
-JDK 8u及以上版本，JVM提供了`-XX:NativeMemoryTracking=detail`来跟踪堆外内存：
-
-```bash
-java -XX:NativeMemoryTracking=detail -XX:+UseG1GC -Xmx2g -Xms2g MyApp
+```java
+// 推荐使用 HeapByteBuffer
+ByteBuffer buffer = ByteBuffer.allocate(4096);
+// 使用后会被 GC 自动回收
 ```
 
-启动后可以通过`jcmd`查看：
+### 选择 DirectByteBuffer 的场景
+
+- 高性能网络框架（Netty、Mina）
+- 大文件 I/O（内存映射文件）
+- NIO 场景下的频繁读写
+- 数据需要跨进程共享
+
+```java
+// 推荐使用 Buffer 池复用
+ByteBuffer buffer = ByteBuffer.allocateDirect(65536);
+// 长期持有，不要频繁创建销毁
+```
+
+### 性能对比
+
+```java
+public class BufferPerfTest {
+    public static void main(String[] args) {
+        int iterations = 1_000_000;
+        long start, end;
+
+        // HeapByteBuffer
+        start = System.nanoTime();
+        for (int i = 0; i < iterations; i++) {
+            ByteBuffer buf = ByteBuffer.allocate(1024);
+            buf.putInt(1);
+            buf.flip();
+            buf.getInt();
+        }
+        end = System.nanoTime();
+        System.out.println("Heap: " + (end - start) / 1_000_000 + "ms");
+
+        // DirectByteBuffer
+        start = System.nanoTime();
+        for (int i = 0; i < iterations; i++) {
+            ByteBuffer buf = ByteBuffer.allocateDirect(1024);
+            buf.putInt(1);
+            buf.flip();
+            buf.getInt();
+        }
+        end = System.nanoTime();
+        System.out.println("Direct: " + (end - start) / 1_000_000 + "ms");
+    }
+}
+```
+
+典型结果：
+
+```
+Heap:  ~150ms（分配快，但 I/O 需要复制）
+Direct: ~200ms（分配慢，但 I/O 无复制）
+```
+
+如果涉及实际 I/O 操作，DirectBuffer 通常更快；如果是纯内存操作，HeapBuffer 可能更快。
+
+## 直接内存的释放机制
+
+### Cleaner 的工作原理
+
+`DirectByteBuffer` 的堆内对象本身会被 GC 回收，但堆外内存需要通过 ` Cleaner` 主动释放：
+
+```java
+public class DirectByteBuffer extends MappedByteBuffer {
+
+    // 持有 Cleaner，用于释放堆外内存
+    private final Cleaner cleaner;
+
+    DirectByteBuffer(long addr, int cap) {
+        // 创建 Cleaner，传入一个清理任务
+        this.cleaner = Cleaner.create(this, new Deallocator(addr, cap));
+    }
+
+    // GC 时，如果对象没有引用了...
+    // Cleaner 的 freeMemory 会被调用
+}
+```
+
+**释放时机**：
+
+1. `DirectByteBuffer` 对象被 GC 回收
+2. Cleaner 注册的 `Deallocator` 任务被触发
+3. 调用 `Unsafe.freeMemory()` 释放堆外内存
+
+### 内存泄漏的常见原因
+
+**场景一：创建速度 > 回收速度**
+
+```java
+// 错误：频繁创建 DirectBuffer
+public class LeakDemo {
+    public void process(ByteBuffer data) {
+        // 每次请求创建一个 1MB 的 DirectBuffer
+        ByteBuffer buffer = ByteBuffer.allocateDirect(1024 * 1024);
+        buffer.put(data);
+        channel.write(buffer);
+        // buffer 对象被 GC 回收，但需要等 GC 触发 Cleaner
+        // 如果请求量大，堆外内存会持续增长
+    }
+}
+```
+
+**解决方案：使用 Buffer 池**
+
+```java
+public class BufferPoolDemo {
+    // 使用 Netty 的 ByteBuf 池
+    public void process(ByteBuffer data) {
+        ByteBuf buf = PooledByteBufAllocator.DEFAULT
+            .directBuffer(1024 * 1024);
+        try {
+            buf.writeBytes(data);
+            channel.write(buf);
+        } finally {
+            buf.release();  // 归还到池
+        }
+    }
+}
+```
+
+**场景二：容器中 MaxDirectMemorySize 未配置**
 
 ```bash
+# 错误：没有设置限制，依赖默认值
+docker run -m 512m java:8 java -jar app.jar
+
+# 正确：显式设置
+docker run -m 512m \
+  -XX:MaxDirectMemorySize=256m \
+  java:8 java -jar app.jar
+```
+
+## 监控直接内存
+
+### JMX 监控
+
+```java
+import java.lang.management.*;
+
+public class DirectMemoryMonitor {
+    public static void main(String[] args) {
+        // 获取堆外内存 MXBean
+        BufferPoolMXBean directBufferPool =
+            ManagementFactory.getPlatformMXBeans(BufferPoolMXBean.class)
+                .stream()
+                .filter(p -> p.getName().equals("direct"))
+                .findFirst()
+                .orElseThrow();
+
+        System.out.println("Direct Buffer Pool:");
+        System.out.println("  数量: " + directBufferPool.getCount());
+        System.out.println("  已用: " +
+            directBufferPool.getMemoryUsed() / 1024 / 1024 + " MB");
+        System.out.println("  总容量: " +
+            directBufferPool.getTotalCapacity() / 1024 / 1024 + " MB");
+    }
+}
+```
+
+### JCMD 命令行
+
+```bash
+# 查看直接内存使用情况
 jcmd <pid> VM.native_memory summary
+
+# 重点关注：
+# - Direct buffer memory: 直接内存使用量
+# - GC 后的释放情况
 ```
 
-输出类似：
+## 总结：直接内存使用 checklist
 
-```
-Native Memory Tracking:
-Total: reserved=2048MB, committed=512MB
--                  (堆外内存细分)
-  malloc:           128MB by NIO
-  mmap:             256MB by internal
-```
+| 检查项 | 说明 |
+|---|---|
+| 容器环境配置 | Docker 中是否设置了 `-XX:MaxDirectMemorySize`？ |
+| 内存池化 | 是否使用了 Buffer 池（Netty ByteBuf Pool）？ |
+| 生命周期管理 | DirectBuffer 是否被正确释放？ |
+| 监控告警 | 是否配置了直接内存的 JMX 监控？ |
+| 容器内存比例 | 直接内存限制是否足够（建议不超过容器内存的 50%）？ |
 
-### 限制堆外内存大小
-
-`-XX:MaxDirectMemorySize=512m`限制堆外内存最大512MB。超过这个值会触发Full GC试图释放DirectBuffer：
-
-```java
-// 触发Full GC清理不再使用的DirectByteBuffer
-System.gc();
-```
-
-但这不能保证立即释放——GC只是标记Cleaner，真正的释放由ReferenceHandler异步执行。
-
-### 调优建议
-
-根据实际经验给出几点建议：
-
-1. **使用对象池**：Netty的`PooledByteBufAllocator`是最佳实践
-2. **监控内存**：开启NMT，定期检查是否有泄漏
-3. **合理设置大小**：单个DirectBuffer不要太大（几个MB足矣）
-4. **及时释放引用**：让不再使用的Buffer能被GC及时回收
-
-## Netty的DirectBuffer池化实践
-
-Netty是DirectBuffer用得最好的框架。它的`PooledByteBufAllocator`实现了高效的堆外内存池：
-
-```java
-// Netty 4.x的PooledByteBufAllocator
-// 核心思想：预分配多个Chunk，每个Chunk管理多个Page
-
-PooledByteBufAllocator allocator = new PooledByteBufAllocator(
-    true,  // preferDirect，优先使用堆外内存
-    12,    // 堆内线程缓存数量
-    12,    // 堆外线程缓存数量
-    DefaultObjectPool.newPooledByteBufArena
-);
-```
-
-工作原理：
-
-1. **预分配**：启动时预先分配内存池，避免运行时malloc
-2. **分块管理**：大Buffer从大Chunk分配，小Buffer从Page分配
-3. **线程缓存**：每个线程有自己的缓存，减少锁竞争
-4. **引用计数**：基于ReferenceCounted接口，用完归还而不是等待GC
-
-Netty还实现了**零拷贝文件传输**：
-
-```java
-// 使用FileRegion实现零拷贝
-FileInputStream in = new FileInputStream("largefile.dat");
-FileRegion region = new DefaultFileRegion(
-    in.getChannel(), 0, file.length());
-
-ctx.write(region);  // 直接sendfile，不经过Java堆
-```
-
-这种零拷贝让文件传输的吞吐量大增，CPU占用率大降。
-
-## 什么场景该用DirectBuffer
-
-总结一下DirectBuffer的适用场景：
-
-**应该用DirectBuffer**：
-
-- 高性能网络框架（Netty、gRPC）
-- 频繁进行I/O操作的应用
-- 大文件传输（配合内存映射更佳）
-- 需要减少GC压力的场景（避免Buffer进入GC扫描）
-
-**不该用DirectBuffer**：
-
-- 小数据量、低频I/O（创建成本不划算）
-- 内存中的数据处理（CPU缓存友好更重要）
-- 需要序列化/反序列化的数据（堆内更方便）
-
-**判断标准**：如果你的应用每秒I/O吞吐量超过1GB，DirectBuffer的性能优势会很明显。如果只是每秒几千个请求，每个请求几KB，HeapByteBuffer完全够用。
-
-## 面试高频问题
-
-### Q1：堆外内存溢出怎么办？
-
-**A**：堆外内存耗尽会抛出`OutOfMemoryError: Direct buffer memory`。解决思路：
-
-1. 检查是否泄漏：监控NMT，找出谁在分配
-2. 限制容量：`-XX:MaxDirectMemorySize=256m`
-3. 修复泄漏代码：确保Buffer能被GC回收，或使用池化
-4. 考虑降级：对于非核心功能，可以catch异常降级到堆内Buffer
-
-### Q2：DirectBuffer会被GC回收吗？
-
-**A**：DirectBuffer对象本身会被GC回收，但**堆外内存不会立即释放**。真正释放依赖Cleaner（虚引用），由ReferenceHandler线程异步执行。这意味着即使你不再引用DirectBuffer对象，堆外内存也可能持续占用一段时间。
-
-### Q3：堆内Buffer和堆外Buffer的选择策略？
-
-**A**：
-
-```
-I/O密集型 + 高并发 -> DirectBuffer + 池化
-I/O密集型 + 低并发 -> HeapBuffer即可
-计算密集型 -> HeapBuffer
-需要共享/传输 -> HeapBuffer
-```
-
-下一节，我们聊聊Netty——这个用DirectBuffer用得最溜的框架，如何用NIO构建高性能网络通信。
+直接内存是一把双刃剑——用得好可以显著提升 I/O 性能，用不好就会成为线上隐患。理解它的底层机制，才能在性能和稳定性之间找到平衡。

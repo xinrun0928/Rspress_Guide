@@ -1,264 +1,788 @@
 # 分布式唯一任务执行：乐观锁 + 分布式锁双保险
 
-你有没有遇到过这种情况：定时任务部署了两台机器，结果两边同时跑，同一个任务执行了两次。数据重复了，优惠券重复发放了，日志重复写了好几条……
+两个定时任务同时触发，都要处理同一批数据。如果不加控制，它们会重复执行——你可能给用户发了两次短信，扣了两次钱。
 
-分布式环境下，保证**同一时刻只有一个节点执行同一个任务**，是分布式调度最核心的问题。
+分布式唯一任务执行，就是为了解决这个问题。
 
-## 问题分析：为什么会有重复执行？
+## 为什么需要唯一执行？
+
+### 重复执行的问题
 
 ```
-定时任务触发（每分钟执行一次）
-    ↓
-两个节点同时收到调度信号
-    ↓
-节点 A 执行任务，节点 B 也执行任务
-    ↓
-任务被重复执行
+┌──────────────────────────────────────────────────────────────────┐
+│                    定时任务重复执行问题                            │
+├──────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  定时触发: 每分钟执行一次                                         │
+│                                                                   │
+│  时刻 T0:                                                        │
+│  ┌─────────────┐ ┌─────────────┐                                │
+│  │  节点 A     │ │  节点 B     │                                │
+│  │  执行任务   │ │  执行任务   │  ← 重复执行！                   │
+│  │  扣款 ¥100  │ │  扣款 ¥100  │  ← 用户损失 ¥100               │
+│  └─────────────┘ └─────────────┘                                │
+│                                                                   │
+│  后果:                                                           │
+│  - 数据重复处理                                                  │
+│  - 业务逻辑错误                                                  │
+│  - 用户资产损失                                                  │
+│                                                                   │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-根本原因：**调度中心广播了任务触发信号，但多个执行节点都认为自己应该执行。**
+### 解决方案对比
 
-## 方案一：抢任务模式（分布式锁）
+| 方案 | 原理 | 优点 | 缺点 |
+|---|---|---|---|
+| 定时调度器单点 | 只有一个节点执行 | 简单 | 可用性低 |
+| 分布式锁 | 抢锁执行 | 简单可靠 | 锁竞争 |
+| 乐观锁 | 版本号控制 | 无锁竞争 | 可能失败重试 |
+| 任务表 | 数据库记录 | 可靠 | 增加数据库负担 |
 
-最简单的方案：用分布式锁抢任务执行权。只有抢到锁的节点才能执行。
+## 分布式锁实现
+
+### Redis 分布式锁
 
 ```java
-public class DistributedTaskExecutor {
-    
-    @Autowired
-    private RedissonClient redisson;
-    
-    public void executeTask(String taskId, Runnable task) {
-        RLock lock = redisson.getLock("task:" + taskId);
-        
-        // tryLock：尝试获取锁，最多等待 0 秒，锁自动过期 10 秒
-        boolean acquired = lock.tryLock(0, 10, TimeUnit.SECONDS);
-        
-        if (acquired) {
-            try {
-                // 抢到锁，执行任务
-                task.run();
-            } finally {
-                // 任务执行完释放锁
-                if (lock.isHeldByCurrentThread()) {
-                    lock.unlock();
+/**
+ * Redis 分布式锁
+ */
+@Service
+public class RedisDistributedLock {
+
+    private final RedisTemplate<String, Object> redisTemplate;
+    private static final String LOCK_PREFIX = "lock:";
+
+    /**
+     * 尝试获取锁
+     */
+    public boolean tryLock(String key, long expireTime, TimeUnit unit) {
+        String lockKey = LOCK_PREFIX + key;
+        String lockValue = generateLockValue();
+
+        // SET key value NX PX milliseconds
+        Boolean result = redisTemplate.opsForValue().setIfAbsent(
+            lockKey,
+            lockValue,
+            Duration.ofMillis(unit.toMillis(expireTime))
+        );
+
+        return Boolean.TRUE.equals(result);
+    }
+
+    /**
+     * 释放锁
+     */
+    public boolean unlock(String key, String lockValue) {
+        String lockKey = LOCK_PREFIX + key;
+
+        // Lua 脚本：只有锁持有者才能释放
+        String script =
+            "if redis.call('get', KEYS[1]) == ARGV[1] then " +
+            "  return redis.call('del', KEYS[1]) " +
+            "else " +
+            "  return 0 " +
+            "end";
+
+        Long result = redisTemplate.execute(
+            new DefaultRedisScript<>(script, Long.class),
+            Collections.singletonList(lockKey),
+            lockValue
+        );
+
+        return result != null && result > 0;
+    }
+
+    /**
+     * 可重入锁（同一线程可多次获取）
+     */
+    public boolean tryReentrantLock(String key, long expireTime, TimeUnit unit) {
+        String lockKey = LOCK_PREFIX + key;
+        String lockValue = generateLockValue();
+        String threadId = getCurrentThreadId();
+
+        // 检查是否是同一线程持有
+        Object currentValue = redisTemplate.opsForValue().get(lockKey);
+        if (currentValue != null) {
+            LockInfo lockInfo = parseLockValue(currentValue.toString());
+            if (lockInfo.getThreadId().equals(threadId)) {
+                // 同一线程，增加重入计数
+                lockInfo.setCount(lockInfo.getCount() + 1);
+                redisTemplate.opsForValue().set(lockKey,
+                    serializeLockInfo(lockInfo),
+                    Duration.ofMillis(unit.toMillis(expireTime)));
+                return true;
+            }
+        }
+
+        // 尝试获取锁
+        Boolean result = redisTemplate.opsForValue().setIfAbsent(
+            lockKey,
+            serializeLockInfo(new LockInfo(lockValue, threadId, 1)),
+            Duration.ofMillis(unit.toMillis(expireTime))
+        );
+
+        return Boolean.TRUE.equals(result);
+    }
+
+    /**
+     * 生成锁值（包含时间戳和随机数）
+     */
+    private String generateLockValue() {
+        return System.currentTimeMillis() + ":" + UUID.randomUUID().toString();
+    }
+
+    private String getCurrentThreadId() {
+        return Thread.currentThread().getName() + "-" + Thread.currentThread().getId();
+    }
+}
+```
+
+### 分布式锁注解
+
+```java
+/**
+ * 分布式锁注解
+ */
+@Target(ElementType.METHOD)
+@Retention(RetentionPolicy.RUNTIME)
+public @interface DistributedLock {
+
+    /**
+     * 锁的 key
+     */
+    String key();
+
+    /**
+     * 锁过期时间
+     */
+    long expireTime() default 30;
+
+    /**
+     * 时间单位
+     */
+    TimeUnit timeUnit() default TimeUnit.SECONDS;
+
+    /**
+     * 获取锁等待时间
+     */
+    long waitTime() default 0;
+
+    /**
+     * 是否可重入
+     */
+    boolean reentrant() default false;
+}
+
+/**
+ * 分布式锁切面
+ */
+@Aspect
+@Component
+public class DistributedLockAspect {
+
+    private final RedisDistributedLock lockService;
+
+    @Around("@annotation(distributedLock)")
+    public Object around(ProceedingJoinPoint joinPoint,
+                        DistributedLock distributedLock) throws Throwable {
+
+        String key = resolveKey(distributedLock.key(), joinPoint);
+        String lockValue = UUID.randomUUID().toString();
+
+        boolean acquired = false;
+
+        try {
+            // 1. 尝试获取锁
+            acquired = lockService.tryLock(
+                key,
+                distributedLock.expireTime(),
+                distributedLock.timeUnit()
+            );
+
+            if (!acquired) {
+                // 2. 获取失败，根据配置决定行为
+                if (distributedLock.waitTime() > 0) {
+                    // 等待一段时间
+                    Thread.sleep(distributedLock.waitTime());
+                    acquired = lockService.tryLock(key,
+                        distributedLock.expireTime(),
+                        distributedLock.timeUnit());
+                }
+
+                if (!acquired) {
+                    throw new LockAcquisitionException("获取锁失败: " + key);
                 }
             }
-        } else {
-            log.info("任务 {} 被其他节点抢走了", taskId);
-        }
-    }
-}
-```
 
-### 分布式锁的问题
+            // 3. 执行目标方法
+            return joinPoint.proceed();
 
-分布式锁看起来简单，但有几个隐藏的坑：
-
-**问题一：锁过期时间设多久？**
-```java
-// ❌ 错误：锁过期时间太短，任务还没执行完就自动释放了
-lock.tryLock(0, 5, TimeUnit.SECONDS);  // 任务要跑 10 秒，锁 5 秒就过期了
-
-// ✅ 正确：根据任务预估时间 + buffer 设置
-// 任务预估 10 秒，锁过期时间设为 30 秒（3 倍 buffer）
-lock.tryLock(0, 30, TimeUnit.SECONDS);
-
-// ✅ 更可靠：用看门狗自动续期
-RLock lock = redisson.getLock("task:xxx");
-// 不设置过期时间，Redisson 会自动续期（默认每 10 秒续期 30 秒）
-lock.lock();
-```
-
-**问题二：任务执行超时**
-```java
-// 执行任务时，设置超时保护
-public void executeWithTimeout(String taskId, Runnable task, long timeoutSeconds) {
-    RLock lock = redisson.getLock("task:" + taskId);
-    
-    if (lock.tryLock(0, timeoutSeconds * 2, TimeUnit.SECONDS)) {
-        try {
-            Future<?> future = executor.submit(() -> {
-                task.run();
-            });
-            
-            future.get(timeoutSeconds, TimeUnit.SECONDS);
-        } catch (TimeoutException e) {
-            log.error("任务 {} 执行超时（{}s），强制中断", taskId, timeoutSeconds);
-            future.cancel(true);
         } finally {
-            if (lock.isHeldByCurrentThread()) {
-                lock.forceUnlock();  // 强制释放
+            // 4. 释放锁
+            if (acquired) {
+                lockService.unlock(key, lockValue);
             }
         }
     }
+
+    private String resolveKey(String keyTemplate, ProceedingJoinPoint joinPoint) {
+        // 支持 SpEL 表达式
+        if (keyTemplate.contains("#")) {
+            EvaluationContext context = new StandardEvaluationContext();
+            String[] parameterNames = getParameterNames(joinPoint);
+            Object[] args = joinPoint.getArgs();
+
+            for (int i = 0; i < parameterNames.length; i++) {
+                ((StandardEvaluationContext) context).setVariable(parameterNames[i], args[i]);
+            }
+
+            return new SpelExpressionParser().parseExpression(keyTemplate)
+                .getValue(context, String.class);
+        }
+        return keyTemplate;
+    }
 }
 ```
 
-## 方案二：乐观锁（数据库版本号）
+## 乐观锁实现
 
-用数据库的版本号字段实现乐观锁，不需要分布式锁。
+### 数据库乐观锁
 
 ```sql
--- 任务调度表
+-- 任务表加版本号
 CREATE TABLE scheduled_task (
-    id VARCHAR(64) PRIMARY KEY,      -- 任务 ID
-    cron_expression VARCHAR(32),      -- cron 表达式
-    status VARCHAR(16),              -- IDLE/RUNNING/SUCCESS/FAILED
-    lock_version INT DEFAULT 0,     -- 乐观锁版本号
-    lock_node VARCHAR(64),          -- 抢到锁的节点 ID
-    lock_time BIGINT,                -- 加锁时间
-    update_time BIGINT,              -- 更新时间
-    INDEX idx_status_update (status, update_time)
-);
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    task_key VARCHAR(128) NOT NULL COMMENT '任务唯一标识',
+    task_type VARCHAR(64) NOT NULL COMMENT '任务类型',
+    status VARCHAR(32) NOT NULL DEFAULT 'IDLE' COMMENT '状态: IDLE/RUNNING/COMPLETED/FAILED',
+    version INT NOT NULL DEFAULT 0 COMMENT '乐观锁版本',
+    last_execute_time DATETIME COMMENT '上次执行时间',
+    next_execute_time DATETIME COMMENT '下次执行时间',
+    max_execute_time DATETIME COMMENT '最大执行时间',
+    result TEXT COMMENT '执行结果',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+    UNIQUE KEY uk_task_key (task_key),
+    INDEX idx_status (status),
+    INDEX idx_next_execute_time (next_execute_time)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 ```
 
+### 乐观锁服务
+
 ```java
-public class OptimisticLockTaskExecutor {
-    
+/**
+ * 乐观锁任务服务
+ */
+@Service
+public class OptimisticLockTaskService {
+
     @Autowired
     private JdbcTemplate jdbcTemplate;
-    
-    public boolean tryAcquire(String taskId) {
-        String nodeId = getCurrentNodeId();
-        
-        // 乐观锁更新：只有当前版本号匹配才能更新成功
-        String sql = """
-            UPDATE scheduled_task
-            SET status = 'RUNNING',
-                lock_node = ?,
-                lock_version = lock_version + 1,
-                lock_time = ?
-            WHERE id = ?
-              AND status = 'IDLE'
-              AND lock_version = ?
-            """;
-        
+
+    /**
+     * 尝试获取任务执行权
+     * 使用乐观锁，只有版本号匹配才能更新成功
+     */
+    public TaskClaimResult claimTask(String taskKey, long maxExecuteTime) {
+        // 1. 获取当前时间
         long now = System.currentTimeMillis();
-        int updated = jdbcTemplate.update(sql, nodeId, now, taskId, getCurrentVersion(taskId));
-        
-        return updated > 0;  // updated == 1 表示抢锁成功
+
+        // 2. 尝试获取任务（乐观锁）
+        String sql =
+            "UPDATE scheduled_task " +
+            "SET status = 'RUNNING', " +
+            "    last_execute_time = ?, " +
+            "    max_execute_time = ?, " +
+            "    version = version + 1 " +
+            "WHERE task_key = ? " +
+            "  AND status IN ('IDLE', 'COMPLETED', 'FAILED') " +
+            "  AND (next_execute_time IS NULL OR next_execute_time <= ?) " +
+            "  AND version = ?";
+
+        // 先查询当前版本
+        Task currentTask = findByTaskKey(taskKey);
+        if (currentTask == null) {
+            return TaskClaimResult.FAILED_TASK_NOT_FOUND;
+        }
+
+        // 尝试更新
+        int updated = jdbcTemplate.update(sql,
+            new Date(now),
+            new Date(maxExecuteTime),
+            taskKey,
+            new Date(now),
+            currentTask.getVersion()
+        );
+
+        if (updated == 1) {
+            // 获取成功
+            Task claimedTask = findByTaskKey(taskKey);
+            return TaskClaimResult.success(claimedTask);
+        } else {
+            // 获取失败（被其他节点抢走）
+            return TaskClaimResult.FAILED_LOCK_CONFLICT;
+        }
     }
-    
-    public void release(String taskId, String status) {
-        String sql = """
-            UPDATE scheduled_task
-            SET status = ?, lock_node = NULL, lock_version = lock_version + 1
-            WHERE id = ?
-            """;
-        jdbcTemplate.update(sql, status, taskId);
+
+    /**
+     * 完成任务
+     */
+    public void completeTask(String taskKey, String result) {
+        String sql =
+            "UPDATE scheduled_task " +
+            "SET status = 'COMPLETED', " +
+            "    result = ?, " +
+            "    version = version + 1 " +
+            "WHERE task_key = ? AND status = 'RUNNING'";
+
+        jdbcTemplate.update(sql, result, taskKey);
+    }
+
+    /**
+     * 标记任务失败
+     */
+    public void failTask(String taskKey, String errorMessage) {
+        String sql =
+            "UPDATE scheduled_task " +
+            "SET status = 'FAILED', " +
+            "    result = ?, " +
+            "    version = version + 1 " +
+            "WHERE task_key = ? AND status = 'RUNNING'";
+
+        jdbcTemplate.update(sql, errorMessage, taskKey);
+    }
+
+    /**
+     * 释放任务（用于超时处理）
+     */
+    public void releaseTask(String taskKey) {
+        String sql =
+            "UPDATE scheduled_task " +
+            "SET status = 'FAILED', " +
+            "    result = '执行超时', " +
+            "    version = version + 1 " +
+            "WHERE task_key = ? " +
+            "  AND status = 'RUNNING' " +
+            "  AND max_execute_time < ?";
+
+        jdbcTemplate.update(sql, taskKey, new Date());
     }
 }
 ```
 
-### 乐观锁的问题
+## 双保险实现
 
-乐观锁在高并发下会有**锁竞争问题**：大量节点同时尝试更新，但只有第一个成功，其他全部失败（白白浪费资源）。
-
-## 方案三：双保险——分布式锁 + 乐观锁
-
-生产环境推荐用**分布式锁做第一道关卡，乐观锁做兜底**。
+### 乐观锁 + 分布式锁
 
 ```java
-public class DoubleGuardTaskExecutor {
-    
-    @Autowired
-    private RedissonClient redisson;
-    @Autowired
-    private JdbcTemplate jdbcTemplate;
-    
-    private final String taskId;
-    
-    public void execute(Runnable task) {
-        // 第一步：分布式锁（快速过滤大部分节点）
-        RLock lock = redisson.getLock("task:lock:" + taskId);
-        if (!lock.tryLock(0, 10, TimeUnit.SECONDS)) {
-            log.debug("分布式锁未抢到，跳过");
-            return;
-        }
-        
+/**
+ * 分布式定时任务执行器
+ * 结合乐观锁和分布式锁，保证任务唯一执行
+ */
+@Service
+public class DistributedTaskExecutor {
+
+    private final OptimisticLockTaskService optimisticLockService;
+    private final RedisDistributedLock distributedLock;
+    private final TaskExecutor taskExecutor;
+
+    private static final String TASK_LOCK_PREFIX = "task:lock:";
+
+    /**
+     * 执行定时任务（双保险）
+     */
+    public void executeTask(String taskKey) {
+        String distributedLockKey = TASK_LOCK_PREFIX + taskKey;
+        String lockValue = UUID.randomUUID().toString();
+
+        boolean lockAcquired = false;
+
         try {
-            // 第二步：乐观锁（数据库层面再确认一次）
-            if (!dbTryAcquire(taskId)) {
-                log.debug("数据库乐观锁未抢到，跳过");
+            // 第一层：分布式锁（快速失败）
+            lockAcquired = distributedLock.tryLock(distributedLockKey, lockValue, 30, TimeUnit.SECONDS);
+
+            if (!lockAcquired) {
+                log.info("未能获取分布式锁，跳过执行: {}", taskKey);
                 return;
             }
-            
-            // 执行任务
-            try {
-                task.run();
-                dbRelease(taskId, "SUCCESS");
-            } catch (Exception e) {
-                dbRelease(taskId, "FAILED");
-                throw e;
+
+            // 第二层：乐观锁（保证唯一）
+            TaskClaimResult claimResult = optimisticLockService.claimTask(
+                taskKey,
+                System.currentTimeMillis() + 5 * 60 * 1000  // 5 分钟后超时
+            );
+
+            if (!claimResult.isSuccess()) {
+                log.info("乐观锁获取失败: taskKey={}, reason={}",
+                    taskKey, claimResult.getFailReason());
+                return;
             }
+
+            // 执行任务
+            executeTaskInternal(taskKey, claimResult.getTask());
+
+        } catch (Exception e) {
+            log.error("执行任务异常: taskKey={}", taskKey, e);
+            optimisticLockService.failTask(taskKey, e.getMessage());
+
         } finally {
-            if (lock.isHeldByCurrentThread()) {
-                lock.unlock();
+            // 释放分布式锁
+            if (lockAcquired) {
+                distributedLock.unlock(distributedLockKey, lockValue);
             }
         }
     }
-    
-    private boolean dbTryAcquire(String taskId) {
-        String sql = """
-            UPDATE scheduled_task
-            SET status = 'RUNNING', lock_node = ?, lock_time = ?
-            WHERE id = ? AND status = 'IDLE'
-            """;
-        return jdbcTemplate.update(sql, getNodeId(), System.currentTimeMillis(), taskId) > 0;
-    }
-    
-    private void dbRelease(String taskId, String status) {
-        String sql = "UPDATE scheduled_task SET status = ?, lock_node = NULL WHERE id = ?";
-        jdbcTemplate.update(sql, status, taskId);
+
+    private void executeTaskInternal(String taskKey, Task task) {
+        try {
+            // 执行具体的业务逻辑
+            Object result = taskExecutor.execute(task);
+
+            // 任务完成
+            optimisticLockService.completeTask(taskKey, toJson(result));
+
+            log.info("任务执行成功: taskKey={}", taskKey);
+
+        } catch (Exception e) {
+            log.error("任务执行失败: taskKey={}", taskKey, e);
+            optimisticLockService.failTask(taskKey, e.getMessage());
+        }
     }
 }
 ```
 
-## 方案四：任务分片（最推荐的方案）
-
-把任务按执行节点分片，每个节点只执行自己负责的那部分。天然不会有重复执行问题。
+### Spring @Scheduled 改造
 
 ```java
-public class ShardingTaskExecutor {
-    
-    // 10 个节点，节点 0 只执行分片 0，节点 1 只执行分片 1...
-    public void execute(String taskId, int totalShards, int shardIndex, Runnable task) {
-        String nodeId = getCurrentNodeId();
-        int nodeShard = calculateShard(nodeId, totalShards);
-        
-        if (nodeShard != shardIndex) {
-            log.debug("分片 {} 不归本节点（{}）执行", shardIndex, nodeShard);
-            return;
+/**
+ * 分布式定时任务调度器
+ */
+@Configuration
+public class DistributedScheduler {
+
+    @Autowired
+    private TaskRepository taskRepository;
+
+    @Autowired
+    private DistributedTaskExecutor taskExecutor;
+
+    /**
+     * 分布式定时任务（不再使用 @Scheduled）
+     */
+    @Scheduled(fixedDelay = 60000)  // 1 分钟调度一次
+    public void scheduleTasks() {
+        // 1. 查询待执行的任务
+        List<Task> tasks = taskRepository.findRunnableTasks(
+            new Date(),
+            10  // 每次最多调度 10 个
+        );
+
+        for (Task task : tasks) {
+            // 2. 异步执行任务
+            CompletableFuture.runAsync(() ->
+                taskExecutor.executeTask(task.getTaskKey())
+            );
         }
-        
-        task.run();
     }
-    
-    // 节点 ID → 分片序号的映射（一致性哈希，保证节点变化时影响最小）
-    private int calculateShard(String nodeId, int totalShards) {
-        int hash = Math.abs(nodeId.hashCode());
-        return hash % totalShards;
+
+    /**
+     * 处理超时任务
+     */
+    @Scheduled(fixedDelay = 60000)  // 1 分钟检查一次
+    public void handleTimeoutTasks() {
+        List<Task> timeoutTasks = taskRepository.findTimeoutTasks(new Date());
+
+        for (Task task : timeoutTasks) {
+            log.warn("发现超时任务: taskKey={}, maxExecuteTime={}",
+                task.getTaskKey(), task.getMaxExecuteTime());
+
+            // 释放任务（乐观锁）
+            optimisticLockService.releaseTask(task.getTaskKey());
+        }
     }
 }
 ```
 
-## 各种方案对比
+### XXL-Job 集成
 
-| 方案 | 实现复杂度 | 可靠性 | 适用场景 |
-|---|---|---|---|
-| 分布式锁 | 低 | 中（依赖锁可靠性） | 短任务 |
-| 乐观锁 | 中 | 高（数据库保证） | 中等并发 |
-| 双保险 | 高 | 最高 | 核心任务 |
-| 任务分片 | 中 | 最高（天然去重） | 大量数据处理 |
+```java
+/**
+ * XXL-Job 执行器
+ */
+@Configuration
+public class XxlJobConfig {
+
+    @Bean
+    public XxlJobSpringExecutor xxlJobExecutor() {
+        XxlJobSpringExecutor executor = new XxlJobSpringExecutor();
+        executor.setAppname("my-task-executor");
+        executor.setAdminAddresses("http://xxl-job-admin:8080/xxl-job-admin");
+        executor.setIp("");
+        executor.setPort(9999);
+        executor.setAccessToken("");
+        executor.setLogPath("/data/applogs/xxl-job/jobhandler");
+        executor.setLogRetentionDays(30);
+        return executor;
+    }
+}
+
+/**
+ * 分布式任务 Handler
+ */
+@Component
+public class DistributedTaskHandler {
+
+    /**
+     * 使用分布式锁的定时任务
+     */
+    @XxlJob("distributedDataSyncJob")
+    public ReturnT<String> execute() {
+        String taskKey = "data-sync-task";
+
+        try {
+            // 调用分布式执行器
+            distributedTaskExecutor.executeTask(taskKey);
+            return ReturnT.SUCCESS;
+        } catch (Exception e) {
+            log.error("分布式任务执行失败", e);
+            return new ReturnT<>(ReturnT.FAIL_CODE, e.getMessage());
+        }
+    }
+}
+```
+
+## 任务调度策略
+
+### 分片广播任务
+
+```java
+/**
+ * 分片广播任务
+ * 所有节点都执行相同的任务，用于数据同步等场景
+ */
+@Component
+public class ShardingBroadcastTask {
+
+    @Autowired
+    private ShardingStrategy shardingStrategy;
+
+    @XxlJob("shardingBroadcastJob")
+    public ReturnT<String> execute() {
+        // 1. 获取当前节点的分片编号
+        ShardingEnv shardingEnv = XxlJobHelper.getShardingEnv();
+        int currentShard = shardingEnv.getIndex();
+        int totalShards = shardingEnv.getTotal();
+
+        log.info("分片广播任务: current={}, total={}", currentShard, totalShards);
+
+        // 2. 执行本分片的任务
+        List<Long> ids = shardingStrategy.getShardingIds(currentShard, totalShards, 100000);
+
+        for (Long id : ids) {
+            processItem(id);
+        }
+
+        return ReturnT.SUCCESS;
+    }
+
+    private void processItem(Long id) {
+        // 处理逻辑
+    }
+}
+```
+
+### 顺序执行任务
+
+```java
+/**
+ * 顺序执行任务
+ * 保证同一业务的任务按顺序执行
+ */
+@Service
+public class SequentialTaskExecutor {
+
+    private final RedisTemplate<String, Object> redisTemplate;
+    private static final String SEQUENTIAL_LOCK_PREFIX = "sequential:lock:";
+
+    /**
+     * 按顺序执行任务
+     */
+    public <T> void executeSequentially(String businessKey, Supplier<T> task) {
+        String lockKey = SEQUENTIAL_LOCK_PREFIX + businessKey;
+
+        // 使用 Redis 队列保证顺序
+        redisTemplate.opsForList().rightPush("sequential:queue:" + businessKey, businessKey);
+
+        // 获取执行权
+        while (true) {
+            // 检查是否轮到当前任务
+            Object front = redisTemplate.opsForList().get("sequential:queue:" + businessKey, 0);
+            if (businessKey.equals(front)) {
+                // 是第一个，执行任务
+                try {
+                    task.get();
+                } finally {
+                    // 完成后移除
+                    redisTemplate.opsForList().leftPop("sequential:queue:" + businessKey);
+                }
+                break;
+            }
+
+            // 等待
+            try {
+                Thread.sleep(100);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+    }
+}
+```
+
+## 监控与告警
+
+### 任务监控
+
+```java
+/**
+ * 任务执行监控
+ */
+@Service
+public class TaskExecutionMonitor {
+
+    @Autowired
+    private TaskRepository taskRepository;
+
+    @Scheduled(fixedRate = 60000)
+    public void monitorTaskExecution() {
+        // 1. 检查正在运行的任务
+        List<Task> runningTasks = taskRepository.findByStatus("RUNNING");
+
+        for (Task task : runningTasks) {
+            // 检查是否超时
+            if (isTaskTimeout(task)) {
+                handleTaskTimeout(task);
+            }
+        }
+
+        // 2. 统计任务执行情况
+        reportTaskStatistics();
+    }
+
+    private boolean isTaskTimeout(Task task) {
+        if (task.getMaxExecuteTime() == null) {
+            return false;
+        }
+        return System.currentTimeMillis() > task.getMaxExecuteTime().getTime();
+    }
+
+    private void handleTaskTimeout(Task task) {
+        log.warn("任务执行超时: taskKey={}, maxExecuteTime={}",
+            task.getTaskKey(), task.getMaxExecuteTime());
+
+        // 释放任务
+        optimisticLockService.releaseTask(task.getTaskKey());
+
+        // 发送告警
+        alertService.sendAlert("任务执行超时",
+            AlertLevel.WARNING,
+            Map.of("taskKey", task.getTaskKey()));
+    }
+
+    private void reportTaskStatistics() {
+        // 上报任务执行指标到监控系统
+        Map<String, Object> stats = taskRepository.getTaskStatistics();
+        metricsService.record("task.running", stats.get("running"));
+        metricsService.record("task.failed", stats.get("failed"));
+        metricsService.record("task.completed", stats.get("completed"));
+    }
+}
+```
+
+## 常见问题与解决
+
+### 问题一：锁释放失败
+
+```java
+// 使用看门狗自动续期
+@Service
+public class LockRenewalService {
+
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
+
+    public String acquireLockWithWatchdog(String key, long expireTime) {
+        String lockValue = UUID.randomUUID().toString();
+        String lockKey = "lock:" + key;
+
+        // 尝试获取锁
+        Boolean acquired = redisTemplate.opsForValue().setIfAbsent(
+            lockKey, lockValue, Duration.ofSeconds(expireTime));
+
+        if (!Boolean.TRUE.equals(acquired)) {
+            return null;
+        }
+
+        // 启动看门狗，自动续期
+        scheduleRenewal(lockKey, expireTime);
+
+        return lockValue;
+    }
+
+    private void scheduleRenewal(String lockKey, long expireTime) {
+        scheduler.scheduleAtFixedRate(() -> {
+            // 检查锁是否还存在
+            if (Boolean.TRUE.equals(redisTemplate.hasKey(lockKey))) {
+                // 续期
+                redisTemplate.expire(lockKey, Duration.ofSeconds(expireTime));
+            }
+        }, expireTime / 3, expireTime / 3, TimeUnit.SECONDS);
+    }
+}
+```
+
+### 问题二：任务重复调度
+
+```java
+// 使用唯一调度键
+@XxlJob(value = "uniqueDataSyncJob", cron = "0 0 2 * * ?")
+public ReturnT<String> execute() {
+    // 使用分布式锁保证唯一执行
+    String lockKey = "xxl-job:unique:dataSyncJob";
+    if (!distributedLock.tryLock(lockKey, 30, TimeUnit.SECONDS)) {
+        return new ReturnT<>(ReturnT.SUCCESS_CODE, "任务已在其他节点执行");
+    }
+
+    try {
+        // 执行任务
+        return doExecute();
+    } finally {
+        distributedLock.unlock(lockKey);
+    }
+}
+```
 
 ## 总结
 
-分布式唯一任务执行，关键是**让任务执行权和任务本身解耦**：
+分布式唯一任务执行的核心是**双重保障**：
 
-- **分布式锁**：适合短任务，锁可靠性是关键
-- **乐观锁**：适合中等并发场景，数据库层面保证
-- **双保险**：适合核心任务，两层保护
-- **任务分片**：最适合大批量数据处理，天然无冲突
+| 机制 | 作用 | 特点 |
+|---|---|---|
+| 分布式锁 | 第一道防线，快速失败 | 性能好，可能死锁 |
+| 乐观锁 | 第二道防线，唯一保证 | 可靠，可能重试 |
 
-实际生产中，**任务分片 + 分布式锁** 是最推荐的组合：分片保证任务不重复，锁保证分片内同一时刻只有一个节点执行。
+最佳实践：
+
+1. **优先使用分布式锁**：性能好，大部分场景够用
+2. **关键任务加乐观锁**：对数据一致性要求高的任务
+3. **设置任务超时**：防止任务卡死导致锁无法释放
+4. **做好监控告警**：及时发现和处理异常
+
+记住：**没有银弹**。不同的场景需要不同的方案，要根据实际需求选择。
+

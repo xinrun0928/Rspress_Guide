@@ -1,0 +1,434 @@
+# DM 实时主备与异步主备：架构设计与配置详解
+
+数据是企业最核心的资产。
+
+单机数据库再强，也扛不住硬盘故障、机房断电、服务器宕机。**高可用**不是锦上添花，而是生产环境的必备能力。
+
+DM（达梦数据库）提供了 **实时主备（Primary-Synchronous Standby）** 和 **异步主备（Primary-Asynchronous Standby）** 两种方案。前者保证数据零丢失，后者保证业务连续性。选哪个，要看你的业务需求。
+
+## 主备集群核心概念
+
+### 主备架构原理
+
+DM 的主备集群基于 **日志同步** 机制：
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     DM 主备架构                                  │
+│                                                                 │
+│    ┌──────────────┐                      ┌──────────────┐      │
+│    │   Primary    │ ──▶ 实时日志同步 ──▶ │  Standby 1   │      │
+│    │   (主库)     │                      │  (实时备库)   │      │
+│    └──────────────┘                      └──────────────┘      │
+│          │                                        │             │
+│          │           ┌──────────────┐              │             │
+│          └─────────▶ │  Standby 2   │              │             │
+│                      │  (异步备库)  │              │             │
+│                      └──────────────┘              │             │
+│                                                       │             │
+│    ┌──────────────┐                                   │             │
+│    │  Monitor     │◀─────────────────────────────────┘             │
+│    │  (监视器)     │                                              │
+│    └──────────────┘                                              │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**核心组件**：
+
+| 组件 | 说明 |
+|---|---|
+| Primary | 主库，处理所有读写请求 |
+| Standby | 备库，从主库同步日志，可选是否承载读请求 |
+| Monitor | 监视器，监控主备状态，触发故障转移 |
+| Archive Log | 归档日志，主库产生的日志，备库实时或异步读取 |
+
+### 实时同步 vs 异步同步
+
+| 特性 | 实时主备 | 异步主备 |
+|---|---|---|
+| 同步方式 | 实时同步，日志同步完成才算事务提交 | 异步同步，主库提交后异步发送日志 |
+| 数据一致性 | 零丢失（Zero Data Loss）| 可能丢失数据（根据延迟而定）|
+| 性能影响 | 主库性能略受影响（等待日志确认）| 主库性能无影响 |
+| 网络要求 | 网络质量要求高 | 网络延迟可接受 |
+| 适用场景 | 金融、交易等强一致性场景 | 报表、灾备等允许延迟的场景 |
+
+## 实时主备配置
+
+### 环境准备
+
+```bash
+# 1. 确保两台服务器可以网络互通
+ping 192.168.1.20
+
+# 2. 初始化 DM 数据库（两台机器分别执行）
+./dminit path=/data/dmdb db_name=DAMENG instance_name=DAMENG
+
+# 3. 启动主库
+./dmserver /data/dmdb/DAMENG/dm.ini
+```
+
+### 主库配置（Primary）
+
+```ini
+# dm.ini 主库配置
+INSTANCE_NAME = DAMENG
+PORT_NUM = 5236
+DW_PORT = 5237                    # 主备通信端口
+MAL_PORT = 5238                   # MAL 系统端口
+ALTER_MODE_STATUS = 0             # 不允许手动修改模式
+ENABLE_OFFLINE_TS = FALSE         # 不允许离线表空间
+ARCH_INI = 1                       # 开启归档
+
+# 主库唯一标识
+DW_PORT = 5237
+PWDHP_GRP = 0
+PWDHP_MODE = 1
+TIME_INTERVAL = 30
+MSG_WAIT_INTERVAL = 30
+ARCH_WAIT_INTERVAL = 30
+```
+
+```xml
+# dmarch.ini 归档配置
+[ARCHIVE_LOCAL]
+ARCH_TYPE = LOCAL
+ARCH_DEST = /data/dmdb/arch
+ARCH_FILE_SIZE = 128
+ARCH_SPACE_LIMIT = 51200
+ARCH_FLUSH_BUF = 32
+
+[ARCHIVE_REALTIME]
+ARCH_TYPE = REALTIME
+ARCH_DEST = DAMENG_STANDBY        # 备库实例名
+```
+
+```xml
+# dmmal.ini MAL 系统配置
+MAL_CHECK_INTERVAL = 30
+MAL_CONN_FAIL_INTERVAL = 30
+MAL_TEMP_PATH = /data/dmdb/mal
+MAL_ENABLE = 1
+
+[MAL_INST0]
+MAL_INST_NAME = DAMENG            # 主库实例名
+MAL_HOST = 192.168.1.10           # 主库 IP
+MAL_PORT = 5238                   # MAL 端口
+MAL_INST_HOST = 192.168.1.10
+MAL_INST_PORT = 5236
+
+[MAL_INST1]
+MAL_INST_NAME = DAMENG_STANDBY   # 备库实例名
+MAL_HOST = 192.168.1.20           # 备库 IP
+MAL_PORT = 5238
+MAL_INST_HOST = 192.168.1.20
+MAL_INST_PORT = 5236
+```
+
+### 备库配置（Standby）
+
+```ini
+# dm.ini 备库配置
+INSTANCE_NAME = DAMENG_STANDBY
+PORT_NUM = 5236
+DW_PORT = 5237
+MAL_PORT = 5238
+ALTER_MODE_STATUS = 0
+ENABLE_OFFLINE_TS = FALSE
+ARCH_INI = 1
+
+# 备库特有配置
+STANDBY_CHAIN = 1                 # 级联备库标识
+```
+
+```xml
+# dmarch.ini 备库归档配置
+[ARCHIVE_LOCAL]
+ARCH_TYPE = LOCAL
+ARCH_DEST = /data/dmdb/arch
+ARCH_FILE_SIZE = 128
+ARCH_SPACE_LIMIT = 51200
+
+# 备库不配置 REALTIME 归档（被动接收）
+```
+
+```xml
+# dmmal.ini 与主库相同
+[MAL_INST0]
+MAL_INST_NAME = DAMENG
+MAL_HOST = 192.168.1.10
+MAL_PORT = 5238
+MAL_INST_HOST = 192.168.1.10
+MAL_INST_PORT = 5236
+
+[MAL_INST1]
+MAL_INST_NAME = DAMENG_STANDBY
+MAL_HOST = 192.168.1.20
+MAL_PORT = 5238
+MAL_INST_HOST = 192.168.1.20
+MAL_INST_PORT = 5236
+```
+
+### 主备切换与同步
+
+```bash
+# 1. 备份主库脱密密钥
+./disencrypt /data/dmdb/DAMENG/dm.ini
+
+# 2. 在备库执行恢复（将主库数据同步到备库）
+./dmrman
+RMAN> RESTORE DATABASE '/data/dmdb/DAMENG_STANDBY/dm.ini' FROM BACKUPSET '/backup/full';
+
+# 3. 启动备库
+./dmserver /data/dmdb/DAMENG_STANDBY/dm.ini
+```
+
+```sql
+-- 4. 备库执行同步
+SP_SET_GLOBAL_REDO_FLAG(1);  -- 允许全局重演
+
+-- 5. 将备库注册到主库
+SP_DB_PRIVILEGE('DAMENG_STANDBY', 1, 1);
+
+-- 6. 查看主备状态
+SELECT * FROM V$INSTANCE;  -- 查看当前实例状态
+```
+
+## 异步主备配置
+
+### 异步同步原理
+
+异步主备与实时主备的区别在于 **日志同步时机**：
+
+```
+实时同步：
+BEGIN TRANSACTION
+  │ 
+  ├──▶ 写入本地日志
+  │ 
+  ├──▶ 等待备库确认
+  │    │
+  │    └──▶ 备库接收日志完成
+  │ 
+  └──▶ COMMIT（事务提交完成）
+
+异步同步：
+BEGIN TRANSACTION
+  │
+  ├──▶ 写入本地日志
+  │
+  └──▶ COMMIT（立即返回，不等待备库确认）
+       │
+       └──▶ 后台异步发送到备库
+```
+
+### 异步主备配置
+
+```xml
+# dmarch.ini 异步归档配置
+[ARCHIVE_LOCAL]
+ARCH_TYPE = LOCAL
+ARCH_DEST = /data/dmdb/arch
+ARCH_FILE_SIZE = 128
+ARCH_SPACE_LIMIT = 51200
+
+[ARCHIVE_ASYNC]
+ARCH_TYPE = ASYNC
+ARCH_DEST = DAMENG_STANDBY_ASYNC   # 异步备库实例名
+ARCH_INCOMING_PATH = /data/dmdb/arch_async
+ARCH_FILE_SIZE = 128
+ARCH_SPACE_LIMIT = 102400
+```
+
+```xml
+# dmmal.ini 增加异步备库配置
+[MAL_INST2]
+MAL_INST_NAME = DAMENG_STANDBY_ASYNC
+MAL_HOST = 192.168.1.30
+MAL_PORT = 5238
+MAL_INST_HOST = 192.168.1.30
+MAL_INST_PORT = 5236
+```
+
+### 异步同步监控
+
+```sql
+-- 查看异步同步状态
+SELECT * FROM V$ARCH_ASYNC_INFO;
+
+-- 查看归档延迟
+SELECT ARCH_DEST, ARCH_DELAY, ARCH_SEND_DELAY
+FROM V$ARCH_STATUS;
+
+-- 延迟时间（秒）
+ARCH_DELAY: 30 表示日志发送延迟 30 秒
+
+-- 查看备库接收状态
+SELECT * FROM V$STANDBY_APPLY_INFO;
+```
+
+## Monitor 监视器配置
+
+### 单机监视器
+
+```ini
+# dmmonitor.ini
+MON_DW_CONFIRM = 1                 # 确认模式
+MON_LOG_PATH = /data/dmdb/log
+MON_LOG_INTERVAL = 30
+MON_LOG_FILE_SIZE = 128
+MON_LOG_SPACE_LIMIT = 1024
+
+MON_INST_OPEN_MODE = ARCH
+MON_LOG_LEVEL = INFO
+
+[MAL_INST0]
+MAL_INST_NAME = DAMENG
+MAL_HOST = 192.168.1.10
+MAL_PORT = 5238
+MAL_INST_PORT = 5236
+MON_INST_ID = 0
+
+[MAL_INST1]
+MAL_INST_NAME = DAMENG_STANDBY
+MAL_HOST = 192.168.1.20
+MAL_PORT = 5238
+MAL_INST_PORT = 5236
+MON_INST_ID = 1
+
+[MAL_INST2]
+MAL_INST_NAME = DAMENG_STANDBY_ASYNC
+MAL_HOST = 192.168.1.30
+MAL_PORT = 5238
+MAL_INST_PORT = 5236
+MON_INST_ID = 2
+```
+
+### 启动监视器
+
+```bash
+# 启动监视器
+./dmmonitor /data/dmdb/dmmonitor.ini
+
+# 监视器命令
+# 进入监视器控制台后：
+
+# 查看集群状态
+select;
+
+# 手动故障转移
+switchover;
+
+# 查看实例信息
+show instance;
+
+# 退出监视器
+exit
+```
+
+### 自动故障转移
+
+当主库发生故障时，Monitor 会自动将备库切换为主库：
+
+```bash
+# 故障转移过程
+# 1. Monitor 检测到主库不可达（心跳超时）
+# 2. 确认备库已接收所有实时日志
+# 3. 备库执行 failover，提升为主库
+# 4. 其他备库重定向到新主库
+# 5. 通知应用连接串口切换
+```
+
+## 主备日常运维
+
+### 主备切换
+
+```bash
+# 手动主备切换（用于维护）
+# 1. 确认所有备库已同步
+SELECT * FROM V$ARCH_STATUS;
+
+# 2. 在主库执行切换
+ALTER DATABASE PRIMARY TO STANDBY;
+
+# 3. 在备库执行切换
+ALTER DATABASE STANDBY TO PRIMARY;
+
+# 4. 重启所有实例
+```
+
+### 备库重建
+
+当备库数据严重落后或损坏时，需要重建：
+
+```bash
+# 1. 在主库生成备份
+./disql sysdba/SYSDBA
+SQL> BACKUP DATABASE BACKUPSET '/backup/full_primary';
+
+# 2. 将备份传输到备库
+scp -r /backup/full_primary 192.168.1.20:/backup/
+
+# 3. 在备库恢复
+./dmserver
+SQL> RESTORE DATABASE '/data/dmdb/DAMENG_STANDBY/dm.ini' FROM BACKUPSET '/backup/full_primary';
+
+# 4. 启动备库
+./dmserver /data/dmdb/DAMENG_STANDBY/dm.ini
+```
+
+### 监控告警
+
+```sql
+-- 设置主库故障告警
+-- 在 Monitor 中配置邮件或短信告警
+
+-- 关键监控指标
+SELECT 
+    INST_NAME,
+    STATUS,
+    MODE,
+    OK_TIME,
+    BUILD_VERSION
+FROM V$INSTANCE;
+
+-- 查看归档同步延迟
+SELECT 
+    DEST_ID,
+    DEST_NAME,
+    ARCH_DEST,
+    ARCH_DELAY,
+    ARCH_SEND_COUNT,
+    ARCH_RECV_COUNT
+FROM V$ARCH_DEST_STATUS;
+```
+
+## 场景选型建议
+
+### 选择实时主备的场景
+
+| 场景 | 原因 |
+|---|---|
+| 金融交易系统 | 数据零丢失是底线 |
+| 核心业务系统 | 任何数据丢失都不可接受 |
+| 强一致性要求 | 监管或合规要求 |
+| 网络质量好 | 两地网络延迟 `<` 10ms |
+
+### 选择异步主备的场景
+
+| 场景 | 原因 |
+|---|---|
+| 跨地域灾备 | 网络延迟较大 |
+| 报表查询备库 | 允许分钟级数据延迟 |
+| 历史数据归档 | 对数据实时性要求低 |
+| 成本敏感 | 实时同步对网络要求高 |
+
+## 总结
+
+DM 的主备集群提供了完整的高可用方案：
+
+- **实时主备**：零数据丢失，适合强一致性场景，但依赖网络质量
+- **异步主备**：性能无影响，适合灾备和报表场景，但可能丢失数据
+- **Monitor**：自动化故障转移，无需人工干预
+- **合理组合**：实时主备用于核心业务，异步主备用于灾备和分析
+
+根据业务需求选择合适的方案，才能在 **数据安全** 和 **业务连续性** 之间找到最佳平衡点。

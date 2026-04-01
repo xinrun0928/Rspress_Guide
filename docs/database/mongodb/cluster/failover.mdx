@@ -1,384 +1,225 @@
-import { Badge } from '@rspress/core/theme';
+# MongoDB 高可用：故障转移与选举原理
 
-# MongoDB 高可用与故障转移
+凌晨 2 点，你的告警平台疯狂推送消息：主节点宕了。业务团队的电话一个接一个打过来，数据库连接超时、应用响应缓慢、用户投诉不断……
 
-「MongoDB 分片集群中，如果一个分片挂了会发生什么？」
+但如果你用的是 MongoDB 副本集，这件事可能没那么可怕。**故障转移（Failover）** 会自动发生，副本集会在秒级内选举出新的主节点，业务中断时间从"手动恢复的数十分钟"缩短到"自动切换的几秒钟"。
 
-理解故障转移机制，是保证 MongoDB 生产环境高可用的基础。MongoDB 的高可用设计让系统能够自动从故障中恢复，最大程度减少停机时间。
+这一切是如何实现的？我们从副本集选举机制说起。
 
-## 副本集故障转移
+## 副本集选举核心要素
 
-### 主节点故障
+MongoDB 副本集通过 **Raft 共识算法的变体** 实现主节点选举。但与标准 Raft 不同，MongoDB 的选举考虑了更多实际因素：成员优先级、网络延迟、oplog 同步状态等。
 
-```
-副本集故障转移流程：
+### OpTime：选举的"时钟"
 
-正常状态：
-┌─────────────────────────────────────────┐
-│ Primary ──同步 oplog──→ Secondary-1    │
-│ Primary ──同步 oplog──→ Secondary-2    │
-└─────────────────────────────────────────┘
+OpTime（Operation Time）是 MongoDB 副本集选举中最核心的概念。它不是简单的时间戳，而是由两部分组成：
 
-Primary 故障：
-┌─────────────────────────────────────────┐
-│ ❌ Primary 宕机                          │
-│ 心跳检测超时（默认 10 秒）                 │
-└─────────────────────────────────────────┘
-
-选举过程：
-┌─────────────────────────────────────────┐
-│ Secondary-1 → "选举" → Secondary-2       │
-│ Secondary-2 → "投票" → Secondary-1       │
-│ Secondary-1 获得多数票，成为 Primary      │
-│ 选举耗时约 10-30 秒                      │
-└─────────────────────────────────────────┘
-
-恢复后：
-┌─────────────────────────────────────────┐
-│ Primary ← 同步 oplog ← Secondary-1 (原) │
-│ Secondary ← 同步 oplog ← Primary        │
-└─────────────────────────────────────────┘
-```
-
-### 故障检测机制
+| 组成部分 | 说明 |
+|---|---|
+| `term` | 选举轮次，类似于 Raft 的 term，递增用于检测"新鲜度" |
+| `optime` | oplog 中最新一条操作的时间戳 |
 
 ```javascript
-// 心跳机制
-// 副本集成员每 2 秒发送一次心跳
-// 默认 10 秒无响应则判定为失效
-
-// 查看心跳状态
+// 查看当前节点的 OpTime 状态
 rs.status().members.forEach(m => {
-  print(m.name + ": " +
-    "health=" + m.health + ", " +
-    "lastHeartbeat=" + m.lastHeartbeat
-  );
+    print(m.name + ": term=" + m.term + ", optime=" + m.optimeDate);
 });
-
-// 查看选举超时配置
-cfg = rs.conf();
-print("electionTimeoutMillis: " + cfg.settings.electionTimeoutMillis);
 ```
 
-### 故障转移时间
+选举时，MongoDB 会比较所有有资格成为主节点的成员的 OpTime。**谁的 OpTime 最新，谁就更有可能赢得选举。**
 
-| 阶段 | 默认时间 | 说明 |
-|---|---|---|
-| 心跳超时 | 10 秒 | 检测到主节点失效 |
-| 选举超时 | 15 秒 | 等待选举完成 |
-| 故障转移总时间 | 30-50 秒 | 整个过程 |
+### Priority：优先级权重
+
+每个副本集成员都有一个 `priority` 配置，取值范围 0-1000（默认 1）。优先级越高，在选举中获得胜利的概率越大。
 
 ```javascript
-// 优化故障转移时间
+// 配置成员优先级
 cfg = rs.conf();
-cfg.settings = {
-  heartbeatTimeoutSecs: 5,    // 缩短心跳超时（默认 10）
-  electionTimeoutMs: 10000    // 缩短选举超时（默认 15000）
-};
+cfg.members[0].priority = 2;  // 第一个成员优先级设为 2
+cfg.members[1].priority = 1;  // 第二个成员保持默认优先级 1
+cfg.members[2].priority = 0;  // 第三个成员永远不能成为主节点（灾备节点）
 rs.reconfig(cfg);
 ```
 
-## 分片集群故障转移
+**Priority 为 0 的成员称为 Arbiter（仲裁节点）**，它参与选举投票但不存储数据，通常用于在副本集只有两个数据节点时提供奇数票。
 
-### 单个 Shard 故障
+## 选举触发条件
 
-```javascript
-// 分片副本集故障：
-// 如果 Shard 是副本集，自动进行故障转移
+MongoDB 副本集不会无缘无故发起选举。以下几种情况会触发选举：
 
-// 场景：Shard1 的 Primary 宕机
-// 影响：Shard1 的数据暂时不可用
-// 恢复：副本集自动选举新 Primary 后恢复
+### 1. 主节点不可达
 
-// 查看分片状态
-sh.status()
-
-// 示例输出：
-// shards:
-//   { "_id": "shard0001", "host": "rs1/host1:27017", "state": 1 }
-//   { "_id": "shard0002", "host": "rs2/host2:27017", "state": 1 }  ← 故障
-```
-
-### 多个 Shard 故障
-
-<Badge text="重要" type="warning" /> 多个 Shard 同时故障可能导致数据永久丢失。
+这是最常见的触发场景。当主节点与副本集其他成员的 heartbeat 超时（默认 10 秒），副本集认为主节点宕机，触发重新选举。
 
 ```javascript
-// 3 分片集群：
-// - 1 个 Shard 故障：数据部分可用，可降级服务
-// - 2 个 Shard 故障：多数分片不可用，整个集群不可写
-// - 3 个 Shard 故障：整个集群不可用
-
-// 设计原则：确保数据冗余和副本数量足够
-// 建议：每个 Shard 至少 3 节点副本集
+// 查看心跳超时配置
+rs.conf().settings.heartbeatTimeoutSecs  // 默认 10 秒
 ```
 
-### Config Server 故障
+### 2. 手动触发选举
+
+管理员可以主动发起选举，用于维护或故障演练：
 
 ```javascript
-// Config Server 故障影响：
-// - 元数据查询暂缓（不影响数据读写）
-// - 集群扩缩容暂停
-// - 均衡器暂停
-
-// Config Server 是副本集，自动故障转移
-
-// 查看 Config Server 状态
-db.adminCommand({ replSetGetStatus: 1 })  // 在 Config Server 上执行
+// 强制触发选举（需要先关闭主节点或使用 rs.freeze）
+rs.freeze(30);  // 冻结当前节点 30 秒不接受选举
+rs.stepDown();   // 当前主节点主动降级
 ```
 
-### mongos 故障
+### 3. 成员状态变化
+
+- 从节点加入副本集
+- 优先级更高的节点加入
+- 现有成员优先级被修改
+
+### 4. 心跳超时重置
+
+如果一个从节点长时间与主节点失联（超过 `electionTimeoutMillis`，默认 10 秒），它会认为主节点不可达，主动发起选举。
+
+## 选举过程详解
+
+当选举被触发后，MongoDB 遵循以下流程：
+
+```
+1. 候选者发起选举请求
+   ↓
+2. 其他成员投票
+   ↓
+3. 得票过半者成为新主节点
+   ↓
+4. 其他节点切换为从节点
+```
+
+### 第一步：候选者资格检查
+
+发起选举的节点必须满足以下条件：
+
+- `priority > 0`（优先级为 0 不能发起选举）
+- 数据同步状态足够新（oplog 已追上主节点）
+- 与大多数成员网络可达
 
 ```javascript
-// mongos 故障影响：
-// - 客户端连接中断
-// - 请求无法路由
-
-// mongos 无状态，客户端应连接多个 mongos
-
-// 推荐架构：
-// 应用程序 ──→ mongos1 ──┐
-// 应用程序 ──→ mongos2 ──┼──→ Shards
-// 应用程序 ──→ mongos3 ──┘
-
-// 客户端连接字符串
-// mongodb://mongos1:27017,mongos2:27017,mongos3:27017
-```
-
-## 高可用架构设计
-
-### 最小高可用架构
-
-```javascript
-// 最小推荐架构：
-// 副本集：至少 3 节点
-// 分片集群：每个 Shard 至少 3 节点副本集
-// Config Server：3 节点副本集
-// mongos：至少 2 个（无状态，可水平扩展）
-```
-
-### 推荐架构
-
-```
-高可用分片集群架构：
-
-┌──────────────────────────────────────────────┐
-│                Load Balancer                  │
-│                                              │
-└──────────────┬───────────────┬───────────────┘
-               │               │
-        ┌──────┴──────┐ ┌──────┴──────┐
-        │    mongos   │ │    mongos   │
-        │  (无状态)    │ │  (无状态)    │
-        └──────┬──────┘ └──────┬──────┘
-               │               │
-    ┌──────────┴───────────────┴──────────┐
-    │                                      │
-┌───┴────┐ ┌────┴────┐ ┌────┴────┐ ┌────┴───┐
-│Shard1  │ │ Shard2  │ │ Shard3  │ │ Shard4 │
-│ (RS)   │ │  (RS)   │ │  (RS)   │ │  (RS)  │
-│ P/S/S  │ │  P/S/S  │ │  P/S/S  │ │  P/S/S │
-└────────┘ └─────────┘ └─────────┘ └────────┘
-
-┌──────────────────────────────────────────────┐
-│           Config Server Replica Set           │
-│                  (3 节点)                      │
-└──────────────────────────────────────────────┘
-```
-
-### 地理分布式高可用
-
-```javascript
-// 跨数据中心架构：
-// 数据中心 A: Primary
-// 数据中心 B: Secondary
-// 数据中心 C: Secondary (仲裁)
-
-// 配置
-rs.initiate({
-  _id: "geo-replica",
-  members: [
-    { _id: 0, host: "dc-a:27017", priority: 3 },  // 主数据中心优先
-    { _id: 1, host: "dc-b:27017", priority: 2 },
-    { _id: 2, host: "dc-c:27017", priority: 1, arbiterOnly: true }
-  ]
-});
-```
-
-## 读写策略与高可用
-
-### 写入策略
-
-```javascript
-// 推荐：多数节点确认
-db.collection.insertOne(
-  { data: "value" },
-  { writeConcern: { w: "majority" } }
-);
-
-// 最高持久性：journal + majority
-db.collection.insertOne(
-  { data: "value" },
-  { writeConcern: { w: "majority", j: true, wtimeout: 5000 } }
-);
-```
-
-### 读取策略
-
-```javascript
-// 高可用读取：
-// 1. 主优先（有故障自动切换到从）
-db.collection.find({}).readPref("primaryPreferred")
-
-// 2. 从优先（负载均衡）
-db.collection.find({}).readPref("secondaryPreferred")
-
-// 3. 就近读取（低延迟）
-db.collection.find({}).readPref("nearest")
-
-// 分片集群读取
-// mongos 自动路由到可用的分片
-```
-
-## 故障恢复
-
-### 节点恢复
-
-```javascript
-// 节点重新加入副本集：
-// 1. 从节点自动同步缺失的 oplog
-// 2. 同步完成后恢复正常状态
-
-// 手动触发同步
-db.adminCommand({ resync: "hostname:port" });
-
-// 查看同步状态
-rs.status().members.forEach(m => {
-  if (m.stateStr === "SECONDARY") {
-    print(m.name + ": " +
-      "optime=" + m.optimeDate + ", " +
-      "lag=" + m.lagSinceLastHeartbeat + "s"
-    );
-  }
-});
-```
-
-### 数据恢复
-
-```javascript
-// 从备份恢复
-// 1. 全量备份
-mongodump --host hostname --out /backup/full
-
-// 2. oplog 增量
-mongodump --host hostname --out /backup/oplog --query "{ ts: { $gt: lastBackupTs } }"
-
-// 3. 恢复到指定时间点
-mongorestore --host hostname --oplogReplay --oplogLimit lastBackupTs
-```
-
-### 副本集重建
-
-```javascript
-// 严重故障后重建副本集：
-
-// 1. 选择健康节点作为种子
-// 2. 清理所有节点的数据目录
-// 3. 在新节点初始化副本集
-rs.initiate({
-  _id: "rs0",
-  members: [
-    { _id: 0, host: "new-host1:27017" },
-    { _id: 1, host: "new-host2:27017" },
-    { _id: 2, host: "new-host3:27017" }
-  ]
-});
-
-// 4. 从备份恢复数据
-// 5. 验证数据完整性
-```
-
-## 监控与告警
-
-### 关键监控指标
-
-```javascript
-// 1. 副本集状态
-rs.status().members.forEach(m => {
-  if (m.health !== 1) {
-    print("WARNING: " + m.name + " is down!");
-  }
-});
-
-// 2. 复制延迟
+// 查看节点同步状态
 db.adminCommand({ replSetGetStatus: 1 }).members.forEach(m => {
-  if (m.lagSinceLastHeartbeat > 30) {
-    print("WARNING: " + m.name + " replication lag is " + m.lagSinceLastHeartbeat + "s");
-  }
+    print(m.name + ": stateStr=" + m.stateStr +
+          ", syncedTo=" + m.optimeDate);
 });
+```
 
-// 3. 主节点状态
-const status = rs.status();
-const primary = status.members.find(m => m.stateStr === "PRIMARY");
-if (!primary) {
-  print("WARNING: No primary in replica set!");
+### 第二步：OpTime 对比与投票
+
+MongoDB 使用一种优化的 OpTime 对比算法：
+
+```javascript
+// 投票逻辑伪代码
+function canVoteFor(candidateOpTime, myOpTime) {
+    // 如果候选者的 OpTime 比自己更新，支持
+    if (candidateOpTime.term > myOpTime.term) return true;
+    if (candidateOpTime.term == myOpTime.term &&
+        candidateOpTime.optime > myOpTime.optime) return true;
+    return false;
 }
 ```
 
-### 告警配置
+**注意**：这里有一个关键优化——候选者的 OpTime 不需要是全局最新的，只要比投票者新即可。这避免了"所有节点同时宕机恢复时，谁都不敢当候选者"的问题。
+
+### 第三步：确认当选
+
+当选票超过副本集成员总数的 **过半（majority）** 时，候选者当选主节点：
+
+| 副本集成员数 | 最低投票数 |
+|---|---|
+| 3 | 2 |
+| 5 | 3 |
+| 7 | 4 |
 
 ```javascript
-// 推荐告警阈值：
-// - 副本集成员 down: 立即告警
-// - 复制延迟 > 30 秒: 告警
-// - 副本集无主节点: 立即告警
-// - oplog 使用率 > 80%: 告警
-// - 连接数 > 80% max: 告警
+// 副本集应保持奇数成员，避免平票
+// 推荐配置：3 个数据节点 或 2 数据节点 + 1 Arbiter
 ```
 
-## 面试实战
+## 选举时间参数调优
 
-**面试官问**：「MongoDB 分片集群某个分片宕机会怎样？」
+MongoDB 提供了多个参数控制选举行为：
 
-**深入回答**：
+```javascript
+// 调整选举超时时间（默认 10 秒）
+cfg = rs.conf();
+cfg.settings = cfg.settings || {};
+cfg.settings.electionTimeoutMillis = 15000;  // 15 秒超时
+rs.reconfig(cfg);
+```
 
-> 这取决于分片架构：
->
-> 1. **单分片是副本集**：副本集会自动选举新主节点，约 30-50 秒恢复
->
-> 2. **部分数据不可用**：故障分片的数据无法读写，其他分片正常
->
-> 3. **写入可能失败**：如果写入配置了 `w: majority`，涉及故障分片的写入会失败
->
-> 4. **查询降级**：不涉及故障分片的查询可以正常执行
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `electionTimeoutMillis` | 10000ms | 心跳超时后多久触发选举 |
+| `heartbeatTimeoutSecs` | 10s | 心跳超时阈值 |
+| `heartbeatIntervalMillis` | 2000ms | 心跳间隔 |
 
-**面试官问**：「如何保证 MongoDB 的高可用？」
+**调优建议**：
 
-**深入回答**：
+- 网络不稳定的机房环境，可适当增大 `electionTimeoutMillis`
+- 对可用性要求极高的场景，可减小 `electionTimeoutMillis`，但可能导致"假故障"触发不必要的选举
 
-> 架构层面的高可用措施：
->
-> 1. **副本集**：至少 3 节点，配置合理的优先级
->
-> 2. **writeConcern**：使用 `w: majority` 确保数据持久性
->
-> 3. **readConcern**：使用 `majority` 或 `snapshot` 确保读取一致性
->
-> 4. **多 mongos**：应用程序连接多个 mongos，避免单点故障
->
-> 5. **跨机房部署**：防止单机房故障导致数据丢失
->
-> 6. **监控告警**：及时发现故障，快速响应
+## 选举中的常见问题与优化
+
+### 脑裂问题
+
+如果副本集被分割成两个等大小的分区，每个分区都会尝试选举主节点，导致"脑裂"。MongoDB 通过**过半机制**防止这个问题：
+
+- 3 节点副本集：需要 2 票才能当选
+- 如果分成 1+2 两个分区：2 的那个分区可以选主，1 的那个无法当选
+
+### Priority 配置不当导致的问题
+
+```javascript
+// 错误配置：两个节点 priority 相同，可能导致频繁切换
+cfg.members[0].priority = 2;
+cfg.members[1].priority = 2;  // 问题：优先级相同
+cfg.members[2].priority = 1;
+
+// 正确配置：明确主次
+cfg.members[0].priority = 3;  // 主数据中心
+cfg.members[1].priority = 2;  // 次数据中心
+cfg.members[2].priority = 1;  // 第三个节点
+```
+
+### 网络分区导致的"假选举"
+
+当主节点网络中断但实际存活时，可能出现：
+
+1. 从节点发起选举并当选新主
+2. 旧主恢复后发现 term 已更新，自动降级为从节点
+
+这可能导致短暂的**双主状态**（旧主还未感知降级），此时写入旧主的数据会丢失。
+
+```javascript
+// 配置 catchUpTimeoutMs 控制新主等待从节点追数据的超时
+cfg.settings.catchUpTimeoutMillis = 30000;  // 30 秒
+```
+
+## 最佳实践
+
+1. **保持奇数成员**：优先使用 3 节点副本集，避免偶数导致平票
+2. **合理设置 Priority**：明确主备关系，灾备节点设置 `priority = 0`
+3. **跨机房部署**：主节点和多数投票节点应分布在不同机房
+4. **监控选举频率**：频繁选举说明网络不稳定或参数配置不当
+5. **预留 Arbiter**：对于只有两个数据中心的场景，可用 Arbiter 解决奇数问题
+
+```javascript
+// 推荐的 3 节点副本集配置
+{
+    _id: "rs0",
+    members: [
+        { _id: 0, host: "192.168.1.10:27017", priority: 2 },
+        { _id: 1, host: "192.168.1.11:27017", priority: 2 },
+        { _id: 2, host: "192.168.1.12:27017", priority: 1, arbiterOnly: true }
+    ]
+}
+```
 
 ## 总结
 
-高可用核心要点：
+MongoDB 的故障转移机制是保证高可用的核心。理解 OpTime 对比、Priority 权重、选举触发条件，你就能设计出稳定可靠的副本集架构。
 
-- **副本集故障转移**：自动进行，约 30-50 秒完成
-- **分片集群故障**：单个 Shard 故障不影响其他 Shard
-- **Config Server 故障**：只影响元数据操作，不影响数据读写
-- **mongos 故障**：无状态，多个 mongos 保证高可用
-- **读写策略**：合理配置 writeConcern 和 readConcern
-- **监控告警**：及时发现和处理故障
-
-高可用设计是生产环境 MongoDB 部署的关键，需要从架构、配置、监控等多个层面综合考虑。
+下次主节点宕机时，别慌——副本集已经在自动为你处理了。

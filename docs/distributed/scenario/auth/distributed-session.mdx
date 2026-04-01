@@ -1,613 +1,525 @@
-# 分布式 Session 实战指南
+# 分布式 Session：Spring Session + Redis 方案
 
-你可能听说过「无状态设计」，也用过 JWT。但如果我告诉你，**很多场景下 Session 比 Token 更好用**，你信吗？
+用户刚刚登录了你的系统，下一秒请求被负载均衡到了另一台服务器。用户状态丢了，又要重新登录。这就是分布式 Session 的经典问题。
 
-比如秒杀系统中，你需要临时存储用户的「冷却状态」；比如购物车场景，商品信息频繁读写，用 Session 更方便；比如某些老系统，改造成本太高，继续用 Session 是最务实的选择。
+Session 不一致，是分布式系统中最容易出错的环节之一。
 
-今天我们深入聊一聊分布式 Session 的设计、问题和最佳实践。
+## 为什么需要分布式 Session？
 
-## 一、为什么分布式 Session 是个难题
+### 单机 Session 的问题
 
-### 1.1 从一个问题说起
+```java
+// 单机 Tomcat 的 Session 存储
+HttpSession session = request.getSession();
+session.setAttribute("user", currentUser);
 
-```java title="单机版 Session 用法"
-@RestController
-public class UserController {
-    @PostMapping("/login")
-    public Result login(@RequestParam String username, @RequestParam String password) {
-        User user = userService.login(username, password);
-        // 单机场景：Session 直接存在应用内存
-        HttpSession session = request.getSession();
-        session.setAttribute("user", user);
-        session.setMaxInactiveInterval(3600); // 1小时
-        return Result.success(user);
-    }
-
-    @GetMapping("/userinfo")
-    public Result getUserInfo(HttpSession session) {
-        User user = (User) session.getAttribute("user");
-        if (user == null) {
-            return Result.fail("Not logged in");
-        }
-        return Result.success(user);
-    }
-}
+// 问题：用户下次请求可能被路由到另一台服务器
+// 这台服务器上没有这个用户的 Session
 ```
 
-这段代码在单机环境下完美运行。但当你部署两个实例、用 Nginx 做负载均衡时：
+当你的系统部署了多个实例，用户请求被随机分配时，Session 状态丢失的问题就出现了：
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                           负载均衡                                      │
-│                                                                         │
-│   GET /login ─────▶ [实例1] ──▶ 用户登录，Session 存在实例1内存          │
-│                          ↓                                               │
-│   GET /userinfo ──▶ [实例2] ──▶ 实例2内存里没有这个 Session！             │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+1. **水平扩展困难**：无法简单增加服务器数量
+2. **负载不均**：某些策略可能加剧 Session 丢失
+3. **故障转移失败**：主服务器宕机时，用户状态全部丢失
 
-用户登录后，下次请求可能路由到不同实例，而新实例不认这个 Session。
+### 分布式 Session 解决方案对比
 
-### 1.2 三种基础解决思路
-
-| 方案 | 原理 | 优点 | 缺点 |
+| 方案 | 优点 | 缺点 | 适用场景 |
 |---|---|---|---|
-| Session 粘性 | 相同用户固定路由到同一实例 | 改动最小 | 扩缩容麻烦，单机故障时用户被迫登出 |
-| Session 复制 | 实例间同步 Session | 对应用透明 | 网络开销大，延迟增加 |
-| Session 集中存储 | Session 存储在独立存储 | 扩缩容友好 | 依赖外部存储，引入复杂度 |
+| Session 复制 | 实现简单 | 网络开销大，延迟高 | 集群规模小（< 5 台） |
+| Session 绑定 | 可控性好 | 失去负载均衡优势 | 有状态服务 |
+| Cookie 存储 | 无存储成本 | 安全风险，容量有限 | 简单场景 |
+| Redis 集中存储 | 高性能，易扩展 | 增加复杂度 | **生产环境推荐** |
 
-## 二、Session 集中存储：Redis 方案
-
-这是生产环境最常用的方案。
-
-### 2.1 整体架构
+## Spring Session + Redis 架构
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│   用户浏览器                                                          │
-│   Cookie: SESSIONID=abc123                                           │
-└─────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│   应用服务器集群                                                      │
-│   ┌─────────┐  ┌─────────┐  ┌─────────┐                               │
-│   │ 实例1   │  │ 实例2   │  │ 实例3   │                               │
-│   └────┬────┘  └────┬────┘  └────┬────┘                               │
-│        │            │            │                                      │
-│        └────────────┴────────────┘                                      │
-│                     │                                                   │
-└─────────────────────│───────────────────────────────────────────────────┘
-                      │
-                      ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│   Redis Cluster                                                       │
-│   Key: spring:session:sessions:abc123                                 │
-│   Value: { user: {...}, loginTime: 1699999999, ... }                  │
-│   TTL: 1800秒（30分钟，可配置）                                         │
-└─────────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                   Spring Session + Redis 架构                     │
+├──────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│   用户浏览器                                                    │
+│       │                                                         │
+│       │ HTTP 请求（携带 JSESSIONID Cookie）                      │
+│       ▼                                                         │
+│   ┌─────────────┐                                              │
+│   │   Tomcat A  │                                              │
+│   │  (实例 1)   │                                              │
+│   └──────┬──────┘                                              │
+│          │                                                      │
+│          │ Session 操作                                         │
+│          ▼                                                      │
+│   ┌─────────────┐     ┌─────────────┐                         │
+│   │    Redis     │◄───►│   Tomcat B  │                         │
+│   │  (Session   │     │  (实例 2)   │                         │
+│   │   存储)     │     └─────────────┘                         │
+│   │             │     ┌─────────────┐                         │
+│   └─────────────┘◄───►│   Tomcat C  │                         │
+│                       │  (实例 3)   │                           │
+│                       └─────────────┘                          │
+│                                                                   │
+│   所有实例共享同一个 Redis，Session 数据自动同步                  │
+│                                                                   │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-### 2.2 Spring Session + Redis 配置
+## 快速集成 Spring Session
 
-```xml title="pom.xml"
-<dependency>
-    <groupId>org.springframework.session</groupId>
-    <artifactId>spring-session-data-redis</artifactId>
-</dependency>
-<dependency>
-    <groupId>org.springframework.boot</groupId>
-    <artifactId>spring-boot-starter-data-redis</artifactId>
-</dependency>
+### Maven 依赖
+
+```xml
+<dependencies>
+    <!-- Spring Session Core -->
+    <dependency>
+        <groupId>org.springframework.session</groupId>
+        <artifactId>spring-session-core</artifactId>
+    </dependency>
+
+    <!-- Spring Session + Redis -->
+    <dependency>
+        <groupId>org.springframework.session</groupId>
+        <artifactId>spring-session-data-redis</artifactId>
+    </dependency>
+
+    <!-- Lettuce 客户端（推荐，比 Jedis 性能更好）-->
+    <dependency>
+        <groupId>io.lettuce</groupId>
+        <artifactId>lettuce-core</artifactId>
+    </dependency>
+
+    <!-- Redis 连接池 -->
+    <dependency>
+        <groupId>org.apache.commons</groupId>
+        <artifactId>commons-pool2</artifactId>
+    </dependency>
+</dependencies>
 ```
 
-```java title="Session 配置类"
+### 配置类
+
+```java
+// Spring Session 配置
 @Configuration
-@EnableRedisHttpSession(maxInactiveIntervalInSeconds = 1800)
+@EnableRedisHttpSession(maxInactiveIntervalInSeconds = 1800)  // Session 30 分钟过期
 public class SessionConfig {
-    // Redis 连接配置在 application.yml 中
+
+    @Value("${spring.redis.host}")
+    private String redisHost;
+
+    @Value("${spring.redis.port}")
+    private int redisPort;
+
+    @Value("${spring.redis.password:}")
+    private String redisPassword;
+
+    @Value("${spring.redis.database:0}")
+    private int redisDatabase;
+
+    @Bean
+    public LettuceConnectionFactory redisConnectionFactory() {
+        RedisStandaloneConfiguration config = new RedisStandaloneConfiguration();
+        config.setHostName(redisHost);
+        config.setPort(redisPort);
+        config.setPassword(RedisPassword.of(redisPassword));
+        config.setDatabase(redisDatabase);
+
+        // 连接池配置
+        LettucePoolingClientConfiguration poolConfig = LettucePoolingClientConfiguration.builder()
+            .commandTimeout(Duration.ofSeconds(2))
+            .poolConfig(new GenericObjectPoolConfig() {{
+                setMaxTotal(100);
+                setMaxIdle(20);
+                setMinIdle(5);
+                setMaxWait(Duration.ofMillis(3000));
+            }})
+            .build();
+
+        return new LettuceConnectionFactory(config, poolConfig);
+    }
 }
 ```
 
-```yaml title="application.yml"
+### Spring Boot 自动化配置
+
+如果使用 Spring Boot，只需要在配置文件中指定即可：
+
+```yaml
 spring:
   session:
-    store-type: redis
+    store-type: redis  # 启用 Redis 存储
+    timeout: 30m       # Session 过期时间
     redis:
-      namespace: myapp:session  # 自定义 key 前缀
-      flush-mode: on_save       # 保存时刷新
-      save-mode: always          # 总是保存（记录用户操作）
+      namespace: myapp:session  # Redis key 前缀
   redis:
     host: localhost
     port: 6379
-    password: xxx
-    timeout: 2000ms
+    password: ${REDIS_PASSWORD:}
+    database: 0
     lettuce:
       pool:
-        max-active: 8
-        max-idle: 8
-        min-idle: 2
+        max-active: 100
+        max-idle: 20
+        min-idle: 5
 ```
 
-### 2.3 Session 使用示例
+## Session 数据操作
 
-```java title="用户登录与 Session 操作"
+### 基本操作
+
+```java
 @RestController
-@RequestMapping("/api/user")
-public class UserController {
+@RequestMapping("/api/session")
+public class SessionController {
 
-    @PostMapping("/login")
-    public Result login(@RequestBody LoginRequest request, HttpSession session) {
-        User user = userService.login(request.getUsername(), request.getPassword());
-        if (user == null) {
-            return Result.fail("Invalid credentials");
-        }
+    @GetMapping("/test")
+    public ResponseEntity<?> testSession(HttpSession session) {
+        // 获取 Session ID
+        String sessionId = session.getId();
 
-        // 存储用户信息到 Session
-        session.setAttribute("userId", user.getId());
-        session.setAttribute("username", user.getUsername());
-        session.setAttribute("roles", user.getRoles());
+        // 存储数据
+        session.setAttribute("user", "张三");
+        session.setAttribute("loginTime", LocalDateTime.now());
 
-        // 记录登录时间
-        session.setAttribute("loginTime", System.currentTimeMillis());
+        // 读取数据
+        String user = (String) session.getAttribute("user");
+        LocalDateTime loginTime = (LocalDateTime) session.getAttribute("loginTime");
 
-        // 记录登录设备
-        session.setAttribute("loginDevice", request.getDevice());
+        Map<String, Object> result = new HashMap<>();
+        result.put("sessionId", sessionId);
+        result.put("user", user);
+        result.put("loginTime", loginTime);
 
-        return Result.success(user);
+        return ResponseEntity.ok(result);
     }
 
-    @GetMapping("/info")
-    public Result getUserInfo(HttpSession session) {
-        Long userId = (Long) session.getAttribute("userId");
-        if (userId == null) {
-            return Result.fail("Not logged in");
-        }
-        return Result.success(userService.getUserById(userId));
-    }
-
-    @PostMapping("/logout")
-    public Result logout(HttpSession session) {
-        // 清除 Session
+    @DeleteMapping("/clear")
+    public ResponseEntity<?> clearSession(HttpSession session) {
+        // 使 Session 失效
         session.invalidate();
-        return Result.success();
+        return ResponseEntity.ok("Session 已清除");
     }
 }
 ```
 
-## 三、Session 数据序列化问题
+### 分布式锁保护 Session
 
-### 3.1 默认序列化问题
+在并发场景下，多个请求可能同时修改 Session：
 
-Spring Session 默认使用 JDK 序列化，存储的数据不可读，且存在安全风险（反序列化漏洞）。
+```java
+@Service
+public class DistributedSessionService {
 
-```json title="默认 JDK 序列化结果"
-{
-  "spring:session:sessions:abc123": "rO0ABXQAAAAA...（乱码）"
+    private final StringRedisTemplate redisTemplate;
+    private static final String LOCK_PREFIX = "session:lock:";
+
+    public DistributedSessionService(StringRedisTemplate redisTemplate) {
+        this.redisTemplate = redisTemplate;
+    }
+
+    /**
+     * 分布式锁保护的 Session 操作
+     */
+    public <T> T executeWithLock(String sessionId, SessionCallback<T> callback) {
+        String lockKey = LOCK_PREFIX + sessionId;
+        String lockValue = UUID.randomUUID().toString();
+
+        try {
+            // 获取锁（最多等待 5 秒，锁自动 30 秒过期）
+            boolean locked = redisTemplate.opsForValue()
+                .setIfAbsent(lockKey, lockValue, Duration.ofSeconds(30));
+
+            if (!locked) {
+                throw new RuntimeException("获取 Session 锁失败");
+            }
+
+            // 执行操作
+            return callback.execute();
+
+        } finally {
+            // 释放锁（只能释放自己的锁）
+            String currentValue = redisTemplate.opsForValue().get(lockKey);
+            if (lockValue.equals(currentValue)) {
+                redisTemplate.delete(lockKey);
+            }
+        }
+    }
+
+    /**
+     * 原子性增加积分
+     */
+    public void addPoints(String sessionId, int points) {
+        executeWithLock(sessionId, () -> {
+            String pointsKey = "session:points:" + sessionId;
+
+            // 获取当前积分
+            String currentPoints = redisTemplate.opsForValue().get(pointsKey);
+            int newPoints = (currentPoints == null ? 0 : Integer.parseInt(currentPoints)) + points;
+
+            // 更新积分
+            redisTemplate.opsForValue().set(pointsKey, String.valueOf(newPoints));
+
+            return newPoints;
+        });
+    }
+}
+
+@FunctionalInterface
+interface SessionCallback<T> {
+    T execute();
 }
 ```
 
-### 3.2 改用 JSON 序列化
+## Session 集群方案对比
 
-```java title="JSON 序列化配置"
+### 方案一：Tomcat Session 复制
+
+```xml
+<!-- Tomcat server.xml -->
+<Cluster className="org.apache.catalina.ha.tcp.SimpleTcpCluster"
+         channelSendOptions="8">
+
+    <Manager className="org.apache.catalina.ha.session.DeltaManager"
+             expireSessionsOnShutdown="false"
+             notifyListenersOnReplication="true"/>
+
+    <Channel className="org.apache.catalina.tribes.group.GroupChannel">
+
+        <Membership className="org.apache.catalina.tribes.membership.McastService"
+                    address="228.0.0.4"
+                    port="45564"
+                    frequency="100"
+                    dropTime="3000"/>
+
+        <Receiver className="org.apache.catalina.tribes.transport.nio.NioReceiver"
+                  address="auto"
+                  port="4000"
+                  autoBind="true"
+                  selectorTimeout="5000"/>
+
+        <Sender className="org.apache.catalina.tribes.transport.ReplicationTransmitter">
+            <Transport className="org.apache.catalina.tribes.transport.nio.PooledParallelSender"/>
+        </Sender>
+
+        <Interceptor className="org.apache.catalina.tribes.group.interceptors.TcpFailureDetector"/>
+        <Interceptor className="org.apache.catalina.tribes.group.interceptors.MessageDispatchInterceptor"/>
+    </Channel>
+
+    <Valve className="org.apache.catalina.ha.tcp.ReplicationValve"
+           filter=".*\.gif;.*\.js;.*\.jpg;.*\.png;.*\.css;.*\.js;.*\.html;.*\.htm;"/>
+
+    <ClusterListener className="org.apache.catalina.ha.session.ClusterSessionListener"/>
+</Cluster>
+```
+
+### 方案二：Nginx Session 绑定
+
+```nginx
+# nginx.conf - 基于 Cookie 的 Session 绑定
+upstream backend {
+    # 哈希 key 为 $cookie_jsessionid
+    ip_hash;
+
+    server 192.168.1.101:8080;
+    server 192.168.1.102:8080;
+    server 192.168.1.103:8080;
+}
+
+server {
+    listen 80;
+
+    location / {
+        proxy_pass http://backend;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+
+        # Session 粘性配置
+        proxy_cookie_path / /;
+    }
+}
+```
+
+### 方案三：Spring Session + Redis（推荐）
+
+```java
+// 完整的 Spring Session + Redis 配置
 @Configuration
 @EnableRedisHttpSession(maxInactiveIntervalInSeconds = 1800)
 public class RedisSessionConfig {
 
+    @Primary
     @Bean
-    public RedisSerializer<Object> redisSerializer() {
-        // Jackson 序列化
-        GenericJackson2JsonRedisSerializer serializer = new GenericJackson2JsonRedisSerializer();
-        return serializer;
+    public LettuceConnectionFactory redisConnectionFactory() {
+        // 使用主 Redis
+        return createConnectionFactory("master");
     }
 
-    @Bean
-    public RedisTemplate<String, Object> redisTemplate(RedisConnectionFactory factory) {
-        RedisTemplate<String, Object> template = new RedisTemplate<>();
-        template.setConnectionFactory(factory);
-        template.setKeySerializer(new StringRedisSerializer());
-        template.setValueSerializer(redisSerializer());
-        template.setHashKeySerializer(new StringRedisSerializer());
-        template.setHashValueSerializer(redisSerializer());
-        template.afterPropertiesSet();
-        return template;
+    @Bean("clusterRedisConnectionFactory")
+    public LettuceConnectionFactory clusterRedisConnectionFactory() {
+        // 使用 Redis Cluster
+        RedisClusterConfiguration config = new RedisClusterConfiguration();
+        config.addNodeAddress("redis-node-1:6379");
+        config.addNodeAddress("redis-node-2:6379");
+        config.addNodeAddress("redis-node-3:6379");
+
+        return new LettuceConnectionFactory(config);
     }
 }
 ```
 
-### 3.3 自定义序列化对象
+## 常见问题与解决
 
-```java title="Session 存储的用户对象"
-public class SessionUser implements Serializable {
+### 问题一：Session 序列化失败
+
+Session 数据存储到 Redis 需要序列化。复杂对象必须实现序列化：
+
+```java
+// 方式一：实现 Serializable 接口
+public class User implements Serializable {
     private static final long serialVersionUID = 1L;
-
     private Long id;
     private String username;
     private String email;
-    private List<String> roles;
-
-    // 允许的字段才序列化到 Redis
-    // 敏感信息（如 password、token）绝不存入 Session
+    private String password;  // 敏感信息不建议存在 Session
 }
-```
 
-:::warning 安全注意
-存入 Session 的数据必须经过筛选，敏感信息（密码、Token、明文密码）严禁存入 Session。同时，Session 数据应定期清理，避免数据膨胀。
-:::
-
-## 四、Session 集群下的棘手问题
-
-### 4.1 Session 并发修改
-
-当用户在多个标签页同时操作时，可能出现并发修改 Session 的问题。
-
-```java title="并发场景示例"
-public class OrderService {
-    @Autowired
-    private HttpSession session;
-
-    /**
-     * 场景：用户快速点击「加入购物车」两次
-     * 预期：商品数量 +2
-     * 实际：可能只 +1（后一个覆盖前一个）
-     */
-    @GetMapping("/add-to-cart")
-    public Result addToCart(Long productId) {
-        List<Long> cart = (List<Long>) session.getAttribute("cart");
-        if (cart == null) {
-            cart = new ArrayList<>();
-        }
-        cart.add(productId);
-        session.setAttribute("cart", cart); // 覆盖操作，非原子
-        return Result.success();
-    }
-}
-```
-
-**解决方案：使用 Redis 的原子操作**
-
-```java title="原子计数器方案"
-@Service
-public class CartService {
-    @Autowired
-    private StringRedisTemplate redisTemplate;
-
-    /**
-     * 使用 Redis INCR 保证原子性
-     */
-    public void addToCart(String sessionId, Long productId) {
-        String cartKey = "cart:" + sessionId;
-        redisTemplate.opsForList().rightPush(cartKey, productId.toString());
-        // 顺便记录商品数量
-        redisTemplate.opsForHash().increment("cart:count", sessionId, 1);
-    }
-
-    public Long getCartCount(String sessionId) {
-        Object count = redisTemplate.opsForHash().get("cart:count", sessionId);
-        return count == null ? 0L : Long.parseLong(count.toString());
-    }
-}
-```
-
-### 4.2 Session 踢人下线
-
-当管理员强制用户下线时，需要清除用户的 Session。
-
-```java title="Session 管理服务"
-@Service
-public class SessionManager {
-    @Autowired
-    private RedisTemplate<String, Object> redisTemplate;
-
-    private static final String SESSION_NAMESPACE = "myapp:session:sessions:";
-
-    /**
-     * 根据用户ID获取所有 Session
-     * 需要额外维护 userId -> sessionIds 的映射
-     */
-    public List<String> getUserSessions(Long userId) {
-        String mappingKey = "user:session:mapping:" + userId;
-        return redisTemplate.opsForList().range(mappingKey, 0, -1);
-    }
-
-    /**
-     * 强制用户下线
-     */
-    public void forceLogout(Long userId) {
-        List<String> sessionIds = getUserSessions(userId);
-        if (sessionIds != null) {
-            for (String sessionId : sessionIds) {
-                String sessionKey = SESSION_NAMESPACE + sessionId;
-                // 删除 Session
-                redisTemplate.delete(sessionKey);
-                // 从用户映射中移除
-                redisTemplate.opsForList().remove("user:session:mapping:" + userId, 0, sessionId);
-            }
-        }
-    }
-
-    /**
-     * 单点登录：用户登录前，踢掉之前的 Session
-     */
-    public void singleLogin(Long userId, String newSessionId) {
-        // 先强制下线
-        forceLogout(userId);
-        // 记录新的 Session
-        String mappingKey = "user:session:mapping:" + userId;
-        redisTemplate.opsForList().rightPush(mappingKey, newSessionId);
-    }
-}
-```
-
-### 4.3 跨域 Session
-
-如果你的应用分布在不同子域名（如 `www.example.com` 和 `api.example.com`），需要特殊处理 Cookie。
-
-```java title="跨域 Session 配置"
+// 方式二：使用 JSON 序列化
 @Configuration
-@EnableRedisHttpSession(maxInactiveIntervalInSeconds = 1800)
-public class CrossDomainSessionConfig {
-    @Bean
-    public CookieSerializer cookieSerializer() {
-        DefaultCookieSerializer serializer = new DefaultCookieSerializer();
-        // 父域名，使子域名共享 Cookie
-        serializer.setDomainParent("example.com");
-        // Cookie 路径
-        serializer.setCookiePath("/");
-        // 安全设置
-        serializer.setUseHttpOnlyCookie(true);
-        serializer.setUseSecureCookie(true); // 生产环境开启
-        return serializer;
-    }
-}
-```
-
-## 五、Spring Session 核心原理
-
-### 5.1 请求拦截流程
-
-```
-请求进入 → Spring Session 拦截器识别 Cookie 中的 SESSIONID
-         ↓
-         发现 SESSIONID，从 Redis 获取 Session 数据
-         ↓
-         如果不存在，创建一个新 Session
-         ↓
-         将 Session 绑定到当前请求线程（ThreadLocal）
-         ↓
-         业务代码通过 HttpSession 操作
-         ↓
-         响应前：序列化 Session 数据，写回 Redis
-         ↓
-         响应头：设置新的 Cookie（如果 SESSIONID 变化）
-```
-
-### 5.2 Session 创建事件
-
-```java title="监听 Session 创建事件"
-@Component
-public class SessionEventListener {
-    @Autowired
-    private SessionManager sessionManager;
-    @Autowired
-    private LoginLogService loginLogService;
-
-    /**
-     * Session 创建时（用户首次访问或新登录）
-     */
-    @EventListener
-    public void onSessionCreated(ApplicationEvent event) {
-        if (event instanceof SessionCreatedEvent) {
-            SessionCreatedEvent sce = (SessionCreatedEvent) event;
-            Map<String, Object> sessionData = sce.getSession();
-
-            String sessionId = sce.getSessionId();
-            Object userId = sessionData.get("userId");
-
-            if (userId != null) {
-                // 记录 Session 与用户的映射
-                sessionManager.bindSessionToUser(sessionId.toString(), userId.toString());
-
-                // 记录登录日志
-                loginLogService.logLogin(userId.toString(), sessionData.get("loginDevice").toString());
-            }
-        }
-    }
-
-    /**
-     * Session 销毁时（过期或主动注销）
-     */
-    @EventListener
-    public void onSessionDeleted(ApplicationEvent event) {
-        if (event instanceof SessionDeletedEvent) {
-            SessionDeletedEvent sde = (SessionDeletedEvent) event;
-            Map<String, Object> sessionData = sde.getSession();
-
-            Object userId = sessionData.get("userId");
-            if (userId != null) {
-                // 清理映射
-                sessionManager.unbindSession(userId.toString(), sde.getSessionId());
-
-                // 记录登出日志
-                loginLogService.logLogout(userId.toString(), "session_expired");
-            }
-        }
-    }
-}
-```
-
-## 六、高可用 Session 方案
-
-### 6.1 Redis Cluster 部署
-
-```yaml title="Redis Cluster 配置"
-spring:
-  redis:
-    cluster:
-      nodes:
-        - 192.168.1.101:6379
-        - 192.168.1.102:6379
-        - 192.168.1.103:6379
-        - 192.168.1.104:6379
-        - 192.168.1.105:6379
-        - 192.168.1.106:6379
-      max-redirects: 3
-```
-
-### 6.2 客户端双写
-
-为了更高的可用性，可以同时写两份 Session（主从）。
-
-```java title="Session 存储增强"
-@Configuration
-public class MultiRedisSessionConfig {
-    @Bean
-    public RedisTemplate<String, Object> masterRedisTemplate() {
-        // 主库
-    }
+public class JsonSessionConfig {
 
     @Bean
-    public RedisTemplate<String, Object> slaveRedisTemplate() {
-        // 从库
-    }
-
-    @Bean
-    public SessionRepository<?> sessionRepository() {
-        return new DualWriteRedisSessionRepository(
-            masterRedisTemplate(),
-            slaveRedisTemplate()
+    public RedisSerializer<Object> springSessionDefaultRedisSerializer() {
+        return new GenericJackson2JsonRedisSerializer(
+            new ObjectMapper()
+                .registerModule(new JavaTimeModule())  // 支持 Java 8 时间
+                .activateDefaultTyping(
+                    BasicPolymorphicTypeValidator.builder()
+                        .allowIfBaseType(Object.class)
+                        .build()
+                )
         );
     }
 }
 ```
 
-### 6.3 Session 降级方案
+### 问题二：Session 并发竞争
 
-当 Redis 不可用时，系统不应该直接崩溃。
+多个请求同时修改 Session，可能导致数据覆盖：
 
-```java title="Session 降级处理"
-@Service
-public class FallbackSessionService {
-    @Autowired
-    private HttpSessionFactory sessionFactory;
+```java
+// 使用乐观锁
+@Bean
+public RedisTemplate<String, Object> redisTemplate() {
+    RedisTemplate<String, Object> template = new RedisTemplate<>();
+    template.setKeySerializer(new StringRedisSerializer());
+    template.setValueSerializer(new Jackson2JsonRedisSerializer<>(Object.class));
 
-    private volatile boolean redisAvailable = true;
+    // 开启事务支持
+    template.setEnableTransactionSupport(true);
+    return template;
+}
 
-    /**
-     * 检查 Redis 可用性
-     */
-    @Scheduled(fixedRate = 5000)
-    public void healthCheck() {
-        try {
-            redisTemplate.opsForValue().get("health:check");
-            redisAvailable = true;
-        } catch (Exception e) {
-            redisAvailable = false;
+// 服务层使用事务
+public void updateSessionWithTransaction(HttpSession session, String key, Object value) {
+    redisTemplate.execute(new SessionCallback<Object>() {
+        @Override
+        public Object execute(RedisOperations operations) throws DataAccessException {
+            operations.watch(key);  // 监视 key
+
+            // 在事务中执行操作
+            operations.multi();
+            operations.opsForValue().set(getSessionKey(session) + ":" + key, value);
+            operations.exec();
+
+            return null;
         }
-    }
-
-    public HttpSession getSession(boolean create) {
-        if (redisAvailable) {
-            // 正常走 Redis Session
-            return sessionFactory.createSession();
-        } else {
-            // 降级：使用本地 Session（用户可能需要重新登录）
-            return new LocalFallbackSession();
-        }
-    }
+    });
 }
 ```
 
-## 七、Session 与 Token 的对比
+### 问题三：Session 过期时间不生效
 
-| 维度 | Session + Redis | JWT Token |
-|---|---|---|
-| 存储位置 | 服务端（Redis） | 客户端（浏览器/App） |
-| 状态 | 有状态 | 无状态 |
-| 主动失效 | 支持 | 需配合黑名单 |
-| 数据大小 | 限制小（可存对象） | 限制大（URL 长度限制） |
-| 跨域 | 需特殊处理 | 天生支持 |
-| 防篡改 | 服务端控制 | 签名保证 |
-| 适用场景 | 复杂业务逻辑、需要实时变更权限 | RESTful API、简单认证 |
+```java
+// 设置 Session 过期时间
+HttpSession session = request.getSession();
 
-:::tip 选择建议
-- 需要实时「踢人下线」→ Session
-- 需要存储大量用户数据 → Session
-- 微服务间无状态认证 → JWT
-- 开放平台、第三方登录 → JWT
-- 两者结合：JWT 做认证，Session 存业务状态
-:::
-
-## 八、性能优化
-
-### 8.1 Session 数据精简
-
-```java title="精简 Session 数据"
-@Configuration
+// 方式一：全局配置（已在 @EnableRedisHttpSession 中设置）
 @EnableRedisHttpSession(maxInactiveIntervalInSeconds = 1800)
-public class OptimizedSessionConfig {
-    @Bean
-    public MapSession redisMapSession() {
-        // 减少不必要的 Session 字段
-        return new MapSession() {
-            {
-                setMaxInactiveInterval(Duration.ofSeconds(1800));
-            }
-        };
-    }
+
+// 方式二：动态设置
+session.setMaxInactiveInterval(Duration.ofHours(2));
+
+// 方式三：刷新 Session 过期时间
+public void refreshSessionExpiration(HttpSession session) {
+    // Spring Session 中使用
+    ((ExpiringSession) session).setLastAccessedTime(new Date());
 }
 ```
 
-### 8.2 热点数据分离
+### 问题四：跨域 Session 丢失
 
-```java title="热点数据用独立 Key"
-@Service
-public class CartService {
-    private static final String CART_KEY_PREFIX = "cart:";
-
-    /**
-     * 购物车数据量大，单独存储
-     * 不放在 Session 里，减少 Session 序列化开销
-     */
-    public void addToCart(String sessionId, CartItem item) {
-        String key = CART_KEY_PREFIX + sessionId;
-        redisTemplate.opsForList().rightPush(key, JsonUtil.toJson(item));
-        // 设置单独的过期时间
-        redisTemplate.expire(key, 7, TimeUnit.DAYS);
-    }
-}
-```
-
-### 8.3 读写分离
-
-```java title="Session 读写分离"
+```java
+// CORS 配置中允许凭证
 @Configuration
-@EnableRedisHttpSession(maxInactiveIntervalInSeconds = 1800)
-public class ReadWriteSessionConfig {
-    @Bean
-    public LettuceConnectionFactory redisConnectionFactory() {
-        LettuceClientConfiguration clientConfig = LettucePoolingClientConfiguration.builder()
-            .commandTimeout(Duration.ofMillis(2000))
-            .readFrom(ReadFrom.REPLICA_PREFERRED) // 优先读从库
-            .build();
+public class CorsConfig implements WebMvcConfigurer {
 
-        RedisStandaloneConfiguration config = new RedisStandaloneConfiguration();
-        config.setHostName("redis-master.example.com");
-        // 配置从库地址...
-
-        return new LettuceConnectionFactory(config, clientConfig);
+    @Override
+    public void addCorsMappings(CorsRegistry registry) {
+        registry.addMapping("/api/**")
+            .allowedOrigins("https://example.com")
+            .allowedMethods("GET", "POST", "PUT", "DELETE")
+            .allowedHeaders("*")
+            .allowCredentials(true)  // 允许携带 Cookie
+            .maxAge(3600);
     }
 }
 ```
 
-## 结尾
+## Session 监控与运维
 
-分布式 Session 不是万能的，它解决的是「状态共享」问题，而不是「认证」问题。在选择 Session 还是 Token 时，关键看你的业务场景是否需要：
+### Redis Session 键结构
 
-1. **实时控制用户状态**（踢人、修改权限）→ Session
-2. **存储大量业务数据**（购物车、临时表单）→ Session
-3. **简单的身份验证**（RESTful API）→ JWT
-4. **跨域/跨平台认证**（移动端、第三方）→ JWT
+```bash
+# Spring Session + Redis 的 key 结构
+spring:session:sessions:7e8e9b3f-4a6c-4d8e-9f1a-2b3c4d5e6f7a
+spring:session:sessions:expires:7e8e9b3f-4a6c-4d8e-9f1a-2b3c4d5e6f7a
+spring:session:index:org.springframework.session.FindByIndexNameRequestWrapper.PRINCIPAL_NAME_INDEX_NAME:user@example.com
+```
 
-下一节，我们来看纯无状态方案——JWT 在微服务中的最佳实践，以及如何解决 Token 的主动失效问题。
+### 监控命令
+
+```bash
+# 查看当前在线 Session 数量
+redis-cli KEYS "spring:session:sessions:*" | grep -v "expires" | wc -l
+
+# 查看某个用户的 Session
+redis-cli GET "spring:session:sessions:7e8e9b3f-4a6c-4d8e-9f1a-2b3c4d5e6f7a"
+
+# 清理过期 Session（Redis 自动处理，但可以手动触发）
+redis-cli --scan --pattern "spring:session:sessions:expires:*" | xargs redis-cli DEL
+```
+
+## 总结
+
+分布式 Session 的核心是**集中存储 + 共享访问**：
+
+| 组件 | 作用 |
+|---|---|
+| Redis | Session 数据存储 |
+| Spring Session | Session 生命周期管理 |
+| Filter/拦截器 | 自动处理 Session 读写 |
+
+Spring Session + Redis 的优势：
+
+1. **无侵入**：几乎不需要修改业务代码
+2. **高性能**：Redis 内存存储，毫秒级响应
+3. **易扩展**：增加实例只需配置 Redis 连接
+4. **高可用**：配合 Redis Cluster 或哨兵模式
+
+记住三个最佳实践：
+
+1. Session 中只存储必要的数据，不要存储大对象
+2. 敏感信息（如密码）不要存入 Session
+3. 设置合理的 Session 过期时间，平衡安全与用户体验
+

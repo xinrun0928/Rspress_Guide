@@ -1,429 +1,709 @@
-# 超时重试风暴治理
+# 超时重试风暴治理：重试策略与熔断降级组合
 
-服务 A 超时了，重试；服务 B 超时了，重试；服务 C 也超时了，继续重试。结果：1 个请求变成了 100 个，系统被自己的重试打垮了。
+你的服务 A 调用服务 B，B 超时了，A 重试；B 还没恢复，A 继续重试；同时服务 C 也在重试。结果呢？B 直接被请求淹没，彻底崩溃。
 
-这就是**重试风暴**。今天我们剖析这个问题的根源，并给出解决方案。
+这就是超时重试风暴。
 
-## 一、重试风暴的根源
+## 重试的本质
 
-### 1.1 问题分析
+### 重试的双刃剑
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        重试风暴示意                                    │
-│                                                                         │
-│   初始请求：1 个                                                       │
-│       │                                                                 │
-│       ▼                                                                 │
-│   服务A 超时 ──▶ 重试 3 次                                             │
-│       │                                                                 │
-│       ▼                                                                 │
-│   服务B 超时 ──▶ 重试 3 次                                             │
-│       │                                                                 │
-│       ▼                                                                 │
-│   服务C 超时 ──▶ 重试 3 次                                             │
-│       │                                                                 │
-│       ▼                                                                 │
-│   实际请求：27 个（3 × 3 × 3）！                                       │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-### 1.2 重试放大系数
-
-| 调用层级 | 每层重试次数 | 总放大倍数 |
-|---|---|---|
-| 1 层 | 3 | 3 |
-| 2 层 | 3 | 9 |
-| 3 层 | 3 | 27 |
-| 4 层 | 3 | 81 |
-
-## 二、重试原则
-
-### 2.1 重试三大原则
+重试可以提高系统的容错能力，但也会带来风险：
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        重试三大原则                                    │
-│                                                                         │
-│   1. 只重试幂等的操作                                                  │
-│   - GET 请求天然幂等                                                   │
-│   - DELETE 请求天然幂等                                               │
-│   - POST 需要业务层面幂等                                              │
-│                                                                         │
-│   2. 限制重试次数和间隔                                                │
-│   - 重试次数 ≤ 3                                                     │
-│   - 间隔采用指数退避                                                   │
-│                                                                         │
-│   3. 设置超时时间                                                      │
-│   - 单次调用超时 < 重试间隔                                            │
-│   - 总超时 = 重试次数 × 单次超时                                      │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                    重试风暴形成过程                               │
+├──────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  时刻 T0：服务 B 响应变慢                                         │
+│  ┌─────────┐              ┌─────────┐                          │
+│  │  服务 A  │ ───────────> │  服务 B  │  超时                    │
+│  └─────────┘              └─────────┘                          │
+│                                                                   │
+│  时刻 T1：A 重试，同时 C 也在调用 B                             │
+│  ┌─────────┐              ┌─────────┐                          │
+│  │  服务 A  │ ───────────> │  服务 B  │ × 3                    │
+│  └─────────┘              └─────────┘                          │
+│  ┌─────────┐              ┌─────────┐                          │
+│  │  服务 C  │ ───────────> │  服务 B  │ × 2                    │
+│  └─────────┘              └─────────┘                          │
+│                                                                   │
+│  结果：B 的请求量从 1x 暴增到 5x，彻底崩溃                        │
+│                                                                   │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-### 2.2 指数退避
+### 重试的原则
 
-```java title="指数退避")
-@Service
-public class ExponentialBackoff {
-    private static final int MAX_RETRIES = 3;
-    private static final long BASE_DELAY_MS = 100;
-    private static final long MAX_DELAY_MS = 5000;
+| 原则 | 说明 |
+|---|---|
+| 可幂等 | 重试的操作必须幂等 |
+| 有上限 | 重试次数必须有上限 |
+| 要退避 | 重试间隔要递增，不要频繁重试 |
+| 可熔断 | 被调方压力大时要熔断 |
+| 要监控 | 重试量和成功率必须监控 |
+
+## 重试策略
+
+### 退避算法
+
+```java
+/**
+ * 重试退避策略
+ */
+public class BackoffStrategy {
 
     /**
-     * 计算重试延迟
+     * 固定间隔退避
      */
-    public long getDelay(int retryCount) {
-        // 指数退避：100ms, 200ms, 400ms...
-        long delay = BASE_DELAY_MS * (1L << retryCount);
-        // 添加随机抖动
-        delay = (long) (delay * (0.5 + Math.random()));
-
-        return Math.min(delay, MAX_DELAY_MS);
+    public static long fixedDelay(int attempt) {
+        return 1000;  // 每次间隔 1 秒
     }
 
     /**
-     * 执行带重试的操作
+     * 线性递增退避
      */
-    public <T> T executeWithRetry(Supplier<T> operation) {
-        Exception lastException = null;
-
-        for (int i = 0; i < MAX_RETRIES; i++) {
-            try {
-                return operation.get();
-            } catch (Exception e) {
-                lastException = e;
-                if (i < MAX_RETRIES - 1) {
-                    long delay = getDelay(i);
-                    log.warn("操作失败，准备重试: attempt={}, delay={}ms",
-                            i + 1, delay);
-                    sleep(delay);
-                }
-            }
-        }
-
-        throw new RuntimeException("重试失败", lastException);
+    public static long linearDelay(int attempt, long baseDelay) {
+        return baseDelay * attempt;  // 1s, 2s, 3s...
     }
 
-    private void sleep(long millis) {
-        try {
-            Thread.sleep(millis);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
+    /**
+     * 指数退避（推荐）
+     */
+    public static long exponentialDelay(int attempt, long baseDelay) {
+        // 1s, 2s, 4s, 8s, 16s...
+        return (long) (baseDelay * Math.pow(2, attempt - 1));
+    }
+
+    /**
+     * 指数退避 + 抖动（推荐用于生产环境）
+     * 加入随机抖动，避免多客户端同时重试
+     */
+    public static long exponentialDelayWithJitter(int attempt, long baseDelay) {
+        long exponentialDelay = (long) (baseDelay * Math.pow(2, attempt - 1));
+        // 添加 0-50% 的随机抖动
+        long jitter = (long) (exponentialDelay * (Math.random() * 0.5));
+        return exponentialDelay + jitter;
     }
 }
 ```
 
-## 三、Feign 重试配置
+### Spring Retry 配置
 
-### 3.1 Feign 重试配置
-
-```java title="Feign 重试")
+```java
 @Configuration
-public class FeignRetryConfig {
-    @Bean
-    public Retryer retryer() {
-        // 最大重试 3 次，间隔 100ms-500ms
-        return new Retryer.Default(100, 500, 3);
-    }
-}
-```
+@EnableRetry
+public class RetryConfig {
 
-### 3.2 超时配置
-
-```yaml title="application.yml"
-feign:
-  client:
-    config:
-      default:
-        connect-timeout: 2000
-        read-timeout: 5000
-        retryer: never  # 全局关闭重试，由业务层控制
-```
-
-### 3.3 禁用重试
-
-```java title="禁用重试")
-@FeignClient(name = "order-service", configuration = FeignNoRetryConfig.class)
-public interface OrderFeignClient {
-    @RequestMapping(method = RequestMethod.GET, value = "/order/{id}")
-    Order getOrder(@PathVariable("id") Long id);
-}
-
-@Configuration
-public class FeignNoRetryConfig {
-    @Bean
-    public Retryer retryer() {
-        // 不重试
-        return Retryer.NEVER_RETRY;
-    }
-}
-```
-
-## 四、RestTemplate 重试
-
-### 4.1 重试配置
-
-```java title="RestTemplate 重试")
-@Configuration
-public class RestTemplateRetryConfig {
+    /**
+     * 全局重试配置
+     */
     @Bean
     public RetryTemplate retryTemplate() {
         RetryTemplate template = new RetryTemplate();
 
-        // 简单策略
-        SimpleRetryPolicy policy = new SimpleRetryPolicy();
-        policy.setMaxAttempts(3);
-        template.setRetryPolicy(policy);
+        // 1. 设置重试策略
+        // 最大重试 3 次
+        SimpleRetryPolicy retryPolicy = new SimpleRetryPolicy();
+        retryPolicy.setMaxAttempts(3);
 
-        // 指数退避
+        // 2. 设置退避策略
+        ExponentialBackOffPolicy backOffPolicy = new ExponentialBackOffPolicy();
+        backOffPolicy.setInitialInterval(1000);      // 初始间隔 1 秒
+        backOffPolicy.setMultiplier(2.0);            // 指数退避
+        backOffPolicy.setMaxInterval(10000);          // 最大间隔 10 秒
+
+        template.setRetryPolicy(retryPolicy);
+        template.setBackOffPolicy(backOffPolicy);
+
+        return template;
+    }
+
+    /**
+     * 带熔断的重试模板
+     */
+    @Bean
+    public RetryTemplate circuitBreakerRetryTemplate() {
+        RetryTemplate template = new RetryTemplate();
+
+        // 使用 CircuitBreakerRetryPolicy
+        CircuitBreakerRetryPolicy retryPolicy = new CircuitBreakerRetryPolicy(
+            new SimpleRetryPolicy()
+        );
+
+        // 熔断器配置
+        retryPolicy.setOpenTimeout(5000);      // 熔断器打开时间
+        retryPolicy.setResetTimeout(30000);    // 熔断器重置时间
+
+        template.setRetryPolicy(retryPolicy);
+
+        return template;
+    }
+}
+```
+
+### 使用示例
+
+```java
+@Service
+public class RemoteCallService {
+
+    @Autowired
+    private RetryTemplate retryTemplate;
+
+    private final RestTemplate restTemplate;
+
+    /**
+     * 使用 RetryTemplate 重试
+     */
+    public User getUserById(Long userId) {
+        return retryTemplate.execute(context -> {
+            // context.getRetryCount() 可以获取重试次数
+            log.info("尝试获取用户，次数={}", context.getRetryCount() + 1);
+
+            return restTemplate.getForObject(
+                "http://user-service/api/users/" + userId,
+                User.class
+            );
+        });
+    }
+
+    /**
+     * 使用注解方式重试
+     */
+    @Retryable(
+        value = { RemoteException.class, SocketTimeoutException.class },
+        maxAttempts = 3,
+        backoff = @Backoff(delay = 1000, multiplier = 2, maxDelay = 10000)
+    )
+    public Order getOrder(Long orderId) {
+        return orderClient.getOrder(orderId);
+    }
+
+    /**
+     * 重试失败后的处理
+     */
+    @Retryable(
+        value = Exception.class,
+        maxAttempts = 3,
+        recover = "getOrderFallback"
+    )
+    public Order getOrderWithFallback(Long orderId) {
+        return orderClient.getOrder(orderId);
+    }
+
+    /**
+     * 重试失败后的兜底方法
+     */
+    public Order getOrderFallback(Long orderId, Exception e) {
+        log.error("获取订单失败，orderId={}, 错误={}", orderId, e.getMessage());
+        return orderRepository.findById(orderId).orElse(null);
+    }
+}
+```
+
+## 熔断器模式
+
+### 熔断器原理
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                      熔断器状态转换                               │
+├──────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│   ┌─────────┐                                                     │
+│   │  CLOSED │ ←─── 失败率 `<=` 阈值 ───┐                         │
+│   │  关闭    │                         │                         │
+│   │         │                         │                         │
+│   │ 正常请求  │                         │                         │
+│   │ 通过     │                         │                         │
+│   └────┬────┘                         │                         │
+│        │                              │                         │
+│        │ 失败率 > 阈值               │                         │
+│        ▼                              │                         │
+│   ┌─────────┐                         │                         │
+│   │  OPEN   │ ←─── 超时时间 ──────────┘                         │
+│   │  打开    │                                                 │
+│   │         │                                                 │
+│   │ 快速失败 │ ──── 半开 ────────── ┐                         │
+│   │ 返回默认 │                    │                         │
+│   └────┬────┘                    │                         │
+│        │                         │                         │
+│        │ 成功                    │ 失败                     │
+│        ▼                         │                         │
+│   ┌─────────┐                    │                         │
+│   │ HALF-   │ ──────────────────  │                         │
+│   │ OPEN    │                    │                         │
+│   │ 半开    │                    │                         │
+│   └─────────┘                    │                         │
+│                                 │                         │
+│                                 ▼                         │
+│                           ┌─────────┐                      │
+│                           │ OPEN    │                      │
+│                           │ 打开     │                      │
+│                           └─────────┘                      │
+│                                                                   │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### Resilience4j 熔断器
+
+```java
+@Configuration
+public class Resilience4jConfig {
+
+    @Bean
+    public CircuitBreakerRegistry circuitBreakerRegistry() {
+        // 创建熔断器注册表
+        CircuitBreakerRegistry registry = CircuitBreakerRegistry.of(
+            CircuitBreakerConfig.custom()
+                // 滑动窗口配置
+                .slidingWindowType(SlidingWindowType.COUNT_BASED)  // 基于请求次数
+                .slidingWindowSize(100)                            // 滑动窗口大小
+                .minimumNumberOfCalls(20)                           // 最小调用次数
+
+                // 失败率阈值
+                .failureRateThreshold(50)  // 失败率 50% 时触发熔断
+
+                // 慢调用阈值
+                .slowCallRateThreshold(80)   // 80% 慢调用时触发熔断
+                .slowCallDurationThreshold(Duration.ofSeconds(5))
+
+                // 熔断持续时间
+                .waitDurationInOpenState(Duration.ofSeconds(30))
+
+                // 半开状态下允许的调用次数
+                .permittedNumberOfCallsInHalfOpenState(10)
+
+                // 自动从打开变为半开
+                .automaticTransitionFromOpenToHalfOpenEnabled(true)
+
+                .build()
+        );
+
+        return registry;
+    }
+
+    /**
+     * 为不同服务创建不同的熔断器
+     */
+    @Bean
+    public CircuitBreaker userServiceCircuitBreaker(CircuitBreakerRegistry registry) {
+        return registry.circuitBreaker("userService");
+    }
+
+    @Bean
+    public CircuitBreaker paymentServiceCircuitBreaker(CircuitBreakerRegistry registry) {
+        CircuitBreakerConfig config = CircuitBreakerConfig.custom()
+            // 支付服务更严格
+            .failureRateThreshold(30)
+            .slowCallDurationThreshold(Duration.ofSeconds(2))
+            .build();
+
+        return registry.circuitBreaker("paymentService", config);
+    }
+}
+```
+
+### 熔断器使用
+
+```java
+@Service
+public class CircuitBreakerRemoteCallService {
+
+    private final CircuitBreaker userServiceCircuitBreaker;
+    private final CircuitBreaker paymentServiceCircuitBreaker;
+    private final UserClient userClient;
+    private final PaymentClient paymentClient;
+
+    public CircuitBreakerRemoteCallService(
+            @Qualifier("userServiceCircuitBreaker") CircuitBreaker userServiceCircuitBreaker,
+            @Qualifier("paymentServiceCircuitBreaker") CircuitBreaker paymentServiceCircuitBreaker,
+            UserClient userClient,
+            PaymentClient paymentClient) {
+        this.userServiceCircuitBreaker = userServiceCircuitBreaker;
+        this.paymentServiceCircuitBreaker = paymentServiceCircuitBreaker;
+        this.userClient = userClient;
+        this.paymentClient = paymentClient;
+    }
+
+    /**
+     * 用户服务调用（带熔断）
+     */
+    public User getUser(Long userId) {
+        return userServiceCircuitBreaker.executeSupplier(() -> {
+            return userClient.getUser(userId);
+        });
+    }
+
+    /**
+     * 支付服务调用（带熔断和降级）
+     */
+    public PaymentResult pay(PaymentRequest request) {
+        return Decorators.ofSupplier(() -> paymentClient.pay(request))
+            // 配置熔断器
+            .withCircuitBreaker(paymentServiceCircuitBreaker)
+            // 配置超时
+            .withTimeout(Duration.ofSeconds(5))
+            // 配置降级
+            .withFallback(List.of(Exception.class),
+                e -> {
+                    log.warn("支付服务熔断，返回降级结果", e);
+                    return PaymentResult.degraded();
+                })
+            .decorateSupplier()
+            .get();
+    }
+}
+```
+
+## 组合策略：重试 + 熔断
+
+### 完整配置
+
+```java
+/**
+ * 重试 + 熔断的完整配置
+ */
+@Configuration
+public class RetryAndCircuitBreakerConfig {
+
+    @Bean
+    public RetryTemplate resilientRetryTemplate(CircuitBreakerRegistry registry) {
+        RetryTemplate template = new RetryTemplate();
+
+        // 熔断重试策略
+        CircuitBreakerRetryPolicy retryPolicy = new CircuitBreakerRetryPolicy(
+            new SimpleRetryPolicy()
+        );
+        retryPolicy.setCircuitBreaker(
+            registry.circuitBreaker("default")
+        );
+
+        // 退避策略
         ExponentialBackOffPolicy backOff = new ExponentialBackOffPolicy();
-        backOff.setInitialInterval(100);
+        backOff.setInitialInterval(1000);
         backOff.setMultiplier(2);
-        backOff.setMaxInterval(5000);
+        backOff.setMaxInterval(10000);
+
+        template.setRetryPolicy(retryPolicy);
         template.setBackOffPolicy(backOff);
 
         return template;
     }
-
-    @Bean
-    public RestTemplate restTemplate(RetryTemplate retryTemplate) {
-        return new RestTemplateBuilder()
-                .setRetryTemplate(retryTemplate)
-                .build();
-    }
 }
-```
 
-### 4.2 重试条件
-
-```java title="重试条件")
-@Configuration
-public class ConditionalRetryConfig {
-    @Bean
-    public RetryTemplate selectiveRetryTemplate() {
-        RetryTemplate template = new RetryTemplate();
-
-        // 只在特定异常时重试
-        Map<Class<? extends Throwable>, Boolean> retryable =
-                Collections.singletonMap(
-                        TimeoutException.class,
-                        true
-                );
-
-        SimpleRetryPolicy policy = new SimpleRetryPolicy(3, retryable);
-        template.setRetryPolicy(policy);
-
-        return template;
-    }
-}
-```
-
-## 五、重试风暴治理
-
-### 5.1 熔断器防止风暴
-
-```java title="熔断器防风暴")
+/**
+ * 使用示例
+ */
 @Service
-@Slf4j
-public class RetryStormProtection {
-    private final AtomicInteger concurrentRetries = new AtomicInteger(0);
-    private volatile boolean circuitOpen = false;
-    private static final int MAX_CONCURRENT_RETRIES = 100;
+public class ResilientRemoteService {
+
+    @Autowired
+    private RetryTemplate retryTemplate;
+
+    @Autowired
+    private CircuitBreakerRegistry circuitBreakerRegistry;
 
     /**
-     * 带保护的重试
+     * 带完整保护的远程调用
      */
-    public <T> T retryWithProtection(Supplier<T> operation, Supplier<T> fallback) {
-        // 检查熔断状态
-        if (circuitOpen) {
-            log.warn("重试熔断打开，直接降级");
+    public <T> T callWithFullProtection(
+            Supplier<T> supplier,
+            Supplier<T> fallback,
+            String serviceName) {
+
+        // 1. 获取或创建熔断器
+        CircuitBreaker circuitBreaker = circuitBreakerRegistry.circuitBreaker(serviceName);
+
+        // 2. 使用熔断器包装
+        Supplier<T> decoratedSupplier = Decorators.ofSupplier(supplier)
+            .withCircuitBreaker(circuitBreaker)
+            .withFallback(List.of(Exception.class), e -> fallback.get())
+            .decorate();
+
+        // 3. 使用重试模板执行
+        return retryTemplate.execute(context -> {
+            log.info("调用 {}, 第 {} 次尝试", serviceName, context.getRetryCount() + 1);
+            return decoratedSupplier.get();
+        }, context -> {
+            // 重试耗尽后的处理
+            log.error("调用 {} 重试耗尽，共尝试 {} 次",
+                serviceName, context.getRetryCount());
             return fallback.get();
-        }
-
-        // 检查并发重试数
-        if (concurrentRetries.get() >= MAX_CONCURRENT_RETRIES) {
-            log.warn("并发重试数过多，直接降级");
-            return fallback.get();
-        }
-
-        concurrentRetries.incrementAndGet();
-        try {
-            return executeWithRetry(operation);
-        } finally {
-            concurrentRetries.decrementAndGet();
-        }
-    }
-
-    /**
-     * 触发熔断
-     */
-    public void triggerCircuitOpen() {
-        circuitOpen = true;
-        log.error("重试熔断打开");
-
-        // 30 秒后尝试恢复
-        CompletableFuture.runAsync(() -> {
-            try {
-                Thread.sleep(30000);
-                circuitOpen = false;
-                log.info("重试熔断关闭");
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
         });
     }
 }
 ```
 
-### 5.2 限流防止风暴
+### Dubbo 集成
 
-```java title="限流防止风暴")
+```java
+/**
+ * Dubbo 重试和熔断配置
+ */
+@Configuration
+public class DubboRetryConfig {
+
+    @Bean
+    public DubboConfig dubboConfig() {
+        DubboConfig config = new DubboConfig();
+        config.setTimeout(3000);  // 超时时间
+        config.setRetries(2);     // 重试次数
+
+        // 配置重试策略
+        RetryPolicy retryPolicy = new RetryPolicy();
+        retryPolicy.setMaxAttempts(3);
+        retryPolicy.setBackoff(Backoff.exponential(1000, 2, 10000));
+        retryPolicy.setRetryOn(Exception.class);
+
+        config.setRetryPolicy(retryPolicy);
+
+        return config;
+    }
+}
+
+/**
+ * Dubbo 服务调用
+ */
+@DubboReference(timeout = 3000, retries = 2)
+private UserService userService;
+
+@DubboReference(
+    timeout = 5000,
+    retries = 2,
+    cluster = "failover",          // 故障转移
+    loadbalance = "roundrobin"     // 负载均衡
+)
+private OrderService orderService;
+
+/**
+ * 使用注解自定义熔断
+ */
+@DubboReference(
+    timeout = 3000,
+    methods = {
+        @Method(
+            name = "getUser",
+            timeout = 2000,
+            retries = 2
+        ),
+        @Method(
+            name = "getOrder",
+            timeout = 5000,
+            retries = 0  // 不重试
+        )
+    }
+)
+private UserService customUserService;
+```
+
+## 降级策略
+
+### 降级方法
+
+```java
+/**
+ * 降级策略实现
+ */
 @Service
-@Slf4j
-public class RetryRateLimiter {
-    private final Semaphore semaphore = new Semaphore(50);
-    private final RateLimiter rateLimiter = RateLimiter.create(100); // 100 QPS
+public class DegradationStrategyService {
 
     /**
-     * 限流重试
+     * 返回默认值
      */
-    public <T> T retryWithLimit(Supplier<T> operation) {
-        // 限流获取
-        if (!rateLimiter.tryAcquire()) {
-            throw new RetryRejectedException("重试请求被限流");
+    public User getUserFallback(Long userId, Exception e) {
+        log.warn("获取用户失败，返回默认用户: userId={}", userId);
+        User defaultUser = new User();
+        defaultUser.setId(userId);
+        defaultUser.setName("默认用户");
+        defaultUser.setDegraded(true);
+        return defaultUser;
+    }
+
+    /**
+     * 返回缓存数据
+     */
+    public List<Product> getProductsFallback(Exception e) {
+        log.warn("获取商品列表失败，返回缓存数据");
+
+        // 从 Redis 获取缓存
+        List<Product> cached = redisTemplate.opsForValue().get("products:cache");
+        if (cached != null) {
+            return cached;
         }
 
-        // 并发限制
-        if (!semaphore.tryAcquire()) {
-            throw new RetryRejectedException("并发重试数超限");
-        }
+        return Collections.emptyList();
+    }
 
-        try {
-            return operation.get();
-        } finally {
-            semaphore.release();
-        }
+    /**
+     * 返回友好错误提示
+     */
+    public Order createOrderFallback(OrderRequest request, Exception e) {
+        log.error("创建订单失败，降级处理: request={}", request);
+
+        Order order = new Order();
+        order.setId("DEGRADED-" + System.currentTimeMillis());
+        order.setStatus("PENDING");
+        order.setRemark("系统繁忙，订单稍后处理");
+
+        // 放入延迟队列，稍后重试
+        delayedQueue.put(request);
+
+        return order;
+    }
+
+    /**
+     * 限流降级
+     */
+    public Response rateLimitFallback(String resource, Exception e) {
+        return Response.error("系统繁忙，请稍后重试", 429);
     }
 }
 ```
 
-### 5.3 单链路重试
+## 监控与告警
 
-```java title="单链路重试")
+### 熔断器监控
+
+```java
+/**
+ * 熔断器监控
+ */
 @Service
-@Slf4j
-public class Single链路重试Service {
-    private final ThreadLocal<Boolean> retrying = ThreadLocal.withInitial(() -> false);
+public class CircuitBreakerMonitoringService {
 
-    /**
-     * 只在最外层重试
-     */
-    public <T> T executeWithSingleRetry(Supplier<T> operation) {
-        // 如果已经在重试中，直接调用
-        if (retrying.get()) {
-            return operation.get();
-        }
-
-        try {
-            retrying.set(true);
-            return executeWithRetry(operation);
-        } finally {
-            retrying.set(false);
-        }
-    }
-}
-```
-
-## 六、重试最佳实践
-
-### 6.1 重试清单
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        重试检查清单                                    │
-│                                                                         │
-│   □ 操作是否幂等？                                                     │
-│   □ 重试次数是否限制（≤3）？                                          │
-│   □ 间隔是否采用退避策略？                                             │
-│   □ 是否设置了超时？                                                   │
-│   □ 是否有熔断保护？                                                   │
-│   □ 是否只在最外层重试？                                              │
-│   □ 重试失败是否有降级？                                              │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-### 6.2 不可重试的场景
-
-| 场景 | 原因 | 处理 |
-|---|---|---|
-| POST 创建资源 | 可能产生重复资源 | 业务幂等 + 唯一键 |
-| 支付操作 | 资金安全 | 不重试，人工处理 |
-| 删除操作 | 资源已删除 | 幂等，返回成功 |
-| 非幂等查询 | 结果可能变化 | 不重试 |
-
-### 6.3 监控告警
-
-```java title="重试监控")
-@Service
-@Slf4j
-public class RetryMonitor {
     @Autowired
-    private MeterRegistry meterRegistry;
+    private CircuitBreakerRegistry registry;
 
-    private Counter retrySuccessCounter;
-    private Counter retryFailureCounter;
-    private Timer retryDuration;
+    @Scheduled(fixedRate = 30000)  // 每 30 秒
+    public void monitorCircuitBreakers() {
+        for (String name : registry.getAllCircuitBreakers().stream()
+                .map(CircuitBreaker::getName)
+                .collect(Collectors.toList())) {
 
-    @PostConstruct
-    public void init() {
-        retrySuccessCounter = meterRegistry.counter("retry.success");
-        retryFailureCounter = meterRegistry.counter("retry.failure");
-        retryDuration = meterRegistry.timer("retry.duration");
+            CircuitBreaker cb = registry.circuitBreaker(name);
+            CircuitBreakerMetrics metrics = cb.getMetrics();
+
+            // 获取关键指标
+            long failureRate = metrics.getFailureRate();
+            long slowCallRate = metrics.getSlowCallRate();
+            int bufferedCalls = metrics.getNumberOfBufferedCalls();
+            int failedCalls = metrics.getNumberOfFailedCalls();
+
+            // 记录到监控系统
+            recordMetrics(name, metrics);
+
+            // 触发告警
+            if (failureRate > 80) {
+                alert("严重告警: " + name + " 熔断器打开，失败率=" + failureRate + "%");
+            }
+        }
     }
 
-    public <T> T monitorRetry(Supplier<T> operation) {
-        Timer.Sample sample = Timer.start(meterRegistry);
+    /**
+     * 获取熔断器状态
+     */
+    public Map<String, CircuitBreakerStatus> getAllCircuitBreakerStatus() {
+        Map<String, CircuitBreakerStatus> statusMap = new HashMap<>();
 
-        try {
-            T result = operation.get();
-            retrySuccessCounter.increment();
-            return result;
-        } catch (Exception e) {
-            retryFailureCounter.increment();
-            throw e;
-        } finally {
-            sample.stop(retryDuration);
+        for (CircuitBreaker cb : registry.getAllCircuitBreakers()) {
+            CircuitBreakerMetrics metrics = cb.getMetrics();
+
+            statusMap.put(cb.getName(), new CircuitBreakerStatus()
+                .setName(cb.getName())
+                .setState(cb.getState().name())
+                .setFailureRate(metrics.getFailureRate())
+                .setSlowCallRate(metrics.getSlowCallRate())
+                .setBufferedCalls(metrics.getNumberOfBufferedCalls())
+                .setFailedCalls(metrics.getNumberOfFailedCalls())
+                .setSuccessCalls(metrics.getNumberOfSuccessfulCalls())
+            );
         }
+
+        return statusMap;
     }
 }
 ```
 
-## 七、总结
+## 常见问题与解决
 
-| 问题 | 解决方案 |
+### 问题一：幂等性
+
+```java
+// 所有可能重试的操作必须幂等
+@Service
+public class IdempotentOperationService {
+
+    /**
+     * 幂等扣款
+     */
+    @Transactional
+    public boolean deductBalance(String userId, BigDecimal amount, String transactionId) {
+        // 1. 检查是否已处理
+        String key = "transaction:processed:" + transactionId;
+        if (Boolean.TRUE.equals(redisTemplate.hasKey(key))) {
+            log.info("交易已处理: transactionId={}", transactionId);
+            return true;
+        }
+
+        // 2. 执行扣款
+        int affected = jdbcTemplate.update(
+            "UPDATE account SET balance = balance - ? WHERE user_id = ? AND balance >= ?",
+            amount, userId, amount
+        );
+
+        if (affected > 0) {
+            // 3. 标记已处理
+            redisTemplate.opsForValue().set(key, "1", Duration.ofDays(7));
+            return true;
+        }
+
+        return false;
+    }
+}
+```
+
+### 问题二：超时配置
+
+```java
+// 合理的超时配置
+@Configuration
+public class TimeoutConfig {
+
+    @Bean
+    public RestTemplate restTemplate() {
+        SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
+
+        // 连接超时：建立连接的时间
+        factory.setConnectTimeout(1000);   // 1 秒
+
+        // 读取超时：等待响应的时间
+        factory.setReadTimeout(3000);      // 3 秒
+
+        return new RestTemplate(factory);
+    }
+}
+```
+
+## 总结
+
+超时重试风暴治理的核心是**保护 + 恢复**：
+
+| 策略 | 作用 |
 |---|---|
-| 无限重试 | 限制重试次数 |
-| 快速重试 | 指数退避 |
-| 嵌套重试 | 单链路重试 |
-| 并发风暴 | 熔断器 + 限流 |
-| 无降级 | 降级兜底 |
+| 退避算法 | 避免同时重试 |
+| 熔断器 | 快速失败，保护下游 |
+| 降级 | 优雅降级，不影响主流程 |
+| 监控 | 及时发现问题 |
 
-:::tip 实战建议
-1. **默认不重试**：让重试成为例外，而不是默认
-2. **退避很重要**：避免重试风暴
-3. **幂等是前提**：重试的基础是幂等
-:::
+最佳实践：
 
-## 结尾
+1. **幂等优先**：任何可能重试的操作必须幂等
+2. **有限重试**：设置最大重试次数
+3. **指数退避**：重试间隔递增
+4. **熔断保护**：防止雪崩
+5. **降级兜底**：有备无患
 
-重试是双刃剑，用好是保护，用不好是灾难。记住三个要点：
+记住：**重试是把双刃剑**，用好了提高可用性，用不好制造故障。
 
-1. **重试要克制**：能不多次就不重试
-2. **退避是必须的**：让系统有时间恢复
-3. **幂等是前提**：没有幂等就不要重试
-
-下一节，我们来看系统自适应限流——如何让限流更智能。

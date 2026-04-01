@@ -1,0 +1,185 @@
+# 索引下推（Index Condition Pushdown）
+
+MySQL 5.6 之前，有这么一个「反人类」的设计：
+
+```sql
+CREATE INDEX idx_name_age ON employees(name, age);
+
+SELECT * FROM employees WHERE name LIKE 'A%' AND age = 30;
+```
+
+这条 SQL，MySQL 明明建了 `(name, age)` 联合索引，却先把所有 `name LIKE 'A%'` 的主键 ID 都查出来，**拿到服务层过滤 `age`**，再回表取完整数据。
+
+明明 `age` 也是索引列，为什么不在索引层就过滤掉？
+
+答案很简单：**因为那时候的优化器不支持**。这个问题，直到 MySQL 5.6 引入了 ICP（Index Condition Pushdown）才解决。
+
+## 什么是索引下推
+
+**ICP（Index Condition Pushdown）**：把 WHERE 条件下推到存储引擎层，在索引遍历过程中就完成过滤，减少回表次数。
+
+### 无 ICP 的执行流程
+
+```
+服务层（MySQL Server）
+    ↓ 发送主键 ID 列表
+存储引擎层（InnoDB）
+    ↓ 根据主键 ID 回表取数据
+    ↓ 返回完整行数据
+服务层
+    ↓ 根据 WHERE 条件过滤 age = 30
+```
+
+每一条 `name LIKE 'A%'` 的记录都要回表，然后在服务层过滤。10 万条 `A` 开头的名字，就要回表 10 万次。
+
+### 有 ICP 的执行流程
+
+```
+存储引擎层（InnoDB）
+    ↓ 遍历索引树
+    ↓ 同时过滤 name LIKE 'A%' AND age = 30
+    ↓ 只返回满足全部条件的 主键 ID
+服务层（MySQL Server）
+    ↓ 根据主键 ID 回表取数据
+```
+
+存储引擎层直接用 `(name, age)` 索引过滤，只回表取真正需要的行。
+
+## 实战验证：ICP 到底省了什么
+
+先创建测试表：
+
+```sql
+CREATE TABLE employees (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    name VARCHAR(50),
+    age INT,
+    dept_id INT,
+    email VARCHAR(100),
+    INDEX idx_name_age (name, age)
+);
+
+-- 插入 10 万条测试数据
+INSERT INTO employees (name, age, dept_id, email)
+SELECT CONCAT('Name_', n), FLOOR(20 + RAND() * 40), FLOOR(1 + RAND() * 100),
+       CONCAT('user', n, '@company.com')
+FROM (SELECT @row := @row + 1 AS n FROM
+      (SELECT 0 UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3) a,
+      (SELECT 0 UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3) b,
+      (SELECT 0 UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3) c,
+      (SELECT 0 UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3) d,
+      (SELECT @row:=0) r
+      LIMIT 100000) t;
+```
+
+查看执行计划：
+
+```sql
+SET optimizer_switch = 'index_condition_pushdown=off';  -- 关闭 ICP
+EXPLAIN SELECT * FROM employees WHERE name LIKE 'Name_5%' AND age = 30;
+```
+
+```text
++----+-------------+-----------+------+-------------------+------+---------+
+| id | select_type | table     | key  | Extra             | rows | filtered|
++----+-------------+-----------+------+-------------------+------+---------+
+|  1 | SIMPLE      | employees | idx  | Using where       | 1000 |   10.00 |
++----+-------------+-----------+------+-------------------+------+---------+
+```
+
+开启 ICP：
+
+```sql
+SET optimizer_switch = 'index_condition_pushdown=on';   -- 开启 ICP
+EXPLAIN SELECT * FROM employees WHERE name LIKE 'Name_5%' AND age = 30;
+```
+
+```text
++----+-------------+-----------+------+--------------------+------+---------+
+| id | select_type | table     | key  | Extra              | rows | filtered|
++----+-------------+-----------+------+--------------------+------+---------+
+|  1 | SIMPLE      | employees | idx  | Using index condition| 1000|   10.00|
++----+-------------+-----------+------+--------------------+------+---------+
+```
+
+注意 `Extra` 列的区别：
+- `Using where`：服务层过滤
+- `Using index condition`：索引下推
+
+## ICP 的工作原理：存储引擎层的过滤
+
+从执行流程来看，ICP 在索引遍历阶段就完成了过滤：
+
+1. **索引遍历**：InnoDB 从 B+ 树根节点开始，按 `name` 列匹配 `Name_5%`
+2. **条件下推**：同时检查 `age = 30` 条件
+3. **回表**（如果需要）：只有同时满足两个条件的记录才回表取完整数据
+
+```
+B+ 树索引层
+    ↓ name LIKE 'Name_5%' AND age = 30
+    ↓ 同时满足两个条件
+    ↓ 才返回主键 ID
+回表取完整行
+```
+
+## ICP 的限制条件
+
+ICP 不是万能的，以下情况不适用：
+
+| 限制 | 说明 |
+|---|---|
+| 只能用于索引辅助查询 | 索引必须覆盖查询涉及的列 |
+| 不支持 `FULLTEXT` 索引 | 全文索引不适用 |
+| 不支持 `geometry` 类型的空间索引 | 空间索引暂不支持 |
+| 多表 `JOIN` 时条件不下推 | 只在单表查询时生效 |
+
+### ICP 适用于哪些查询
+
+```sql
+-- 范围查询 + 等值查询
+SELECT * FROM t WHERE name > 'A' AND age = 30;
+
+-- LIKE 前缀 + 等值查询
+SELECT * FROM t WHERE name LIKE 'A%' AND city = 'Beijing';
+
+-- 多条件组合
+SELECT * FROM t WHERE name = 'Alice' AND age > 25 AND dept_id IN (101, 102);
+```
+
+## 为什么 ICP 重要：性能差异肉眼可见
+
+假设 `name LIKE 'A%'` 匹配 5000 条，但只有 50 条 `age = 30`：
+
+| 方式 | 回表次数 | 性能 |
+|---|---|---|
+| 无 ICP | 5000 次 | 差 |
+| 有 ICP | 50 次 | 好 |
+
+回表次数减少 100 倍，性能提升是质的飞跃。
+
+## ICP 与覆盖索引的区别
+
+很多人容易把 ICP 和覆盖索引搞混，它们是两种不同的优化：
+
+| 优化 | 作用阶段 | 解决的问题 |
+|---|---|---|
+| 覆盖索引 | 查询阶段 | 不需要回表，直接从索引获取数据 |
+| ICP | 过滤阶段 | 在索引层提前过滤，减少回表次数 |
+
+两者可以叠加使用：
+
+```sql
+CREATE INDEX idx_name_age_dept ON employees(name, age, dept_id);
+
+-- 既使用了 ICP（索引层过滤 age）
+-- 又使用了覆盖索引（dept_id 不需要回表）
+SELECT name, dept_id FROM employees WHERE name LIKE 'A%' AND age = 30;
+```
+
+## 总结：ICP 让索引更「聪明」
+
+索引下推的核心思想是：**把能提前做的过滤，在存储引擎层做完**。
+
+这减少了不必要的回表操作，特别是在联合索引 + 范围查询的场景下，效果尤为明显。
+
+MySQL 5.6 引入 ICP，5.7 持续优化，8.0 之后更是把这一步做得更彻底。如果你的 MySQL 版本低于 5.6，升级是第一选择。

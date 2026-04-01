@@ -1,330 +1,296 @@
 # 偏向锁的获取、撤销与批量重偏向
 
-偏向锁是 JDK 6 引入的重量级优化，它的核心思想简单而优雅——如果一个同步块从未被多个线程竞争过，为什么要让后续的每次进入都要做同步操作呢？偏向锁让第一个获取锁的线程"记住"自己的身份，后续再进入时无需任何原子操作。但这把双刃剑也有它的复杂性：偏向锁的获取、撤销、批量重偏向，每个环节都藏着精妙的设计。
+JDK 6 引入了一项革命性的优化：**偏向锁**（Biased Locking）。
 
-## 偏向锁的获取：一次 CAS，永久偏向
+它的核心思想简单到令人发指——「如果一个线程反复进入同一把锁，干嘛还要每次都竞争？」
 
-当一个线程首次执行 `synchronized(obj)` 时，JVM 会尝试将对象设置为偏向锁状态。这个过程只需要一次 CAS 操作：
+但这项优化在 JDK 15 后被废弃了。
 
-```java
-// 偏向锁获取的简化流程
-void bias_revive(Object obj, Thread requesting_thread) {
-    // 1. 获取对象当前的 Mark Word（应该是无锁状态）
-    markOop mark = obj.mark_word();
-    
-    // 2. 检查是否可以偏向
-    //    - 锁标志位必须是 01（无锁）
-    //    - 偏向标志位必须是 0（未偏向）
-    if (mark.is_biased() && !mark.has_biased_locker()) {
-        // 3. 构造偏向锁的 Mark Word
-        //    - 线程ID：requesting_thread 的线程ID
-        //    - Epoch：类的 Epoch 值
-        //    - 偏向标志：1
-        //    - 锁标志：01
-        biasedMark = mark.with_biased_info(requesting_thread, epoch);
-        
-        // 4. CAS 设置偏向锁
-        //    这是唯一一次原子操作！
-        if (obj.mark_word.compare_and_set(mark, biasedMark)) {
-            // 偏向成功，线程永久持有偏向
-            requesting_thread.increment_biased_lock_count();
-            return ACQUIRED;
-        }
-        
-        // CAS 失败，说明有竞争，撤销偏向
-        revoke_and_retry(obj);
-    }
-}
-```
+今天，我们来聊聊偏向锁的设计原理、撤销机制，以及为什么它最终被放弃。
 
-偏向锁的核心就是这次 **CAS**。一旦成功，Mark Word 中就记录了当前线程的 ID，后续该线程进入同步块时，只需要比较 Mark Word 中的线程 ID 是否是自己。
+## 偏向锁的设计初衷
 
-## 偏向锁的快速路径：零开销同步
-
-偏向锁获取后，线程再次进入同步块的路径变得极其高效：
-
-```java
-// 偏向锁的快速路径（伪代码）
-void fast_path_enter(Object obj) {
-    markOop mark = obj.mark_word();
-    
-    // 检查：是否是我偏向的锁？
-    if (mark.has_biased_locker() && 
-        mark.biased_thread() == Thread.currentThread()) {
-        // 完全是零开销！
-        // 不需要任何 CAS 或同步操作
-        return ACQUIRED;
-    }
-    
-    // 不是我的偏向锁，走慢速路径
-    slow_path_enter(obj);
-}
-```
-
-这种"零开销"是偏向锁最大的优势。在锁竞争很少的场景下，性能提升显著。
-
-## 偏向锁的撤销：竞争的代价
-
-偏向锁虽好，但一旦有其他线程尝试获取，JVM 必须撤销偏向。这个过程比获取复杂得多。
-
-### 为什么要撤销偏向？
-
-考虑这个场景：
-
-```java
-Thread A:  // 持有偏向锁
-    synchronized (obj) {
-        // 业务操作
-    }
-
-Thread B:  // 尝试获取锁
-    synchronized (obj) {  // 偏向锁被撤销
-        // ...
-    }
-```
-
-Thread B 不能简单地"覆盖" Thread A 的偏向，因为这样会导致数据不一致。JVM 必须确保 Thread A 完全释放锁后，Thread B 才能获取。
-
-### 撤销的时机：安全点
-
-偏向锁的撤销发生在**安全点（Safe Point）**。安全点是 JVM 生成的字节码位置，此时所有 Java 线程都已暂停，JVM 可以安全地执行一些需要"全局视角"的操作。
-
-```java
-// 安全点撤销偏向锁的完整流程
-void revoke_bias_at_safe_point(Object obj) {
-    // 1. JVM 触发 Stop The World，所有线程停止
-    
-    // 2. 判断持有偏向锁的线程状态
-    Thread biased_thread = obj.mark_word.biased_thread();
-    
-    if (biased_thread.is_executing_sync()) {
-        // 线程正在同步块中
-        // 升级为轻量级锁
-        upgrade_to_thin_lock(obj);
-    } else {
-        // 线程不在同步块中（已释放锁）
-        // 直接恢复为无锁状态
-        obj.mark_word = UNLOCKED_MARK;
-    }
-    
-    // 3. JVM 恢复所有线程
-    // 4. Thread B 尝试获取锁（现在是轻量级锁）
-}
-```
-
-**安全点撤销的代价**：需要 Stop The World，所有 Java 线程都会停顿。对于大型应用，这可能导致数百毫秒的停顿。这是偏向锁的致命缺点，也是 JDK 15 废弃偏向锁的原因之一。
-
-### 偏向撤销的四种情况
-
-```java
-enum BiasRevokeReason {
-    // 1. 同类竞争：同一个类的不同实例被不同线程使用
-    CLASS_DEMOTION,
-    
-    // 2. 批量操作：HashMap 等批量操作触发
-    BULK_REBIAS,
-    
-    // 3. 批量撤销：大量实例被多个线程竞争
-    BULK_REVOKE,
-    
-    // 4. 哈希码请求：调用 hashCode() 需要无锁状态
-    HASH_CODE_REQUEST
-}
-```
-
-### 哈希码与偏向锁的冲突
-
-这是一个容易被忽视的点：**对象获取哈希码后，就无法进入偏向锁状态了**。
-
-```java
-Object obj = new Object();
-obj.hashCode();  // 计算并缓存哈希码
-
-// 此时 Mark Word 结构：
-// unused:25 | hashcode:31 | age:4 | biased_lock:0 | lock:01
-//                                        ↑ 偏向标志为0
-// 对象无法再偏向！
-```
-
-原因：偏向锁状态下，Mark Word 存储的是线程 ID，没有空间存储哈希码。而 `hashCode()` 需要读取对象的哈希码。
-
-```java
-// hash() 方法的实现
-public int hashCode() {
-    // 获取 Mark Word
-    int hash = mark_word.identity_hash();
-    if (hash == 0) {
-        // 懒加载：第一次调用时计算
-        hash = compute_identity_hash();
-        mark_word.set_hash(hash);
-    }
-    return hash;
-}
-```
-
-## 批量重偏向：批量处理的艺术
-
-JVM 对偏向锁的撤销和重偏向做了批量优化。当一个类的多个实例被反复撤销偏向时，JVM 会"批量重偏向"，而不是逐个处理。
-
-### Epoch：偏向锁的时间戳
-
-Epoch 是偏向锁的"版本号"，存储在两处：
-
-1. **对象头**：每个对象的 Mark Word 中
-2. **Class 元数据**：每个类的 `class` 对象中
+在没有偏向锁的时代，即使只有一个线程反复访问同步块，JVM 也需要进行锁竞争：
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                      Class 元数据                        │
-│  ┌─────────────────────────────────────────────────┐   │
-│  │  biased_lock_statistics                          │   │
-│  │  ├── total_biased: 1000  (偏向次数)              │   │
-│  │  ├── revoked_biased: 950  (撤销次数)              │   │
-│  │  └── last_epoch: 2        (当前 Epoch)            │   │
-│  └─────────────────────────────────────────────────┘   │
-│                                                         │
-│                      对象头                              │
-│  ┌─────────────────────────────────────────────────┐   │
-│  │  Mark Word                                       │   │
-│  │  ├── thread_id: xxx                              │   │
-│  │  ├── epoch: 2        ◄── 与 Class 的 epoch 对比   │   │
-│  │  └── biased_lock: 1                              │   │
-│  └─────────────────────────────────────────────────┘   │
+│              无偏向锁时代的每次竞争                        │
+├─────────────────────────────────────────────────────────┤
+│                                                          │
+│  线程 A 获取锁 ──> 执行 ──> 释放锁                        │
+│       ↑______________|______________↓                   │
+│                                                          │
+│  线程 A 再次获取锁：                                       │
+│       竞争锁 ──> 获取 ─> 执行 ──> 释放 ──> 竞争           │
+│                                                          │
+│  即使是同一个线程，也要走完整的 CAS 流程                   │
 └─────────────────────────────────────────────────────────┘
+```
+
+偏向锁的目标：**如果一个锁始终只被一个线程访问，就把这个锁「偏向」给这个线程，后续访问直接跳过竞争**。
+
+## Mark Word 与偏向锁
+
+理解偏向锁，需要先理解对象的内存布局。在 64 位 JVM 中，对象头（Mark Word）有 64 位：
+
+```java
+// 64 位 Mark Word 结构（无偏向锁状态）
+┌──────────────────────────────────────┐
+│  无锁状态                              │
+│  25 位: 对象哈希码                      │
+│  4 位: 对象分代年龄                     │
+│  1 位: 偏向锁位 (0)                    │
+│  2 位: 锁状态 (01)                    │
+└──────────────────────────────────────┘
+
+┌──────────────────────────────────────┐
+│  偏向锁状态                            │
+│  54 位: 线程 ID                        │
+│  2 位: epoch                           │
+│  4 位: 对象分代年龄                     │
+│  1 位: 偏向锁位 (1)                    │
+│  2 位: 锁状态 (01)                    │
+└──────────────────────────────────────┘
+```
+
+**偏向锁开启后，对象头的最后两位会标记为 `01`**。
+
+## 偏向锁的获取
+
+### 场景：线程 A 首次进入同步块
+
+```java
+public class BiasedLockDemo {
+    public static void main(String[] args) {
+        Object lock = new Object();
+
+        synchronized (lock) {  // 线程 A 首次进入
+            // 临界区代码
+        }
+    }
+}
+```
+
+执行过程：
+
+```
+┌─────────────────────────────────────────────────────────┐
+│           偏向锁获取流程（线程 A 首次进入）               │
+├─────────────────────────────────────────────────────────┤
+│                                                          │
+│  1. 检查对象头：                                         │
+│     - 偏向锁位 = 0（未偏向）                            │
+│     - 锁状态 = 01（轻量级锁）                           │
+│              ↓                                          │
+│  2. 使用 CAS 将 Mark Word 设置为：                      │
+│     - 线程 ID = 线程 A 的 ID                            │
+│     - epoch = 0                                        │
+│     - 偏向锁位 = 1                                      │
+│     - 锁状态 = 01                                      │
+│              ↓                                          │
+│  3. 偏向成功！线程 A 获得偏向锁                          │
+│                                                          │
+└─────────────────────────────────────────────────────────┘
+```
+
+### 代码层面
+
+```java
+// HotSpot 伪代码：偏向锁获取
+if (mark->has_bias_pattern()) {
+    // 当前线程 ID
+    Thread* current = Thread::current();
+    // 对象头中记录的偏向线程
+    mark = mark->Bias();
+    // 相同线程，直接进入临界区
+    if (mark->Bias() == current) {
+        return true;
+    }
+    // 不同线程，尝试 CAS 偏向
+    if (mark->Age() != 0) {
+        // 有年龄，进入批量重偏向逻辑
+        return attempt_biased_revoke();
+    }
+    // CAS 替换线程 ID
+    if (mark->CasBias(current)) {
+        return true;
+    }
+}
+```
+
+## 偏向锁的撤销
+
+当其他线程尝试获取偏向锁时，偏向锁会被撤销。撤销有两种类型：
+
+### 场景一：安全点撤销
+
+当有其他线程尝试竞争偏向锁时，JVM 会在「安全点」（Safe Point）撤销偏向锁。
+
+```java
+public class BiasedLockRevoke {
+    public static void main(String[] args) throws InterruptedException {
+        Object lock = new Object();
+
+        // 线程 A 获取偏向锁
+        synchronized (lock) {
+            System.out.println("Thread A got biased lock");
+        }
+        // 线程 A 退出同步块，偏向锁仍保留
+
+        // 线程 B 尝试获取锁
+        Thread threadB = new Thread(() -> {
+            synchronized (lock) {
+                System.out.println("Thread B got lock");
+            }
+        });
+        threadB.start();
+    }
+}
+```
+
+执行流程：
+
+```
+┌─────────────────────────────────────────────────────────┐
+│           偏向锁撤销流程（线程 B 竞争）                   │
+├─────────────────────────────────────────────────────────┤
+│                                                          │
+│  线程 A 持有偏向锁，线程 B 请求同一把锁：                  │
+│                                                          │
+│  线程 B: "我想获取锁"                                    │
+│              ↓                                          │
+│  JVM: "等一下，让线程 A 到达安全点"                       │
+│              ↓                                          │
+│  [线程 A 到达安全点，挂起]                               │
+│              ↓                                          │
+│  JVM: "好了，我来撤销偏向锁"                             │
+│              ↓                                          │
+│  - 检查线程 A 是否在临界区内                             │
+│  - 如果不在：将对象头恢复为无锁状态                      │
+│  - 如果在：升级为轻量级锁                                │
+│              ↓                                          │
+│  线程 B: 尝试 CAS 获取轻量级锁                          │
+│                                                          │
+└─────────────────────────────────────────────────────────┘
+```
+
+### 场景二：调用 hashCode() 撤销
+
+```java
+Object lock = new Object();
+System.out.println(lock.hashCode());  // 计算哈希码
+// 此时对象已经无法偏向（因为 Mark Word 被哈希码占用）
+```
+
+**哈希码占用了 Mark Word 的大部分空间，没有空间存储偏向线程信息**。
+
+## 批量重偏向（Bulk Rebiasing）
+
+当一个类的对象大量被同一个线程偏向，然后被另一个线程竞争时，JVM 不会逐个撤销，而是批量处理：
+
+```java
+// 类 A 的对象被批量创建，全部偏向线程 A
+for (int i = 0; i < 1000; i++) {
+    locks[i] = new Object();
+    synchronized (locks[i]) { /* 线程 A */ }
+}
+
+// 然后线程 B 竞争这些锁
+for (int i = 0; i < 1000; i++) {
+    new Thread(() -> {
+        synchronized (locks[i]) { /* 线程 B */ }
+    }).start();
+}
 ```
 
 ### 批量重偏向的触发条件
 
+| 条件 | 值 |
+|---|---|
+| 偏向锁批量撤销阈值 | `BiasedLockingStartupDelay = 4000ms`（JVM 启动 4 秒后生效） |
+| 批量重偏向阈值 | `BiasedLockingBulkRebiasThreshold = 20` |
+| 批量撤销阈值 | `BiasedLockingBulkRevokeThreshold = 40` |
+
+### 批量重偏向的过程
+
+```
+┌─────────────────────────────────────────────────────────┐
+│           批量重偏向示意图                                │
+├─────────────────────────────────────────────────────────┤
+│                                                          │
+│  类 A 的对象被偏向线程 A，然后被线程 B 竞争：              │
+│                                                          │
+│  epoch 机制：                                            │
+│  ┌─────────────────────────────────────────────┐        │
+│  │ Class A 中有一个共享的 epoch 计数器           │        │
+│  │ 每次批量重偏向时，epoch++                     │        │
+│  │ 对象头中存储的是自己的 epoch                   │        │
+│  └─────────────────────────────────────────────┘        │
+│                                                          │
+│  线程 B 到达安全点：                                      │
+│  1. 将 Class A 的 epoch++                               │
+│  2. 遍历所有偏向线程 A 的对象：                          │
+│     - 如果对象在安全点：重新偏向到线程 B                  │
+│     - 如果对象不在安全点：等到安全点再处理               │
+│                                                          │
+└─────────────────────────────────────────────────────────┘
+```
+
+## 批量撤销（Bulk Revoke）
+
+当竞争过于激烈时，JVM 会批量撤销整个类的偏向状态：
+
+```
+批量重偏向阈值: 20 次
+批量撤销阈值: 40 次
+
+竞争次数分布：
+0-20: 正常竞争，每次重偏向
+20-40: 批量重偏向
+>40:  批量撤销，后续对象不再偏向
+```
+
+## 偏向锁的废弃
+
+JDK 15 废弃了偏向锁，原因包括：
+
+### 1. 撤销成本高
+
 ```java
-// 批量重偏向的触发条件（JVM 参数可调）
-if (revoked_biased > (total_biased * BiasedLockingBulkRebiasThreshold)) {
-    // 撤销次数超过阈值（默认20），触发批量重偏向
-    
-    // 遍历类的所有实例
-    for (Object instance : class.instances()) {
-        // 如果对象处于偏向锁状态
-        if (instance.mark_word.is_biased()) {
-            // 直接更新 epoch，不需要遍历所有线程的栈
-            instance.mark_word.set_epoch(class.last_epoch);
-        }
+// 偏向锁撤销需要挂起线程
+// 这在低延迟场景下是不可接受的
+while (true) {
+    // 高频同步操作
+    synchronized (this) {
+        process();
     }
 }
 ```
 
-### 批量重偏向的原理
+### 2. 安全问题
 
-当某个类的实例在**多个线程间被反复转移**时（如生产者-消费者场景中的任务对象），批量重偏向可以避免大量的安全点停顿：
+偏向锁的撤销发生在安全点，如果应用长时间停顿在安全点，会导致延迟毛刺。
 
-```java
-// 场景：生产者-消费者模式
-public class TaskQueue {
-    Queue<Task> tasks = new LinkedBlockingQueue<>();
-    
-    public void put(Task t) {
-        synchronized (t) {  // 线程A：生产者
-            // ...
-        }
-    }
-    
-    public Task get() {
-        synchronized (task) {  // 线程B：消费者
-            // ...
-        }
-    }
-}
+### 3. 维护成本
 
-// 未优化前：每个 task 对象都会触发偏向锁撤销
-// 优化后：批量重偏向后，task 直接偏向消费者线程
-```
-
-### 批量撤销
-
-如果撤销次数过多，JVM 会认为这个类"不适合偏向"，触发**批量撤销**：
-
-```java
-if (revoked_biased > (total_biased * BiasedLockingBulkRevokeThreshold)) {
-    // 批量撤销：该类的所有实例都不能再偏向
-    
-    // 遍历类的所有实例
-    for (Object instance : class.instances()) {
-        // 将对象恢复为无锁状态
-        instance.mark_word = instance.mark_word.remove_biased_info();
-    }
-    
-    // 更新 Class：禁用该类的偏向锁
-    class.set_biased_lock_enabled(false);
-}
-```
-
-## JVM 参数调优
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `-XX:+UseBiasedLocking` | true | 是否启用偏向锁（JDK 15+ 默认 false） |
-| `-XX:BiasedLockingStartupDelay` | 4000ms | JVM 启动后延迟启用偏向锁的时间 |
-| `-XX:BiasedLockingBulkRebiasThreshold` | 20 | 批量重偏向阈值 |
-| `-XX:BiasedLockingBulkRevokeThreshold` | 40 | 批量撤销阈值 |
-| `-XX:BiasedLockingDecayTime` | 25000ms | 衰减时间，撤销计数重置的间隔 |
-
-```bash
-# 禁用偏向锁（高并发场景推荐）
-java -XX:-UseBiasedLocking -jar app.jar
-
-# 调整批量重偏向阈值
-java -XX:BiasedLockingBulkRebiasThreshold=50 -jar app.jar
-
-# 延迟偏向锁启用
-java -XX:BiasedLockingStartupDelay=10000 -jar app.jar
-```
-
-## 实战：观察偏向锁行为
-
-```java
-import java.util.concurrent.TimeUnit;
-
-public class BiasedLockDemo {
-    
-    public static void main(String[] args) throws Exception {
-        Object obj = new Object();
-        
-        System.out.println("=== 测试偏向锁获取 ===");
-        synchronized (obj) {
-            System.out.println("偏向锁已获取（快速路径，无 CAS）");
-        }
-        
-        System.out.println("\n=== 等待 JVM 偏向锁启用 ===");
-        TimeUnit.SECONDS.sleep(5);
-        
-        System.out.println("\n=== 同一线程再次获取 ===");
-        synchronized (obj) {
-            System.out.println("偏向锁命中（零开销）");
-        }
-        
-        System.out.println("\n=== 制造竞争，观察撤销 ===");
-        Thread competitor = new Thread(() -> {
-            synchronized (obj) {
-                System.out.println("竞争对手获取了锁");
-            }
-        });
-        
-        competitor.start();
-        competitor.join();
-        
-        System.out.println("\n=== 撤销后再次获取 ===");
-        synchronized (obj) {
-            System.out.println("已升级为轻量级锁");
-        }
-    }
-}
-```
+偏向锁的代码路径复杂，bug 难以排查，且收益在现代 CPU 上越来越小。
 
 ## 总结
 
-偏向锁是 JVM 为低竞争场景设计的优化，它用一次 CAS 操作换取后续的零开销同步。但这把双刃剑也有其复杂性：
+偏向锁的核心机制：
 
-- **获取**：只需要一次 CAS，之后完全零开销
-- **撤销**：需要在安全点执行，可能导致 STW 停顿
-- **批量重偏向**：避免重复处理同一类对象的偏向撤销
-- **哈希码冲突**：一旦对象调用 hashCode()，就无法偏向
+1. **获取**：首次进入时，CAS 将线程 ID 写入对象头
+2. **维持**：同一线程再次进入，直接跳过竞争
+3. **撤销**：其他线程竞争时，在安全点撤销
+4. **批量重偏向**：当竞争模式固定时，批量调整偏向目标
+5. **批量撤销**：竞争过于激烈时，禁用整个类的偏向
 
-从 JDK 15 开始，偏向锁已被废弃。JVM 团队认为在现代高并发场景下，偏向锁的开销大于收益。但理解其原理，仍然有助于我们深入理解 JVM 的锁机制。你有没有想过，在什么场景下偏向锁仍然有价值？
+| 概念 | 说明 |
+|---|---|
+| 偏向锁状态 | `01`，但偏向位 = 1 |
+| 撤销触发 | 其他线程竞争 / 调用 hashCode() / GC |
+| 撤销代价 | 需要到达安全点，线程暂停 |
+| 批量重偏向 | 同一类 20+ 次竞争后，批量调整 |
+| 批量撤销 | 同一类 40+ 次竞争后，禁用偏向 |
+
+虽然偏向锁在 JDK 15 后被废弃，但它代表了 JVM 对锁优化的经典思路：**消除不必要的竞争**。

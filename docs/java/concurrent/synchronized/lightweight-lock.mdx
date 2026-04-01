@@ -1,394 +1,383 @@
-# 轻量级锁：CAS + 自旋的高效之道
+# 轻量级锁：CAS + 自旋
 
-当偏向锁不再适用——要么是多个线程竞争同一把锁，要么是偏向锁被撤销——JVM 会启用轻量级锁。轻量级锁的核心思想是：**不用 OS 的重量级锁，而是用 CPU 的 CAS 指令 + 自旋来实现同步**。这种方式避免了线程的阻塞和唤醒，但只适合锁竞争程度较轻、锁持有时间较短的场景。
+面试官问：「synchronized 的锁升级过程是什么？」
 
-## 轻量级锁的设计初衷
+你回答：「无锁 → 偏向锁 → 轻量级锁 → 重量级锁。」
 
-在 JDK 6 之前，所有的 synchronized 都是重量级锁。线程获取不到锁时，会被 OS 阻塞（Blocked），等待 OS 将其唤醒。这个过程涉及用户态到内核态的切换，开销巨大。
+面试官点点头：「那轻量级锁是怎么工作的？」
 
-```java
-// 重量级锁的问题
-synchronized (obj) {
-    // 如果锁被占用，线程被阻塞
-    // OS 需要介入，进行上下文切换
-    // ...
-}
+你：「用 CAS...然后自旋...」
+
+面试官追问：「具体是怎么用 CAS 的？自旋多少次？」
+
+你沉默了。
+
+今天，我们来彻底理解轻量级锁的原理。
+
+## 为什么需要轻量级锁？
+
+偏向锁解决了「同一线程反复进入同步块」的问题。但如果有多个线程交替进入同步块呢？
+
+```
+┌─────────────────────────────────────────────────────────┐
+│         偏向锁失效的场景                                  │
+├─────────────────────────────────────────────────────────┤
+│                                                          │
+│  时间线：                                                │
+│  T1: 线程 A 获取偏向锁，执行                             │
+│  T2: 线程 A 释放锁                                       │
+│  T3: 线程 B 获取偏向锁（偏向撤销）                       │
+│  T4: 线程 B 释放锁                                       │
+│  T5: 线程 A 获取偏向锁（偏向撤销）                       │
+│  ...                                                    │
+│                                                          │
+│  线程 A 和 B 交替进入同步块：                             │
+│  每次都要撤销偏向锁，代价很大！                          │
+│                                                          │
+└─────────────────────────────────────────────────────────┘
 ```
 
-设想这样的场景：锁的持有时间只有几微秒，但阻塞/唤醒的开销可能达到几十毫秒。这种情况下，自旋等待比阻塞等待高效得多。
+这种情况叫做「交错竞争」或「多线程交替执行」。偏向锁会频繁撤销，性能反而下降。
 
-**轻量级锁**就是为了解决这个问题：用自旋代替阻塞，用 CAS 代替互斥量。
+**轻量级锁的设计目标**：在多线程交替执行时，避免频繁的线程阻塞和用户态/内核态切换。
 
-## 加锁过程：CAS + Lock Record
-
-轻量级锁的加锁分为两个阶段：**创建 Lock Record** 和 **CAS 替换 Mark Word**。
-
-### 第一步：在栈帧中创建 Lock Record
-
-```cpp
-// 轻量级锁加锁的伪代码
-void ObjectMonitor::enter() {
-    // 1. 在当前线程的栈帧中分配一个 Lock Record
-    BasicLock lock_record;
-    lock_record.set_obj(obj);
-    
-    // 2. 将对象的 Mark Word 复制到 Lock Record 的 Displaced Header
-    //    这是为了之后的解锁做准备
-    markOop displaced = obj.mark_word();
-    lock_record.set_displaced_header(displaced);
-    
-    // 3. 尝试用 CAS 将 Mark Word 替换为指向 Lock Record 的指针
-    //    如果成功，说明获取了锁
-    //    如果失败，说明有竞争，需要自旋等待
-}
-```
-
-Lock Record 是栈帧的一部分，每个线程都有自己的栈，所以 Lock Record 是线程私有的。
-
-### 第二步：CAS 替换 Mark Word
-
-```java
-// CAS 替换 Mark Word 的核心逻辑
-markOop mark = obj.mark_word();
-
-// 构造期望的 Mark Word：无锁状态的 Mark Word
-// 期望：mark_word 没有被修改过
-markOop expected = mark;
-
-// 构造新值：指向栈帧中 Lock Record 的指针
-// 新值：锁标志位为 00，表示轻量级锁
-markOop new_value = lock_record_address.with_lock_flag(00);
-
-// CAS 原子替换
-if (mark_word.compare_and_swap(expected, new_value)) {
-    // CAS 成功！获取轻量级锁
-    return;
-}
-
-// CAS 失败，说明有其他线程持有锁或正在竞争
-// 进入自旋等待
-spin_and_retry();
-```
-
-CAS（Compare-And-Swap）是一条 CPU 原子指令：
-- 比较内存中的值与期望值
-- 如果相等，将新值写入内存
-- 这个过程是原子的，CPU 保证
+## 轻量级锁的获取
 
 ### Mark Word 的变化
 
-加锁前后，Mark Word 的变化：
-
-```
-┌────────────────────────────────────────────────────────────────┐
-│                        无锁状态（加锁前）                          │
-├────────────────────────────────────────────────────────────────┤
-│ unused:25 │ hashcode:31 │ age:4 │ biased_lock:1 │ lock:2       │
-│     0    │   对象的hash码  │  0   │       0       │    01       │
-└────────────────────────────────────────────────────────────────┘
-                              │
-                              │ synchronized(obj)
-                              │ CAS(mark_word, old, pointer_to_lock_record)
-                              ▼
-┌────────────────────────────────────────────────────────────────┐
-│                        轻量级锁状态（加锁后）                       │
-├────────────────────────────────────────────────────────────────┤
-│               ptr to Lock Record (aligned)            │ lock:2   │
-│                      指向栈帧中的 Lock Record                 │    00   │
-└────────────────────────────────────────────────────────────────┘
-```
-
-## 解锁过程：还原 Mark Word
+轻量级锁状态下，Mark Word 存储的是「指向栈中锁记录的指针」：
 
 ```java
-// 轻量级锁解锁的伪代码
-void ObjectMonitor::exit() {
-    // 1. 获取栈帧中的 Lock Record
-    BasicLock* lock_record = current_frame.last_frame().lock();
-    
-    // 2. 获取 Displaced Header（之前保存的 Mark Word）
-    markOop dh = lock_record.displaced_header();
-    
-    // 3. CAS 将 Displaced Header 写回 Mark Word
-    //    如果成功，说明没有重入，解锁完成
-    //    如果失败，说明有重入，需要继续处理
-    if (obj.mark_word.compare_and_set(lock_record_address, dh)) {
-        // 解锁成功
-        return;
-    }
-    
-    // CAS 失败，说明有重入
-    // 需要继续处理重入计数...
-}
+// 64 位 Mark Word - 轻量级锁状态
+┌──────────────────────────────────────┐
+│  62 位: 指向栈中锁记录的指针           │
+│  2 位: 锁状态 = 00（轻量级锁）         │
+└──────────────────────────────────────┘
 ```
 
-## 自旋：等待的艺术
-
-当 CAS 失败时，说明有其他线程持有锁。轻量级锁不会立即让线程阻塞，而是会**自旋等待**。
-
-### 为什么要自旋？
-
-考虑两种情况：
-
-**情况一：锁很快释放**（几微秒）
-- 线程阻塞 + 唤醒可能需要几十毫秒
-- 自旋等待只需要几微秒的 CPU 空转
-- 自旋胜出
-
-**情况二：锁长时间占用**
-- 自旋会浪费 CPU 资源
-- 应该让线程阻塞，释放 CPU
-
-JVM 的自旋策略是**自适应自旋**：根据之前自旋的成功率，动态调整自旋次数。
-
-```java
-// JDK 6 之前的固定自旋
-for (int i = 0; i < DEFAULT_SPIN; i++) {  // 默认10次
-    if (obj.mark_word.try_lock()) {
-        return;  // 自旋成功
-    }
-    cpu_pause();  // CPU 空转优化
-}
-
-// JDK 6+ 的自适应自旋
-void spin_acquire() {
-    int spin_count = 0;
-    int last_failed_spin_count = 0;
-    
-    while (true) {
-        // 根据历史成功率调整自旋次数
-        if (spin_count < adaptive_spin_limit) {
-            if (obj.mark_word.try_lock()) {
-                return;  // 自旋成功
-            }
-            spin_count++;
-            cpu_pause();
-        } else {
-            // 自旋超过阈值
-            // 升级为重量级锁
-            inflate_and_block();
-        }
-    }
-}
-```
-
-### 自适应自旋的逻辑
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    自适应自旋策略                              │
-│                                                              │
-│   上一次自旋成功率                          本次自旋次数        │
-│         │                                    │              │
-│         ▼                                    ▼              │
-│   ┌───────────┐     高成功率     ┌───────────────┐        │
-│   │  成功率 > 50%  │ ──────────► │  增加自旋次数   │        │
-│   └───────────┘                └───────────────┘        │
-│         │                                    │              │
-│         │ 低成功率                           │              │
-│         ▼                                    ▼              │
-│   ┌───────────┐                ┌───────────────┐        │
-│   │  成功率 < 50% │             │  减少自旋次数   │        │
-│   └───────────┘                └───────────────┘        │
-│                                                              │
-│         ◄──────────────────────────────────────           │
-│              JVM 动态调整，最多几十次自旋                      │
-└─────────────────────────────────────────────────────────────┘
-```
-
-## 锁重入：Lock Record 的妙用
-
-轻量级锁支持重入。当同一线程再次获取同一把锁时：
-
-```java
-public class ReentrantLightLock {
-    private final Object lock = new Object();
-    
-    public void outer() {
-        synchronized (lock) {    // 第一次获取锁
-            inner();             // 重入
-        }
-    }
-    
-    public void inner() {
-        synchronized (lock) {    // 重入，不需要 CAS
-            // 业务逻辑
-        }
-    }
-}
-```
-
-重入的检测方式：比较 Mark Word 中的指针指向的是不是当前线程的栈。
-
-```java
-// 重入检测
-void reentrant_check() {
-    markOop mark = obj.mark_word();
-    pointer lock_record_addr = mark.forwarding_address();
-    
-    // 检查 Lock Record 是否属于当前线程
-    BasicLock* lock_record = addr_to_lock_record(lock_record_addr);
-    
-    if (lock_record.is_owned_by(current_thread)) {
-        // 重入：将 Displaced Header 设置为特殊值
-        lock_record.set_displaced_header(markOopDesc::unused_mark());
-        // 增加重入计数
-        return;  // 不执行 CAS，直接返回
-    }
-}
-```
-
-重入后，Lock Record 的 Displaced Header 会被设置为特殊值，用于区分"首次获取"和"重入"。
-
-## 轻量级锁的膨胀
-
-当自旋超过阈值，或者等待线程过多时，轻量级锁会膨胀为重量级锁。
-
-```java
-// 膨胀的触发条件
-void check_for_inflation() {
-    // 条件1：自旋次数超过阈值
-    if (spin_count > max_spin) {
-        inflate_and_exit();
-        return;
-    }
-    
-    // 条件2：自适应的 spin_limit 降到 0
-    if (adaptive_spin_limit == 0) {
-        inflate_and_exit();
-        return;
-    }
-    
-    // 条件3：等待线程过多（通过 _cxq 长度判断）
-    if (monitor._cxq.length() > max_threads_for_thin_lock) {
-        inflate_and_exit();
-        return;
-    }
-    
-    // 继续自旋...
-}
-
-// 膨胀过程
-void inflate_and_exit() {
-    // 1. 创建 ObjectMonitor 对象
-    ObjectMonitor* monitor = new ObjectMonitor();
-    
-    // 2. 原子地将 Mark Word 替换为 Monitor 地址
-    //    锁标志位从 00 变为 10
-    markOop old_mark = obj.mark_word();
-    markOop new_mark = monitor.with_lock_flag(10);
-    
-    // CAS 操作（可能失败，因为其他线程也在尝试膨胀）
-    if (obj.mark_word.compare_and_set(old_mark, new_mark)) {
-        // 膨胀成功
-        
-        // 3. 将当前线程加入 Monitor 的 EntryList
-        monitor.enter(current_thread);
-    }
-}
-```
-
-膨胀后，Mark Word 的结构：
-
-```
-┌────────────────────────────────────────────────────────────────┐
-│                        重量级锁状态（膨胀后）                     │
-├────────────────────────────────────────────────────────────────┤
-│               ptr to ObjectMonitor (aligned)         │ lock:2  │
-│                      指向 Monitor 对象                        │    10  │
-└────────────────────────────────────────────────────────────────┘
-```
-
-## 轻量级锁的优缺点
-
-### 优点
-
-1. **避免线程阻塞**：用自旋代替阻塞，减少上下文切换
-2. **用户态执行**：CAS 操作在用户态完成，不需要进入内核态
-3. **快速响应**：对于锁持有时间短的场景，响应更快
-
-### 缺点
-
-1. **自旋消耗 CPU**：如果锁竞争激烈，自旋会浪费大量 CPU
-2. **无法保证公平性**：自旋线程可能会"插队"
-3. **栈帧膨胀**：每个锁都对应一个 Lock Record，增加栈内存开销
-
-## 适用场景
-
-轻量级锁最适合以下场景：
-
-```java
-// 场景一：锁持有时间很短
-synchronized (cache) {
-    return cache.get(key);  // 微秒级操作
-}
-
-// 场景二：竞争程度较轻
-// 线程数少，或获取锁的频率低
-
-// 场景三：不会有大量线程阻塞
-// 如果锁会被长时间占用，应该用重量级锁
-```
-
-不适合轻量级锁的场景：
-
-```java
-// 场景：锁持有时间长
-synchronized (databaseLock) {
-    query.execute();  // 可能需要几秒
-    // 不应该自旋，应该阻塞
-}
-```
-
-## 实战：观察轻量级锁行为
+### 获取流程
 
 ```java
 public class LightweightLockDemo {
-    
-    static Object lock = new Object();
-    
-    public static void main(String[] args) throws InterruptedException {
-        // 线程1：持有锁
-        Thread holder = new Thread(() -> {
-            synchronized (lock) {
-                System.out.println("线程1获取轻量级锁");
-                try {
-                    Thread.sleep(2000);  // 持有2秒
-                } catch (InterruptedException e) {
-                    e.printStackTrace();
-                }
-            }
-        });
-        
-        // 线程2：尝试获取锁
-        Thread waiter = new Thread(() -> {
-            synchronized (lock) {
-                System.out.println("线程2获取了锁");
-            }
-        });
-        
-        holder.start();
-        Thread.sleep(100);  // 确保线程1先获取锁
-        waiter.start();
-        
-        holder.join();
-        waiter.join();
-        
-        System.out.println("测试完成");
+    static final Object lock = new Object();
+
+    public static void main(String[] args) {
+        synchronized (lock) {
+            // 临界区
+        }
     }
 }
 ```
 
-如果锁持有时间超过自旋阈值，线程2会阻塞并等待重量级锁。
+线程进入同步块时：
+
+```
+┌─────────────────────────────────────────────────────────┐
+│           轻量级锁获取流程                                │
+├─────────────────────────────────────────────────────────┤
+│                                                          │
+│  线程 A 进入同步块：                                      │
+│                                                          │
+│  1. 在线程 A 的栈帧中创建锁记录（Lock Record）            │
+│     ┌─────────────────────────────┐                    │
+│     │  Lock Record                 │                    │
+│     │  ┌─────────────────────────┐│                   │
+│     │  │ 对象头的 Mark Word (COPY) ││                   │
+│     │  └─────────────────────────┘│                    │
+│     │  │ 对象 reference            ││                   │
+│     │  └─────────────────────────┘│                   │
+│     └─────────────────────────────┘                    │
+│              ↓                                           │
+│  2. CAS 尝试将对象头的 Mark Word 替换为：                │
+│     - 指向当前线程栈帧中锁记录的指针                      │
+│     - 锁状态位 = 00                                      │
+│              ↓                                           │
+│  3. 替换成功：线程 A 获得轻量级锁                         │
+│  4. 替换失败：说明有其他线程竞争，升级为重量级锁          │
+│                                                          │
+└─────────────────────────────────────────────────────────┘
+```
+
+### HotSpot 源码解析
+
+```cpp
+// interpreterRuntime.cpp 中的获取锁逻辑
+IRT_ENTRY_NO_ASYNC(Object*, InterpreterRuntime::monitorenter(JavaThread* thread, BasicObjectLock* elem))
+    // elem 是栈帧中的锁记录
+    // obj 是被锁对象
+
+    if (UseBiasedLocking) {
+        // 尝试偏向锁（如果偏向可用）
+        ObjectSynchronizer::fast_enter(h_obj, elem, attempt_biased_locking, THREAD);
+    } else {
+        // 直接尝试轻量级锁
+        ObjectSynchronizer::slow_enter(h_obj, elem, THREAD);
+    }
+IRT_END
+
+// slow_enter 实现
+bool ObjectSynchronizer::slow_enter(Handle obj, BasicObjectLock* lock, JavaThread* thread) {
+    markOop mark = obj()->mark();
+
+    if (mark->is_neutral()) {
+        // 对象无锁，尝试 CAS 替换
+        lock->set_displaced_header(mark);  // 保存原 Mark Word
+        if (mark == obj()->cas_set_mark(mark, lock->address())) {
+            // CAS 成功，获取轻量级锁
+            return true;
+        }
+    }
+
+    // CAS 失败，对象已被锁定或偏向，升级为重量级锁
+    return false;
+}
+```
+
+## 轻量级锁的释放
+
+```java
+synchronized (lock) {
+    // 临界区代码
+}
+// 锁在这里释放
+```
+
+线程退出同步块时：
+
+```
+┌─────────────────────────────────────────────────────────┐
+│           轻量级锁释放流程                                │
+├─────────────────────────────────────────────────────────┤
+│                                                          │
+│  线程 A 释放轻量级锁：                                    │
+│                                                          │
+│  1. 从当前栈帧中取出锁记录（Lock Record）                 │
+│  2. 检查锁记录的 displaced_header：                      │
+│     - 如果 Mark Word 指向当前栈帧                        │
+│       （说明是轻量级锁持有者）                           │
+│              ↓                                           │
+│  3. CAS 尝试将对象头的 Mark Word 恢复为：                │
+│     - 锁记录中保存的原始 Mark Word                       │
+│              ↓                                           │
+│  4. 恢复成功：释放轻量级锁成功                            │
+│  5. 恢复失败：说明有其他线程在等待，升级为重量级锁        │
+│                                                          │
+└─────────────────────────────────────────────────────────┘
+```
+
+### 释放代码
+
+```cpp
+bool ObjectSynchronizer::fast_exit(oop obj, BasicObjectLock* lock, JavaThread* thread) {
+    markOop displaced = lock->displaced_header();
+
+    // 获取对象头的当前 Mark Word
+    markOop mark = obj->mark();
+
+    if (mark == lock->addr()) {
+        // 对象头指向当前锁记录，说明是轻量级锁持有者
+        // CAS 恢复原始 Mark Word
+        obj->cas_set_mark(displaced);
+        return true;
+    }
+
+    // CAS 失败，需要膨胀为重量级锁
+    return ObjectSynchronizer::inflate(...)->exit(...);
+}
+```
+
+## 自旋优化
+
+### 为什么需要自旋？
+
+轻量级锁获取失败时，并不立即升级为重量级锁，而是**自旋等待**。
+
+```
+┌─────────────────────────────────────────────────────────┐
+│           自旋等待示意图                                  │
+├─────────────────────────────────────────────────────────┤
+│                                                          │
+│  线程 A 持有轻量级锁，正在临界区执行                       │
+│  线程 B 尝试获取同一把锁：                                │
+│                                                          │
+│  线程 B: "锁被占用了"                                    │
+│          ↓                                              │
+│  线程 B: "等一下，也许很快就释放了"（自旋）               │
+│          ↓                                              │
+│  线程 A 释放锁                                          │
+│          ↓                                              │
+│  线程 B: "拿到锁了！"（CAS 成功）                        │
+│          ↓                                              │
+│  线程 B 进入临界区                                       │
+│                                                          │
+└─────────────────────────────────────────────────────────┘
+```
+
+### 自旋的代价
+
+自旋会占用 CPU 时间。如果自旋时间过长或锁持有者一直不释放，自旋就是浪费。
+
+```java
+// 自旋参数（JDK 6 之前）
+-XX:PreBlockSpin = 10  // 默认自旋 10 次
+
+// JDK 6 之后：自适应自旋
+// 根据上次自旋结果动态调整
+-XX:PreBlockSpin  // 不再推荐设置
+```
+
+### 自适应自旋
+
+```cpp
+// HotSpot 的自适应自旋策略
+int ObjectSynchronizer::TrySpin(JavaThread* thread) {
+    // 记录连续自旋次数
+    int spin_count = 0;
+
+    for (;;) {
+        // 执行 PAUSE 指令（提示 CPU 缓存预取）
+        if (Supports_cx8() && Atomic::cmpxchg(1, &spin_count, spin_count + 1) != spin_count) {
+            // 自旋次数达到上限或被其他线程唤醒
+            return 0;
+        }
+
+        // 检查锁是否已释放
+        if (lock->is_unlocked()) {
+            return spin_count;  // 自旋成功
+        }
+
+        // 如果是其他线程持有（不可偏向），退出自旋
+        if (!UseBiasedLocking || mark->biased_lock_locked()) {
+            return 0;
+        }
+
+        // 继续自旋...
+    }
+}
+```
+
+自适应策略：
+
+| 场景 | 策略 |
+|---|---|
+| 锁持有时间短 | 增加自旋次数 |
+| 锁持有时间长 | 减少自旋次数 |
+| 多核 CPU | 增加自旋 |
+| 单核 CPU | 减少自旋 |
+
+## 轻量级锁的升级
+
+轻量级锁在以下情况会升级为重量级锁：
+
+```
+┌─────────────────────────────────────────────────────────┐
+│           轻量级锁升级条件                                │
+├─────────────────────────────────────────────────────────┤
+│                                                          │
+│  1. 自旋超过阈值                                          │
+│     - 单核：1-2 次                                       │
+│     - 多核：默认 10 次                                    │
+│     - 自适应：根据历史调整                                │
+│                                                          │
+│  2. 多个线程竞争同一把锁                                  │
+│     - CAS 替换失败                                        │
+│     - 说明有并发冲突                                      │
+│                                                          │
+│  3. 持有锁的线程阻塞                                      │
+│     - 线程切换代价大                                       │
+│     - 直接升级重量级锁                                    │
+│                                                          │
+└─────────────────────────────────────────────────────────┘
+```
+
+## 锁膨胀过程图
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    锁升级全过程                           │
+├─────────────────────────────────────────────────────────┤
+│                                                          │
+│  无锁 ──(线程进入)──> 偏向锁 ──(其他线程竞争)──>         │
+│                                                          │
+│  ──> 轻量级锁 ──(自旋失败/多线程竞争)──>                 │
+│                                                          │
+│  ──> 重量级锁                                            │
+│                                                          │
+│  ┌─────────────────────────────────────────────────┐    │
+│  │ 偏向锁：Mark Word 存储线程 ID                     │    │
+│  │ 轻量级锁：Mark Word 存储栈帧指针                  │    │
+│  │ 重量级锁：Mark Word 存储 Monitor 指针             │    │
+│  └─────────────────────────────────────────────────┘    │
+│                                                          │
+└─────────────────────────────────────────────────────────┘
+```
+
+## 实战代码验证
+
+```java
+public class LightweightLockTest {
+
+    public static void main(String[] args) throws InterruptedException {
+        Object lock = new Object();
+
+        // 两个线程交替进入同步块
+        Thread t1 = new Thread(() -> {
+            for (int i = 0; i < 100; i++) {
+                synchronized (lock) {
+                    System.out.println("T1: " + i);
+                }
+            }
+        }, "T1");
+
+        Thread t2 = new Thread(() -> {
+            for (int i = 0; i < 100; i++) {
+                synchronized (lock) {
+                    System.out.println("T2: " + i);
+                }
+            }
+        }, "T2");
+
+        t1.start();
+        t2.start();
+        t1.join();
+        t2.join();
+
+        System.out.println("Done");
+    }
+}
+```
+
+在这个场景下，偏向锁会被频繁撤销，轻量级锁会接管。如果竞争加剧，最终会升级为重量级锁。
+
+## 面试追问
+
+### Q1：轻量级锁和偏向锁的 Mark Word 区别？
+
+- 偏向锁 Mark Word：存储线程 ID
+- 轻量级锁 Mark Word：存储栈帧中锁记录的指针
+
+### Q2：为什么轻量级锁用栈帧指针而不是线程 ID？
+
+因为轻量级锁需要**快速释放**。用指针指向栈帧，释放时只需要 CAS 恢复原值。如果用线程 ID，还需要额外的线程 ID 查找。
+
+### Q3：轻量级锁在什么场景下性能最好？
+
+- 多线程交替执行（错开执行临界区）
+- 临界区执行时间短
+- 锁竞争不激烈
 
 ## 总结
 
-轻量级锁是 JDK 6 对 synchronized 的重大优化，它用 **CAS + 自旋** 代替了传统的互斥量：
+轻量级锁的核心机制：
 
-- **CAS 替换 Mark Word**：原子地将对象头指向栈帧中的 Lock Record
-- **自旋等待**：避免线程阻塞，用 CPU 时间换取响应速度
-- **自适应调整**：JVM 根据历史成功率动态调整自旋次数
-- **可重入**：通过 Lock Record 的 Displaced Header 记录重入次数
-- **膨胀机制**：竞争激烈时升级为重量级锁
+1. **CAS 替换**：将对象头的 Mark Word 替换为栈帧指针
+2. **自旋等待**：获取失败后，自旋等待锁释放
+3. **自适应调整**：根据历史数据动态调整自旋次数
+4. **升级条件**：自旋超时或多线程竞争时，升级为重量级锁
 
-理解轻量级锁的原理，能帮助我们在编写高并发代码时做出更好的决策。你有没有想过，在实际项目中，如何判断一个锁应该用轻量级锁还是重量级锁？
+| 锁状态 | Mark Word 内容 | 适用场景 |
+|---|---|---|
+| 无锁 | 哈希码 + 年龄 + 偏向位 = 0 |
+| 偏向锁 | 线程 ID + epoch | 单线程反复进入 |
+| 轻量级锁 | 栈帧锁记录指针 | 多线程交替执行 |
+| 重量级锁 | Monitor 指针 | 多线程竞争 |

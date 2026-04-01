@@ -1,447 +1,404 @@
-import { Badge } from '@rspress/core/theme';
-
 # 重量级锁：Monitor 机制与等待队列
 
-当轻量级锁的自旋无法奏效——锁竞争激烈、持有时间过长——JVM 会让轻量级锁膨胀为重量级锁。重量级锁依赖操作系统底层的 **Monitor（管程）** 实现，它是 Java synchronized 的最后一道防线。理解 Monitor 的结构和工作原理，是深入理解 Java 并发机制的关键。
+当线程竞争变得激烈，轻量级锁会膨胀为**重量级锁**。
 
-## Monitor 的前世今生
+这是一种「真正的」锁机制，依赖操作系统底层的Mutex（互斥量）实现。代价是线程会进入阻塞状态，需要从用户态切换到内核态。
 
-Monitor 的概念来自 **C. A. R. Hoare** 和 **Per Brinch Hansen** 在 1970 年代提出的"管程"（Monitor）并发原语。管程是一种结构化的并发控制机制，它将共享变量和对共享变量的操作封装起来，只允许一个线程在管程中执行。
+今天，我们来彻底理解重量级锁的工作原理。
 
-Java 的 synchronized 关键字就是管程的实现，只是早期版本（JDK 1.0-1.5）直接使用 OS 的互斥量，所以被称为"重量级锁"。JDK 6 引入锁升级机制后，轻量级锁和偏向锁在一定程度上优化了 synchronized 的性能。
+## 为什么叫「重量级」？
 
-## HotSpot ObjectMonitor 的结构
+轻量级锁失败后自旋，线程不会阻塞。重量级锁则不同：
 
-在 HotSpot JVM 中，重量级锁通过 `ObjectMonitor` 实现。每个 Java 对象都关联一个 Monitor，当对象被 synchronized 锁定时，Monitor 就会被关联上。
+```
+┌─────────────────────────────────────────────────────────┐
+│          用户态 vs 内核态切换                             │
+├─────────────────────────────────────────────────────────┤
+│                                                          │
+│  用户态（User Mode）：                                    │
+│  - Java 代码执行区域                                      │
+│  - 执行速度快，切换成本低                                 │
+│                                                          │
+│  内核态（Kernel Mode）：                                   │
+│  - 操作系统内核执行区域                                   │
+│  - 可以访问硬件、管理线程                                 │
+│  - 切换成本高（约 1000-10000 CPU 周期）                   │
+│                                                          │
+│  轻量级锁自旋：用户态内完成                                │
+│  重量级锁阻塞：用户态 ──> 内核态 ──> 用户态               │
+│                                                          │
+└─────────────────────────────────────────────────────────┘
+```
+
+重量级锁的「重量」指的是线程状态切换的开销。
+
+## Monitor 的本质
+
+在 HotSpot 中，每个对象都关联一个 **Monitor**（监视器锁）。
 
 ```cpp
-// HotSpot VM 中 ObjectMonitor 的简化结构
+// Monitor 结构（简化）
 class ObjectMonitor {
-private:
-    volatile _Header;           // Mark Word 或等待状态
-    void*  _object;              // 关联的 Java 对象
-    void*  _owner;               // 持有锁的线程
-    ParkEvent * _WaitSet;        // 等待队列（调用 wait() 的线程）
-    ObjectWaiter * _EntryList;   // 阻塞队列（等待获取锁的线程）
-    intptr_t _recursions;        // 重入次数
-    int _count;                  // 等待线程计数（已废弃）
-    int _waiters;                // 调用 wait() 的线程数
-    ObjectWaiter * _cxq;         // 竞争队列（后来加入的等待者）
-    void * _succ;                // 继承锁的候选线程
-    void * _FreeNext;           // 自由链表指针
-    int _WakeMode;               // 唤醒模式
-    int _Responsible;           // 负责任务
-    NOTIFIER(_notifytag);        // 通知标签
-    
-public:
-    void enter(TRAPS);           // 获取锁
-    void exit(TRAPS);            // 释放锁
-    void wait();                 // 等待
-    void notify();               // 通知
-    void notifyAll();            // 通知所有
+    // 头部
+    ObjectHeader*  _header;      // 对象头
+    volatile void* _object;       // 被监控的对象
+
+    // 持有者信息
+    volatile Thread * _owner;     // 持有锁的线程
+    volatile intptr_t _count;     // 锁的递归计数
+
+    // 等待队列
+    ObjectWaiter * _WaitSet;      // 调用 wait() 的线程队列
+    ObjectWaiter * _EntryList;    // 阻塞等待锁的线程队列
+
+    // 其他状态
+    volatile intptr_t _recursions; // 递归次数
 };
 ```
 
-### 核心字段详解
-
-**`_owner`**：指向持有锁的线程。如果为 NULL，表示锁未被持有。这是指针，不是对象头中的 Mark Word。
-
-**`_WaitSet`**：调用了 `Object.wait()` 的线程组成的链表。这些线程在等待某个条件满足。
-
-**`_EntryList`**：尝试获取锁但被阻塞的线程链表。这些线程在排队等待获取锁。
-
-**`_cxq`**（Contention Queue）：后来加入的等待者组成的单向链表。在某些实现中，`_cxq` 和 `_EntryList` 会合并。
-
-**`_recursions`**：重入次数。如果同一线程多次获取同一把锁，这个计数会累加。
-
-## Monitor 的等待队列：线程的状态转换
-
-理解 Monitor 的关键是理解线程在不同队列之间的流动：
-
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│                      Monitor 线程状态转换                              │
-│                                                                      │
-│                        ┌─────────────┐                               │
-│                        │   Running   │  线程正在执行同步代码块          │
-│                        │   线程运行中 │                                │
-│                        └──────┬──────┘                               │
-│                               │                                      │
-│                               │  synchronized                        │
-│                               ▼                                      │
-│                    ┌─────────────────────┐                           │
-│                    │    _owner = 线程A    │  线程持有 Monitor        │
-│                    │    锁被持有          │                           │
-│                    └─────────────────────┘                           │
-│                               │                                      │
-│                    ┌─────────┴─────────┐                             │
-│                    │                   │                             │
-│                    │ wait()            │ 其他线程竞争                  │
-│                    ▼                   ▼                             │
-│          ┌────────────────┐   ┌────────────────┐                     │
-│          │   _WaitSet     │   │  _EntryList    │                     │
-│          │   等待条件变量   │   │  阻塞等待锁     │                     │
-│          │   (wait() 调用) │   │  (被唤醒后)    │                     │
-│          └────────┬───────┘   └───────┬────────┘                     │
-│                   │                   │                              │
-│                   │ notify/All       │ 锁释放                        │
-│                   ▼                   ▼                              │
-│          ┌────────────────┐   ┌────────────────┐                     │
-│          │  回到 EntryList │   │ 成为 _owner    │                     │
-│          └────────────────┘   └────────────────┘                     │
-│                                                                      │
-└──────────────────────────────────────────────────────────────────────┘
-```
-
-## 锁的获取：enter 方法
+### 对象头与 Monitor 的关联
 
 ```java
-// ObjectMonitor::enter 的简化实现
+// 64 位 JVM 中，Mark Word 结构
+┌──────────────────────────────────────────────────────────┐
+│  无锁状态 (biased_lock=0, lock=01)                        │
+│  25 位: hashCode                                          │
+│  4 位: age                                                │
+│  1 位: biased_lock                                        │
+│  2 位: lock                                               │
+└──────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────┐
+│  重量级锁状态 (lock=10)                                   │
+│  62 位: 指向 Monitor 的指针                               │
+│  2 位: lock                                               │
+└──────────────────────────────────────────────────────────┘
+```
+
+## 重量级锁的获取
+
+```java
+synchronized (object) {
+    // 临界区代码
+}
+```
+
+执行过程：
+
+```
+┌─────────────────────────────────────────────────────────┐
+│           重量级锁获取流程                                │
+├─────────────────────────────────────────────────────────┤
+│                                                          │
+│  线程 A 执行 synchronized (object)：                      │
+│                                                          │
+│  1. 检查对象头的 Mark Word：                              │
+│     - 如果是无锁状态：CAS 加锁，进入临界区                │
+│     - 如果是轻量级锁：膨胀为重量级锁                      │
+│     - 如果是重量级锁：进入 EntryList 等待                 │
+│              ↓                                           │
+│  2. 成功获取锁：                                         │
+│     - _owner = 当前线程                                  │
+│     - _count++                                          │
+│     - 进入临界区执行                                      │
+│              ↓                                           │
+│  3. 释放锁：                                             │
+│     - _owner = null                                     │
+│     - _count = 0                                        │
+│     - 从 EntryList 唤醒一个线程                          │
+│                                                          │
+└─────────────────────────────────────────────────────────┘
+```
+
+### 获取锁的源码
+
+```cpp
+// objectMonitor.cpp
 void ObjectMonitor::enter(TRAPS) {
-    Thread * current = THREAD;
-    
-    // 1. 尝试快速获取锁（ObjectMonitor 的 _owner 字段）
-    if (_owner == NULL) {
-        if (Atomic::cmpxchg_ptr(current, &_owner, NULL) == NULL) {
-            // 成功，设置重入次数
-            _recursions = 0;
-            return;  // 获取成功
-        }
+    Thread * const Self = THREAD;
+
+    // 尝试 CAS 获取锁
+    if (Try_Increment(&_count) != 0) {
+        // 成功，锁计数加 1
+        return;
     }
-    
-    // 2. 如果当前线程已经是 owner（重入）
-    if (current == _owner) {
-        _recursions++;
-        return;  // 重入成功
-    }
-    
-    // 3. 快速获取失败，进入自旋或阻塞
+
+    // CAS 失败，进入自旋重试
     for (;;) {
-        // 尝试自旋等待（基于 CPU 的快速等待）
-        int spin_count = _SpinFreq;
-        while (spin_count-- > 0) {
-            if (_owner == NULL) {
-                if (Atomic::cmpxchg_ptr(current, &_owner, NULL) == NULL) {
-                    _recursions = 0;
-                    return;
-                }
-            }
-        }
-        
-        // 自旋失败，进入 _cxq 队列
-        ObjectWaiter node(current);
-        node._next = _cxq;
-        _cxq = &node;
-        
-        // 尝试获取锁
-        if (TryLock(current) == 0) {
-            // 获取成功
+        // 自旋获取
+        if (Try_Spin(Self)) {
             return;
         }
-        
-        // 获取失败，阻塞线程
-        ParkEvent * ev = node._event;
-        ev->park();  // 线程被挂起，等待被唤醒
-        
-        // 被唤醒后，检查是否成功获取锁
-        // 如果没有，继续循环尝试
+
+        // 自旋失败，进入系统调用，阻塞当前线程
+        EnterI(THREAD);
     }
 }
-```
 
-关键点：`_owner` 使用 CAS 操作而非互斥量，这使得大部分情况下锁的获取非常快速。只有在竞争激烈时才会真正阻塞线程。
+// 进入等待队列
+void ObjectMonitor::EnterI(TRAPS) {
+    // 创建等待节点
+    ObjectWaiter node(Self);
+    node._prev = nullptr;
+    node.TState = ObjectWaiter::TS_CXQ;
 
-## 锁的释放：exit 方法
-
-```java
-// ObjectMonitor::exit 的简化实现
-void ObjectMonitor::exit(TRAPS) {
-    Thread * current = THREAD;
-    
-    // 1. 检查是否是 owner
-    if (_owner != current) {
-        // 不是 owner，非法状态
-        return;
-    }
-    
-    // 2. 处理重入
-    if (_recursions > 0) {
-        _recursions--;  // 减少重入计数，不释放锁
-        return;
-    }
-    
-    // 3. 真正释放锁
+    // 加入等待队列（CX 队列，插入头部）
     for (;;) {
-        // 尝试将 _owner 设置为 NULL
-        if (Atomic::cmpxchg_ptr(NULL, &_owner, current) != NULL) {
-            break;  // 释放成功
+        ObjectWaiter * n = _CXQ;
+        node._next = n;
+        if (Atomic::cmpxchg(&_CXQ, &n, &node) == n) {
+            break;
         }
-        // CAS 失败，可能有其他线程在操作
+        // 自旋等待...
     }
-    
-    // 4. 唤醒等待队列中的线程
-    if (_EntryList != NULL || _cxq != NULL) {
-        // 优先从 _EntryList 唤醒
-        if (_EntryList != NULL) {
-            ObjectWaiter * w = _EntryList;
-            _EntryList = w->_next;
-            // 唤醒线程
-            w->_event->unpark();
-        } else if (_cxq != NULL) {
-            // _cxq 非空，需要特殊处理
-            // 可能会将 _cxq 的节点转移到 _EntryList
-            // ...
+
+    // 挂起线程
+    for (;;) {
+        if (Try_Acquire(Self)) {
+            return;
         }
+        // park 挂起
+        Self->_ParkEvent->park((use_absolute, 0));
     }
 }
 ```
 
-## wait/notify：条件变量的实现
+## 等待队列与阻塞机制
 
-`Object.wait()`、`Object.notify()`、`Object.notifyAll()` 是 Java 提供的条件变量机制，它们必须在 synchronized 代码块内部使用。
+### 两个队列
 
-### wait 方法
+Monitor 有两个重要的等待队列：
+
+```
+┌─────────────────────────────────────────────────────────┐
+│           Monitor 的等待队列                              │
+├─────────────────────────────────────────────────────────┤
+│                                                          │
+│   EntryList ──────────────────────────────────────────┐ │
+│   ┌──────┐ ┌──────┐ ┌──────┐                         │ │
+│   │ T1   │ │ T2   │ │ T3   │  ← 等待获取锁的线程      │ │
+│   └──────┘ └──────┘ └──────┘                         │ │
+│                                                          │ │
+│   WaitSet ──────────────────────────────────────────── │ │
+│   ┌──────┐ ┌──────┐ ┌──────┐                         │ │
+│   │ W1   │ │ W2   │ │ W3   │  ← 调用 wait() 的线程  │ │
+│   └──────┘ └──────┘ └──────┘                         │ │
+│                                                          │ │
+│   _owner ──────────────> Thread A ← 当前持有锁的线程   │
+│                                                          │ │
+└─────────────────────────────────────────────────────────┘
+```
+
+| 队列 | 存储的线程 | 进入条件 | 唤醒方式 |
+|---|---|---|---|
+| EntryList | 等待获取锁的线程 | CAS 获取锁失败 | 锁持有者释放时唤醒 |
+| WaitSet | 调用 wait() 的线程 | 调用 `Object.wait()` | 调用 `notify()`/`notifyAll()` |
+
+### 线程状态转换
+
+```
+线程 T1, T2, T3 竞争锁（锁被线程 A 持有）
+
+T1: RUNNABLE ──(CAS 失败)──> BLOCKED ──(A 释放)──> RUNNABLE（获得锁）
+T2: RUNNABLE ──(CAS 失败)──> BLOCKED ──(A 释放)──> BLOCKED ──(T1 释放)──> RUNNABLE
+T3: RUNNABLE ──(CAS 失败)──> BLOCKED ──(A 释放)──> BLOCKED ──(T1 释放)──> BLOCKED
+```
+
+## wait/notify 机制
+
+### wait()
 
 ```java
-// ObjectMonitor::wait 的简化实现
-void ObjectMonitor::wait() {
-    Thread * current = THREAD;
-    
-    // 1. 检查是否持有锁
-    if (_owner != current) {
-        throw IllegalMonitorStateException();
-    }
-    
-    // 2. 创建等待节点
-    ObjectWaiter node(current);
-    
-    // 3. 将节点加入 _WaitSet 队列
-    node._next = _WaitSet;
-    _WaitSet = &node;
-    
-    // 4. 释放锁（_owner 设为 NULL，重入计数设为 0）
-    _recursions = 0;
-    _owner = NULL;
-    
-    // 5. 阻塞当前线程
-    node._event->park();
-    
-    // 6. 被唤醒后，重新获取锁
-    //    （由调用 notify 的线程唤醒）
-    enter(current);
-}
-```
+public class WaitNotifyDemo {
+    private static final Object lock = new Object();
 
-### notify 方法
-
-```java
-// ObjectMonitor::notify 的简化实现
-void ObjectMonitor::notify() {
-    // 1. 检查是否持有锁
-    if (_owner != THREAD) {
-        throw IllegalMonitorStateException();
-    }
-    
-    // 2. 从 _WaitSet 中取出一个节点
-    ObjectWaiter * w = _WaitSet;
-    if (w != NULL) {
-        // 移除节点
-        _WaitSet = w->_next;
-        
-        // 3. 将节点加入 _EntryList（或 _cxq）
-        //    让它重新竞争锁
-        w->_next = _cxq;
-        _cxq = w;
-        
-        // 4. 标记节点状态
-        w->_wait_state = OBJECT_WAIT;
-        
-        // 注意：这里只是把线程加入竞争队列
-        // 并没有真正唤醒它
-        // 线程会在当前线程释放锁后被唤醒
-    }
-}
-```
-
-### notifyAll 方法
-
-```java
-// notifyAll 就是遍历 _WaitSet，唤醒所有节点
-void ObjectMonitor::notifyAll() {
-    ObjectWaiter * w = _WaitSet;
-    while (w != NULL) {
-        ObjectWaiter * next = w->_next;
-        // 逐个移动到 _cxq
-        w->_next = _cxq;
-        _cxq = w;
-        w = next;
-    }
-}
-```
-
-## Park/Unpark：线程阻塞的底层机制
-
-在 JVM 层面，线程的阻塞和唤醒依赖 **Park/Unpark** 机制。这是 JDK 提供的比 wait/notify 更底层的同步原语。
-
-```java
-// JDK 底层的 Park/Unpark API
-public class LockSupport {
-    // 阻塞当前线程
-    public static void park();
-    
-    // 阻塞指定线程
-    public static void park(Object blocker);
-    
-    // 唤醒指定线程
-    public static void unpark(Thread thread);
-}
-```
-
-### Park/Unpark 的优势
-
-相比 OS 的 mutex + condition variable，Park/Unpark 有以下优势：
-
-1. **精确控制**：可以单独 unpark 某个线程，不需要 broadcast
-2. **可重入**：park 支持"许可"（permit）机制
-3. **性能更好**：避免了一些不必要的内核调用
-
-```java
-// Park/Unpark 的许可机制
-Thread t = new Thread(() -> {
-    System.out.println("线程开始");
-    LockSupport.park();  // 阻塞，等待许可
-    System.out.println("线程结束");
-});
-
-t.start();
-
-LockSupport.unpark(t);  // 给 t 一个许可
-// t 被唤醒
-
-// 如果调用两次 unpark
-LockSupport.unpark(t);
-LockSupport.unpark(t);  // 两个许可，但只生效一次
-t.start();
-LockSupport.park();     // 消费一个许可，继续运行
-LockSupport.park();     // 消费第二个许可，继续运行
-// 第三次 park 会真正阻塞
-```
-
-### 与 wait/notify 的关系
-
-`Object.wait()` 实际上调用了 `LockSupport.park()`：
-
-```java
-// wait() 的实现
-public final void wait() throws InterruptedException {
-    if (Thread.interrupted()) {
-        throw new InterruptedException();
-    }
-    if (millis == 0) {
-        // 调用底层的 park
-        LockSupport.park(this);
-    } else {
-        // 带超时的 park
-        LockSupport.parkNanos(this, nanos);
-    }
-}
-```
-
-## Monitor 的公平性
-
-Monitor 默认是**非公平**的，后加入 _cxq 的线程可能会先获取锁：
-
-```
-_cxq 的策略：
-新加入的等待者放在队列头部
-唤醒时从头部取出
-这可能导致"后来者先得"
-
-_EntryList 的策略：
-新加入的等待者放在队列尾部
-唤醒时从头部取出
-这是传统的 FIFO 策略
-```
-
-可以通过设置 JVM 参数调整公平性：`UseBiasedLocking`、`ContentionSpinLimit` 等。
-
-## 实战：Monitor 状态观察
-
-```java
-import sun.misc.Unsafe;
-import java.lang.reflect.Field;
-
-public class MonitorDemo {
-    
-    private static Unsafe unsafe;
-    
-    static {
-        try {
-            Field f = Unsafe.class.getDeclaredField("theUnsafe");
-            f.setAccessible(true);
-            unsafe = (Unsafe) f.get(null);
-        } catch (Exception e) {
-            throw new RuntimeException(e);
-        }
-    }
-    
-    public static void main(String[] args) throws Exception {
-        Object obj = new Object();
-        
-        System.out.println("=== 初始状态 ===");
-        printMarkWord(obj);
-        
-        System.out.println("\n=== 线程持有锁 ===");
-        Thread holder = new Thread(() -> {
-            synchronized (obj) {
+    public static void main(String[] args) throws InterruptedException {
+        Thread waiter = new Thread(() -> {
+            synchronized (lock) {
                 try {
-                    System.out.println("持有锁中...");
-                    Thread.sleep(1000);
-                } catch (InterruptedException e) {}
+                    System.out.println("线程等待信号...");
+                    lock.wait();  // 进入 WaitSet，释放锁
+                    System.out.println("收到信号！");
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
             }
         });
-        
-        holder.start();
-        Thread.sleep(100);  // 确保线程已获取锁
-        
-        printMarkWord(obj);
-        
-        holder.join();
-        
-        System.out.println("\n=== 锁释放后 ===");
-        printMarkWord(obj);
-    }
-    
-    static void printMarkWord(Object obj) throws Exception {
-        long addr = unsafe.objectFieldOffset(
-            Object.class.getDeclaredField("markWord"));
-        long markWord = unsafe.getLong(obj, addr);
-        String binary = Long.toBinaryString(markWord);
-        System.out.println("Mark Word (二进制): " + binary);
-        System.out.println("锁标志位: " + 
-            (markWord & 0x3) + " (00=轻量级, 10=重量级, 01=无锁/偏向)");
+
+        Thread notifier = new Thread(() -> {
+            synchronized (lock) {
+                System.out.println("发送信号...");
+                lock.notify();  // 唤醒 WaitSet 中的一个线程
+                // 注意：notify 后，当前线程不会立即释放锁
+                // 需要执行完 synchronized 代码块才释放
+                System.out.println("已发送信号，锁仍持有");
+            }
+        });
+
+        waiter.start();
+        Thread.sleep(100);
+        notifier.start();
     }
 }
 ```
+
+### wait/notify 的流程
+
+```
+┌─────────────────────────────────────────────────────────┐
+│           wait/notify 完整流程                            │
+├─────────────────────────────────────────────────────────┤
+│                                                          │
+│  线程 A（持有锁）调用 wait()：                            │
+│  1. 将 _owner 置为 null                                  │
+│  2. 将线程 A 加入 WaitSet                               │
+│  3. 线程 A 进入 BLOCKED/WAITING 状态                    │
+│              ↓                                           │
+│  线程 A 释放锁                                            │
+│              ↓                                           │
+│  线程 B（从 EntryList 被唤醒）获得锁                      │
+│              ↓                                           │
+│  线程 B 调用 notify()：                                   │
+│  1. 从 WaitSet 中取出线程 A                              │
+│  2. 将线程 A 加入 EntryList（尾部）                      │
+│  3. 线程 B 继续执行...直到释放锁                         │
+│              ↓                                           │
+│  线程 C（EntryList 头部）获得锁                          │
+│  线程 A 从 wait() 返回，重新竞争锁                       │
+│                                                          │
+└─────────────────────────────────────────────────────────┘
+```
+
+## notify 的「虚假唤醒」问题
+
+### 问题描述
+
+`notify()` 只唤醒一个线程，但**被唤醒的线程不一定是最早等待的线程**。
+
+```java
+// WaitSet 的实现可能是链表、栈或队列
+// 不同 JVM 实现不同
+```
+
+### 解决方案
+
+`wait()` 必须始终在循环中调用：
+
+```java
+// 错误写法
+synchronized (lock) {
+    while (condition 不满足) {
+        lock.wait();  // 虚假唤醒后可能继续执行
+    }
+    // 处理
+}
+
+// 正确写法
+synchronized (lock) {
+    while (!condition) {
+        lock.wait();
+    }
+    // 处理
+}
+```
+
+## 生产者-消费者模式
+
+```java
+public class ProducerConsumer {
+    private static final int CAPACITY = 10;
+    private static final List<Integer> buffer = new ArrayList<>();
+
+    public static void main(String[] args) {
+        Object lock = new Object();
+
+        // 生产者
+        Thread producer = new Thread(() -> {
+            for (int i = 0; i < 100; i++) {
+                synchronized (lock) {
+                    while (buffer.size() >= CAPACITY) {
+                        try {
+                            lock.wait();
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                        }
+                    }
+                    buffer.add(i);
+                    System.out.println("Produced: " + i);
+                    lock.notify();  // 唤醒消费者
+                }
+            }
+        });
+
+        // 消费者
+        Thread consumer = new Thread(() -> {
+            while (true) {
+                synchronized (lock) {
+                    while (buffer.isEmpty()) {
+                        try {
+                            lock.wait();
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                        }
+                    }
+                    int item = buffer.remove(0);
+                    System.out.println("Consumed: " + item);
+                    lock.notify();  // 唤醒生产者
+                }
+            }
+        });
+
+        producer.start();
+        consumer.start();
+    }
+}
+```
+
+## 性能问题与优化
+
+### 重量级锁的痛点
+
+| 问题 | 原因 | 解决 |
+|---|---|---|
+| 线程阻塞 | 用户态/内核态切换 | 使用轻量级锁/偏向锁 |
+| 唤醒延迟 | 操作系统调度 | 控制等待时间 |
+| 竞争热点 | 单一锁 | 拆分锁/分段锁 |
+
+### 解决方案：分段锁
+
+ConcurrentHashMap 的分段锁设计：
+
+```
+┌─────────────────────────────────────────────────────────┐
+│           ConcurrentHashMap 分段锁                       │
+├─────────────────────────────────────────────────────────┤
+│                                                          │
+│  ┌─────────┬─────────┬─────────┬─────────┐            │
+│  │ Segment │ Segment │ Segment │ Segment │            │
+│  │   0     │   1     │   2     │   3     │            │
+│  └────┬────┴────┬────┴────┬────┴────┬────┘            │
+│       │         │         │         │                  │
+│       ▼         ▼         ▼         ▼                  │
+│   ┌───────┐ ┌───────┐ ┌───────┐ ┌───────┐            │
+│   │ Hash  │ │ Hash  │ │ Hash  │ │ Hash  │            │
+│   │ Bucket│ │ Bucket│ │ Bucket│ │ Bucket│            │
+│   └───────┘ └───────┘ └───────┘ └───────┘            │
+│                                                          │
+│  不同 Segment 的操作可以并行                              │
+│                                                          │
+└─────────────────────────────────────────────────────────┘
+```
+
+JDK 8 的 ConcurrentHashMap 进一步优化，使用 **CAS + synchronized** 代替分段锁。
 
 ## 总结
 
-重量级锁的 Monitor 机制是 Java 并发编程的底层基础：
+重量级锁是 Java 并发的「兜底方案」：
 
-- **`_owner`**：记录锁的持有者
-- **`_WaitSet`**：调用 wait() 的线程等待队列
-- **`_EntryList`**：等待获取锁的线程队列
-- **`_cxq`**：竞争队列，后加入的等待者
+1. **Monitor 机制**：每个对象关联一个 Monitor，Monitor 持有锁信息和等待队列
+2. **EntryList**：竞争锁失败的线程在此等待
+3. **WaitSet**：调用 wait() 的线程在此等待
+4. **用户态/内核态切换**：线程阻塞和唤醒需要上下文切换
+5. **wait/notify 必须成对使用**：且必须在循环中调用 wait()
 
-Monitor 的工作流程：
-1. 线程尝试获取锁，设置 `_owner`
-2. 获取失败，进入 `_EntryList` 或 `_cxq` 阻塞等待
-3. 持有者调用 wait()，进入 `_WaitSet` 释放锁
-4. 其他线程调用 notify()，将 `_WaitSet` 的线程移回竞争队列
-5. 锁释放后，唤醒 `_EntryList` 中的线程
-
-理解 Monitor 的内部机制，能帮助我们更好地使用 synchronized 和 wait/notify，也能为后续学习 AQS 打下基础。你有没有想过，为什么 wait/notify 必须放在 synchronized 代码块中？
-
-> import { Badge } from '@rspress/core/theme';
-
-<Badge>Note</Badge> ObjectMonitor 是 HotSpot 的实现细节，其他 JVM 实现可能不同
+理解重量级锁的原理，才能理解为什么 Java 要设计锁升级机制——**尽量用轻量级方案解决问题，只在必要时才动用「重量级」武器**。

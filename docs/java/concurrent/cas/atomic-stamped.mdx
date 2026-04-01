@@ -1,307 +1,342 @@
 # AtomicStampedReference：解决 ABA 问题
 
-import { Badge } from '@rspress/core/theme';
+前面我们讲了 CAS 的 ABA 问题——一个变量的值从 A 变成 B，又变回 A，CAS 认为是「没变化」，但实际上中间发生了修改。
 
-<Badge type="info" value="JDK 1.5+" />
+现在的问题是：**怎么让 CAS 知道「变化了多少次」？**
 
-ABA 问题是 CAS 操作的一个经典陷阱。当你使用 AtomicReference 时，可能遇到这样的场景：值从 A 变成 B 又变回 A，但你的 CAS 仍然成功了。
+答案就是 `AtomicStampedReference`。
 
-**AtomicStampedReference 就是来解决这个问题的**——它不仅比较值，还比较版本号。
+## ABA 问题的严重性
 
-## 为什么需要版本号
+先看一个实际场景：
 
-### ABA 问题的场景
+```java
+// 栈数据结构（简化版）
+class Node {
+    int value;
+    Node next;
+}
+
+// 无锁栈
+class LockFreeStack {
+    private AtomicReference<Node> top = new AtomicReference<>();
+
+    public void push(Node node) {
+        Node oldTop;
+        do {
+            oldTop = top.get();
+            node.next = oldTop;
+        } while (!top.compareAndSet(oldTop, node));  // ABA 问题！
+    }
+
+    public Node pop() {
+        Node oldTop, newTop;
+        do {
+            oldTop = top.get();
+            if (oldTop == null) return null;
+            newTop = oldTop.next;
+        } while (!top.compareAndSet(oldTop, newTop));  // ABA 问题！
+        return oldTop;
+    }
+}
+```
+
+**ABA 问题的危险**：
 
 ```
-没有版本号：
-初始：A → 线程A读取A
-      B → 线程B修改A→B
-      A → 线程B修改B→A（变回来了）
-      C → 线程A的CAS(A→C)成功！← 不知道中间经历了什么
+初始状态：A -> B -> C
 
-有版本号：
-初始：A, v1 → 线程A读取(A, v1)
-      B, v2 → 线程B修改(A→B, v1→v2)
-      A, v3 → 线程B修改(B→A, v2→v3)  ← 版本号不同了！
-      A, v1 → 线程A的CAS(A→C, v1)失败！
+线程1：准备 pop A
+      读取 top = A
+      读取 A.next = B
+
+线程2：pop A，pop B，push D（变成 D -> C）
+      pop C，push A（变成 A -> C）
+      // 此时栈：A -> C
+
+线程1：CAS(top, A, B)，成功！
+      // 但 B.next 已经是 null 了！
+      // 导致 C 节点丢失
 ```
 
-## AtomicStampedReference 详解
+## AtomicStampedReference 的设计
 
-### 基本结构
+### 核心思想：版本号
+
+`AtomicStampedReference` 为每次修改关联一个**版本号（stamp）**：
 
 ```java
 public class AtomicStampedReference<V> {
-    // Pair 类存储值和版本号
+    // 内部使用 Pair 存储值和版本号
     private static class Pair<T> {
-        final T reference;   // 值
-        final int stamp;     // 版本号（时间戳）
-        // ...
+        final T reference;
+        final int stamp;
+        private Pair(T reference, int stamp) {
+            this.reference = reference;
+            this.stamp = stamp;
+        }
     }
 
     private volatile Pair<V> pair;
 }
 ```
 
-### 核心方法
+CAS 操作不仅比较值，还比较版本号：
 
 ```java
-// 获取当前值和版本号
-public V get(int[] stampHolder) {
-    Pair<V> pair = this.pair;
-    stampHolder[0] = pair.stamp;
-    return pair.reference;
-}
-
-// 比较并设置
-public boolean compareAndSet(
-    V expectedReference,  // 期望值
-    V newReference,       // 新值
-    int expectedStamp,    // 期望版本号
-    int newStamp         // 新版本号
-) {
+public boolean compareAndSet(V expectedReference,
+                             V newReference,
+                             int expectedStamp,
+                             int newStamp) {
     Pair<V> current = pair;
-    // 只有值和版本号都匹配时才更新
-    return expectedReference == current.reference &&
-           expectedStamp == current.stamp &&
-           ((newReference == current.reference &&
-             newStamp == current.stamp) ||
-            casPair(current, Pair.of(newReference, newStamp)));
+    return
+        expectedReference == current.reference &&
+        expectedStamp == current.stamp &&           // 版本号也要匹配！
+        ((newReference == current.reference &&
+          newStamp == current.stamp) ||
+         casPair(current, Pair.of(newReference, newStamp)));
 }
 ```
-
-## 使用示例
 
 ### 基本用法
 
 ```java
-import java.util.concurrent.atomic.AtomicStampedReference;
+public class StampedReferenceDemo {
+    public static void main(String[] args) {
+        // 初始值：reference = "A"，版本号 = 1
+        AtomicStampedReference<String> ref =
+            new AtomicStampedReference<>("A", 1);
 
-public class StampedDemo {
-    private AtomicStampedReference<Integer> ref = 
-        new AtomicStampedReference<>(100, 0);
-
-    public void demo() {
+        // 获取当前版本号
         int[] stamp = new int[1];
+        String value = ref.get(stamp);
+        System.out.println("初始值: " + value + ", 版本号: " + stamp[0]);
 
-        // 获取当前值和版本号
-        Integer value = ref.get(stamp);
-        System.out.println("值: " + value + ", 版本号: " + stamp[0]);
-
-        // CAS 更新
-        boolean success = ref.compareAndSet(100, 200, stamp[0], stamp[0] + 1);
-        System.out.println("更新成功: " + success);
-
-        // 再次获取
+        // 正确更新：值变为 B，版本号变为 2
+        ref.compareAndSet("A", "B", stamp[0], stamp[0] + 1);
         value = ref.get(stamp);
-        System.out.println("新值: " + value + ", 新版本号: " + stamp[0]);
+        System.out.println("更新后: " + value + ", 版本号: " + stamp[0]);
+
+        // 错误的更新：版本号不匹配，失败
+        boolean success = ref.compareAndSet("A", "C", 1, 2);
+        System.out.println("使用旧版本号更新: " + success);  // false
+
+        // 正确的更新
+        success = ref.compareAndSet("B", "C", stamp[0], stamp[0] + 1);
+        System.out.println("使用正确版本号更新: " + success);  // true
     }
 }
 ```
 
-### 模拟 ABA 问题场景
+## ABA 问题的解决
+
+### 修复无锁栈
 
 ```java
-import java.util.concurrent.atomic.AtomicStampedReference;
+class SafeNode {
+    int value;
+    SafeNode next;
+}
 
-public class ABAWithStamp {
-    private AtomicStampedReference<String> ref = 
-        new AtomicStampedReference<>("A", 0);
+class SafeLockFreeStack {
+    // Stamp = 更新次数
+    private AtomicStampedReference<SafeNode> top =
+        new AtomicStampedReference<>(null, 0);
 
-    public void abaScenario() throws InterruptedException {
+    public void push(SafeNode node) {
+        SafeNode oldTop;
         int[] stamp = new int[1];
 
-        // 线程A：读取初始值
-        String initial = ref.get(stamp);
-        int initialStamp = stamp[0];
-        System.out.println("线程A读取: " + initial + ", 版本号: " + initialStamp);
+        do {
+            oldTop = top.get(stamp);
+            node.next = oldTop;
+        } while (!top.compareAndSet(oldTop, node, stamp[0], stamp[0] + 1));
+    }
 
-        // 线程B：修改 A → B → A
-        Thread threadB = new Thread(() -> {
-            int[] bStamp = new int[1];
-            ref.get(bStamp);
+    public SafeNode pop() {
+        SafeNode oldTop, newTop;
+        int[] stamp = new int[1];
 
-            // A → B
-            ref.compareAndSet("A", "B", bStamp[0], bStamp[0] + 1);
-            System.out.println("线程B: A → B");
+        do {
+            oldTop = top.get(stamp);
+            if (oldTop == null) return null;
 
-            // B → A
-            ref.get(bStamp);
-            ref.compareAndSet("B", "A", bStamp[0], bStamp[0] + 1);
-            System.out.println("线程B: B → A, 版本号: " + (bStamp[0] + 1));
-        });
+            newTop = oldTop.next;
+            // 版本号不匹配会失败，防止 ABA
+        } while (!top.compareAndSet(oldTop, newTop, stamp[0], stamp[0] + 1));
 
-        threadB.start();
-        threadB.join();
-
-        // 线程A：尝试 CAS，版本号不匹配会失败
-        boolean success = ref.compareAndSet("A", "C", initialStamp, initialStamp + 1);
-        System.out.println("线程A CAS结果: " + success);
-        // 即使值相同（都是A），但版本号已变，CAS失败！
+        return oldTop;
     }
 }
 ```
 
-## 实战：实现线程安全的计数器
-
-### 带历史记录的计数器
+### 模拟 ABA 场景
 
 ```java
-import java.util.concurrent.atomic.AtomicStampedReference;
+public class ABASolutionDemo {
+    public static void main(String[] args) {
+        AtomicStampedReference<String> ref =
+            new AtomicStampedReference<>("A", 1);
 
-public class HistoryCounter {
-    private final AtomicStampedReference<Long> value = 
-        new AtomicStampedReference<>(0L, 0);
-    private final AtomicStampedReference<Long> minValue = 
-        new AtomicStampedReference<>(Long.MAX_VALUE, 0);
-    private final AtomicStampedReference<Long> maxValue = 
-        new AtomicStampedReference<>(Long.MIN_VALUE, 0);
+        // 线程1：准备修改
+        new Thread(() -> {
+            int[] stamp = new int[1];
+            String value = ref.get(stamp);
+            System.out.println("线程1读取: " + value + ", 版本号: " + stamp[0]);
 
-    public void increment() {
-        while (true) {
-            long[] holder = new long[2];
-            Long current = value.get(holder);
-            int stamp = (int) holder[1];
+            try { Thread.sleep(100); } catch (InterruptedException ignored) {}
 
-            long[] minHolder = new long[2];
-            Long currentMin = minValue.get(minHolder);
-            int minStamp = (int) minHolder[1];
+            // 尝试 CAS（使用旧版本号）
+            boolean success = ref.compareAndSet(value, "B", stamp[0], stamp[0] + 1);
+            System.out.println("线程1 CAS结果: " + success + " (版本号过期)");
+        }).start();
 
-            long[] maxHolder = new long[2];
-            Long currentMax = maxValue.get(maxHolder);
-            int maxStamp = (int) maxHolder[1];
+        // 线程2：A -> B -> A
+        new Thread(() -> {
+            int[] stamp = new int[1];
+            ref.get(stamp);
 
-            if (value.compareAndSet(current, current + 1, stamp, stamp + 1) &&
-                (current + 1 < currentMin || 
-                 minValue.compareAndSet(currentMin, current + 1, minStamp, minStamp + 1)) &&
-                (current + 1 > currentMax || 
-                 maxValue.compareAndSet(currentMax, current + 1, maxStamp, maxStamp + 1))) {
-                return;
-            }
-        }
-    }
+            ref.compareAndSet("A", "B", stamp[0], stamp[0] + 1);
+            System.out.println("线程2: A -> B");
 
-    public long get() {
-        return value.getReference();
-    }
-
-    public long getMin() {
-        return minValue.getReference();
-    }
-
-    public long getMax() {
-        return maxValue.getReference();
+            ref.get(stamp);
+            ref.compareAndSet("B", "A", stamp[0], stamp[0] + 1);
+            System.out.println("线程2: B -> A");
+        }).start();
     }
 }
 ```
 
-### 乐观锁的版本控制
+输出：
+
+```
+线程1读取: A, 版本号: 1
+线程2: A -> B
+线程2: B -> A
+线程1 CAS结果: false (版本号过期)  // 版本号变成 2 了，CAS 失败！
+```
+
+## AtomicMarkableReference：更轻量的版本号
+
+有时候我们不需要完整的版本号，只需要一个**布尔标记**（比如「已删除」）。
+
+`AtomicMarkableReference` 就是为此设计的：
 
 ```java
-import java.util.concurrent.atomic.AtomicStampedReference;
-
-public class OptimisticEntity {
-    private final AtomicStampedReference<VersionedData> dataRef = 
-        new AtomicStampedReference<>(new VersionedData("initial", 1), 0);
-
-    public boolean update(String newValue) {
-        while (true) {
-            VersionedData[] holder = new VersionedData[1];
-            int stamp = dataRef.get(holder);
-            VersionedData current = holder[0];
-
-            VersionedData newData = new VersionedData(newValue, current.version + 1);
-            
-            if (dataRef.compareAndSet(current, newData, stamp, stamp + 1)) {
-                return true;
-            }
-            // 更新失败，自旋重试
-        }
+public class AtomicMarkableReference<T> {
+    private static class Pair<T> {
+        final T reference;
+        final boolean mark;
+        // ...
     }
 
-    public VersionedData get() {
-        return dataRef.getReference();
-    }
-
-    public static class VersionedData {
-        public final String value;
-        public final int version;
-
-        public VersionedData(String value, int version) {
-            this.value = value;
-            this.version = version;
-        }
+    // compareAndSet 只比较 mark，不比较完整版本号
+    public boolean compareAndSet(V expectedReference,
+                                  V newReference,
+                                  boolean expectedMark,
+                                  boolean newMark) {
+        // ...
     }
 }
 ```
 
-## 与 AtomicMarkableReference 的区别
+### 典型应用：逻辑删除
+
+```java
+class Node {
+    int value;
+    AtomicMarkableReference<Node> next;
+}
+
+class LogicalDeleteStack {
+    private AtomicMarkableReference<Node> top =
+        new AtomicMarkableReference<>(null, false);
+
+    public void markAsDeleted(Node node) {
+        // 只改变 mark，不改变 reference
+        // ...
+    }
+}
+```
+
+### AtomicStampedReference vs AtomicMarkableReference
 
 | 特性 | AtomicStampedReference | AtomicMarkableReference |
-|------|----------------------|----------------------|
-| 版本类型 | int（整数版本号） | boolean（标记位） |
-| 版本含义 | 递增的版本号 | 二进制标记 |
-| 适用场景 | 需要追踪修改次数 | 只需知道是否修改过 |
-| 示例 | 乐观锁、计数器 | 逻辑删除、生命周期 |
+| --- | --- | --- |
+| 版本信息 | int 版本号 | boolean 标记 |
+| 内存开销 | 稍大 | 更小 |
+| 适用场景 | 需要知道修改次数 | 只需要二元状态（已删除/未删除） |
+| 示例 | 栈、队列 | 逻辑删除、标记移除 |
+
+## 手写简易版本
+
+理解原理后，我们可以实现一个简化版：
 
 ```java
-// AtomicMarkableReference：适用于"软删除"场景
-private AtomicMarkableReference<Node> head = 
-    new AtomicMarkableReference<>(null, false);
+public class SimpleStampedReference<T> {
+    private volatile Pair<T> pair;
 
-// 标记为已删除
-head.compareAndSet(node, node, false, true);
-```
+    private static class Pair<T> {
+        final T reference;
+        final int stamp;
 
-## 性能考虑
-
-### 版本号溢出的问题
-
-```java
-// 版本号是 int，会溢出
-// 最大值：Integer.MAX_VALUE = 2147483647
-// 溢出后变成负数
-
-// 解决方案：使用 Long 版本号，或定期重置
-public class OverflowSafeStamp {
-    private final AtomicStampedReference<String> ref = 
-        new AtomicStampedReference<>("A", 0);
-
-    public void safeUpdate() {
-        while (true) {
-            String[] holder = new String[1];
-            int stamp = ref.get(holder);
-
-            // 检查是否接近溢出
-            if (stamp == Integer.MAX_VALUE) {
-                // 重置版本号
-                ref.compareAndSet(holder[0], holder[0], stamp, 0);
-            }
-
-            if (ref.compareAndSet(holder[0], "B", stamp, stamp + 1)) {
-                return;
-            }
+        Pair(T reference, int stamp) {
+            this.reference = reference;
+            this.stamp = stamp;
         }
+
+        static <T> Pair<T> of(T reference, int stamp) {
+            return new Pair<>(reference, stamp);
+        }
+    }
+
+    public SimpleStampedReference(T initialRef, int initialStamp) {
+        pair = Pair.of(initialRef, initialStamp);
+    }
+
+    public T getReference() {
+        return pair.reference;
+    }
+
+    public int getStamp() {
+        return pair.stamp;
+    }
+
+    public T get(int[] stampHolder) {
+        stampHolder[0] = pair.stamp;
+        return pair.reference;
+    }
+
+    public boolean compareAndSet(T expectedReference,
+                                  T newReference,
+                                  int expectedStamp,
+                                  int newStamp) {
+        Pair<T> current = pair;
+        return
+            expectedReference == current.reference &&
+            expectedStamp == current.stamp &&
+            ((newReference == current.reference &&
+              newStamp == current.stamp) ||
+             casPair(current, Pair.of(newReference, newStamp)));
+    }
+
+    private boolean casPair(Pair<T> expect, Pair<T> update) {
+        if (pair == expect) {
+            pair = update;
+            return true;
+        }
+        return false;
     }
 }
 ```
 
-## 面试核心问题
+## 总结
 
-**问题 1**：AtomicStampedReference 是如何解决 ABA 问题的？
+`AtomicStampedReference` 和 `AtomicMarkableReference` 是解决 ABA 问题的利器：
 
-**答案**：AtomicStampedReference 不仅存储值，还存储一个版本号（stamp）。compareAndSet() 方法需要同时满足期望值、期望版本号、新值、新版本号四个条件才能成功。即使值从 A 变到 B 又变回 A，版本号会持续递增，所以 CAS 会失败。
+- **核心机制**：为每次修改关联一个版本号或标记
+- **CAS 语义**：不仅比较值，还要比较版本号/标记
+- **应用场景**：无锁数据结构（栈、队列）、需要版本追踪的场景
+- **选择建议**：只需要二元状态用 `AtomicMarkableReference`，需要计数用 `AtomicStampedReference`
 
-**问题 2**：为什么版本号能解决 ABA 问题？
-
-**答案**：因为版本号是递增的。即使值"变回来"了，版本号也不会相同。例如：A(v1) → B(v2) → A(v3)，版本号从 v1 变成 v3，线程尝试用 v1 的版本号做 CAS 会失败，因为它期望的是旧版本。
-
-**问题 3**：AtomicStampedReference 和 AtomicMarkableReference 的区别是什么？
-
-**答案**：StampedReference 使用 int 版本号，可以追踪完整的修改历史，适用于乐观锁等需要知道"修改了多少次"的场景。MarkableReference 使用 boolean 标记，只能表示"修改过"或"未修改过"，适用于软删除等只需要知道"是否修改"的场景。
-
-**问题 4**：版本号溢出怎么处理？
-
-**答案**：版本号是 int 类型，会溢出变成负数。处理方法：1）检测版本号接近 Integer.MAX_VALUE 时进行重置；2）使用其他机制（如时间戳 + 版本号的组合）；3）在极端情况下接受溢出（因为溢出会导致版本号变得很大，CAS 仍会失败）。
-
-理解 AtomicStampedReference 是解决 ABA 问题的基础。下一篇文章我们将对比 LongAdder 和 AtomicLong 的性能。
+理解这两个类的设计思想，对于实现无锁算法和理解 Java 并发工具箱都有重要意义。

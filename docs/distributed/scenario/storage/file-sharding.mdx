@@ -1,692 +1,784 @@
-# 文件分片上传
+# 文件分片上传与断点续传实现
 
-用户要上传一个 5GB 的视频文件。传统方式：整个文件一次性上传，失败了就重来。用户崩溃了，服务器也扛不住。
+用户上传一个 2GB 的视频文件，结果网络断了，前功尽弃——没有断点续传的话，用户体验极差。
 
-这就是大文件上传的经典困境：**文件太大，失败率高，服务器压力大，用户体验差**。
+分片上传就是解决方案：把大文件切成小块，每块独立上传，断点后只重传失败的块，而不是整个文件。
 
-今天我们来看如何用**分片上传**解决这个问题，让大文件上传变得稳定、可靠、可续传。
+## 分片上传原理
 
-## 一、分片上传原理
-
-### 1.1 核心思想
-
-「把大文件拆成小块，一块一块上传，失败了只重传失败的那一块。」
+### 核心流程
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        分片上传原理                                     │
-│                                                                         │
-│   大文件（5GB）                                                        │
-│   ┌─────────────────────────────────────────────────────────────────┐  │
-│   │ Chunk 1 │ Chunk 2 │ Chunk 3 │ Chunk 4 │ ... │ Chunk 1000 │     │  │
-│   └─────────────────────────────────────────────────────────────────┘  │
-│                                                                         │
-│   每个分片独立上传：                                                    │
-│   Chunk 1 ──▶ 上传成功 ──▶ 记录                                        │
-│   Chunk 2 ──▶ 上传成功 ──▶ 记录                                        │
-│   Chunk 3 ──▶ 上传失败 ──▶ 记录（待重传）                             │
-│   Chunk 4 ──▶ 上传成功 ──▶ 记录                                        │
-│   ...                                                                  │
-│   Chunk 3 ──▶ 重传成功 ──▶ 合并                                        │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                      文件分片上传流程                              │
+├──────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│   客户端                      服务端                          OSS │
+│      │                          │                               │
+│      │  1. 初始化上传（获取 uploadId）  │                          │
+│      │ ───────────────────────> │                               │
+│      │                          │                               │
+│      │  2. 切分文件为多个 chunk   │                               │
+│      │                          │                               │
+│      │  3. 上传 chunk 1         │ 4. 存储 chunk 1                │
+│      │ ───────────────────────> │ ───────────────────────────> │ │
+│      │      成功，返回 checksum   │                               │
+│      │ <─────────────────────── │                               │
+│      │                          │                               │
+│      │  5. 上传 chunk 2         │ 6. 存储 chunk 2                │
+│      │ ───────────────────────> │ ───────────────────────────> │ │
+│      │      成功，返回 checksum   │                               │
+│      │ <─────────────────────── │                               │
+│      │                          │                               │
+│      │  ... (继续上传剩余 chunks) │                               │
+│      │                          │                               │
+│      │  7. 合并 chunks           │ 8. 组装完整文件                 │
+│      │ ───────────────────────> │ ───────────────────────────> │ │
+│      │                          │                               │
+│      │  9. 上传完成，返回 fileId │                               │
+│      │ <─────────────────────── │                               │
+│                                                                   │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-### 1.2 分片上传流程
+### 分片策略
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        完整分片上传流程                                  │
-│                                                                         │
-│   1. 初始化：请求服务端，创建上传任务                                   │
-│   2. 分片上传：逐个上传分片                                             │
-│   3. 分片校验：检查分片是否完整                                         │
-│   4. 分片合并：服务端合并所有分片                                       │
-│   5. 结果返回：返回最终文件信息                                         │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+| 分片大小 | 适用场景 | 优缺点 |
+|---|---|---|
+| 1MB | 普通文件（< 100MB） | 网络稳定时效率高 |
+| 5MB | 大文件（100MB - 1GB） | 平衡重传成本与并发效率 |
+| 10MB | 超大文件（> 1GB） | 减少请求数，但重传成本高 |
+| 动态计算 | 通用场景 | 根据文件大小自动调整 |
 
-## 二、服务端设计
+## 服务端实现
 
-### 2.1 数据库设计
+### 文件上传服务
 
-```sql title="上传任务表"
-CREATE TABLE upload_task (
-    id BIGINT PRIMARY KEY AUTO_INCREMENT,
-    task_id VARCHAR(64) NOT NULL UNIQUE COMMENT '任务ID',
-    file_name VARCHAR(255) NOT NULL COMMENT '文件名',
-    file_size BIGINT NOT NULL COMMENT '文件大小（字节）',
-    chunk_size INT NOT NULL DEFAULT 5242880 COMMENT '分片大小（默认5MB）',
-    chunk_count INT NOT NULL COMMENT '总分片数',
-    uploaded_count INT DEFAULT 0 COMMENT '已上传分片数',
-    file_hash VARCHAR(64) COMMENT '文件唯一标识（秒传用）',
-    status TINYINT DEFAULT 0 COMMENT '状态：0-初始化，1-上传中，2-完成，3-失败',
-    file_path VARCHAR(512) COMMENT '合并后文件路径',
-    user_id BIGINT COMMENT '用户ID',
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    expire_at TIMESTAMP COMMENT '过期时间（清理未完成任务）',
-    INDEX idx_task_id (task_id),
-    INDEX idx_status (status),
-    INDEX idx_expire (expire_at)
-) COMMENT '分片上传任务表';
-
-CREATE TABLE upload_chunk (
-    id BIGINT PRIMARY KEY AUTO_INCREMENT,
-    task_id VARCHAR(64) NOT NULL COMMENT '任务ID',
-    chunk_number INT NOT NULL COMMENT '分片序号',
-    chunk_size BIGINT COMMENT '分片大小',
-    chunk_hash VARCHAR(64) COMMENT '分片哈希',
-    uploaded TINYINT DEFAULT 0 COMMENT '是否已上传',
-    uploaded_at TIMESTAMP,
-    UNIQUE KEY uk_task_chunk (task_id, chunk_number),
-    INDEX idx_task_id (task_id)
-) COMMENT '上传分片记录表';
-```
-
-### 2.2 实体类
-
-```java title="上传任务实体")
-@Data
-public class UploadTask {
-    private String taskId;
-    private String fileName;
-    private Long fileSize;
-    private Integer chunkSize;
-    private Integer chunkCount;
-    private Integer uploadedCount;
-    private String fileHash;
-    private Integer status;
-    private String filePath;
-    private Long userId;
-    private LocalDateTime createdAt;
-    private LocalDateTime expireAt;
-
-    public enum Status {
-        INIT(0),      // 初始化
-        UPLOADING(1), // 上传中
-        COMPLETED(2), // 完成
-        FAILED(3)     // 失败
-    }
-}
-```
-
-### 2.3 上传服务
-
-```java title="分片上传服务")
+```java
 @Service
-@Slf4j
-public class ChunkUploadService {
-    @Autowired
-    private UploadTaskMapper taskMapper;
-    @Autowired
-    private UploadChunkMapper chunkMapper;
-    @Autowired
-    private MinioFileService minioFileService;
+public class FileUploadService {
 
-    private static final String UPLOAD_DIR = "/data/uploads/chunks/";
-    private static final int CHUNK_SIZE = 5 * 1024 * 1024; // 5MB
+    private final MinioClient minioClient;
+    private final RedisTemplate<String, Object> redisTemplate;
+    private static final String UPLOAD_KEY_PREFIX = "upload:";
+    private static final int DEFAULT_PART_SIZE = 5 * 1024 * 1024;  // 5MB
 
     /**
-     * 1. 初始化上传任务
+     * 初始化分片上传
+     * 返回 uploadId 和预签名 URL
      */
-    @Transactional
-    public UploadTask initTask(UploadTaskRequest request) {
-        // 检查是否已上传过（秒传）
-        if (request.getFileHash() != null) {
-            UploadTask existTask = checkFileExists(request.getFileHash());
-            if (existTask != null) {
-                existTask.setStatus(UploadTask.Status.COMPLETED.getCode());
-                return existTask;
+    public InitUploadResponse initUpload(InitUploadRequest request) {
+        // 1. 生成唯一 uploadId
+        String uploadId = UUID.randomUUID().toString();
+
+        // 2. 计算分片数量
+        int partCount = (int) Math.ceil((double) request.getFileSize() / DEFAULT_PART_SIZE);
+
+        // 3. 创建 OSS 分片上传任务
+        String objectName = generateObjectName(request.getFileName());
+        String bucketName = "uploads";
+
+        try {
+            String ossUploadId = minioClient.initiateMultipartUpload(
+                InitiateMultipartUploadArgs.builder()
+                    .bucket(bucketName)
+                    .object(objectName)
+                    .build()
+            );
+
+            // 4. 存储上传上下文
+            UploadContext context = new UploadContext()
+                .setUploadId(uploadId)
+                .setOssUploadId(ossUploadId)
+                .setObjectName(objectName)
+                .setBucketName(bucketName)
+                .setFileName(request.getFileName())
+                .setFileSize(request.getFileSize())
+                .setPartCount(partCount)
+                .setUploadedParts(new ConcurrentHashMap<>())
+                .setCreatedAt(System.currentTimeMillis());
+
+            String contextKey = UPLOAD_KEY_PREFIX + uploadId;
+            redisTemplate.opsForValue().set(contextKey, context, Duration.ofHours(24));
+
+            // 5. 生成分片预签名 URL（支持直接上传到 OSS）
+            List<PresignedPart> presignedParts = new ArrayList<>();
+            for (int i = 0; i < partCount; i++) {
+                long start = (long) i * DEFAULT_PART_SIZE;
+                long end = Math.min(start + DEFAULT_PART_SIZE, request.getFileSize()) - 1;
+
+                String presignedUrl = minioClient.getPresignedObjectUrl(
+                    GetPresignedObjectUrlArgs.builder()
+                        .method(Method.PUT)
+                        .bucket(bucketName)
+                        .object(objectName)
+                        .expiry(1, TimeUnit.HOURS)
+                        .extraQueryParam("uploadId", ossUploadId)
+                        .extraQueryParam("partNumber", String.valueOf(i + 1))
+                        .build()
+                );
+
+                presignedParts.add(new PresignedPart()
+                    .setPartNumber(i + 1)
+                    .setUrl(presignedUrl)
+                    .setStart(start)
+                    .setEnd(end)
+                    .setSize(end - start + 1)
+                );
             }
+
+            return new InitUploadResponse()
+                .setUploadId(uploadId)
+                .setObjectName(objectName)
+                .setPartCount(partCount)
+                .setPartSize(DEFAULT_PART_SIZE)
+                .setPresignedParts(presignedParts);
+
+        } catch (Exception e) {
+            throw new UploadException("初始化上传失败", e);
         }
-
-        // 计算分片数
-        int chunkCount = (int) Math.ceil((double) request.getFileSize() / CHUNK_SIZE);
-
-        // 创建任务
-        UploadTask task = new UploadTask();
-        task.setTaskId(UUID.randomUUID().toString().replace("-", ""));
-        task.setFileName(request.getFileName());
-        task.setFileSize(request.getFileSize());
-        task.setChunkSize(CHUNK_SIZE);
-        task.setChunkCount(chunkCount);
-        task.setFileHash(request.getFileHash());
-        task.setStatus(UploadTask.Status.INIT.getCode());
-        task.setUserId(request.getUserId());
-        task.setCreatedAt(LocalDateTime.now());
-        task.setExpireAt(LocalDateTime.now().plusDays(7));
-
-        taskMapper.insert(task);
-
-        // 初始化分片记录
-        for (int i = 0; i < chunkCount; i++) {
-            UploadChunk chunk = new UploadChunk();
-            chunk.setTaskId(task.getTaskId());
-            chunk.setChunkNumber(i);
-            chunk.setUploaded(0);
-            chunkMapper.insert(chunk);
-        }
-
-        return task;
     }
 
     /**
-     * 2. 上传分片
+     * 确认分片上传完成
+     * 合并所有分片
      */
-    @Transactional
-    public void uploadChunk(String taskId, Integer chunkNumber, MultipartFile file) throws Exception {
-        UploadTask task = taskMapper.selectByTaskId(taskId);
-        if (task == null) {
-            throw new BusinessException("上传任务不存在");
+    public CompleteUploadResponse completeUpload(String uploadId, List<UploadedPart> uploadedParts) {
+        String contextKey = UPLOAD_KEY_PREFIX + uploadId;
+        UploadContext context = (UploadContext) redisTemplate.opsForValue().get(contextKey);
+
+        if (context == null) {
+            throw new UploadException("上传上下文不存在或已过期");
         }
 
-        // 保存分片文件
-        String chunkDir = UPLOAD_DIR + taskId;
-        File dir = new File(chunkDir);
-        if (!dir.exists()) {
-            dir.mkdirs();
-        }
+        try {
+            // 1. 对上传的分片按 ETag 排序
+            uploadedParts.sort(Comparator.comparingInt(UploadedPart::getPartNumber));
 
-        String chunkFileName = chunkDir + "/" + chunkNumber;
-        file.transferTo(new File(chunkFileName));
-
-        // 计算分片哈希
-        String chunkHash = calculateFileHash(new File(chunkFileName));
-
-        // 更新分片记录
-        UploadChunk chunk = chunkMapper.selectByTaskAndNumber(taskId, chunkNumber);
-        chunk.setChunkSize(file.getSize());
-        chunk.setChunkHash(chunkHash);
-        chunk.setUploaded(1);
-        chunk.setUploadedAt(LocalDateTime.now());
-        chunkMapper.update(chunk);
-
-        // 更新任务进度
-        task.setUploadedCount(chunkMapper.countUploaded(taskId));
-        if (task.getUploadedCount().equals(task.getChunkCount())) {
-            task.setStatus(UploadTask.Status.UPLOADING.getCode());
-        }
-        taskMapper.update(task);
-
-        log.info("分片上传成功: taskId={}, chunk={}", taskId, chunkNumber);
-    }
-
-    /**
-     * 3. 合并分片
-     */
-    @Transactional
-    public UploadTask mergeChunks(String taskId) throws Exception {
-        UploadTask task = taskMapper.selectByTaskId(taskId);
-        if (task == null) {
-            throw new BusinessException("上传任务不存在");
-        }
-
-        // 检查所有分片是否已上传
-        int uploadedCount = chunkMapper.countUploaded(taskId);
-        if (uploadedCount < task.getChunkCount()) {
-            throw new BusinessException("还有 " + (task.getChunkCount() - uploadedCount) + " 个分片未上传");
-        }
-
-        // 创建合并文件
-        String originalFileName = task.getFileName();
-        String extension = originalFileName.substring(originalFileName.lastIndexOf("."));
-        String mergedFileName = UUID.randomUUID().toString() + extension;
-        String mergedFilePath = "/data/uploads/files/" + mergedFileName;
-
-        File mergedFile = new File(mergedFilePath);
-        FileOutputStream fos = new FileOutputStream(mergedFile);
-
-        // 按顺序合并分片
-        for (int i = 0; i < task.getChunkCount(); i++) {
-            String chunkFileName = UPLOAD_DIR + taskId + "/" + i;
-            File chunkFile = new File(chunkFileName);
-
-            FileInputStream fis = new FileInputStream(chunkFile);
-            byte[] buffer = new byte[4096];
-            int len;
-            while ((len = fis.read(buffer)) > 0) {
-                fos.write(buffer, 0, len);
-            }
-            fis.close();
-
-            // 删除分片文件
-            chunkFile.delete();
-        }
-
-        fos.close();
-
-        // 删除分片目录
-        new File(UPLOAD_DIR + taskId).delete();
-
-        // 上传到 MinIO
-        FileInputStream fis = new FileInputStream(mergedFile);
-        String filePath = minioFileService.uploadFile(fis, mergedFileName);
-        fis.close();
-
-        // 删除本地合并文件
-        mergedFile.delete();
-
-        // 更新任务状态
-        task.setStatus(UploadTask.Status.COMPLETED.getCode());
-        task.setFilePath(filePath);
-        taskMapper.update(task);
-
-        log.info("分片合并成功: taskId={}, filePath={}", taskId, filePath);
-
-        return task;
-    }
-
-    /**
-     * 4. 获取已上传的分片列表
-     */
-    public List<Integer> getUploadedChunks(String taskId) {
-        List<UploadChunk> chunks = chunkMapper.selectUploadedByTaskId(taskId);
-        return chunks.stream()
-                .map(UploadChunk::getChunkNumber)
+            // 2. 完成 OSS 分片上传
+            List<Part> parts = uploadedParts.stream()
+                .map(p -> Part.from(p.getPartNumber(), p.getEtag()))
                 .collect(Collectors.toList());
-    }
 
-    /**
-     * 秒传检查
-     */
-    private UploadTask checkFileExists(String fileHash) {
-        return taskMapper.selectByFileHash(fileHash, UploadTask.Status.COMPLETED.getCode());
-    }
+            ObjectWriteResponse response = minioClient.completeMultipartUpload(
+                CompleteMultipartUploadArgs.builder()
+                    .bucket(context.getBucketName())
+                    .object(context.getObjectName())
+                    .uploadId(context.getOssUploadId())
+                    .parts(parts)
+                    .build()
+            );
 
-    /**
-     * 计算文件哈希
-     */
-    private String calculateFileHash(File file) throws Exception {
-        MessageDigest digest = MessageDigest.getInstance("SHA-256");
-        FileInputStream fis = new FileInputStream(file);
-        byte[] buffer = new byte[4096];
-        int len;
-        while ((len = fis.read(buffer)) > 0) {
-            digest.update(buffer, 0, len);
+            // 3. 清理上传上下文
+            redisTemplate.delete(contextKey);
+
+            // 4. 返回文件访问 URL
+            String fileUrl = String.format("%s/%s/%s",
+                minioClient.getObjectUrl(context.getBucketName(), context.getObjectName()));
+
+            return new CompleteUploadResponse()
+                .setFileId(uploadId)
+                .setFileUrl(fileUrl)
+                .setObjectName(context.getObjectName())
+                .setFileSize(context.getFileSize());
+
+        } catch (Exception e) {
+            throw new UploadException("完成上传失败", e);
         }
-        fis.close();
-        byte[] hash = digest.digest();
-        return Hex.encodeHexString(hash);
+    }
+
+    /**
+     * 查询已上传的分片（用于断点续传）
+     */
+    public List<UploadedPart> listUploadedParts(String uploadId) {
+        String contextKey = UPLOAD_KEY_PREFIX + uploadId;
+        UploadContext context = (UploadContext) redisTemplate.opsForValue().get(contextKey);
+
+        if (context == null) {
+            return Collections.emptyList();
+        }
+
+        // 返回已成功上传的分片
+        return context.getUploadedParts().values().stream()
+            .sorted(Comparator.comparingInt(UploadedPart::getPartNumber))
+            .collect(Collectors.toList());
+    }
+
+    /**
+     * 取消上传
+     */
+    public void abortUpload(String uploadId) {
+        String contextKey = UPLOAD_KEY_PREFIX + uploadId;
+        UploadContext context = (UploadContext) redisTemplate.opsForValue().get(contextKey);
+
+        if (context != null) {
+            try {
+                // 取消 OSS 上的分片上传任务
+                minioClient.abortMultipartUpload(
+                    AbortMultipartUploadArgs.builder()
+                        .bucket(context.getBucketName())
+                        .object(context.getObjectName())
+                        .uploadId(context.getOssUploadId())
+                        .build()
+                );
+            } catch (Exception e) {
+                log.warn("取消 OSS 分片上传失败", e);
+            }
+
+            // 清理本地上下文
+            redisTemplate.delete(contextKey);
+        }
+    }
+
+    private String generateObjectName(String originalFileName) {
+        String timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy/MM/dd"));
+        String uuid = UUID.randomUUID().toString().replace("-", "");
+        String ext = getFileExtension(originalFileName);
+        return String.format("uploads/%s/%s%s", timestamp, uuid, ext);
+    }
+
+    private String getFileExtension(String fileName) {
+        int lastDot = fileName.lastIndexOf('.');
+        return lastDot > 0 ? fileName.substring(lastDot) : "";
     }
 }
 ```
 
-### 2.4 上传控制器
+### 上传上下文实体
 
-```java title="上传控制器")
+```java
+@Data
+public class UploadContext implements Serializable {
+    private static final long serialVersionUID = 1L;
+
+    private String uploadId;          // 内部 uploadId
+    private String ossUploadId;       // OSS 的 uploadId
+    private String objectName;        // OSS 对象名
+    private String bucketName;        // OSS bucket
+    private String fileName;          // 原始文件名
+    private long fileSize;            // 文件大小
+    private int partCount;            // 分片数量
+    private Map<Integer, UploadedPart> uploadedParts;  // 已上传的分片
+    private long createdAt;           // 创建时间
+}
+
+@Data
+public class UploadedPart implements Serializable {
+    private int partNumber;           // 分片编号（从 1 开始）
+    private String etag;              // OSS 返回的 ETag
+    private long size;                // 分片大小
+    private long uploadedAt;          // 上传时间
+}
+```
+
+### 并发上传控制器
+
+```java
 @RestController
 @RequestMapping("/api/upload")
-public class ChunkUploadController {
-    @Autowired
-    private ChunkUploadService uploadService;
+public class FileUploadController {
+
+    private final FileUploadService fileUploadService;
+
+    public FileUploadController(FileUploadService fileUploadService) {
+        this.fileUploadService = fileUploadService;
+    }
 
     /**
-     * 1. 初始化上传任务
+     * 初始化上传
      */
     @PostMapping("/init")
-    public Result<UploadTask> init(@RequestBody @Validated UploadTaskRequest request) {
-        UploadTask task = uploadService.initTask(request);
-        return Result.success(task);
+    public ResponseEntity<?> initUpload(@RequestBody InitUploadRequest request) {
+        InitUploadResponse response = fileUploadService.initUpload(request);
+        return ResponseEntity.ok(response);
     }
 
     /**
-     * 2. 上传分片
+     * 确认上传完成
      */
-    @PostMapping("/chunk")
-    public Result<Void> uploadChunk(
-            @RequestParam String taskId,
-            @RequestParam Integer chunkNumber,
-            @RequestParam("file") MultipartFile file) {
-        try {
-            uploadService.uploadChunk(taskId, chunkNumber, file);
-            return Result.success();
-        } catch (Exception e) {
-            log.error("分片上传失败", e);
-            return Result.fail(e.getMessage());
-        }
+    @PostMapping("/complete")
+    public ResponseEntity<?> completeUpload(
+            @RequestParam String uploadId,
+            @RequestBody List<UploadedPart> uploadedParts) {
+        CompleteUploadResponse response = fileUploadService.completeUpload(uploadId, uploadedParts);
+        return ResponseEntity.ok(response);
     }
 
     /**
-     * 3. 合并分片
+     * 查询已上传分片（断点续传）
      */
-    @PostMapping("/merge")
-    public Result<UploadTask> merge(@RequestParam String taskId) {
-        try {
-            UploadTask task = uploadService.mergeChunks(taskId);
-            return Result.success(task);
-        } catch (Exception e) {
-            log.error("分片合并失败", e);
-            return Result.fail(e.getMessage());
-        }
+    @GetMapping("/status/{uploadId}")
+    public ResponseEntity<?> getUploadStatus(@PathVariable String uploadId) {
+        List<UploadedPart> uploadedParts = fileUploadService.listUploadedParts(uploadId);
+        return ResponseEntity.ok(Map.of(
+            "uploadId", uploadId,
+            "uploadedParts", uploadedParts
+        ));
     }
 
     /**
-     * 4. 查询已上传的分片
+     * 取消上传
      */
-    @GetMapping("/chunks")
-    public Result<List<Integer>> getUploadedChunks(@RequestParam String taskId) {
-        List<Integer> chunks = uploadService.getUploadedChunks(taskId);
-        return Result.success(chunks);
+    @DeleteMapping("/{uploadId}")
+    public ResponseEntity<?> abortUpload(@PathVariable String uploadId) {
+        fileUploadService.abortUpload(uploadId);
+        return ResponseEntity.ok("上传已取消");
     }
 }
 ```
 
-## 三、前端实现
+## 客户端实现
 
-### 3.1 分片上传核心逻辑
+### JavaScript 分片上传
 
-```javascript title="分片上传前端实现")
+```javascript
 class ChunkUploader {
-    constructor(options) {
+    constructor(options = {}) {
         this.file = options.file;
         this.chunkSize = options.chunkSize || 5 * 1024 * 1024; // 5MB
-        this.parallel = options.parallel || 3;
-        this.fileHash = null;
-        this.uploadedChunks = [];
+        this.concurrency = options.concurrency || 3;  // 并发数
+        this.initUrl = options.initUrl;
+        this.completeUrl = options.completeUrl;
+        this.statusUrl = options.statusUrl;
+
+        this.uploadId = null;
+        this.uploadedChunks = new Set();
+        this.totalChunks = Math.ceil(this.file.size / this.chunkSize);
     }
 
-    async upload() {
-        // 1. 计算文件哈希
-        this.fileHash = await this.calculateFileHash();
-
-        // 2. 初始化上传任务
-        const task = await this.initTask();
-
-        if (task.status === 'completed') {
-            // 秒传成功
-            return { success: true, filePath: task.filePath };
+    /**
+     * 开始上传
+     */
+    async start() {
+        // 1. 检查是否有未完成的上传（断点续传）
+        const savedUploadId = localStorage.getItem(this.getUploadIdKey());
+        if (savedUploadId) {
+            this.uploadId = savedUploadId;
+            const status = await this.checkUploadStatus();
+            if (status) {
+                console.log('断点续传，已上传', status.uploadedParts.length, '个分片');
+                this.uploadedChunks = new Set(status.uploadedParts.map(p => p.partNumber));
+            }
+        } else {
+            // 2. 初始化上传
+            const initResponse = await fetch(this.initUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    fileName: this.file.name,
+                    fileSize: this.file.size,
+                    fileHash: await this.getFileHash()
+                })
+            });
+            const initData = await initResponse.json();
+            this.uploadId = initData.uploadId;
+            localStorage.setItem(this.getUploadIdKey(), this.uploadId);
         }
 
-        // 3. 获取已上传的分片
-        this.uploadedChunks = await this.getUploadedChunks(task.taskId);
+        // 3. 上传剩余的分片
+        await this.uploadChunks();
 
-        // 4. 计算需要上传的分片
-        const chunks = this.getNeedUploadChunks();
-        console.log(`需要上传 ${chunks.length} 个分片`);
+        // 4. 完成上传
+        await this.completeUpload();
+    }
 
-        // 5. 并发上传分片
-        await this.uploadChunks(chunks, task.taskId);
+    /**
+     * 检查上传状态（断点续传）
+     */
+    async checkUploadStatus() {
+        try {
+            const response = await fetch(`${this.statusUrl}/${this.uploadId}`);
+            if (response.ok) {
+                return await response.json();
+            }
+        } catch (e) {
+            console.warn('检查上传状态失败', e);
+        }
+        return null;
+    }
 
-        // 6. 合并分片
-        const result = await this.mergeChunks(task.taskId);
+    /**
+     * 上传所有未完成的分片
+     */
+    async uploadChunks() {
+        const pendingChunks = [];
+        for (let i = 1; i <= this.totalChunks; i++) {
+            if (!this.uploadedChunks.has(i)) {
+                pendingChunks.push(i);
+            }
+        }
+
+        // 使用 Promise 并发控制
+        const results = await this.uploadWithConcurrency(pendingChunks, this.concurrency);
+
+        // 检查失败的分片并重试
+        const failedChunks = results.filter(r => !r.success);
+        if (failedChunks.length > 0) {
+            console.warn('有', failedChunks.length, '个分片上传失败，开始重试');
+            await this.retryFailedChunks(failedChunks.map(f => f.partNumber));
+        }
+    }
+
+    /**
+     * 并发上传
+     */
+    async uploadWithConcurrency(chunks, concurrency) {
+        const results = [];
+        let index = 0;
+
+        const workers = Array(concurrency).fill(null).map(async () => {
+            while (index < chunks.length) {
+                const currentIndex = index++;
+                const partNumber = chunks[currentIndex];
+                try {
+                    const result = await this.uploadChunk(partNumber);
+                    results.push({ partNumber, success: true, result });
+                } catch (e) {
+                    results.push({ partNumber, success: false, error: e });
+                }
+            }
+        });
+
+        await Promise.all(workers);
+        return results;
+    }
+
+    /**
+     * 上传单个分片
+     */
+    async uploadChunk(partNumber) {
+        const start = (partNumber - 1) * this.chunkSize;
+        const end = Math.min(start + this.chunkSize, this.file.size);
+        const chunk = this.file.slice(start, end);
+
+        // 获取预签名 URL
+        const presignedParts = await this.getPresignedUrl(partNumber);
+        const presignedUrl = presignedParts.url;
+
+        // 使用预签名 URL 直接上传到 OSS
+        const response = await fetch(presignedUrl, {
+            method: 'PUT',
+            body: chunk,
+            headers: {
+                'Content-Type': 'application/octet-stream'
+            }
+        });
+
+        if (!response.ok) {
+            throw new Error(`分片 ${partNumber} 上传失败`);
+        }
+
+        // 获取 ETag
+        const etag = response.headers.get('ETag');
+        this.uploadedChunks.add(partNumber);
+
+        // 记录进度
+        this.onProgress({
+            uploaded: this.uploadedChunks.size,
+            total: this.totalChunks,
+            percent: Math.round(this.uploadedChunks.size / this.totalChunks * 100)
+        });
+
+        return { partNumber, etag };
+    }
+
+    /**
+     * 获取预签名 URL
+     */
+    async getPresignedUrl(partNumber) {
+        const response = await fetch(`${this.initUrl}/${this.uploadId}/part/${partNumber}`);
+        return response.json();
+    }
+
+    /**
+     * 完成上传
+     */
+    async completeUpload() {
+        const response = await fetch(this.completeUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                uploadId: this.uploadId,
+                parts: Array.from(this.uploadedChunks).map(partNumber => ({
+                    partNumber,
+                    etag: this.getEtag(partNumber)
+                }))
+            })
+        });
+
+        const result = await response.json();
+
+        // 清理本地存储
+        localStorage.removeItem(this.getUploadIdKey());
 
         return result;
     }
 
     /**
-     * 计算文件哈希（秒传标识）
+     * 重试失败的分片
      */
-    async calculateFileHash() {
-        return new Promise((resolve) => {
-            const spark = new SparkMD5.ArrayBuffer();
-            const reader = new FileReader();
+    async retryFailedChunks(failedChunks, maxRetries = 3) {
+        for (let retry = 0; retry < maxRetries; retry++) {
+            const stillFailing = [];
 
-            reader.onload = (e) => {
-                spark.append(e.target.result);
-                resolve(spark.end());
-            };
-
-            // 读取文件前 2MB 和后 2MB，以及文件大小
-            const chunks = [];
-            const size = this.file.size;
-
-            if (size > 4 * 1024 * 1024) {
-                // 大文件：读取首尾各 2MB
-                chunks.push(this.file.slice(0, 2 * 1024 * 1024));
-                chunks.push(this.file.slice(size - 2 * 1024 * 1024));
-            } else {
-                // 小文件：读取整个
-                chunks.push(this.file);
+            for (const partNumber of failedChunks) {
+                try {
+                    await this.uploadChunk(partNumber);
+                } catch (e) {
+                    stillFailing.push(partNumber);
+                }
             }
 
-            reader.readAsArrayBuffer(new Blob(chunks));
-        });
-    }
-
-    /**
-     * 计算分片哈希
-     */
-    calculateChunkHash(chunk) {
-        return new Promise((resolve) => {
-            const reader = new FileReader();
-            reader.onload = (e) => {
-                const hash = SparkMD5.ArrayBuffer.hash(e.target.result);
-                resolve(hash);
-            };
-            reader.readAsArrayBuffer(chunk);
-        });
-    }
-
-    /**
-     * 初始化上传任务
-     */
-    async initTask() {
-        const response = await fetch('/api/upload/init', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                fileName: this.file.name,
-                fileSize: this.file.size,
-                fileHash: this.fileHash
-            })
-        });
-        return response.json();
-    }
-
-    /**
-     * 获取已上传的分片
-     */
-    async getUploadedChunks(taskId) {
-        const response = await fetch(`/api/upload/chunks?taskId=${taskId}`);
-        const result = await response.json();
-        return result.data;
-    }
-
-    /**
-     * 获取需要上传的分片
-     */
-    getNeedUploadChunks() {
-        const chunks = [];
-        const chunkCount = Math.ceil(this.file.size / this.chunkSize);
-
-        for (let i = 0; i < chunkCount; i++) {
-            if (!this.uploadedChunks.includes(i)) {
-                chunks.push({
-                    index: i,
-                    start: i * this.chunkSize,
-                    end: Math.min((i + 1) * this.chunkSize, this.file.size)
-                });
+            if (stillFailing.length === 0) {
+                break;
             }
+
+            // 指数退避
+            await new Promise(resolve => setTimeout(resolve, Math.pow(2, retry) * 1000));
+            failedChunks = stillFailing;
         }
 
-        return chunks;
-    }
-
-    /**
-     * 并发上传分片
-     */
-    async uploadChunks(chunks, taskId) {
-        // 分批次上传
-        for (let i = 0; i < chunks.length; i += this.parallel) {
-            const batch = chunks.slice(i, i + this.parallel);
-
-            await Promise.all(batch.map(async (chunk) => {
-                const blob = this.file.slice(chunk.start, chunk.end);
-                const formData = new FormData();
-                formData.append('taskId', taskId);
-                formData.append('chunkNumber', chunk.index);
-                formData.append('file', blob);
-
-                await fetch('/api/upload/chunk', {
-                    method: 'POST',
-                    body: formData
-                });
-
-                // 更新进度
-                this.onProgress && this.onProgress({
-                    uploaded: i + 1,
-                    total: chunks.length
-                });
-            }));
+        if (failedChunks.length > 0) {
+            throw new Error(`有 ${failedChunks.length} 个分片上传失败`);
         }
     }
 
     /**
-     * 合并分片
+     * 获取文件的唯一标识（用于断点续传）
      */
-    async mergeChunks(taskId) {
-        const response = await fetch('/api/upload/merge', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: `taskId=${taskId}`
-        });
-        return response.json();
+    getUploadIdKey() {
+        return `upload_${this.file.name}_${this.file.size}_${this.file.lastModified}`;
+    }
+
+    /**
+     * 计算文件 Hash（秒传验证）
+     */
+    async getFileHash() {
+        const chunkSize = 2 * 1024 * 1024;  // 2MB
+        const chunks = Math.ceil(this.file.size / chunkSize);
+        const spark = new SparkMD5();
+
+        for (let i = 0; i < chunks; i++) {
+            const chunk = this.file.slice(i * chunkSize, (i + 1) * chunkSize);
+            const buffer = await chunk.arrayBuffer();
+            spark.append(buffer);
+        }
+
+        return spark.end();
+    }
+
+    /**
+     * 进度回调
+     */
+    onProgress(info) {
+        if (this.options.onProgress) {
+            this.options.onProgress(info);
+        }
     }
 }
 ```
 
-### 3.2 使用示例
+### 前端页面集成
 
-```javascript title="Vue 组件中使用")
-<template>
-  <div>
-    <input type="file" @change="handleFileChange" />
-    <button @click="startUpload" :disabled="uploading">
-      {{ uploading ? '上传中...' : '开始上传' }}
-    </button>
-    <div v-if="progress > 0">
-      进度: {{ progress }}%
-    </div>
-  </div>
-</template>
+```html
+<!DOCTYPE html>
+<html>
+<head>
+    <title>文件上传</title>
+    <script src="https://cdn.jsdelivr.net/npm/spark-md5@3.0.2/spark-md5.min.js"></script>
+</head>
+<body>
+    <input type="file" id="fileInput" />
+    <button onclick="startUpload()">上传</button>
+    <div id="progress">0%</div>
+    <script>
+        let uploader;
 
-<script>
-export default {
-  data() {
-    return {
-      file: null,
-      uploading: false,
-      progress: 0
-    };
-  },
-  methods: {
-    handleFileChange(e) {
-      this.file = e.target.files[0];
-    },
-    async startUpload() {
-      if (!this.file) return;
+        function startUpload() {
+            const file = document.getElementById('fileInput').files[0];
+            if (!file) {
+                alert('请选择文件');
+                return;
+            }
 
-      this.uploading = true;
+            uploader = new ChunkUploader({
+                file: file,
+                chunkSize: 5 * 1024 * 1024,  // 5MB
+                concurrency: 3,
+                initUrl: '/api/upload/init',
+                completeUrl: '/api/upload/complete',
+                statusUrl: '/api/upload/status',
+                options: {
+                    onProgress: (info) => {
+                        document.getElementById('progress').textContent =
+                            `已上传 ${info.uploaded}/${info.total} 个分片 (${info.percent}%)`;
+                    }
+                }
+            });
 
-      const uploader = new ChunkUploader({
-        file: this.file,
-        chunkSize: 5 * 1024 * 1024,
-        parallel: 3,
-        onProgress: (data) => {
-          this.progress = Math.round((data.uploaded / data.total) * 100);
+            uploader.start()
+                .then(result => {
+                    alert('上传成功！');
+                    console.log('文件 URL:', result.fileUrl);
+                })
+                .catch(err => {
+                    alert('上传失败: ' + err.message);
+                });
         }
-      });
+    </script>
+</body>
+</html>
+```
 
-      try {
-        const result = await uploader.upload();
-        if (result.success) {
-          this.$message.success('上传成功');
-        }
-      } catch (e) {
-        this.$message.error('上传失败: ' + e.message);
-      } finally {
-        this.uploading = false;
-      }
+## 秒传功能
+
+### 秒传原理
+
+用户上传前先计算文件 MD5，服务端检查是否已存在相同文件：
+
+```java
+/**
+ * 秒传检查
+ */
+public FileCheckResponse checkFileExists(String fileHash, String fileName, long fileSize) {
+    // 1. 查询文件 Hash 表
+    FileRecord record = fileRepository.findByHash(fileHash);
+
+    if (record != null && record.getFileSize() == fileSize) {
+        // 2. 文件已存在，直接返回
+        return new FileCheckResponse()
+            .setExists(true)
+            .setFileId(record.getFileId())
+            .setFileUrl(record.getFileUrl());
     }
-  }
-};
-</script>
-```
 
-## 四、断点续传
-
-### 4.1 断点续传原理
-
-```
-用户上传中断：
-- 已上传分片记录在数据库
-- 重新上传时，只上传缺失的分片
-- 已上传的分片不需要重新上传
-```
-
-### 4.2 续传逻辑
-
-```javascript title="续传逻辑")
-async resumeUpload() {
-    // 1. 获取任务列表（未完成的任务）
-    const tasks = await this.getUnfinishedTasks();
-
-    for (const task of tasks) {
-        // 2. 获取已上传的分片
-        const uploadedChunks = await this.getUploadedChunks(task.taskId);
-
-        // 3. 继续上传缺失的分片
-        const missingChunks = this.getMissingChunks(uploadedChunks);
-        await this.uploadChunks(missingChunks, task.taskId);
-
-        // 4. 合并
-        await this.mergeChunks(task.taskId);
-    }
+    // 3. 返回不存在，需要上传
+    return new FileCheckResponse()
+        .setExists(false)
+        .setUploadId(null);
 }
 ```
 
-## 五、并发控制
+```javascript
+async checkAndUpload() {
+    // 1. 计算文件 Hash
+    const fileHash = await this.getFileHash();
 
-### 5.1 服务端限流
+    // 2. 检查是否秒传
+    const checkResponse = await fetch('/api/upload/check', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            hash: fileHash,
+            fileName: this.file.name,
+            fileSize: this.file.size
+        })
+    });
 
-```java title="分片上传限流")
+    const checkResult = await checkResponse.json();
+
+    if (checkResult.exists) {
+        // 秒传成功
+        console.log('秒传成功！文件已存在');
+        return { success: true, fileUrl: checkResult.fileUrl };
+    }
+
+    // 3. 继续分片上传
+    return this.start();
+}
+```
+
+## 常见问题与解决
+
+### 问题一：并发上传导致服务器压力
+
+```java
+// 使用信号量限制并发
 @Service
-public class ChunkUploadRateLimiter {
-    // 每个用户的并发上传任务数
-    private static final int MAX_PARALLEL_UPLOAD = 3;
+public class ThrottledUploadService {
 
-    // 每个分片的最大大小
-    private static final long MAX_CHUNK_SIZE = 10 * 1024 * 1024; // 10MB
+    private final Semaphore semaphore = new Semaphore(50);  // 最多 50 个并发
 
-    public void validateChunk(String taskId, MultipartFile file) {
-        // 检查文件大小
-        if (file.getSize() > MAX_CHUNK_SIZE) {
-            throw new BusinessException("分片大小不能超过 10MB");
-        }
-
-        // 检查分片是否合法
-        if (file.isEmpty()) {
-            throw new BusinessException("分片文件为空");
+    public PresignedUrlResponse getUploadUrl(String uploadId, int partNumber) {
+        try {
+            semaphore.acquire();
+            return generatePresignedUrl(uploadId, partNumber);
+        } catch (InterruptedException e) {
+            throw new UploadException("服务器繁忙，请稍后重试");
+        } finally {
+            semaphore.release();
         }
     }
 }
 ```
 
-## 六、总结
+### 问题二：网络波动导致超时
 
-| 特性 | 说明 |
+```javascript
+// 使用 axios 并配置超时重试
+const axiosInstance = axios.create({
+    timeout: 60000,  // 60 秒超时
+    retry: 3,
+    retryDelay: 1000
+});
+
+// 请求拦截器处理重试
+axiosInstance.interceptors.response.use(
+    response => response,
+    error => {
+        const config = error.config;
+        if (!config || !config.retry) return Promise.reject(error);
+
+        config.retry -= 1;
+        if (config.retry <= 0) return Promise.reject(error);
+
+        return new Promise(resolve =>
+            setTimeout(() => resolve(axiosInstance(config)), config.retryDelay)
+        );
+    }
+);
+```
+
+### 问题三：分片丢失导致合并失败
+
+```java
+// 完整性校验
+public void validateUploadComplete(String uploadId, List<UploadedPart> uploadedParts) {
+    UploadContext context = getUploadContext(uploadId);
+
+    // 1. 检查分片数量
+    if (uploadedParts.size() != context.getPartCount()) {
+        throw new UploadException("分片数量不匹配");
+    }
+
+    // 2. 检查分片编号连续性
+    Set<Integer> partNumbers = uploadedParts.stream()
+        .map(UploadedPart::getPartNumber)
+        .collect(Collectors.toSet());
+
+    for (int i = 1; i <= context.getPartCount(); i++) {
+        if (!partNumbers.contains(i)) {
+            throw new UploadException("缺少分片: " + i);
+        }
+    }
+}
+```
+
+## 总结
+
+分片上传的核心是**化整为零 + 断点续传**：
+
+| 组件 | 职责 |
 |---|---|
-| 分片大小 | 建议 2-10MB，平衡重传开销和并发效率 |
-| 并发数 | 建议 3-5，避免对服务器压力过大 |
-| 秒传 | 基于文件哈希，已存在则跳过上传 |
-| 断点续传 | 基于分片记录，中断后可继续 |
-| 合并策略 | 服务端按顺序合并，保证文件完整 |
+| 初始化 | 生成 uploadId，计算分片数 |
+| 分片上传 | 并发上传各分片，记录进度 |
+| 续传检查 | 查询已上传分片，跳过已完成的 |
+| 合并完成 | 合并所有分片，清理临时数据 |
 
-:::tip 实战建议
-1. **分片大小**：5MB 是比较平衡的选择
-2. **秒传**：大文件秒传体验提升明显
-3. **进度条**：实时反馈让用户有耐心等待
-4. **错误重试**：网络不稳定时自动重试
-:::
+实现要点：
 
-## 结尾
+1. **预签名 URL**：服务端生成签名，客户端直传 OSS，避免流量经过应用服务器
+2. **进度持久化**：将已上传分片信息存储到 Redis，支持重启后续传
+3. **并发控制**：限制并发数，避免压垮服务器或 OSS
+4. **秒传优化**：通过文件 Hash 快速判断是否已存在
 
-分片上传让大文件上传变得稳定可靠。记住三个要点：
-
-1. **分片是核心**：小块上传，失败只重传小块
-2. **秒传是亮点**：基于哈希，已存在就不上传
-3. **断点续传是保障**：中断不怕，继续传就行
-
-下一节，我们来看 CDN + OSS 分发加速——如何让用户就近访问静态资源，提升加载速度。
