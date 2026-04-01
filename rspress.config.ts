@@ -120,7 +120,7 @@ export default defineConfig({
      */
     editLink: {
       // 文档在 Git 仓库中的根目录 URL
-      docRepoBaseUrl: 'https://github.com/xinrun0928/Rspress_Guide/tree/main/website/docs',
+      docRepoBaseUrl: 'https://github.com/xinrun0928/Rspress_Guide/blob/main/docs',
     },
 
     /**
