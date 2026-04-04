@@ -167,7 +167,7 @@ export const javaSidebar = [
         items: [
           { text: 'synchronized 锁的是什么？对象头结构', link: '/java/concurrent/synchronized/object' },
           { text: 'synchronized 修饰方法 vs 代码块', link: '/java/concurrent/synchronized/method-block' },
-          { text: 'JDK 6 之后锁升级机制：偏向锁 → 轻量级锁 → 重量级锁', link: '/java/concurrent/synchronized/lock-escalation' },
+          { text: '锁升级机制：偏向锁 → 轻量级锁 → 重量级锁', link: '/java/concurrent/synchronized/lock-escalation' },
           { text: '偏向锁的获取、撤销与批量重偏向', link: '/java/concurrent/synchronized/biased-lock' },
           { text: '轻量级锁：CAS + 自旋', link: '/java/concurrent/synchronized/lightweight-lock' },
           { text: '重量级锁：Monitor 机制与等待队列', link: '/java/concurrent/synchronized/heavyweight-lock' },
