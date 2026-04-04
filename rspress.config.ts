@@ -71,11 +71,11 @@ export default defineConfig({
   // ==============================================
   themeConfig: {
 
-    // 顶部导航栏配置
-    nav: nav,
+    // // 顶部导航栏配置
+    // nav: nav,
  
-    // 侧边栏配置
-    sidebar: sidebar,
+    // // 侧边栏配置
+    // sidebar: sidebar,
 
     /**
      * 搜索框开关
