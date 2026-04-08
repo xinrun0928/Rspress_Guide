@@ -2,12 +2,28 @@
 import * as path from 'node:path';
 // 导入 Rspress 核心配置定义函数，提供类型提示和配置校验
 import { defineConfig } from '@rspress/core';
+import { pluginSass } from '@rsbuild/plugin-sass';
+
+// Rspress 插件：mermaid 需要以函数方式调用，返回 Rspress 插件对象
+import mermaid from 'rspress-plugin-mermaid';
 
 import { nav } from './theme_config/nav'
 import { sidebar } from './theme_config/sidebar'
 
 // Rspress 文档站点核心配置导出
 export default defineConfig({
+  // ==============================================
+  // 插件配置（Rspress 专属插件，如 mermaid、自定义 remark/unified 插件等）
+  // 注意：@rsbuild/plugin-sass 属于构建工具插件，应放在 builderConfig.plugins 中
+  // ==============================================
+  plugins: [
+    mermaid({
+      mermaidConfig: {
+        theme: 'forest',
+      },
+    })
+  ],
+
   // ==============================================
   // 基础站点配置（站点根目录、全局资源、基础信息）
   // ==============================================
@@ -66,23 +82,29 @@ export default defineConfig({
     dark: '/icon.png',
   },
 
+  builderConfig: {
+    plugins: [
+      pluginSass(),
+    ],
+  },
+
   // ==============================================
   // 主题外观配置（导航、侧边栏、搜索、页脚等）
   // ==============================================
   themeConfig: {
 
-    // // 顶部导航栏配置
-    // nav: nav,
+    // 顶部导航栏配置
+    nav: nav,
  
-    // // 侧边栏配置
-    // sidebar: sidebar,
+    // 侧边栏配置
+    sidebar: sidebar,
 
     /**
      * 搜索框开关
      * true：在顶部导航栏显示文档搜索框（支持全文搜索）
      * false：隐藏搜索功能
      */
-    search: true,
+    search: false,
 
     /**
      * 社交链接配置
@@ -158,12 +180,20 @@ export default defineConfig({
     cleanUrls: true,
   },
 
+  /**
+   * 搜索框开关
+   * true：在顶部导航栏显示文档搜索框（支持全文搜索）
+   * false：隐藏搜索功能
+   */
+  search: false,
+
   // ==============================================
   // 页面头部标签配置（SEO、meta 标签、自定义 head）
   // 用于向 HTML <head> 中注入自定义标签
   // ==============================================
   head: [
     // 写法 1：直接传入 HTML 字符串
-    '<meta name="author" content="Mr.zhang">'
+    '<meta name="author" content="Mr.zhang">',
+    '<meta name="keywords" content="Java,后端开发,架构设计,系统架构,微服务,分布式,并发编程,JVM,数据库,中间件,面试,进阶">',
   ],
 });
