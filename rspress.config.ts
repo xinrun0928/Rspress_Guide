@@ -1,16 +1,56 @@
-// 导入 Node.js 路径处理模块，用于拼接文件绝对路径
+// ==============================================
+// 导入 Rspress 核心依赖
+// ==============================================
+
 import * as path from 'node:path';
-// 导入 Rspress 核心配置定义函数，提供类型提示和配置校验
 import { defineConfig } from '@rspress/core';
 import { pluginSass } from '@rsbuild/plugin-sass';
-
-// Rspress 插件：mermaid 需要以函数方式调用，返回 Rspress 插件对象
 import mermaid from 'rspress-plugin-mermaid';
+import { nav } from './theme_config/nav';
+import { sidebar } from './theme_config/sidebar';
 
-import { nav } from './theme_config/nav'
-import { sidebar } from './theme_config/sidebar'
+// ==============================================
+// 经常变化的配置（站点信息、SEO、导航、社交链接等）
+// ==============================================
 
-// Rspress 文档站点核心配置导出
+/**
+ * 站点基础信息
+ */
+const siteMeta = {
+  /** 网站标题 - 显示在浏览器标签页和导航栏 */
+  title: 'Guide',
+  /** 网站描述 - 用于 SEO 搜索引擎优化 */
+  description: '系统梳理 Java 后端核心知识，覆盖面试高频考点，助你从容应对技术面试',
+  /** 作者信息 */
+  author: 'Mr.zhang',
+  /** 站点关键词 - 根据导航栏目自动生成 */
+  keywords: [
+    // 面试准备
+    '面试准备', 'Java面试', '后端面试', '技术面试', '简历编写', 'STAR法则', '行为面试', '薪资谈判', '大厂面经', 'Offer选择',
+    // 计算机基础
+    '计算机网络', 'TCP', 'IP', 'HTTP', 'HTTPS', '操作系统', '进程', '线程', '内存管理', 'IO模型', '网络安全', '加密算法', '数据机构', '算法',
+    // Java 核心
+    'Java', 'JVM', '并发编程', '线程池', '集合框架', 'HashMap', 'Spring', 'Spring Boot', 'MyBatis',
+    // 数据库
+    'MySQL', 'Redis', 'MongoDB', '索引', '事务', '锁', '缓存', '分布式锁',
+    // 分布式与架构
+    '分布式', '微服务', 'Spring Cloud', '消息队列', 'Kafka', 'RPC', 'Dubbo', 'Nacos', 'Zookeeper',
+    // 高频面试题
+    'Java面试题', 'MySQL面试题', 'Redis面试题', 'JVM面试题', '并发编程面试题', '分布式面试题', '系统设计',
+    // 核心标签
+    '后端开发', '架构设计', '系统架构', '高并发', '高性能', '高可用', '设计模式', '系统设计'
+  ],
+};
+
+/**
+ * GitHub 仓库地址
+ */
+const gitHubRepo = 'https://github.com/xinrun0928/Rspress_Guide';
+
+// ==============================================
+// Rspress 核心配置
+// ==============================================
+
 export default defineConfig({
   // ==============================================
   // 插件配置（Rspress 专属插件，如 mermaid、自定义 remark/unified 插件等）
@@ -21,7 +61,7 @@ export default defineConfig({
       mermaidConfig: {
         theme: 'forest',
       },
-    })
+    }),
   ],
 
   // ==============================================
@@ -47,14 +87,14 @@ export default defineConfig({
    * 显示在浏览器标签页、导航栏、SEO 标题中
    * 是站点的核心名称标识
    */
-  title: 'Guide',
+  title: siteMeta.title,
 
   /**
    * 网站描述
    * 用于 SEO 搜索引擎优化，提升站点被搜索概率
    * 简洁概括站点内容，便于搜索引擎收录
    */
-  description: '系统梳理 Java 后端核心知识，覆盖面试高频考点，助你从容应对技术面试',
+  description: siteMeta.description,
 
   /**
    * 网站 favicon 图标（浏览器标签小图标）
@@ -82,6 +122,18 @@ export default defineConfig({
     dark: '/icon.png',
   },
 
+  /**
+   * 搜索框开关
+   * true：在顶部导航栏显示文档搜索框（支持全文搜索）
+   * false：隐藏搜索功能
+   */
+  search: false,
+
+  /**
+   * 构建工具配置
+   * 用于配置 Rsbuild/Rspack 的构建行为，包括插件、编译器选项等
+   * 注意：@rsbuild/plugin-sass 等构建插件必须放在这里，而非顶层 plugins 配置
+   */
   builderConfig: {
     plugins: [
       pluginSass(),
@@ -95,7 +147,7 @@ export default defineConfig({
 
     // 顶部导航栏配置
     nav: nav,
- 
+
     // 侧边栏配置
     sidebar: sidebar,
 
@@ -113,12 +165,9 @@ export default defineConfig({
      */
     socialLinks: [
       {
-        // 使用 Rspress 内置的 GitHub 图标
         icon: 'github',
-        // 链接模式：link = 跳转到外部链接
         mode: 'link',
-        // 点击图标跳转的目标 URL
-        content: 'https://github.com/xinrun0928/Rspress_Guide',
+        content: gitHubRepo,
       },
     ],
 
@@ -142,7 +191,7 @@ export default defineConfig({
      */
     editLink: {
       // 文档在 Git 仓库中的根目录 URL
-      docRepoBaseUrl: 'https://github.com/xinrun0928/Rspress_Guide/blob/main/docs',
+      docRepoBaseUrl: `${gitHubRepo}/blob/main/docs`,
     },
 
     /**
@@ -151,7 +200,7 @@ export default defineConfig({
      * 支持 HTML 标签，可插入链接、样式等
      */
     footer: {
-      message: 'Copyright © 2025-2026 <a href="https://github.com/xinrun0928/Rspress_Guide">Guide</a>',
+      message: `Copyright © 2025-2026 <a href="${gitHubRepo}">Guide</a>`,
     }
   },
 
@@ -180,20 +229,12 @@ export default defineConfig({
     cleanUrls: true,
   },
 
-  /**
-   * 搜索框开关
-   * true：在顶部导航栏显示文档搜索框（支持全文搜索）
-   * false：隐藏搜索功能
-   */
-  search: false,
-
   // ==============================================
   // 页面头部标签配置（SEO、meta 标签、自定义 head）
   // 用于向 HTML <head> 中注入自定义标签
   // ==============================================
   head: [
-    // 写法 1：直接传入 HTML 字符串
-    '<meta name="author" content="Mr.zhang">',
-    '<meta name="keywords" content="Java,后端开发,架构设计,系统架构,微服务,分布式,并发编程,JVM,数据库,中间件,面试,进阶">',
+    `<meta name="author" content="${siteMeta.author}">`,
+    `<meta name="keywords" content="${siteMeta.keywords.join(',')}">`,
   ],
 });
