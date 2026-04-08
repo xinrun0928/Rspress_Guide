@@ -58,6 +58,8 @@ export const nav = [
       { text: "☁️ Spring Cloud（服务发现/配置中心/网关）", link: "/framework/springcloud/" },
       { text: "📨 消息队列（Kafka/RocketMQ 选型/可靠性/顺序消息）", link: "/framework/mq/" },
       { text: "🔌 RPC 与注册中心（Dubbo/gRPC/ZooKeeper/Nacos）", link: "/framework/rpc/" },
+      { text: "🔍 搜索引擎（Elasticsearch 原理/倒排索引/集群）", link: "/framework/search/" },
+      { text: "🧩 其他中间件（XXL-JOB/ShardingSphere/Apollo）", link: "/framework/other/" },
     ],
   },
   {
@@ -79,18 +81,6 @@ export const nav = [
       { text: "📐 架构模式（MVC/DDD/CQRS/事件驱动）", link: "/design/architectural/" },
       { text: "🚀 系统设计（秒杀/短链/IM/支付系统）", link: "/design/system-design/" },
     ],
-  },
-  {
-    "text": "中间件",
-    "link": "/middleware/",
-    "items": [
-      { "text": "📨 消息队列", "link": "/middleware/mq/" },
-      { "text": "🔌 RPC 框架", "link": "/middleware/rpc/" },
-      { "text": "📡 注册中心", "link": "/middleware/registry/" },
-      { "text": "🚪 API 网关", "link": "/middleware/gateway/" },
-      { "text": "🔍 搜索引擎", "link": "/middleware/search/" },
-      { "text": "🧩 其他中间件", "link": "/middleware/other/" }
-    ]
   },
   // 8. 高频面试题（独立章节，收纳所有题目）
   {
