@@ -1,0 +1,688 @@
+# select/poll/epoll对比
+
+> 目标级别：P6
+
+面试官问：「select、poll、epoll 有什么区别？」你回答「epoll 性能更好」——然后面试官追问：「为什么 epoll 性能更好？」「LT 和 ET 模式有什么区别？」「epoll 在什么场景下会退化为 O(n)？」
+
+select/poll/epoll 是 IO 多路复用的三种实现，理解它们的区别是设计高性能服务器的关键。
+
+## 快速自测
+
+面试前先问自己这三个问题：
+
+1. **为什么 epoll 被称为高效？** 它解决了 select/poll 的哪些问题？
+2. **LT 和 ET 模式有什么区别？** 各有什么优缺点？
+3. **epoll 在什么情况下会出问题？** 什么是惊群问题？
+
+---
+
+## 一、IO 多路复用回顾
+
+### 1.1 核心问题
+
+```
+问题：如何同时监控多个 IO fd？
+
+解决方案：IO 多路复用
+- 一个线程同时监控多个 IO fd
+- 有 IO 事件时再处理
+- 大大减少线程数量
+```
+
+### 1.2 三种实现对比
+
+| 实现 | 诞生时间 | 平台 | 性能 |
+|------|----------|------|------|
+| select | POSIX（1983） | 所有平台 | 差 |
+| poll | Unix（SVR3） | 所有平台 | 中 |
+| epoll | Linux 2.6（2002） | Linux only | 好 |
+
+---
+
+## 二、select 详解
+
+### 2.1 API
+
+```c
+#include <sys/select.h>
+
+int select(int nfds,
+          fd_set *readfds,
+          fd_set *writefds,
+          fd_set *exceptfds,
+          struct timeval *timeout);
+
+// fd_set 操作
+void FD_SET(int fd, fd_set *set);
+void FD_CLR(int fd, fd_set *set);
+void FD_ISSET(int fd, fd_set *set);
+void FD_ZERO(fd_set *set);
+```
+
+### 2.2 使用示例
+
+```c
+#include <stdio.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+
+int main() {
+    int listenfd = socket(AF_INET, SOCK_STREAM, 0);
+
+    fd_set readfds, master;
+    FD_ZERO(&master);
+    FD_SET(listenfd, &master);
+
+    struct timeval timeout;
+    timeout.tv_sec = 5;
+    timeout.tv_usec = 0;
+
+    while (1) {
+        readfds = master;  // 每次都要复制！
+
+        int ready = select(listenfd + 1, &readfds, NULL, NULL, &timeout);
+
+        if (ready < 0) {
+            perror("select error");
+            break;
+        }
+
+        if (ready == 0) {
+            // timeout
+            continue;
+        }
+
+        if (FD_ISSET(listenfd, &readfds)) {
+            // 处理新连接
+            int connfd = accept(listenfd, NULL, NULL);
+            FD_SET(connfd, &master);
+        }
+
+        // 检查其他 fd...
+    }
+
+    return 0;
+}
+```
+
+### 2.3 select 的问题
+
+```
+select 的三大问题：
+
+问题一：fd 数量限制
+- fd_set 使用固定大小的 bitmap
+- 通常是 1024（由 FD_SETSIZE 定义）
+- 无法监控大量连接
+
+问题二：每次都要复制
+- 每次调用 select 都要把 fd_set 从用户态复制到内核态
+- fd 数量大时，复制开销显著
+
+问题三：全量遍历
+- select 返回后，不知道哪些 fd 就绪
+- 需要遍历所有 fd（O(n)）
+- 即使只有 1 个 fd 就绪，也要遍历全部
+```
+
+---
+
+## 三、poll 详解
+
+### 3.1 API
+
+```c
+#include <poll.h>
+
+struct pollfd {
+    int fd;           // 要监控的 fd
+    short events;     // 监控的事件
+    short revents;    // 实际发生的事件
+};
+
+int poll(struct pollfd *fds, nfds_t nfds, int timeout);
+```
+
+### 3.2 使用示例
+
+```c
+#include <stdio.h>
+#include <poll.h>
+
+int main() {
+    int listenfd = socket(AF_INET, SOCK_STREAM, 0);
+
+    struct pollfd fds[1024];
+    fds[0].fd = listenfd;
+    fds[0].events = POLLIN;  // 监控可读事件
+
+    int nfds = 1;
+    int timeout = 5000;  // 5 秒
+
+    while (1) {
+        int ready = poll(fds, nfds, timeout);
+
+        if (ready < 0) {
+            perror("poll error");
+            break;
+        }
+
+        if (ready == 0) {
+            // timeout
+            continue;
+        }
+
+        if (fds[0].revents & POLLIN) {
+            int connfd = accept(listenfd, NULL, NULL);
+
+            // 添加到 pollfd 数组
+            fds[nfds].fd = connfd;
+            fds[nfds].events = POLLIN;
+            nfds++;
+        }
+
+        // 检查其他 fd...
+    }
+
+    return 0;
+}
+```
+
+### 3.3 poll 的改进
+
+```
+poll vs select：
+
+改进：
+- 没有 fd 数量限制（数组大小可控）
+- 使用 pollfd 结构，语义更清晰
+
+仍然存在的问题：
+- 每次调用都要重建 pollfd 数组
+- 每次都要把数组复制到内核态
+- 仍然需要全量遍历找出就绪的 fd
+```
+
+---
+
+## 四、epoll 详解
+
+### 4.1 API
+
+```c
+#include <sys/epoll.h>
+
+// 创建 epoll 实例
+int epoll_create(int size);      // size 已被忽略，只需 > 0
+int epoll_create1(int flags);    // EPOLL_CLOEXEC
+
+// 注册/修改/删除要监控的 fd
+int epoll_ctl(int epfd,
+              int op,
+              int fd,
+              struct epoll_event *event);
+
+// 等待事件
+int epoll_wait(int epfd,
+               struct epoll_event *events,
+               int maxevents,
+               int timeout);
+
+// epoll_event 结构
+struct epoll_event {
+    uint32_t events;    // 监控的事件
+    epoll_data_t data;  // 用户数据
+};
+
+typedef union epoll_data {
+    void *ptr;
+    int fd;
+    uint32_t u32;
+    uint64_t u64;
+} epoll_data_t;
+```
+
+### 4.2 使用示例
+
+```c
+#include <stdio.h>
+#include <sys/epoll.h>
+
+int main() {
+    // 1. 创建 epoll 实例
+    int epfd = epoll_create1(EPOLL_CLOEXEC);
+
+    // 2. 添加监听 socket
+    int listenfd = socket(AF_INET, SOCK_STREAM, 0);
+    struct epoll_event ev;
+    ev.events = EPOLLIN;       // 监控可读事件
+    ev.data.fd = listenfd;
+    epoll_ctl(epfd, EPOLL_CTL_ADD, listenfd, &ev);
+
+    // 3. 事件循环
+    struct epoll_event events[1024];
+
+    while (1) {
+        int ready = epoll_wait(epfd, events, 1024, -1);  // 阻塞等待
+
+        for (int i = 0; i < ready; i++) {
+            int fd = events[i].data.fd;
+
+            if (fd == listenfd) {
+                // 新连接
+                int connfd = accept(listenfd, NULL, NULL);
+                ev.events = EPOLLIN;
+                ev.data.fd = connfd;
+                epoll_ctl(epfd, EPOLL_CTL_ADD, connfd, &ev);
+
+            } else if (events[i].events & EPOLLIN) {
+                // 可读事件
+                char buf[1024];
+                int n = read(fd, buf, sizeof(buf));
+                if (n > 0) {
+                    write(fd, buf, n);  // echo
+                } else {
+                    close(fd);
+                    epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+                }
+            }
+        }
+    }
+
+    close(epfd);
+    return 0;
+}
+```
+
+### 4.3 epoll 的优势
+
+```
+epoll 的三大优势：
+
+优势一：fd 数量无限制
+- 使用红黑树管理 fd
+- 可以监控百万级 fd
+
+优势二：fd 注册一次
+- epoll_ctl 注册 fd
+- 跨调用保留，无需每次重建
+- 只在首次注册时复制到内核态
+
+优势三：只返回已就绪的 fd
+- epoll_wait 只返回已就绪的 fd
+- 避免全量遍历
+- 时间复杂度 O(就绪数量)
+
+整体性能：epoll ≈ O(就绪数量)
+select/poll = O(最大 fd 数)
+```
+
+---
+
+## 五、LT vs ET
+
+### 5.1 模式说明
+
+| 模式 | 全称 | 说明 |
+|------|------|------|
+| LT | Level Trigger（水平触发） | 条件满足时，每次 wait 都返回 |
+| ET | Edge Trigger（边缘触发） | 状态变化时，只返回一次 |
+
+### 5.2 LT 模式
+
+```
+LT 模式行为：
+
+1. fd 可读时，每次 epoll_wait 都返回
+2. 即使你不读取数据，下次调用仍会返回
+3. fd 变为可读时，触发一次
+
+示例：
+fd 可读
+→ epoll_wait 返回（第一次）
+→ 不读取数据
+→ epoll_wait 返回（第二次）  ← LT 重复通知
+```
+
+### 5.3 ET 模式
+
+```
+ET 模式行为：
+
+1. fd 状态变化时，只触发一次
+2. 必须一次性处理完所有数据
+3. 如果还有数据未读，下次不会通知
+
+示例：
+fd 可读
+→ epoll_wait 返回（第一次）
+→ 不读取数据
+→ epoll_wait 不返回（数据还在） ← ET 不重复通知
+→ 读取完所有数据
+→ 新数据到来
+→ epoll_wait 返回（第二次）
+
+ET 模式的优势：
+- 减少不必要的事件通知
+- 更高效
+```
+
+### 5.4 ET 模式示例
+
+```c
+// ET 模式必须用非阻塞 IO，并一次性读完所有数据
+int set_nonblocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+void handle_client(int fd) {
+    set_nonblocking(fd);  // ET 必须非阻塞
+
+    struct epoll_event ev;
+    ev.events = EPOLLIN | EPOLLET;  // 边缘触发
+    ev.data.fd = fd;
+    epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev);
+}
+
+void handle_read(int fd) {
+    char buf[1024];
+    while (1) {
+        int n = read(fd, buf, sizeof(buf));
+        if (n > 0) {
+            // 处理数据
+        } else if (n == 0) {
+            // 连接关闭
+            break;
+        } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            // 数据已读完，下次可读时再处理
+            break;
+        } else {
+            // 错误
+            break;
+        }
+    }
+}
+```
+
+---
+
+## 六、惊群问题
+
+### 6.1 什么是惊群
+
+```
+惊群问题（Thundering Herd）：
+
+当多个进程/线程等待同一个事件时，
+事件发生后，所有等待的进程/线程都被唤醒，
+但只有一个能成功处理，其他的都白跑一趟。
+
+场景：
+- Nginx 多进程 accept
+- accept 锁竞争
+```
+
+### 6.2 accept 惊群
+
+```
+Linux 2.6 之前的 accept 惊群：
+
+进程 A  ─┐
+进程 B  ─┼─→ accept(listenfd) → 内核唤醒所有进程
+进程 C  ─┘
+           → 只有 A 成功，其他白唤醒
+
+Linux 2.6 已修复：
+- EPOLLEXCLUSIVE 选项（Linux 4.5+）
+- 引入 EPOLL_RDHUP 等新事件
+```
+
+### 6.3 epoll_wait 惊群
+
+```
+epoll_wait 惊群：
+
+多个进程监控同一个 epoll fd
+有事件时，所有进程都被唤醒
+
+解决方案：
+- 使用互斥锁
+- EPOLLEXCLUSIVE（Linux 4.5+）
+- 使用 SO_REUSEPORT
+```
+
+---
+
+## 七、实战应用
+
+### 7.1 Redis 中的 epoll
+
+```java
+// Redis 中的 epoll 使用（简化版）
+public class RedisEventLoop {
+    private int epfd;
+    private Selector selector;
+
+    public void create() {
+        // Linux 使用 epoll
+        epfd = Epoll.epoll_create(1024);
+
+        // 注册事件
+        Epoll.epoll_ctl(epfd, Epoll.EPOLL_CTL_ADD, fd,
+                        Epoll.EPOLLIN | Epoll.EPOLL_CTL_MOD);
+    }
+
+    public void eventLoop() {
+        while (true) {
+            // 等待事件
+            int numEvents = Epoll.epoll_wait(epfd, events, 1024, -1);
+
+            for (int i = 0; i < numEvents; i++) {
+                int fd = events[i].data.fd;
+
+                if ((events[i].events & Epoll.EPOLLIN) != 0) {
+                    // 处理可读事件
+                    handleRead(fd);
+                }
+
+                if ((events[i].events & Epoll.EPOLLOUT) != 0) {
+                    // 处理可写事件
+                    handleWrite(fd);
+                }
+            }
+        }
+    }
+}
+```
+
+### 7.2 Nginx 中的 epoll
+
+```nginx
+# Nginx 配置 worker 数量
+worker_processes auto;
+
+events {
+    worker_connections 10240;
+    use epoll;  # Linux 使用 epoll
+    multi_accept on;
+}
+```
+
+---
+
+## 八、面试题精讲
+
+### 🔴 【高频】select、poll、epoll 区别
+
+**问题**：select、poll、epoll 有什么区别？
+
+**标准答案**：
+
+```
+select：
+- 使用 bitmap 存储 fd，fd 数量限制（通常 1024）
+- 每次调用都要重建 bitmap 并复制到内核态
+- 返回后需要全量遍历找出就绪的 fd
+- 时间复杂度 O(n)
+
+poll：
+- 使用 pollfd 数组存储 fd，没有数量限制
+- 每次调用都要重建数组并复制到内核态
+- 返回后仍需全量遍历
+- 时间复杂度 O(n)
+
+epoll：
+- 使用红黑树管理 fd，无数量限制
+- fd 注册一次，跨调用保留
+- 只返回已就绪的 fd
+- 时间复杂度 O(就绪数量)
+
+性能：epoll > poll > select
+跨平台：select/poll > epoll
+```
+
+### 🟡 【中频】LT 和 ET 模式区别
+
+**问题**：epoll 的 LT 和 ET 模式有什么区别？
+
+**标准答案**：
+
+```
+LT（水平触发）：
+- fd 条件满足时，每次 epoll_wait 都返回
+- 即使不处理，下次调用仍会返回
+- 简单，不容易遗漏事件
+- 可能导致大量重复通知
+
+ET（边缘触发）：
+- fd 状态变化时，只返回一次
+- 必须一次性处理完所有数据
+- 高效，减少不必要的通知
+- 必须配合非阻塞 IO 使用
+
+选择建议：
+- 一般使用 LT（更简单）
+- 高性能场景使用 ET（更高效）
+```
+
+### 🟡 【中频】epoll 优势
+
+**问题**：为什么 epoll 性能更好？
+
+**标准答案**：
+
+```
+epoll 性能更好的原因：
+
+1. fd 管理方式
+   - select/poll：每次调用都要重建 fd 集合
+   - epoll：fd 注册一次，红黑树持久化管理
+
+2. fd 复制
+   - select/poll：每次调用都要从用户态复制到内核态
+   - epoll：只复制一次
+
+3. 返回结果
+   - select/poll：返回后要遍历所有 fd 找出就绪的
+   - epoll：只返回已就绪的 fd
+
+4. fd 数量
+   - select：通常 1024
+   - poll/epoll：无限制
+```
+
+---
+
+## 九、常见陷阱与易错点
+
+### ⚠️ 陷阱一：忘记处理 EPOLLHUP 和 EPOLLERR
+
+```c
+// 必须处理异常事件
+if (events[i].events & (EPOLLHUP | EPOLLERR)) {
+    close(fd);  // 对方关闭或错误
+}
+```
+
+### ⚠️ 陷阱二：ET 模式下阻塞 IO
+
+ET 模式必须配合非阻塞 IO，否则可能导致永久阻塞。
+
+### ⚠️ 陷阱三：忘记删除已关闭的 fd
+
+fd 关闭后要调用 epoll_ctl(EPOLL_CTL_DEL)，否则可能出问题。
+
+### ⚠️ 陷阱四：混淆 EPOLLIN 和 EPOLLOUT
+
+| 事件 | 含义 |
+|------|------|
+| EPOLLIN | fd 可读（accept 或 read 不会阻塞） |
+| EPOLLOUT | fd 可写（write 不会阻塞） |
+
+---
+
+## 十、对比总结
+
+### select/poll/epoll 对比
+
+| 维度 | select | poll | epoll |
+|------|--------|------|-------|
+| 底层结构 | bitmap | 数组 | 红黑树 + 链表 |
+| fd 数量 | 1024 | 无限制 | 无限制 |
+| fd 复制 | 每次复制 | 每次复制 | 只复制一次 |
+| 遍历方式 | 全量 | 全量 | 只遍历就绪 |
+| 时间复杂度 | O(n) | O(n) | O(1) |
+| 触发模式 | LT | LT | LT + ET |
+| 跨平台 | 所有平台 | 所有平台 | Linux only |
+| fd 修改 | 重建整个集合 | 重建整个数组 | 直接修改 |
+
+### LT vs ET 对比
+
+| 维度 | LT（水平触发） | ET（边缘触发） |
+|------|----------------|----------------|
+| 通知次数 | 条件满足时每次都通知 | 只通知一次 |
+| 实现复杂度 | 低 | 高 |
+| 配合 IO | 阻塞或非阻塞都行 | 必须非阻塞 |
+| 性能 | 中 | 高 |
+
+---
+
+## 十一、扩展思考
+
+### 💡 加分话题：io_uring
+
+```
+io_uring 是 Linux 5.1 引入的新异步 IO 接口：
+
+优势：
+- 支持真正的异步 IO（读写都异步）
+- 零拷贝（与内核共享缓冲区）
+- 比 epoll 更高效
+
+API：
+- 两个 ring buffer：Submission Queue 和 Completion Queue
+- 提交 IO 请求到 SQ
+- 从 CQ 获取完成结果
+```
+
+### 💡 加分话题：kqueue（macOS/FreeBSD）
+
+```
+kqueue 是 macOS 和 FreeBSD 的 IO 多路复用实现：
+
+优势：
+- 功能比 epoll 更强大
+- 支持文件 IO、信号、定时器等
+- 可以监控目录变化
+
+API：
+kqueue()
+kevent()  // 同时用于注册和等待
+
+与 epoll 对比：
+- epoll：监控 fd
+- kqueue：监控各种事件
+```
+
+> select/poll/epoll 是 IO 多路复用的三种实现。epoll 以其 O(1) 的时间复杂度和百万级的 fd 支持，成为高性能服务器的首选。理解它们的工作原理和适用场景，才能在系统设计时做出正确的选择。
