@@ -8,6 +8,7 @@ import { pluginSass } from '@rsbuild/plugin-sass';
 import mermaid from 'rspress-plugin-mermaid';
 import { nav } from './theme_config/nav';
 import { sidebar } from './theme_config/sidebar';
+import { transformerNotationHighlight } from '@shikijs/transformers';
 
 // ==============================================
 // 经常变化的配置（站点信息、SEO、导航、社交链接等）
@@ -145,11 +146,11 @@ export default defineConfig({
   // ==============================================
   themeConfig: {
 
-    // // 顶部导航栏配置
-    // nav: nav,
+    // 顶部导航栏配置
+    nav: nav,
 
-    // // 侧边栏配置
-    // sidebar: sidebar,
+    // 侧边栏配置
+    sidebar: sidebar,
 
     /**
      * 搜索框开关
@@ -214,6 +215,9 @@ export default defineConfig({
      * false：隐藏代码块行号
      */
     showLineNumbers: true,
+    shiki: {
+      transformers: [transformerNotationHighlight()],
+    },
   },
 
   // ==============================================

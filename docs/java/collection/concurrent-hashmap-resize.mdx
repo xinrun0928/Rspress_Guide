@@ -1,0 +1,525 @@
+---
+title: ConcurrentHashMap 扩容机制深度解析
+description: 从一道面试题出发，逐层拆解 ConcurrentHashMap 的扩容触发条件、JDK7/JDK8扩容机制差异、并发扩容实现原理与生产调优。
+---
+
+## 开场
+
+候选人张伟（五年经验，P6面试）在面试字节跳动的第二轮技术面时，被问到："ConcurrentHashMap 在什么情况下会触发扩容？"
+
+他回答："当元素数量超过阈值时触发扩容，阈值是 `capacity * loadFactor`。"
+
+面试官点点头，继续追问："那 JDK8 的多线程并发扩容是怎么实现的？"
+
+张伟停顿了三秒，小声说："好像是...多个线程一起协助扩容？"
+
+面试官没说话，在笔记本上记了点什么。
+
+后来张伟查了资料才发现，这道题他只拿到40分——扩容机制是 ConcurrentHashMap 最有技术含量的部分之一，很多工作三年的候选人都说不清楚。
+
+---
+
+## 一、扩容触发条件 🔴
+
+### 1.1 问题拆解
+
+先搞清楚一个问题：ConcurrentHashMap 在什么情况下会触发扩容？
+
+### 1.2 ❌ 错误示范
+
+**候选人原话**：
+> "当 size 超过 capacity * loadFactor 时触发扩容。"
+
+**问题诊断**：
+- 把 HashMap 的扩容逻辑直接套用到 ConcurrentHashMap
+- 没有意识到 ConcurrentHashMap 是分段统计的
+- 不理解 `sizeCtl` 的多重语义
+
+### 1.3 标准回答
+
+ConcurrentHashMap 的扩容触发有三种情况：
+
+**第一种：put 后检查**
+
+```java
+// ConcurrentHashMap addCount 方法
+private final void addCount(long x, int check) {
+    CounterCell[] as = counterCells;
+    long b = baseCount;
+    // CAS 更新 baseCount
+    if (as != null || !casBaseCount(b, b + x)) {
+        // counterCells 数组计数
+    }
+
+    // check > 0 说明需要检查是否扩容
+    if (check >= 0) {
+        Node<K,V>[] tab, nt;
+        int n, sc;
+        // [!code highlight] 触发扩容的条件
+        while (sizeCtl > (n = tab.length)) {
+            // 触发扩容
+        }
+    }
+}
+```
+
+**第二种：链表树化时检查**
+
+```java
+// treeifyBin 方法
+private final void treeifyBin(Node<K,V>[] tab, int index) {
+    Node<K,V> b = tabAt(tab, index);
+    if (b != null) {
+        if (b.length >= TREEIFY_THRESHOLD) {
+            // 如果桶内节点 >= 8，尝试树化
+            // 但如果数组太小，先扩容再树化
+            if (tab == null || (n = tab.length) < MIN_TREEIFY_CAPACITY)
+                // [!code highlight] 数组 < 64 时优先扩容
+                tryPresize(n << 1);
+        }
+    }
+}
+```
+
+> [!warning]
+> 注意：当数组大小小于 64 时，即使链表长度达到 8，也会优先扩容而不是树化。这是因为小数组扩容能更快分散元素，比树化代价更小。
+
+**第三种：协助扩容（helpTransfer）**
+
+```java
+// 某个线程 put 时发现正在扩容，协助扩容
+final V putVal(K key, V value, boolean onlyIfAbsent) {
+    // ...
+    else if ((fh = f.hash) == MOVED)
+        // [!code highlight] 协助扩容完成后，再重试
+        tab = helpTransfer(tab, f);
+    // ...
+}
+```
+
+【面试官心理】
+
+面试官问扩容触发条件时，他真正想知道的是：
+1. 你有没有注意到 JDK8 的 `tryPresize` 方法
+2. 你知不知道数组小于 64 时的特殊处理
+3. 你能不能说清楚"协助扩容"这个机制
+
+---
+
+## 二、JDK7 vs JDK8 扩容机制对比 🟡
+
+### 2.1 问题拆解
+
+JDK7 和 JDK8 的扩容机制完全不同，这背后是什么设计权衡？
+
+### 2.2 标准回答
+
+**JDK7：Segment 分段扩容**
+
+```java
+// JDK7 ConcurrentHashMap
+public class ConcurrentHashMap<K, V> {
+    final Segment<K,V>[] segments;
+
+    static final class Segment<K,V> extends ReentrantLock {
+        transient volatile HashEntry<K,V>[] table;
+    }
+
+    // 扩容只影响单个 Segment
+    final void rehash(HashEntry<K,V> node) {
+        // 锁住这个 Segment
+        lock();
+        try {
+            // 扩容这个 Segment 内的 table
+            Entry<K,V>[] newTable = new Entry[newCapacity];
+            // 迁移数据...
+        } finally {
+            unlock();
+        }
+    }
+}
+```
+
+JDK7 的扩容是**分段**的，每个 Segment 独立扩容，锁住一个 Segment 时其他 Segment 仍可用。
+
+**JDK8：去掉了 Segment，改用全场并发扩容**
+
+```java
+// JDK8 核心状态变量
+private transient volatile int sizeCtl;      // 主控标志
+private transient volatile int transferIndex; // 下一个待迁移桶的索引
+private transient int cellsBusy;              // 初始化 CounterCells 的锁
+```
+
+| 变量 | 语义 |
+|------|------|
+| `sizeCtl < 0` | 正在扩容，`-(1 + n)` 表示有 n 个线程在协助扩容 |
+| `sizeCtl == 0` | 未初始化，使用默认值 |
+| `sizeCtl > 0` | 扩容阈值，或初始化容量 |
+| `transferIndex > 0` | 还有桶等待迁移 |
+
+【架构权衡】
+
+JDK8 为什么要废除 Segment 的分段扩容？
+
+| 问题 | JDK7 Segment | JDK8 CAS+synchronized |
+|------|--------------|------------------------|
+| 内存开销 | 每个 Segment 独立对象 | 整个数组一次扩容 |
+| 并发度 | 固定（创建时确定） | 动态，多线程协助 |
+| 热门桶 | 仍是瓶颈 | 可被其他线程协助迁移 |
+| 实现复杂度 | 两层 Map | 一层 Map，更简单 |
+
+---
+
+## 三、JDK8 并发扩容核心流程 🔴
+
+### 3.1 问题拆解
+
+JDK8 的并发扩容是怎么实现的？多个线程如何分工？
+
+### 3.2 标准回答
+
+**扩容入口：tryPresize**
+
+```java
+// JDK8 ConcurrentHashMap
+private final void tryPresize(int size) {
+    // 计算目标容量：>= size * 1.5
+    int c = (size >= (MAXIMUM_CAPACITY >>> 1)) ? MAXIMUM_CAPACITY :
+            tableSizeFor(size + (size >>> 1) + 1);
+
+    int sc;
+    // [!code highlight] 如果 sizeCtl >= 0，说明没有线程在扩容
+    while ((sc = sizeCtl) >= 0) {
+        Node<K,V>[] tab = table;
+        int n = tab.length;
+
+        if (c <= sc || n >= MAXIMUM_CAPACITY)
+            break;  // 不需要扩容
+
+        if (tab == table) {
+            // 计算扩容戳记：sc 高位取反，再减1
+            // 如 sc=0x7fffffff，则 rs=0x80000001
+            int rs = resizeStamp(n);
+
+            if (sc < 0) {
+                // 已经有线程在扩容
+                Node<K,V>[] nt;
+                // 检查是否可以协助扩容
+                if (sc >>> RESIZE_STAMP_SHIFT != rs)
+                    break;  // 戳记不匹配，不参与
+                if (nt = nextTable)
+                    // 等待扩容完成或协助
+                    break;
+            }
+            // [!code highlight] 首次触发：设置 sizeCtl
+            else if (casSizeCtl(sc, (rs << RESIZE_STAMP_SHIFT) + 2))
+                // 开始扩容，transferIndex = n（从后往前迁移）
+                transfer(tab, null);
+        }
+    }
+}
+```
+
+### 3.3 transfer 核心流程
+
+```java
+// JDK8 扩容核心：transfer
+private final void transfer(Node<K,V>[] tab, Node<K,V>[] nextTab) {
+    int n = tab.length, stride;
+
+    // 每个线程最少迁移 16 个桶
+    if ((stride = (NCPU > 1) ? (n >>> 3) / NCPU : n) < MIN_TRANSFER_STRIDE)
+        stride = MIN_TRANSFER_STRIDE;
+
+    // nextTab == null 说明是首个扩容线程
+    if (nextTab == null) {
+        try {
+            @SuppressWarnings("unchecked")
+            Node<K,V>[] nt = (Node<K,V>[]) new Node[n << 1];  // 2倍容量
+            nextTab = nt;
+        } catch (Throwable ex) {
+            sizeCtl = Integer.MAX_VALUE;
+            return;
+        }
+        nextTable = nextTab;
+        transferIndex = n;  // 从后往前迁移
+    }
+
+    int nextn = nextTab.length;
+
+    // 遍历所有桶进行迁移
+    for (int i = 0, bound = 0;;) {
+        // [!code highlight] 每个线程认领一段 [bound, i) 的桶
+        while (i >= bound || i < 0) {
+            // 认领新任务
+            if (i >= n) {
+                // 迁移完成
+                if (finishing) {
+                    table = nextTable;
+                    sizeCtl = n + (n >>> 1);  // 0.75 * 2n
+                    return;
+                }
+                finishing = true;
+                i = n;  // 再检查一遍高位桶
+            }
+            else if (i < 0) {
+                // bound < 0，说明任务被分配完了，重新认领
+                int m = 0;
+                // [!code highlight] 原子性地获取一段任务
+                if ((m = transferIndex) <= 0)
+                    i = -1;  // 没有更多任务
+                else if (U.compareAndSwapInt(this, TRANSFERINDEX, m,
+                        // 分配 [m-stride, m) 区间
+                        m > stride ? m - stride : 0)) {
+                    bound = m > stride ? m - stride : 0;
+                    i = m - 1;  // i 指向区间末尾
+                }
+            }
+            else {
+                // 处理单个桶
+                Node<K,V> f = tabAt(tab, i);
+                // ...
+            }
+        }
+    }
+}
+```
+
+### 3.4 桶迁移逻辑
+
+```java
+// 单个桶的迁移
+private final void transfer(Node<K,V>[] tab, Node<K,V>[] nextTab) {
+    // ...
+    else {
+        Node<K,V> f = tabAt(tab, i);
+        if (f != null) {
+            // 获取桶头节点的 hash
+            int fh = f.hash;
+            if (fh == MOVED) {
+                // 已经被其他线程迁移过了
+                i = -1;
+            }
+            else {
+                synchronized (f) {
+                    // [!code highlight] 锁住桶，开始迁移
+                    if (tabAt(tab, i) == f) {
+                        Node<K,V> ln, hn;  // low node, high node
+                        if (fh >= 0) {
+                            // 普通链表节点
+                            int runBit = fh & n;  // n = 旧容量
+                            // 分裂链表
+                            for (Node<K,V> p = f; p != null; p = p.next) {
+                                int b = p.hash & n;
+                                if (b != runBit) {
+                                    runBit = b;
+                                    hn = p;
+                                }
+                                else {
+                                    ln = p;
+                                }
+                            }
+                            // 迁移到 nextTab
+                            // 尾插法，防止链表反转
+                            setTabAt(nextTab, i, ln);
+                            setTabAt(nextTab, i + n, hn);
+                        }
+                        // 红黑树迁移类似...
+                        setTabAt(tab, i, new ForwardingNode<K,V>(nextTab));
+                    }
+                }
+            }
+        }
+    }
+    // ...
+}
+```
+
+【直观类比】
+
+可以把 ConcurrentHashMap 扩容比作**仓库搬迁**：
+
+- 旧仓库有 N 个货架，新仓库有 2N 个货架
+- 每个货架（桶）有一队货物（链表节点）
+- 搬迁时，先锁住一个货架，把货物分成两队：`hash & N == 0` 的留在原位附近，`!= 0` 的搬到对面货架
+- 多个搬迁队同时工作，每队负责一段货架
+- 搬迁完成后，在旧货架放一个"已搬迁"牌子（ForwardingNode）
+
+---
+
+## 四、核心状态变量解析 🟡
+
+### 4.1 sizeCtl 的多重语义
+
+```java
+// ConcurrentHashMap 核心状态变量
+private transient volatile int sizeCtl;
+```
+
+`sizeCtl` 是 ConcurrentHashMap 最核心的状态变量，它在不同阶段代表不同含义：
+
+| 值 | 语义 | 说明 |
+|---|---|---|
+| `0` | 未初始化 | 使用默认容量 16 |
+| `> 0` | 扩容阈值 | `capacity * loadFactor` 或初始化容量 |
+| `< 0 & ~(MAX_RESIZERS)` | 正在扩容 | `-2` 表示 1 个线程在扩容，`-(n+1)` 表示 n 个线程 |
+| `< 0 & MAX_RESIZERS` | 正在初始化 | `-1` 表示正在初始化 |
+
+```java
+// resizeStamp 计算
+static final int resizeStamp(int n) {
+    // n 是 2 的幂次，返回一个戳记
+    // 例如 n=16，返回 0x80010000 | (Integer.numberOfLeadingZeros(n))
+    return Integer.numberOfLeadingZeros(n) | (1 << (RESIZE_STAMP_SHIFT - 1));
+    // RESIZE_STAMP_SHIFT = 16
+    // 所以 16 对应的戳记是 0x80010000 | 27 = 0x8001001b
+}
+```
+
+### 4.2 CounterCell 并发计数
+
+```java
+// 并发计数：避免 CAS 竞争
+private final void addCount(long x, int check) {
+    CounterCell[] as = counterCells;
+    long b = baseCount;
+
+    // 尝试 CAS 更新 baseCount
+    if (as != null || !casBaseCount(b, b + x)) {
+        if (as == null || as.length == 0)
+            // 首次：初始化 CounterCells
+            initCounterCells();
+
+        long c = b + x;
+        // 更新 CounterCell
+        // ...
+    }
+
+    // 检查是否需要扩容
+    if (check >= 0) {
+        // ...
+    }
+}
+```
+
+> [!tip]
+> size() 方法通过 `baseCount + sum(counterCells)` 计算，避免了全局 CAS 的性能瓶颈。
+
+---
+
+## 五、生产避坑 🟡
+
+### 5.1 扩容期间的性能问题
+
+> [!warning]
+> **典型事故**：某服务在促销高峰期大量请求超时，排查发现是 ConcurrentHashMap 扩容导致的请求阻塞。
+
+**问题分析**：
+- ConcurrentHashMap 扩容期间，get 操作可以正常进行（读旧表或新表）
+- 但 put 操作在发现 `MOVED` 标记后，必须等待协助扩容完成
+- 如果扩容线程不足，请求会堆积
+
+**排查路径**：
+
+```bash
+# 1. 查看线程状态
+jstack <pid> | grep "ConcurrentHashMap"
+
+# 2. 查看 sizeCtl 值
+# 如果是负数，说明正在扩容
+# 例如 sizeCtl = -98278145
+# 98278145 >>> 16 = 1499，说明有 1499 个线程在协助扩容
+
+# 3. Arthas 监控
+dashboard -n 5  # 查看线程面板
+```
+
+### 5.2 初始化并发问题
+
+```java
+// 初始化时的并发问题
+private final Node<K,V>[] initTable() {
+    Node<K,V>[] tab; int sc;
+    while ((tab = table) == null || tab.length == 0) {
+        if ((sc = sizeCtl) < 0)
+            Thread.yield();  // 让出 CPU
+        else if (U.compareAndSwapInt(this, SIZECTL, sc, -1)) {
+            // 只有一个线程能进入这里初始化
+            // ...
+        }
+    }
+    return tab;
+}
+```
+
+> [!warning]
+> 初始化时如果多个线程同时竞争，会使用 `Thread.yield()` 让出 CPU，可能导致性能抖动。
+
+### 5.3 扩容与树化的临界点
+
+```java
+// 数组大小 < 64 时，优先扩容
+if (tab == null || (n = tab.length) < MIN_TREEIFY_CAPACITY)
+    tryPresize(n << 1);  // 扩容到 2 倍
+```
+
+**生产建议**：
+- 如果预知数据量大，初始化时设置足够的容量
+- 避免频繁的小容量扩容（每次扩容有复制开销）
+
+---
+
+## 六、级别差异
+
+| 级别 | 期望回答 |
+|------|----------|
+| P5 | 知道 ConcurrentHashMap 能扩容，了解基本的触发条件 |
+| P6 | 能讲清 JDK7/JDK8 的扩容差异，理解 `sizeCtl` 的多重语义，知道协助扩容机制 |
+| P7 | 能画图解释并发扩容流程，理解 CounterCell 的设计初衷，能结合生产案例分析扩容对性能的影响 |
+
+---
+
+## 七、追问链完整脚本
+
+**第一层：基本概念**
+- 面试官问："ConcurrentHashMap 什么情况下会扩容？"
+- 候选人答："元素数量超过阈值时..."
+
+**第二层：触发细节**
+- 面试官追问："JDK8 的扩容阈值是什么？和 HashMap 有什么区别？"
+- 候选人答：...
+- 面试官追问："为什么数组小于 64 时优先扩容而不是树化？"
+- 候选人答：...
+
+**第三层：并发机制**
+- 面试官追问："JDK8 的并发扩容是怎么实现的？多个线程如何分工？"
+- 候选人答："使用 transferIndex 分配任务..."
+- 面试官追问："那 sizeCtl 为负数时代表什么？"
+- 候选人答：...
+
+**第四层：工程视角**
+- 面试官追问："生产环境中，扩容会引发什么问题？怎么排查？"
+- 候选人答：...
+- 面试官追问："你怎么在代码层面避免扩容带来的性能抖动？"
+- 候选人答："预分配容量..."
+
+---
+
+## 【面试官手记】
+
+上周面了一个候选人，简历上写着"精通并发编程"，问到 ConcurrentHashMap 扩容机制时，他说："JDK8 用的是分段锁，和 JDK7 一样。"
+
+我问他："JDK8 不是已经去掉 Segment 了吗？"
+
+他愣了一下，说："哦，那可能是...CAS？"
+
+这道题他只拿到了 20 分。Segment 是 JDK7 的设计，JDK8 早就重写了。说明他看的技术文章可能停留在 5 年前，或者根本没有看过源码。
+
+真正看过 JDK8 源码的候选人，能说清楚：
+1. `sizeCtl` 的 4 种语义
+2. `transferIndex` 如何实现任务分发
+3. `ForwardingNode` 的占位作用
+4. 为什么 JDK8 能支持更多并发线程同时扩容
+
+这四点说出来，面试官对你的印象分会高很多。
