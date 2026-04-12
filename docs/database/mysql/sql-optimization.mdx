@@ -1,0 +1,285 @@
+---
+title: SQL 优化实战案例
+description: 从多个生产优化案例出发，拆解 SQL 优化的思路、步骤与最佳实践。
+---
+
+候选人小李在阿里 P6+ 面试中，面试官问：
+
+"你最近优化过哪些 SQL？说一个具体案例。"
+
+小李说："我优化过一个慢查询，加了索引，从 5 秒降到 200 毫秒。"
+
+面试官追问："怎么定位到这条慢查询的？怎么判断是索引问题？怎么验证优化效果？"
+
+小李支支吾吾答不上来。
+
+【面试官心理】
+这道题我用来测试候选人有没有完整的 SQL 优化经验。能说出"加索引"的占 80%，能讲清楚定位、分析、验证全流程的占 30%。能说出自己压测数据的，基本都是 P6+。
+
+## 一、慢查询定位 🔴
+
+### 1.1 慢查询日志定位
+
+```sql
+-- 开启慢查询日志
+SET GLOBAL slow_query_log = 'ON';
+SET GLOBAL long_query_time = 1;  -- 超过 1 秒记录
+SET GLOBAL log_queries_not_using_indexes = 'ON';
+
+-- 查看慢查询文件
+SHOW VARIABLES LIKE 'slow_query_log_file';
+```
+
+### 1.2 performance_schema 定位
+
+```sql
+-- 开启监控
+UPDATE performance_schema.setup_consumers
+SET enabled = 'YES'
+WHERE name IN ('events_statements_history', 'events_statements_history_long');
+
+-- 查看耗时最长的 SQL
+SELECT
+    DIGEST_TEXT AS sql_text,
+    COUNT_STAR AS exec_count,
+    SUM_TIMER_WAIT / 1000000000000 AS total_time_sec,
+    AVG_TIMER_WAIT / 1000000000000 AS avg_time_sec,
+    SUM_ROWS_EXAMINED AS rows_scanned
+FROM performance_schema.events_statements_summary_by_digest
+ORDER BY SUM_TIMER_WAIT DESC
+LIMIT 10;
+```
+
+### 1.3 APM 工具定位
+
+```yaml
+# SkyWalking 配置
+# 监控 MySQL 慢查询，自动追踪调用链路
+
+# Pinpoint 配置
+# 实时监控 SQL 执行时间
+```
+
+## 二、优化案例一：索引优化 🟡
+
+### 2.1 问题发现
+
+```sql
+-- 慢查询日志发现
+SELECT sql_text, query_time, rows_sent, rows_examined
+FROM mysql.slow_log
+ORDER BY query_time DESC
+LIMIT 1;
+
+-- 输出：
+-- SELECT * FROM orders WHERE user_id = '1001' AND status = 1 ORDER BY create_time DESC LIMIT 20
+-- query_time: 3.521s
+-- rows_examined: 5000000
+-- rows_sent: 20
+```
+
+### 2.2 分析执行计划
+
+```sql
+EXPLAIN SELECT * FROM orders
+WHERE user_id = '1001' AND status = 1
+ORDER BY create_time DESC LIMIT 20;
+```
+
+| id | type | key | rows | Extra |
+| --- | --- | --- | --- | --- |
+| 1 | ALL | NULL | 5000000 | Using where; Using filesort |
+
+问题：全表扫描 500 万行，只返回 20 行。
+
+### 2.3 优化方案
+
+```sql
+-- 分析：
+-- 1. user_id='1001' 的数据量大，需要单独建索引
+-- 2. 需要 ORDER BY create_time，需要覆盖
+-- 3. 需要避免 filesort
+
+-- 建复合索引
+ALTER TABLE orders ADD INDEX idx_user_status_time (
+    user_id, status, create_time DESC
+);
+
+-- 验证优化
+EXPLAIN SELECT * FROM orders
+WHERE user_id = '1001' AND status = 1
+ORDER BY create_time DESC LIMIT 20;
+```
+
+| id | type | key | rows | Extra |
+| --- | --- | --- | --- | --- |
+| 1 | ref | idx_user_status_time | 50 | Using index |
+
+### 2.4 优化效果
+
+```
+优化前：3.521s，扫描 500 万行
+优化后：0.023s，扫描 50 行
+提升：153 倍
+```
+
+## 三、优化案例二：分页优化 🟡
+
+### 3.1 深度分页问题
+
+```sql
+-- 慢查询
+SELECT * FROM orders ORDER BY id LIMIT 1000000, 20;
+-- 扫描 1000020 行，只返回 20 行
+```
+
+### 3.2 优化方案：游标分页
+
+```sql
+-- ✅ 游标分页：利用主键索引定位
+SELECT * FROM orders
+WHERE id > 1000000
+ORDER BY id
+LIMIT 20;
+-- 只扫描 20 行
+
+-- ✅ 游标分页（带条件）
+SELECT * FROM orders
+WHERE id > 1000000 AND status = 1
+ORDER BY id
+LIMIT 20;
+```
+
+### 3.3 优化方案：延迟关联
+
+```sql
+-- ✅ 延迟关联：先查 id，再关联
+SELECT o.*, u.name
+FROM orders o
+INNER JOIN (
+    SELECT id FROM orders
+    ORDER BY id
+    LIMIT 1000000, 20
+) AS t ON o.id = t.id
+JOIN users u ON o.user_id = u.id;
+```
+
+## 四、优化案例三：JOIN 优化 🟡
+
+### 4.1 大表驱动小表
+
+```sql
+-- ❌ 小表驱动大表错误
+SELECT o.id, o.amount, p.name
+FROM orders o
+JOIN products p ON o.product_id = p.id
+WHERE p.category = '手机';
+
+-- products 表 category='手机' 只有 100 条
+-- orders 表有 500 万条
+-- 应该让 products 做驱动表
+
+-- ✅ 小表先过滤
+SELECT o.id, o.amount, p.name
+FROM products p
+JOIN orders o ON o.product_id = p.id
+WHERE p.category = '手机';
+
+-- ✅ 用子查询强制小表驱动
+SELECT o.id, o.amount
+FROM orders o
+WHERE o.product_id IN (
+    SELECT id FROM products WHERE category = '手机'
+);
+```
+
+### 4.2 避免 SELECT *
+
+```sql
+-- ❌ SELECT * 导致回表
+SELECT * FROM orders o
+JOIN users u ON o.user_id = u.id
+WHERE o.user_id = '1001';
+
+-- ✅ 只查需要的字段
+SELECT o.id, o.order_no, o.amount, u.name, u.phone
+FROM orders o
+JOIN users u ON o.user_id = u.id
+WHERE o.user_id = '1001';
+```
+
+## 五、优化案例四：COUNT 优化 🟡
+
+### 5.1 COUNT(*) 慢的问题
+
+```sql
+-- ❌ 全表 COUNT
+SELECT COUNT(*) FROM orders WHERE status = 1;
+-- 需要扫描所有满足条件的行
+```
+
+### 5.2 优化方案
+
+```sql
+-- 方案1：覆盖索引
+SELECT COUNT(*) FROM orders USE INDEX (idx_status);
+-- 减少回表
+
+-- 方案2：维护计数器
+-- 在 Redis 中维护每个状态的订单数量
+-- 更新订单状态时同时更新 Redis
+-- 查询时直接读 Redis，O(1)
+```
+
+```java
+public class OrderService {
+    private RedisTemplate redis;
+
+    public void updateStatus(Long orderId, Integer newStatus) {
+        // 查询原状态
+        Integer oldStatus = orderMapper.getStatus(orderId);
+
+        // 更新数据库
+        orderMapper.updateStatus(orderId, newStatus);
+
+        // 更新计数器
+        redis.opsForHash().increment("order:count", String.valueOf(oldStatus), -1);
+        redis.opsForHash().increment("order:count", String.valueOf(newStatus), 1);
+    }
+
+    public Long countByStatus(Integer status) {
+        Object count = redis.opsForHash().get("order:count", String.valueOf(status));
+        if (count != null) {
+            return Long.valueOf(count.toString());
+        }
+        return orderMapper.countByStatus(status);
+    }
+}
+```
+
+## 六、优化 Checklist 🟡
+
+### 6.1 索引设计
+
+- [ ] WHERE 条件字段有合适索引
+- [ ] ORDER BY 字段在索引中（方向一致）
+- [ ] SELECT 字段在覆盖索引中
+- [ ] 复合索引字段顺序正确
+- [ ] 没有冗余索引
+
+### 6.2 查询优化
+
+- [ ] 避免 SELECT *
+- [ ] 使用 LIMIT 限制返回行数
+- [ ] 避免深度分页（使用游标）
+- [ ] 避免函数和计算在索引列上
+- [ ] 避免隐式类型转换
+
+### 6.3 架构优化
+
+- [ ] 大表定期归档
+- [ ] 读多写少场景使用缓存
+- [ ] 写多读少场景使用批量操作
+
+【面试官心理】
+能说出自己压测数据的候选人很少。如果能说出"优化前 3.5 秒，优化后 23 毫秒，提升 150 倍"，我就会高看一眼。

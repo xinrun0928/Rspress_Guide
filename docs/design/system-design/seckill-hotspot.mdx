@@ -1,0 +1,310 @@
+---
+title: 秒杀系统热点问题处理
+description: 从热点数据探测到隔离策略，从本地缓存到分布式缓存，深入剖析秒杀系统中热点数据问题的完整解决方案。
+---
+
+# 秒杀系统热点问题处理
+
+## 一个热 key 导致全站崩溃
+
+2023年双十一，我们的秒杀系统遇到了一个诡异的问题：商品 A 的 Redis 缓存命中率突然降到 0%，所有请求都打到了数据库。
+
+排查发现：商品 A 是本次秒杀的主推商品，所有用户都在抢它——这是一个**热点数据**。
+
+**秒杀系统的热点问题：如果同一个 key 被高并发访问，Redis 也会扛不住。**
+
+---
+
+## 二、热点数据的识别🔴
+
+### 2.1 热点探测
+
+```java
+@Service
+class HotKeyDetector {
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+
+    private static final String HOT_KEY_PREFIX = "hot:keys:";
+
+    /**
+     * 实时热点探测
+     */
+    public void reportKeyAccess(String key) {
+        String counterKey = HOT_KEY_PREFIX + key;
+        Long count = redisTemplate.opsForValue().increment(counterKey);
+        redisTemplate.expire(counterKey, Duration.ofSeconds(60));
+    }
+
+    /**
+     * 获取热点 key
+     */
+    public Set<String> getHotKeys(int topN) {
+        Set<String> candidates = redisTemplate.keys(HOT_KEY_PREFIX + "*");
+        if (candidates == null) return Collections.emptySet();
+
+        Map<String, Long> counts = new HashMap<>();
+        for (String key : candidates) {
+            String realKey = key.substring(HOT_KEY_PREFIX.length());
+            Long count = Long.parseLong(
+                Objects.requireNonNull(redisTemplate.opsForValue().get(key))
+            );
+            counts.put(realKey, count);
+        }
+
+        return counts.entrySet().stream()
+            .sorted((a, b) -> b.getValue().compareTo(a.getValue()))
+            .limit(topN)
+            .map(Map.Entry::getKey)
+            .collect(Collectors.toSet());
+    }
+}
+```
+
+### 2.2 热点数据标记
+
+```java
+@Service
+class HotDataService {
+    /**
+     * 标记热点 key
+     */
+    public void markHotKey(String key) {
+        String hotKey = "hot:mark:" + key;
+        redisTemplate.opsForValue().set(hotKey, "1", Duration.ofHours(1));
+    }
+
+    /**
+     * 检查是否是热点 key
+     */
+    public boolean isHotKey(String key) {
+        String hotKey = "hot:mark:" + key;
+        return Boolean.TRUE.equals(redisTemplate.hasKey(hotKey));
+    }
+}
+```
+
+---
+
+## 三、热点数据处理策略🔴
+
+### 3.1 本地缓存兜底
+
+```java
+@Service
+class HotDataCacheService {
+    private final Cache<Long, GoodsStock> localCache;
+    private final RedisTemplate<String, String> redisTemplate;
+
+    /**
+     * 热点数据读取：本地缓存优先
+     */
+    public GoodsStock getHotGoods(Long goodsId) {
+        // L1: 本地缓存（Guava/Caffeine）
+        GoodsStock cached = localCache.getIfPresent(goodsId);
+        if (cached != null) {
+            return cached;
+        }
+
+        // L2: Redis
+        String key = "seckill:stock:" + goodsId;
+        String stock = redisTemplate.opsForValue().get(key);
+        if (stock != null) {
+            GoodsStock goods = new GoodsStock(goodsId, Integer.parseInt(stock));
+            localCache.put(goodsId, goods);
+            return goods;
+        }
+
+        // L3: 数据库兜底
+        return loadFromDatabase(goodsId);
+    }
+}
+```
+
+### 3.2 多级缓存架构
+
+```
+L1: JVM 本地缓存（1万条，TTL 10秒）
+    ↓ 未命中
+L2: Redis 集群（热点 key，TTL 30秒）
+    ↓ 未命中
+L3: MySQL（最终数据源）
+```
+
+```java
+@Configuration
+class CacheConfig {
+    @Bean
+    public Cache<Long, GoodsStock> localCache() {
+        return Caffeine.newBuilder()
+            .maximumSize(10000)
+            .expireAfterWrite(Duration.ofSeconds(10))
+            .build();
+    }
+}
+```
+
+### 3.3 热点 key 的 Redis 解决方案
+
+```java
+@Service
+class RedisHotKeyService {
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+
+    /**
+     * 热 key 分散：热点 key 加随机后缀
+     */
+    public void setHotKey(String baseKey, String value) {
+        // 复制到多个 key
+        for (int i = 0; i < 10; i++) {
+            redisTemplate.opsForValue().set(
+                baseKey + ":" + i,
+                value,
+                Duration.ofMinutes(5)
+            );
+        }
+    }
+
+    /**
+     * 读取时随机路由
+     */
+    public String getHotKey(String baseKey) {
+        int shard = ThreadLocalRandom.current().nextInt(10);
+        return redisTemplate.opsForValue().get(baseKey + ":" + shard);
+    }
+}
+```
+
+---
+
+## 四、热数据隔离🟡
+
+### 4.1 独立热点 Redis 集群
+
+```java
+@Configuration
+class HotRedisConfig {
+    @Bean("hotRedisTemplate")
+    public RedisTemplate<String, String> hotRedisTemplate() {
+        // 独立的 Redis 集群，专门处理热点数据
+        RedisStandaloneConfiguration config =
+            new RedisStandaloneConfiguration("hot-redis-master", 6379);
+        return new RedisTemplate<>(new LettuceConnectionFactory(config));
+    }
+}
+
+@Service
+class HotGoodsService {
+    @Autowired
+    @Qualifier("hotRedisTemplate")
+    private RedisTemplate<String, String> hotRedisTemplate;
+
+    public GoodsStock getHotGoods(Long goodsId) {
+        String key = "hot:seckill:" + goodsId;
+        String stock = hotRedisTemplate.opsForValue().get(key);
+        return new GoodsStock(goodsId, Integer.parseInt(stock));
+    }
+}
+```
+
+### 4.2 热点数据预热
+
+```java
+@Configuration
+class HotDataPreheatRunner implements ApplicationRunner {
+    @Autowired
+    private List<HotGoods> hotGoods;
+
+    @Override
+    public void run(ApplicationArguments args) {
+        for (HotGoods goods : hotGoods) {
+            // 提前加载到本地缓存
+            localCache.put(goods.getId(),
+                new GoodsStock(goods.getId(), goods.getStock()));
+
+            // 提前加载到 Redis 热点集群
+            hotRedisTemplate.opsForValue().set(
+                "hot:seckill:" + goods.getId(),
+                String.valueOf(goods.getStock())
+            );
+        }
+    }
+}
+```
+
+---
+
+## 五、生产避坑🟡
+
+### 5.1 缓存击穿
+
+```java
+// ❌ 错误：热点 key 过期时大量请求击穿到数据库
+GoodsStock stock = localCache.getIfPresent(goodsId);
+if (stock == null) {
+    stock = redisTemplate.opsForValue().get("seckill:" + goodsId);
+    if (stock == null) {
+        stock = dao.getStock(goodsId); // 热点数据这里会击穿
+    }
+}
+
+// ✅ 正确：分布式锁保护
+public GoodsStock getStockWithLock(Long goodsId) {
+    String key = "seckill:" + goodsId;
+
+    GoodsStock stock = localCache.getIfPresent(goodsId);
+    if (stock != null) return stock;
+
+    String lockKey = "lock:" + key;
+    String lockValue = UUID.randomUUID().toString();
+
+    if (Boolean.TRUE.equals(
+            redisTemplate.opsForValue().setIfAbsent(lockKey, lockValue,
+                Duration.ofSeconds(5)))) {
+        try {
+            stock = loadFromRedisOrDb(key);
+            localCache.put(goodsId, stock);
+            return stock;
+        } finally {
+            redisTemplate.delete(lockKey);
+        }
+    }
+
+    // 获取锁失败，等待并重试
+    return localCache.getIfPresent(goodsId);
+}
+```
+
+### 5.2 缓存雪崩
+
+```java
+// ❌ 错误：热点 key 同时过期
+redisTemplate.opsForValue().set("seckill:1", "100", Duration.ofHours(1));
+redisTemplate.opsForValue().set("seckill:2", "100", Duration.ofHours(1));
+// 1小时后同时过期，雪崩
+
+// ✅ 正确：过期时间加随机值
+redisTemplate.opsForValue().set(
+    "seckill:" + goodsId,
+    String.valueOf(stock),
+    Duration.ofHours(1).plusSeconds(random.nextInt(300)) // 1小时~1小时5分钟
+);
+```
+
+【架构权衡】
+热点问题的核心是**数据访问不均衡**。解决方案包括：
+1. 本地缓存减少 Redis 压力
+2. 多级缓存提高命中率
+3. 热点隔离到独立集群
+4. 预热避免冷启动
+
+---
+
+## 六、面试总结
+
+| 级别 | 期望回答 |
+|------|----------|
+| P5 | 能说出多级缓存的架构 |
+| P6 | 能说出热点 key 的处理策略 |
+| P7 | 有实际热点数据处理经验 |

@@ -1,0 +1,264 @@
+---
+title: 数据库乐观锁实现分布式锁
+description: 用 version 字段实现无锁检查，剖析乐观锁在分布式场景下的适用场景、ABA 问题与性能陷阱。
+---
+
+## 事故背景
+
+2023年"618"大促当天，我们商品系统的库存表做了这样一个乐观锁更新：
+
+```sql
+UPDATE inventory SET stock = stock - 1 WHERE product_id = 123 AND stock > 0;
+```
+
+听起来很标准，WHERE 条件里限制了 stock > 0，应该不会超卖。
+
+结果大促峰值 QPS 8000 的情况下，库存从 100 变成了 -67。超卖了 167 件。
+
+更诡异的是，这个 SQL 的影响行数始终是 1，没有报任何错。事后复盘才发现问题出在连接池和事务隔离级别上——两个节点的 UPDATE 语句以不同的顺序拿到了数据库的锁，最终都认为自己"成功"了。
+
+乐观锁在单机数据库里是好方案，但在分布式环境下，它的互斥性并不像看起来那么可靠。今天这篇，我们来把数据库乐观锁的原理、坑点和生产实践全部讲透。
+
+## 一、乐观锁的原理
+
+乐观锁的核心思想是：**假设冲突很少发生，先操作后检查**。不上锁，只在提交时检查数据是否被其他事务修改过。
+
+### 版本号机制
+
+```sql
+-- 1. 读取当前版本和数据
+SELECT stock, version FROM inventory WHERE product_id = 123;
+-- 返回: stock=100, version=5
+
+-- 2. 业务逻辑：stock - 1 = 99
+
+-- 3. 更新时检查版本号
+UPDATE inventory
+SET stock = 99, version = version + 1
+WHERE product_id = 123 AND version = 5;
+-- 如果 version 已被其他事务改成 6，则影响行数 = 0
+```
+
+如果 UPDATE 影响行数为 0，说明在读取和更新之间有其他事务修改了数据，需要重试。
+
+### Java 实现
+
+```java
+public boolean deductStock(Long productId, int quantity) {
+    for (int i = 0; i < MAX_RETRY; i++) {
+        // 1. 读取当前库存和版本
+        Inventory inv = inventoryDao.findByProductId(productId);
+        if (inv.getStock() < quantity) {
+            return false; // 库存不足
+        }
+
+        // 2. 执行乐观锁更新
+        int updated = inventoryDao.updateStockWithVersion(
+            productId,
+            inv.getStock() - quantity,
+            inv.getVersion()
+        );
+
+        if (updated > 0) {
+            return true; // 更新成功
+        }
+        // 3. 版本冲突，重试
+        sleep(randomBackoff(i));
+    }
+    return false;
+}
+```
+
+```java
+@Update("UPDATE inventory SET stock = #{newStock}, version = version + 1 " +
+       "WHERE product_id = #{productId} AND version = #{version}")
+int updateStockWithVersion(@Param("productId") Long productId,
+                           @Param("newStock") Integer newStock,
+                           @Param("version") Integer version);
+```
+
+## 二、乐观锁的三个致命问题
+
+### 问题一：高并发下的性能退化
+
+乐观锁在高竞争场景下会退化为"串行重试"。
+
+```java
+// 伪代码：高峰期 10000 QPS 抢 1 件商品
+for (int retry = 0; retry < 10; retry++) {
+    Inventory inv = inventoryDao.findByProductId(productId);
+    int updated = inventoryDao.updateStockWithVersion(
+        productId, inv.getStock() - 1, inv.getVersion()
+    );
+    if (updated > 0) break;
+    Thread.sleep(10); // 重试等待
+}
+```
+
+10000 个并发请求同时读到 version=5，每个都去 UPDATE，然后都失败，都重试。这不是乐观锁，这是"乐观的 DDoS 攻击"。
+
+在大促峰值下，数据库 CPU 直接被打到 100%，不是因为查询慢，而是因为 10000 QPS 的 UPDATE 全部在重试。
+
+【架构权衡】
+
+乐观锁的性能曲线是一个**凹函数**：
+
+```
+性能
+  ^
+  |        * * * * * * * *    ← 高竞争：大量重试，数据库被打爆
+  |      *
+  |     *                     ← 低竞争：几乎没有冲突，性能最好
+  |    *
+  |   *
+  +----------------------------→ 竞争程度
+```
+
+- 竞争率 `< 5%`：乐观锁性能极好，无需任何锁开销
+- 竞争率 `5%~30%`：性能开始明显下降，重试次数增加
+- 竞争率 `> 30%`：严重退化，应该改用悲观锁
+
+:::warning ⚠️
+"618"超卖事故的根因就在这里：10000 QPS 抢 100 件库存，竞争率 100 倍。乐观锁在这种场景下就是灾难。正确的做法是先扣减 Redis 库存做流控，把数据库的 QPS 控制在安全范围内，再用乐观锁做最终一致性校验。
+:::
+
+### 问题二：ABA 问题
+
+```sql
+-- 时间线：
+-- T0: 线程 A 读取 stock=100, version=5
+-- T1: 线程 B 更新 stock=99, version=6
+-- T2: 线程 C 更新 stock=100, version=7（库存退回）
+-- T3: 线程 A 执行 UPDATE WHERE version=5 —— 成功了！
+```
+
+线程 A 读取的数据在 T0~T3 期间被修改了两次（先变成 99，再变回 100），但版本号检查时仍然只看到 version=5，导致 A 认为数据没变。实际上数据已经被改过又改回来了。
+
+在库存场景下，ABA 问题会导致超卖：库存从 100→99→100→99→...，线程 A 和线程 B 都认为自己拿到了库存。
+
+### 问题三：业务侵入性
+
+乐观锁要求业务代码必须处理更新失败后的重试逻辑：
+
+```java
+// 每一个需要原子更新的业务，都要写这段重试逻辑
+for (int i = 0; i < maxRetries; i++) {
+    // 读 → 算 → 写
+    int rows = dao.updateWithVersion(...);
+    if (rows == 1) break;
+    sleep(randomBackoff(i));
+}
+if (i == maxRetries) throw new OptimisticLockException();
+```
+
+一个系统里有 20 个需要原子操作的场景，就要写 20 遍。换个字段名、换个表，又要复制粘贴一遍。这是典型的"重复代码"味道。
+
+## 三、CAS 字段方案
+
+除了 version 字段，还可以基于业务字段本身做 CAS：
+
+### WHERE stock >= quantity
+
+```sql
+UPDATE inventory
+SET stock = stock - #{quantity}
+WHERE product_id = #{productId} AND stock >= #{quantity};
+-- 影响行数为 0 时说明库存不足
+```
+
+这是更简洁的乐观锁形式，不需要额外的 version 字段。问题在于：不适合减库存之外的场景，而且无法处理"先读后写"以外的原子性要求。
+
+### 更新计数器的原子操作
+
+```sql
+-- 扣库存：库存必须足够才允许扣
+UPDATE inventory SET stock = stock - 1 WHERE product_id = 123 AND stock > 0;
+
+-- 退款：库存必须小于最大值才允许加
+UPDATE inventory SET stock = stock + 1 WHERE product_id = 123 AND stock < max_stock;
+```
+
+这种"比较后更新"（Compare-and-Update）的本质是数据库层面的乐观锁。问题回到第一条：当高并发时，大量 UPDATE 返回 0，数据库 CPU 被打爆。
+
+## 四、生产最佳实践
+
+### 分桶设计：化集中为分散
+
+```java
+// 不要：10000 QPS 打一个商品
+// 要：把库存分成 100 个桶，每个桶 1 件
+
+// 分桶映射
+int bucketId = (int)(Thread.currentThread().getId() % 100);
+// 扣减时只操作单个桶
+String key = "inventory:" + productId + ":" + bucketId;
+redis.decr(key);
+
+// 汇总时用 Lua 脚本原子求和
+redis.eval("return redis.call('mget', KEYS)");
+```
+
+分桶设计把一个热点行的竞争，分散到了 100 个不同的数据库行上。竞争率从 10000:1 变成了 100:1，乐观锁的性能问题迎刃而解。
+
+### 异步补偿：最终一致性
+
+```java
+public void placeOrder(Long productId, int quantity) {
+    // 1. Redis 扣减（快速失败）
+    long remain = redis.decr("inventory:" + productId);
+    if (remain < 0) {
+        throw new StockException("库存不足");
+    }
+
+    // 2. 异步落库（高并发下批量处理）
+    orderQueue.offer(new Order(productId, quantity));
+
+    // 3. 后台 Worker 批量消费，用乐观锁做最终一致性
+    //   不再受高 QPS 影响，因为 DB 写的是增量
+}
+```
+
+【架构权衡】
+
+乐观锁 + 分桶 + 异步补偿是应对高并发库存扣减的标准组合：
+
+| 层次 | 作用 | 方案 |
+|------|------|------|
+| 流控层 | 快速过滤过量请求 | Redis 原子扣减 |
+| 持久层 | 保证数据最终一致 | 数据库乐观锁 + 批量写入 |
+| 兜底层 | 防止 Redis 数据不一致 | 定时对账 + 补偿 |
+
+## 五、适用场景总结
+
+乐观锁最适合的场景：
+
+1. **读多写少**：竞争率低于 5%，几乎不需要重试
+2. **短事务**：单个操作耗时 `< 10ms`，冲突窗口小
+3. **对性能敏感**：不想引入外部锁服务（如 Redis、ZooKeeper）
+4. **业务简单**：只需要简单的"比较后更新"语义
+
+```sql
+-- 好的乐观锁场景：库存充足、更新频率低
+UPDATE account SET balance = balance - 100
+WHERE user_id = 123 AND balance >= 100;
+
+-- 坏的乐观锁场景：10000 人抢 1 件商品
+UPDATE inventory SET stock = stock - 1
+WHERE product_id = 456 AND stock > 0;
+```
+
+## 六、工程代价评估
+
+| 维度 | 评估 |
+|------|------|
+| 开发成本 | 低（SQL 写好就行，不需要额外服务） |
+| 运维成本 | 低（数据库是现成的） |
+| 排障复杂度 | 中等（重试风暴会导致数据库 CPU 飙升，但 SQL 日志能定位） |
+| 扩展性 | 差（单库单表是瓶颈，需要分桶或分库分表） |
+| 性能上限 | 低（乐观锁在高竞争下性能急剧下降） |
+
+:::tip 💡
+数据库乐观锁是分布式锁的"最保守方案"——不需要引入任何新技术，用现成的数据库就能实现。但它的代价是性能上限低。在 QPS 超过 5000 的高并发场景下，乐观锁会变成性能瓶颈。记住：高并发 + 乐观锁 = 灾难组合。
+:::
+
+下篇文章我们看数据库悲观锁——用 `SELECT ... FOR UPDATE` 实现分布式锁，看看它能不能解决乐观锁的性能问题。

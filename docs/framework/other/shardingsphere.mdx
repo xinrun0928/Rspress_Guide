@@ -1,0 +1,514 @@
+---
+title: ShardingSphere 分库分表实战
+description: 从一道"分片键怎么选"的面试题出发，深挖 ShardingSphere 的分片策略、主键生成器与数据迁移方案，详解分页查询的坑与生产避坑指南。
+---
+
+候选人小周在面试某互联网公司时，面试官看了他的项目经验"负责订单库拆分"，问道：
+
+"你们的订单库是怎么拆的？按什么字段分的片？"
+
+小周说："按用户 ID 取模分的，拆了16个库，每库16张表。"
+
+面试官追问："为什么是16不是32？取模和哈希分片有什么区别？"
+
+小周说："呃...感觉16差不多够用了..."
+
+面试官追问："那如果用户查自己的订单，要查多少张表？"
+
+小周愣了一下："要查16*16=256张表？"
+
+面试官说："不是。你分片键是用户ID，查用户订单只用查1个分片。换个问题：如果按订单ID分片，用户查订单会怎么样？"
+
+小周答不上来了。
+
+【面试官心理】
+这道题我用来区分"做过拆分"和"理解拆分原理"的候选人。知道按用户ID分的占60%，能讲清楚分片键选择原则的占30%，能说出分片键选错后的查询放大问题的只有10%。分片键的选择是分库分表的核心，这道题能答到最后的，基本都有实际的生产经验。
+
+## 一、分库分表的核心问题 🔴
+
+### 1.1 为什么要分库分表
+
+```java
+// 单库单表的瓶颈：
+// 1. 数据量：单表超过 500 万行，索引效率下降
+// 2. 连接数：MySQL 默认 max_connections = 100，多个业务共享容易打满
+// 3. 写入压力：高并发写入，同一个数据库实例扛不住
+// 4. 存储空间：单盘容量有限
+
+// 分库分表的优势：
+// 1. 数据分散到多个库/表，单表数据量降低
+// 2. 连接数分散到多个库
+// 3. 写入压力分散
+// 4. 可水平扩展
+
+// 分库分表的代价：
+// 1. 跨库查询困难（JOIN、聚合）
+// 2. 分页查询复杂度增加
+// 3. 分布式事务问题
+// 4. 运维复杂度大幅提升
+```
+
+### 1.2 ShardingSphere 的两种模式
+
+```java
+// ShardingSphere-JDBC：轻量级，Java 应用内集成
+// 原理：在 JDBC 层面拦截 SQL，重写后分发到多个数据源
+
+// 优点：性能高（无额外网络开销），配置灵活
+// 缺点：业务代码需要引入 JAR 包，多语言不支持
+
+// ShardingSphere-Proxy：代理层，独立部署
+// 原理：伪装成 MySQL 服务端，拦截客户端 SQL
+
+// 优点：多语言支持，业务代码无侵入
+// 缺点：多一层网络跳转，性能略低
+
+// 架构对比：
+// ShardingSphere-JDBC：
+// 应用 -> ShardingSphere-JDBC（应用内） -> 分片数据库
+
+// ShardingSphere-Proxy：
+// 应用 -> ShardingSphere-Proxy（独立进程） -> 分片数据库
+```
+
+## 二、分片策略详解 🔴
+
+### 2.1 四种标准分片算法
+
+```java
+// ShardingSphere 内置了 4 种标准分片算法
+
+// 1. ModuloShardingAlgorithm（取模分片）
+// 适用于：均匀分布的数据，无明显热点
+// 问题：扩容时数据迁移量大（所有数据需要重新取模）
+
+@Bean
+public AlgorithmConfiguration modAlgorithm() {
+    return new AlgorithmConfiguration("MOD", // 类型
+        new Properties() {{               // 参数
+            setProperty("sharding-count", "16");
+        }});
+}
+
+// 按 order_id % 16 分片
+// 0 -> 库0表0, 1 -> 库0表1, ..., 15 -> 库0表15
+// 16 -> 库1表0, 17 -> 库1表1, ..., 31 -> 库1表15
+```
+
+```java
+// 2. HashModShardingAlgorithm（哈希取模）
+// 和 MOD 类似，但用哈希函数后再取模
+// 适用于：主键不是数字类型
+
+// 3. InlineShardingAlgorithm（行表达式分片）
+// 使用 Groovy 表达式，最灵活但不够类型安全
+
+@Bean
+public AlgorithmConfiguration inlineAlgorithm() {
+    return new AlgorithmConfiguration("INLINE",
+        new Properties() {{
+            setProperty("algorithm-expression", "t_order_${order_id % 4}");
+            setProperty("sharding-count", "4");
+        }});
+}
+
+// 4. VolumeBasedRangeShardingAlgorithm（基于数据量的范围分片）
+// 当分片数据量超过阈值时，自动扩容到下一个分片
+// 适用于：数据量增长可预期的场景
+
+// 关键参数：
+// range-lower: 起始分片
+// range-upper: 结束分片
+// share-table-initial-bytes: 每个分片的初始容量（字节）
+```
+
+### 2.2 标准分片策略：分库 + 分表
+
+```java
+// 场景：16个库，每库4张表
+// 分片键：order_id
+// 分片策略：分库用 order_id % 16，分表用 order_id % 4
+
+@Bean
+public ShardingRuleConfiguration shardingRuleConfiguration() {
+    ShardingRuleConfiguration config = new ShardingRuleConfiguration();
+
+    // 配置数据源
+    config.setDataSourceRules(createDataSourceRules());
+
+    // 配置表规则
+    config.setTables(
+        new TableRuleConfiguration("t_order", // 逻辑表名
+            "ds_${order_id % 16}.t_order_${order_id % 4}") // 实际表名
+    );
+
+    // 配置分片策略
+    config.setDefaultDatabaseShardingStrategyConfiguration(
+        new StandardShardingStrategyConfiguration("order_id", // 分片键
+            "modAlgorithm"));  // 分片算法
+
+    config.setDefaultTableShardingStrategyConfiguration(
+        new StandardShardingStrategyConfiguration("order_id",
+            "modAlgorithm"));
+
+    return config;
+}
+```
+
+### 2.3 分片键的选择原则 🔴
+
+这是面试官最爱追问的点。
+
+```java
+// 分片键选择的核心原则：
+// 1. 查询频率高：分片键必须是高频查询条件
+// 2. 分布均匀：分片键的值分布要足够散列，避免数据倾斜
+// 3. 避免热点：分片键的值不要有明显的时间特征
+// 4. 业务稳定：分片键一旦确定很难更改
+
+// ✅ 最佳选择：主键（ID）
+// 理由：分布均匀、查询频率最高（按ID查）、业务稳定
+
+// ✅ 次优选择：用户ID（按用户维度的查询）
+// 理由：用户查询自己的订单是最常见场景
+// 问题：如果用户量不均匀（如大V），可能产生数据热点
+
+// ❌ 常见错误：按时间分片
+// 按 created_at 分片
+// 问题：近期数据集中在最新分片，产生热点写入
+// 但按时间分片对"查历史数据"友好
+
+// ❌ 常见错误：按订单状态分片
+// 按 status 分片（待支付/已支付/已取消...）
+// 问题：status 值就几种，分片数量受限
+// 而且按状态查订单是低频场景
+```
+
+:::warning ⚠️
+**查询放大问题**是分库分表最常见的翻车点：
+- 按 `order_id` 分片：查单条订单只需查1个分片（最优）
+- 按 `user_id` 分片：查单用户订单只需查1个分片（OK）
+- 按 `status` 分片：查某个用户的待支付订单需要查所有分片（灾难）
+- 不加分片键（扫全部分片）：所有跨分片查询都要扫全部
+
+所以分片键一定要选查询条件中**高频且等值**的字段。
+:::
+
+### 2.4 绑定表：减少 JOIN 时的分片扫描
+
+```java
+// 场景：订单表和订单明细表，通常按 order_id 分片
+// 如果不配置绑定表
+// SELECT o.*, d.* FROM t_order o JOIN t_order_item d ON o.order_id = d.order_id
+// ShardingSphere 会将 o 和 d 分别全分片扫描后再 JOIN
+// 16库 * 4表 * 16库 * 4表 = 4096 次笛卡尔积
+
+// ✅ 配置绑定表
+// t_order 和 t_order_item 都按 order_id 分片
+// 配置后，ShardingSphere 知道它们是绑定关系
+// 自动优化为：o的分片路由到 d 的对应分片
+
+config.setBindingTables(
+    Arrays.asList("t_order,t_order_item")
+);
+
+// 优化后的执行：
+// 查询 order_id = 10086 的订单和明细
+// 自动定位到 ds_6.t_order_2 和 ds_6.t_order_item_2
+// 只扫描1个分片，而不是4096个
+```
+
+## 三、分布式主键生成器 🔴
+
+### 3.1 为什么要自定义主键生成器
+
+```java
+// MySQL 自增主键的问题：
+// 1. 多个分片的主键无法保证全局唯一
+// 2. 分片扩容后，ID 的大小顺序和分片位置无关（不利于范围查询）
+// 3. 分片间 ID 可能冲突
+
+// ❌ 错误示例：各分片用自增ID
+// 库0表0: 1, 2, 3, 4...
+// 库0表1: 1, 2, 3, 4... (和表0冲突！)
+// 库1表0: 1, 2, 3, 4... (和其他所有表冲突！)
+
+// ✅ 正确做法：使用分布式ID生成器
+// 雪花算法（Snowflake）：时间戳 + 机器ID + 序列号
+// UUID：简单但无序，查询效率低
+// 数据库号段模式：一次从数据库批量获取ID
+```
+
+### 3.2 雪花算法的原理
+
+```java
+// 雪花算法：64位整数
+// |符号位(1)| 时间戳(41)| 机器ID(10)| 序列号(12)|
+// = 1 + 41 + 10 + 12 = 64 位
+
+// 时间戳：使用相对时间（相对于某个纪元），可以用约69年
+// 机器ID：最多支持 1024 个节点
+// 序列号：每毫秒最多生成 4096 个 ID
+
+// 优点：趋势递增、性能高
+// 缺点：依赖系统时钟，如果时钟回拨会导致 ID 重复
+
+public class SnowflakeIdGenerator implements ShardingKeyGenerator {
+
+    private final long twepoch = 1609459200000L; // 2021-01-01
+    private final long workerIdBits = 10L;
+    private final long sequenceBits = 12L;
+
+    private final long maxWorkerId = ~(-1L << workerIdBits); // 1023
+    private final long sequenceMask = ~(-1L << sequenceBits); // 4095
+
+    private long workerId;
+    private long sequence = 0L;
+    private long lastTimestamp = -1L;
+
+    @Override
+    public Comparable<?> generateKey() {
+        long timestamp = timeGen();
+
+        if (timestamp < lastTimestamp) {
+            // 时钟回拨，抛异常或等待
+            throw new RuntimeException("Clock moved backwards!");
+        }
+
+        if (timestamp == lastTimestamp) {
+            sequence = (sequence + 1) & sequenceMask;
+            if (sequence == 0) {
+                timestamp = tilNextMillis(lastTimestamp);
+            }
+        } else {
+            sequence = 0L;
+        }
+
+        lastTimestamp = timestamp;
+        return ((timestamp - twepoch) << workerIdBits | sequenceBits) | workerId | sequence;
+    }
+}
+```
+
+### 3.3 时钟回拨问题
+
+```java
+// ❌ 危险场景：NTP 服务异常，时间被回拨
+// 比如：服务器时间从 10:00:00 回拨到 09:59:59
+// 雪花算法会产生重复 ID
+
+// ✅ 解决方案1：等待回拨结束
+if (timestamp < lastTimestamp) {
+    // 等待到 lastTimestamp + 1 毫秒
+    timestamp = lastTimestamp;
+    sequence = (sequence + 1) & sequenceMask;
+}
+
+// ✅ 解决方案2：使用百度UidGenerator
+// 基于 RingBuffer，每秒获取新的时间戳
+// 即使时钟回拨，也只是用旧的 RingBuffer，不影响已生成的ID
+
+// ✅ 解决方案3：使用美团Leaf
+// 双模式：号段模式（不依赖时钟）和雪花模式（依赖时钟）
+// 号段模式：从数据库批量获取ID段（1-1000），用完再获取
+// 优势：完全不依赖时钟，缺点：ID不连续
+```
+
+## 四、分页查询的坑 🔴
+
+### 4.1 跨分片分页的困境
+
+```java
+// 场景：查询所有订单，按创建时间倒序，取第100页，每页10条
+
+// ❌ 不加分片键的查询：
+// ShardingSphere 会查询所有分片（16库 * 4表 = 64个分片）
+// 每个分片返回前 1000 条（共 64000 条）
+// ShardingSphere 再在内存中排序，取第 100 页
+// 问题：分页越深，需要扫描和排序的数据越多
+
+// SQL：
+SELECT * FROM t_order ORDER BY created_at DESC LIMIT 1000, 10
+// ShardingSphere 实际执行了：
+// ds_0: SELECT * FROM t_order_0 ORDER BY created_at DESC LIMIT 1000, 10
+// ds_0: SELECT * FROM t_order_1 ORDER BY created_at DESC LIMIT 1000, 10
+// ... (64 个分片全部执行一遍)
+
+// ✅ 正确做法1：带上分片键，精确路由到单分片
+SELECT * FROM t_order
+WHERE user_id = '12345'
+ORDER BY created_at DESC LIMIT 1000, 10
+// 只需查询 1 个分片
+```
+
+### 4.2 SHARDINGSPHERE-4813：分页问题
+
+```java
+// ShardingSphere 的一个已知 Issue：SHARDINGSPHERE-4813
+// 当使用 ORDER BY 和分页时，如果排序字段不是分片键
+// 分页结果可能不准确
+
+// 问题演示：
+// 逻辑表：t_order (分片键：user_id)
+// 物理表：ds_0.t_order_0, ds_0.t_order_1, ..., ds_1.t_order_0, ...
+
+// 查询第2页（每页10条）
+SELECT * FROM t_order ORDER BY created_at DESC LIMIT 10, 10
+
+// ShardingSphere 的分页逻辑：
+// 1. 每个分片先查出前 20 条（OFFSET 10 + LIMIT 10）
+// 2. 将 64 个分片的 20 条合并到内存
+// 3. 在内存中再次排序，取前 10 条作为第2页
+
+// 问题：不同分片的数据量差异很大
+// ds_0.t_order_0 可能有 10 万条，ds_1.t_order_3 可能只有 100 条
+// 但每个分片都返回前 20 条，导致全局排序不准确
+
+// ✅ 解决方案：使用游标分页（基于主键）
+SELECT * FROM t_order
+WHERE user_id = '12345'
+AND order_id < #{lastOrderId}  -- 上一页最后一条的ID
+ORDER BY order_id DESC
+LIMIT 10
+```
+
+:::warning ⚠️
+分页查询的坑在生产环境中非常容易翻车。用户翻到第100页，结果和第1页的数据完全不在同一个时间范围内。解决方案：尽量带上分片键查询，或者使用"上一页最后一条的ID"做游标分页。
+:::
+
+## 五、数据迁移方案 🟡
+
+### 5.1 全量迁移
+
+```java
+// 阶段1：双写（原库 + 新库同时写入）
+// 应用层改造，写入两份数据
+
+// 阶段2：全量数据同步
+// 使用 Canal 监听 MySQL binlog
+// 将历史数据实时同步到分片库
+
+// 阶段3：校验与补偿
+// 比对原库和分片库的数据一致性
+// 对不一致的数据进行修复
+
+// 阶段4：切换读流量
+// 先切换读流量到分片库
+// 观察一段时间后，切换写流量
+// 最后关闭双写
+```
+
+### 5.2 增量数据同步
+
+```java
+// 使用 ShardingSphere-Scaling 做数据迁移
+// 它会自动：
+// 1. 全量同步历史数据
+// 2. 增量同步（监听 binlog）
+// 3. 数据校验
+// 4. 切流
+
+// 典型流程：
+// java -jar scaling.jar
+// -> 创建迁移任务（指定源库、目标库）
+// -> 自动创建 canal 连接
+// -> 开始全量同步
+// -> 自动开启增量同步（订阅 binlog）
+// -> 数据校验
+// -> 切流
+```
+
+## 六、面试追问链 🟡
+
+### 追问一：分库分表后，跨库 JOIN 怎么处理？
+
+【面试官心理】
+问这个问题的面试官，通常是想看候选人有没有踩过跨库查询的坑。能说出"在应用层聚合"和"ES方案"的，通常有实战经验。
+
+| 方案 | 做法 | 适用场景 | 代价 |
+| --- | --- | --- | --- |
+| 应用层聚合 | 多次查询，应用内 JOIN | 分片键相同的查询 | 多次网络开销 |
+| 广播表 | 将小表同步到所有库 | 维度表 JOIN | 数据一致性问题 |
+| 全局表 | 复制一份到所有分片 | 变化少的配置表 | 存储浪费 |
+| ES/Hive | 将数据同步到搜索/分析引擎 | 复杂查询、报表 | 额外维护成本 |
+
+### 追问二：分片数量怎么确定？
+
+【面试官心理】
+能回答出"先按预估数据量算，预留扩容空间"的候选人，说明他有容量规划意识。我会继续追问："如果预估错了，扩容怎么办？"能说出"一致性哈希扩容"或"4库4表逐步扩容"的，说明他对扩容有实战经验。
+
+常见做法：
+- 单表数据量控制在 500 万以内
+- 分片数量 = 预估总数据量 / 500万 / 库数
+- 预留 2-3 倍的扩容空间
+- 使用 Mod 取模，扩容时需要做数据迁移
+- 使用一致性哈希，扩容时只需迁移部分数据（但查询复杂度增加）
+
+### 追问三：ShardingSphere-Proxy 和 ShardingSphere-JDBC 选哪个？
+
+【面试官心理】
+能权衡出"多语言支持"和"性能"的候选人，说明他有架构视角。
+
+| 维度 | ShardingSphere-JDBC | ShardingSphere-Proxy |
+| --- | --- | --- |
+| 性能 | 高（应用内，无网络开销） | 中（多一层网络） |
+| 多语言 | 否（Java） | 是（MySQL 协议） |
+| 运维 | 低（无额外组件） | 高（独立部署） |
+| 配置热更新 | 否（需重启应用） | 是（可热加载） |
+| 适用规模 | 中小型 | 大型/多语言 |
+
+## 七、常见翻车现场 🔴
+
+### ❌ 翻车点一：分片键选错，导致全分片扫描
+
+```java
+// ❌ 错误：按时间分片，但查询条件不带时间
+@Bean
+public ShardingRuleConfiguration config() {
+    TableRuleConfiguration orderTable = new TableRuleConfiguration(
+        "t_order",
+        "ds_${created_at.toString().substring(0, 7).hashCode() % 16}.t_order_${created_at % 4}"
+        // ❌ 按年月哈希分库，按日分表
+        // 查询不带 created_at 时，要扫所有分片
+    );
+}
+
+// ✅ 正确：按用户ID分片，查询通常带 user_id
+TableRuleConfiguration orderTable = new TableRuleConfiguration(
+    "t_order",
+    "ds_${user_id % 16}.t_order_${user_id % 4}"
+    // 绝大多数查询带 user_id，单分片查询
+);
+```
+
+### ❌ 翻车点二：没有配置分布式事务
+
+```java
+// ❌ 危险：跨分片的操作没有事务保护
+// 操作1：扣减库存（在 ds_0）
+// 操作2：创建订单（在 ds_1）
+// 如果操作2失败，操作1不会回滚
+// 库存扣了，订单没创建
+
+// ✅ 正确：使用 ShardingSphere 的分布式事务
+// 方式1：XA 事务（强一致性，但性能差）
+@Configuration
+public class DataSourceConfiguration {
+    @Bean
+    public DataSource dataSource() {
+        // 使用 XA 模式
+        return DataSourceWrapper.create(
+            shardingDataSource,
+            "XA",
+            new MySQLXAConnectionFactory()
+        );
+    }
+}
+
+// 方式2：柔性事务（最终一致性，性能好）
+// 使用 Seata 的 AT 模式
+// ShardingSphere + Seata 集成
+
+// 方式3：Saga 模式（补偿事务）
+// 适合长事务，性能最好，但一致性最弱
+```

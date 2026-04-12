@@ -1,0 +1,237 @@
+---
+title: Feed流推拉模式对比
+description: 从推模式到拉模式，从混合模式到时间线聚合，深入剖析 Feed 流系统中三种核心架构的优劣对比与选型决策。
+---
+
+# Feed流推拉模式对比
+
+## 三种 Feed 流架构的选择困境
+
+2023年，我们产品经理提出了三个需求：
+
+```
+需求 1：微博式 Feed（用户看到关注的人的动态）
+需求 2：朋友圈式 Feed（用户看到好友的动态）
+需求 3：抖音式 Feed（推荐算法生成的个性化内容）
+```
+
+这三种 Feed 背后是三种完全不同的架构：**推模式、拉模式、混合模式**。
+
+**选错了架构，轻则用户体验差，重则系统崩溃。**
+
+---
+
+## 二、推模式（Push / Write Fanout）🔴
+
+### 2.1 原理
+
+```
+用户 A 发了一条动态：
+
+用户 A ──发布──▶ 数据库
+       │
+       └───推送到──▶ 粉丝的收件箱
+                     │
+        ┌────────────┼────────────┐
+        ▼            ▼            ▼
+    粉丝1收件箱  粉丝2收件箱  粉丝3收件箱
+```
+
+### 2.2 代码实现
+
+```java
+@Service
+class PushFeedService {
+    @Autowired
+    private FeedDao feedDao;
+    @Autowired
+    private FollowService followService;
+    @Autowired
+    private RocketMQTemplate mqTemplate;
+
+    public void publish(Post post) {
+        // 1. 保存帖子
+        postDao.save(post);
+
+        // 2. 异步推送给粉丝（MQ 解耦）
+        mqTemplate.asyncSend("feed:push:topic",
+            new PushMessage(post.getUserId(), post.getId()),
+            new SendCallback() {
+                @Override
+                public void onSuccess(SendResult result) { }
+
+                @Override
+                public void onException(Throwable e) {
+                    // 重试逻辑
+                }
+            }
+        );
+    }
+}
+
+@RocketMQListener(topic = "feed:push:topic")
+class PushConsumer {
+    @Autowired
+    private FeedDao feedDao;
+    @Autowired
+    private FollowService followService;
+
+    public void handle(PushMessage message) {
+        // 查询所有粉丝
+        List<Long> followers = followService.getFollowers(message.getUserId());
+
+        // 批量写入粉丝收件箱
+        for (Long followerId : followers) {
+            feedDao.pushToInbox(followerId, message.getPostId());
+        }
+    }
+}
+```
+
+### 2.3 优缺点
+
+| 优点 | 缺点 |
+|------|------|
+| 读取极快（O(1)） | 写入慢（大V发一条要写 millions 个收件箱） |
+| 用户体验好 | 存储成本高 |
+| 适合粉丝数少的情况 | 大V问题 |
+
+---
+
+## 三、拉模式（Pull / Read Fanout）🔴
+
+### 3.1 原理
+
+```
+用户 A 刷新 Feed：
+
+请求 ──▶ 拉取关注列表（1万用户）
+       ──▶ 分别拉取每个用户的最新动态
+       ──▶ 合并排序
+       ──▶ 返回
+```
+
+### 3.2 代码实现
+
+```java
+@Service
+class PullFeedService {
+    @Autowired
+    private FollowService followService;
+    @Autowired
+    private PostDao postDao;
+
+    public List<Post> getFeed(Long userId, int offset, int limit) {
+        // 1. 获取关注列表
+        List<Long> following = followService.getFollowing(userId);
+
+        // 2. 并行拉取关注的人的动态
+        ExecutorService executor = Executors.newFixedThreadPool(10);
+        List<Future<List<Post>>> futures = following.stream()
+            .map(followerId ->
+                executor.submit(() -> postDao.getRecentPosts(followerId, 100))
+            )
+            .collect(Collectors.toList());
+
+        // 3. 合并结果
+        List<Post> allPosts = futures.stream()
+            .flatMap(f -> {
+                try {
+                    return f.get().stream();
+                } catch (Exception e) {
+                    return Stream.empty();
+                }
+            })
+            .sorted(Comparator.comparing(Post::getCreatedAt).reversed())
+            .skip(offset)
+            .limit(limit)
+            .collect(Collectors.toList());
+
+        return allPosts;
+    }
+}
+```
+
+### 3.3 优缺点
+
+| 优点 | 缺点 |
+|------|------|
+| 写入极快（只写一条） | 读取慢（N 次查询） |
+| 存储成本低 | 无法做到秒开 |
+| 大V无压力 | 用户列表大时查询慢 |
+
+---
+
+## 四、混合模式（Hybrid）🟡
+
+### 4.1 核心思想
+
+```
+推拉结合：
+- 普通用户：推模式（粉丝少，写入可接受）
+- 大V用户：拉模式（粉丝多，写入成本高）
+
+临界点：粉丝数 > 10000 → 切换为拉模式
+```
+
+### 4.2 实现
+
+```java
+@Service
+class HybridFeedService {
+    private static final long PUSH_THRESHOLD = 10_000;
+
+    public void publish(Post post) {
+        // 1. 保存帖子
+        postDao.save(post);
+
+        // 2. 判断是否大V
+        long followerCount = followService.getFollowerCount(post.getUserId());
+
+        if (followerCount < PUSH_THRESHOLD) {
+            // 普通用户：推模式
+            pushToFollowers(post);
+        } else {
+            // 大V：只记录到帖子表，读取时拉取
+            recordToPostTable(post);
+        }
+    }
+
+    public List<Post> getFeed(Long userId, int offset, int limit) {
+        // 1. 从收件箱获取（推模式的内容）
+        List<Post> inboxPosts = feedDao.getInbox(userId, offset, limit);
+
+        // 2. 拉取大V的最新动态
+        List<Long> bigVs = followService.getBigVFollowing(userId);
+        List<Post> bigVPosts = pullFromBigVs(bigVs, offset, limit);
+
+        // 3. 合并去重
+        return mergeAndDedupe(inboxPosts, bigVPosts);
+    }
+}
+```
+
+---
+
+## 五、模式对比决策表🟡
+
+| 场景 | 推荐模式 | 原因 |
+|------|----------|------|
+| 粉丝数少（< 1000） | 推模式 | 写入成本可接受，读取快 |
+| 粉丝数中等（1000~10000） | 混合模式 | 普通用户推，大V拉 |
+| 粉丝数多（> 10000） | 混合模式或拉模式 | 写放大严重 |
+| 微博式（关注驱动） | 推/混合模式 | 内容由关注决定 |
+| 抖音式（推荐驱动） | 拉模式 | 内容由算法决定，无法预推 |
+
+【架构权衡】
+没有最好的架构，只有最适合的架构。微博选择推模式是因为用户发帖频率低、但读取频率高；抖音选择推荐模式是因为内容由算法生成、无法预推。
+
+---
+
+## 六、面试总结
+
+| 级别 | 期望回答 |
+|------|----------|
+| P5 | 能说出推拉模式的基本原理 |
+| P6 | 能分析两种模式的优缺点 |
+| P7 | 能根据场景选择合适的模式 |

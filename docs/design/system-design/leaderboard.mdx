@@ -1,0 +1,295 @@
+---
+title: 排行榜系统设计
+description: 从Redis ZSet到分布式排行，从实时更新到历史快照，深入剖析如何设计支持千万级用户的高性能排行榜系统。
+---
+
+# 排行榜系统设计
+
+## 一个游戏排行榜的故事
+
+2021年，我们游戏团队的排行榜系统被玩家骂了一整天。
+
+问题：每天凌晨 3 点排行榜更新时，所有玩家的查询延迟从 10ms 飙升到 5000ms，游戏几乎卡死。
+
+排查发现，凌晨 3 点的定时任务在做全量排名计算：
+
+```sql
+-- 噩梦般的 SQL
+SELECT user_id, score,
+       (SELECT COUNT(*) FROM rankings r2
+        WHERE r2.score > r1.score) + 1 AS rank
+FROM rankings r1
+WHERE game_id = 123
+ORDER BY score DESC
+LIMIT 100;
+```
+
+这个 SQL 在百万玩家表上执行，要 30 秒。
+
+**排行榜系统的核心问题是：如何在大数据量下快速计算排名和获取 Top N？**
+
+---
+
+## 二、Redis Sorted Set🔴
+
+### 2.1 核心操作
+
+```java
+@Service
+class LeaderboardService {
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+
+    /**
+     * 更新玩家分数
+     */
+    public void updateScore(Long gameId, Long userId, double score) {
+        String key = "leaderboard:" + gameId;
+        redisTemplate.opsForZSet().add(key, userId.toString(), score);
+    }
+
+    /**
+     * 获取玩家排名（从 0 开始）
+     */
+    public Long getRank(Long gameId, Long userId) {
+        String key = "leaderboard:" + gameId;
+        Long rank = redisTemplate.opsForZSet().reverseRank(key, userId.toString());
+        return rank != null ? rank + 1 : null; // 转为从 1 开始
+    }
+
+    /**
+     * 获取 Top N
+     */
+    public List<LeaderboardEntry> getTopN(Long gameId, int n) {
+        String key = "leaderboard:" + gameId;
+
+        // ZREVRANGE 返回分数最高的 n 个
+        Set<ZSetOperations.TypedTuple<String>> results =
+            redisTemplate.opsForZSet().reverseRangeWithScores(key, 0, n - 1);
+
+        return results.stream()
+            .map(t -> new LeaderboardEntry(
+                Long.parseLong(t.getValue()),
+                t.getScore()
+            ))
+            .collect(Collectors.toList());
+    }
+
+    /**
+     * 获取玩家周围的玩家（附近排名）
+     */
+    public List<LeaderboardEntry> getAround(Long gameId, Long userId, int range) {
+        String key = "leaderboard:" + gameId;
+
+        Long rank = redisTemplate.opsForZSet().reverseRank(key, userId.toString());
+        if (rank == null) return Collections.emptyList();
+
+        long start = Math.max(0, rank - range);
+        long end = rank + range;
+
+        Set<ZSetOperations.TypedTuple<String>> results =
+            redisTemplate.opsForZSet().reverseRangeWithScores(key, start, end);
+
+        return results.stream()
+            .map(t -> new LeaderboardEntry(
+                Long.parseLong(t.getValue()),
+                t.getScore()
+            ))
+            .collect(Collectors.toList());
+    }
+}
+```
+
+### 2.2 Redis ZSet 的时间复杂度
+
+| 操作 | 时间复杂度 | 说明 |
+|------|------------|------|
+| ZADD | O(log N) | 添加元素 |
+| ZREM | O(log N) | 删除元素 |
+| ZSCORE | O(1) | 获取分数 |
+| ZRANK | O(log N) | 获取排名 |
+| ZRANGE | O(log N + M) | 范围查询（M 为返回元素数） |
+
+**O(log N) 意味着：即使有 10 亿玩家，更新分数和查询排名只需要约 30 次比较操作。**
+
+---
+
+## 三、排行榜类型设计🟡
+
+### 3.1 实时排行榜
+
+```java
+@Service
+class RealTimeLeaderboardService {
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+
+    /**
+     * 实时更新分数（累加）
+     */
+    public void incrementScore(Long gameId, Long userId, double delta) {
+        String key = "leaderboard:" + gameId;
+        redisTemplate.opsForZSet().incrementScore(key, userId.toString(), delta);
+    }
+
+    /**
+     * 获取指定分数段的玩家
+     */
+    public List<LeaderboardEntry> getByScoreRange(Long gameId, double min, double max, int offset, int limit) {
+        String key = "leaderboard:" + gameId;
+
+        Set<ZSetOperations.TypedTuple<String>> results =
+            redisTemplate.opsForZSet().reverseRangeByScoreWithScores(key, min, max, offset, limit);
+
+        return results.stream()
+            .map(t -> new LeaderboardEntry(
+                Long.parseLong(t.getValue()),
+                t.getScore()
+            ))
+            .collect(Collectors.toList());
+    }
+}
+```
+
+### 3.2 多维度排行榜
+
+```java
+@Service
+class MultiDimensionLeaderboardService {
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+
+    // 日榜
+    public void updateDailyScore(Long gameId, Long userId, double score) {
+        String key = String.format("leaderboard:%d:daily:%s", gameId, getToday());
+        redisTemplate.opsForZSet().add(key, userId.toString(), score);
+    }
+
+    // 周榜
+    public void updateWeeklyScore(Long gameId, Long userId, double score) {
+        String key = String.format("leaderboard:%d:weekly:%d", gameId, getWeekOfYear());
+        redisTemplate.opsForZSet().add(key, userId.toString(), score);
+    }
+
+    // 月榜
+    public void updateMonthlyScore(Long gameId, Long userId, double score) {
+        String key = String.format("leaderboard:%d:monthly:%d", gameId, getYearMonth());
+        redisTemplate.opsForZSet().add(key, userId.toString(), score);
+    }
+
+    // 总榜
+    public void updateTotalScore(Long gameId, Long userId, double score) {
+        String key = "leaderboard:" + gameId + ":total";
+        redisTemplate.opsForZSet().add(key, userId.toString(), score);
+    }
+
+    // 快照服务：定期归档历史排行榜
+    @Scheduled(cron = "0 0 3 * * ?") // 每天凌晨 3 点
+    public void snapshotDailyLeaderboard() {
+        String todayKey = String.format("leaderboard:1:daily:%s", getYesterday());
+        String snapshotKey = String.format("leaderboard:1:snapshot:%s", getYesterday());
+        redisTemplate.opsForValue().set(snapshotKey, serializeAll(todayKey));
+    }
+}
+```
+
+---
+
+## 四、数据同步与持久化🟡
+
+### 4.1 定时持久化
+
+```java
+@Service
+class LeaderboardPersistenceService {
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+    @Autowired
+    private LeaderboardDao leaderboardDao;
+
+    @Scheduled(fixedRate = 300000) // 每 5 分钟
+    @Transactional
+    public void persistLeaderboard(Long gameId) {
+        String key = "leaderboard:" + gameId;
+
+        // 分批扫描所有玩家
+        Set<String> playerIds = redisTemplate.opsForZSet().range(key, 0, -1);
+
+        for (String playerId : playerIds) {
+            Double score = redisTemplate.opsForZSet().score(key, playerId);
+            Long rank = redisTemplate.opsForZSet().reverseRank(key, playerId);
+
+            leaderboardDao.upsert(gameId, Long.parseLong(playerId),
+                                score != null ? score : 0,
+                                rank != null ? rank + 1 : null);
+        }
+    }
+}
+```
+
+### 4.2 排行榜分表
+
+```sql
+-- 按 game_id 分表
+CREATE TABLE leaderboard_1 LIKE leaderboard_template;
+CREATE TABLE leaderboard_2 LIKE leaderboard_template;
+CREATE TABLE leaderboard_3 LIKE leaderboard_template;
+-- ...
+
+-- 查询时路由到对应分表
+SELECT * FROM leaderboard_{gameId % 10}
+WHERE game_id = ? AND rank <= 100
+ORDER BY score DESC;
+```
+
+---
+
+## 五、生产避坑🟡
+
+### 5.1 排行榜过期数据清理
+
+```java
+@Service
+class LeaderboardCleanupService {
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+
+    @Scheduled(cron = "0 0 1 * * ?") // 每天凌晨 1 点
+    public void cleanupExpiredLeaderboards() {
+        // 删除 30 天前的日榜
+        String oldDate = getDateDaysAgo(30);
+        Set<String> keys = redisTemplate.keys("leaderboard:*:daily:" + oldDate);
+        if (keys != null && !keys.isEmpty()) {
+            redisTemplate.delete(keys);
+        }
+    }
+}
+```
+
+### 5.2 并发更新
+
+```java
+// ❌ 错误：先查后改
+Double oldScore = redisTemplate.opsForZSet().score(key, userId);
+Double newScore = oldScore + delta;
+redisTemplate.opsForZSet().add(key, userId, newScore); // 并发时会丢失更新
+
+// ✅ 正确：直接用 ZINCRBY
+redisTemplate.opsForZSet().incrementScore(key, userId, delta); // 原子操作
+```
+
+【架构权衡】
+Redis ZSet 是排行榜系统的最佳选择，但要注意：
+1. 内存容量限制（如果数据量超过 Redis 内存，需要分层存储）
+2. 过期数据需要定期清理
+3. Redis 宕机时的降级方案（可以降级到数据库查询）
+
+---
+
+## 六、面试总结
+
+| 级别 | 期望回答 |
+|------|----------|
+| P5 | 能说出 Redis ZSet 的基本操作 |
+| P6 | 能设计多维度排行榜，知道持久化方案 |
+| P7 | 能处理大数据量场景，知道分层存储 |

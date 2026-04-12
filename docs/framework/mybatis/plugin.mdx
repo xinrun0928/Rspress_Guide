@@ -1,0 +1,527 @@
+---
+title: MyBatis 插件机制深度解析
+description: 四大拦截点的插件链原理、@Intercepts/@Signature 注解、插件编写模板与生产级插件案例。
+---
+
+候选人小孙在面试阿里P6时，面试官看了看他的简历上写着"有 MyBatis 插件开发经验"，问道：
+
+"MyBatis 的插件机制是怎么实现的？Executor、StatementHandler、ParameterHandler、ResultSetHandler 这四个拦截点分别在什么时候被调用？"
+
+小孙说："插件可以拦截这些对象的方法，在方法执行前后做一些处理..."
+
+面试官追问："那你说说插件的执行顺序是怎样的？如果我配置了两个插件，后面的会先执行还是后面的先执行？"
+
+小孙说："应该是按配置顺序执行？"
+
+面试官继续追问："为什么？Plugin.wrap 里面做了什么？"
+
+小孙卡住了。
+
+【面试官心理】
+这道题我用来筛选"写过插件"和"理解原理"的候选人。知道四大拦截点和基本用法的占 60%，能讲清插件链的 Proxy 嵌套和执行顺序的占 20%，能自己实现一个生产级插件的凤毛麟角。这道题是 P6 和 P7 的分水岭——P5 背概念，P6 看原理，P7 能落地。
+
+## 一、插件架构全貌 🔴
+
+MyBatis 的插件机制基于 **JDK 动态代理**，通过 `InterceptorChain` 在关键组件创建时自动包装它们：
+
+```mermaid
+graph TD
+    A[Configuration.newExecutor] --> B[InterceptorChain.pluginAll]
+    A --> C[Executor 包装<br/>Executor = pluginAll(executor)]
+    C --> D[SimpleExecutor]
+    A --> E[Configuration.newStatementHandler]
+    E --> F[InterceptorChain.pluginAll]
+    E --> G[StatementHandler 包装<br/>StatementHandler = pluginAll(sh)]
+    G --> H[RoutingStatementHandler]
+
+    C --> I[Plugin1.wrap]
+    I --> J[Plugin2.wrap]
+    J --> K[最终代理对象]
+```
+
+### 1.1 四大拦截点一览
+
+| 拦截点 | 拦截方法 | 拦截时机 |
+| --- | --- | --- |
+| `Executor` | `query/update/flushStatements/close` | SQL 执行前、执行后、批量刷新、连接关闭 |
+| `StatementHandler` | `prepare/parameterize/query/update/batch` | Statement 创建、参数绑定、查询执行 |
+| `ParameterHandler` | `getParameterObject/setParameters` | 获取参数对象、设置参数到 PreparedStatement |
+| `ResultSetHandler` | `handleResultSets/handleOutputParameters` | 结果集映射、存储过程输出参数 |
+
+:::tip 💡
+**最容易忽略的拦截点**：`Executor.flushStatements()` 是批量执行模式下的关键拦截点，用于在 flush 时执行所有缓存的 SQL。很多候选人只知道 query/update，不知道这个方法。
+
+**最容易混淆的拦截点**：`ParameterHandler` 拦截的是参数绑定过程，而不是参数本身。很多候选人以为可以拦截参数值，实际上只能拦截绑定过程，在绑定前后做一些处理。
+:::
+
+## 二、插件链原理 🔴
+
+### 2.1 InterceptorChain.pluginAll
+
+```java
+// Configuration.newExecutor 中的插件包装
+public Executor newExecutor(Transaction transaction, ExecutorType executorType) {
+    // 1. 创建原始 Executor
+    Executor executor = new SimpleExecutor(configuration, transaction);
+
+    // 2. 如果开启缓存，包装为 CachingExecutor
+    if (cacheEnabled) {
+        executor = new CachingExecutor(executor);
+    }
+
+    // 3. 关键：插件链包装 —— 嵌套代理
+    executor = (Executor) interceptorChain.pluginAll(executor);
+    return executor;
+}
+
+// InterceptorChain 持有所有注册的拦截器
+public class InterceptorChain {
+    private final List<Interceptor> interceptors = new ArrayList<>();
+
+    public Object pluginAll(Object target) {
+        // 从第一个拦截器开始，层层包装
+        for (Interceptor interceptor : interceptors) {
+            target = interceptor.plugin(target, this);
+        }
+        return target;
+    }
+}
+```
+
+**关键理解**：插件链是**嵌套代理**，而不是链式调用。如果配置了插件 A 和插件 B，执行顺序是：
+
+```java
+// 配置顺序：A 在前，B 在后
+// 包装顺序：A 先包装原始对象，B 再包装 A 包装后的对象
+// 执行顺序：B 先执行，调用 proceed() 后 A 执行，A 调用 proceed() 后原始对象执行
+
+// 即：配置在后的插件先执行
+```
+
+### 2.2 Interceptor.plugin 与 Plugin.wrap
+
+```java
+// 插件接口
+public interface Interceptor {
+    // 拦截逻辑
+    Object intercept(Invocation invocation) throws Throwable;
+
+    // 将目标对象包装为代理对象
+    default Object plugin(Object target) {
+        return Plugin.wrap(target, this);
+    }
+
+    // 插件初始化（从配置读取属性）
+    default void setProperties(Properties properties) {}
+}
+
+// Plugin.wrap 源码
+public class Plugin implements InvocationHandler {
+    // target 是被代理的对象（A Executor 或其包装）
+    // interceptor 是当前拦截器
+    public static Object wrap(Object target, Interceptor interceptor) {
+        // 从 @Intercepts 注解获取要拦截的方法签名
+        Map<Class<?>, Set<Method>> signatureMap = getSignatureMap(interceptor);
+
+        Class<?> type = target.getClass();  // 可能是原始类，也可能是已被代理的类
+        Class<?>[] interfaces = getAllInterfaces(type, signatureMap);
+
+        // 如果没有匹配的方法签名，返回原始对象（不代理）
+        if (interfaces.length == 0) {
+            return target;
+        }
+
+        // 关键：创建 JDK 动态代理
+        return Proxy.newProxyInstance(
+            type.getClassLoader(),
+            interfaces,
+            new Plugin(target, interceptor, signatureMap)
+        );
+    }
+
+    @Override
+    public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+        // 检查当前调用的方法是否在 @Signature 中声明
+        Set<Method> methods = signatureMap.get(type);
+        if (methods != null && methods.contains(method)) {
+            // 在拦截范围内，调用拦截器的 intercept 方法
+            return interceptor.intercept(new Invocation(target, method, args));
+        }
+        // 不在拦截范围内，直接调用原方法
+        return method.invoke(target, args);
+    }
+}
+```
+
+### 2.3 Invocation.proceed()
+
+```java
+public class Invocation {
+    private final Object target;
+    private final Method method;
+    private final Object[] args;
+
+    public Object proceed() throws InvocationTargetException, IllegalAccessException {
+        // 调用被代理对象的方法
+        // 如果 target 已经是代理对象，会继续走代理链
+        return method.invoke(target, args);
+    }
+}
+
+// 插件中的标准写法
+@Intercepts({
+    @Signature(type = Executor.class, method = "query",
+               args = {MappedStatement.class, Object.class,
+                       RowBounds.class, ResultHandler.class})
+})
+public class MyPlugin implements Interceptor {
+    @Override
+    public Object intercept(Invocation invocation) throws Throwable {
+        // 前置处理
+        long start = System.currentTimeMillis();
+
+        // 执行被拦截的方法
+        Object result = invocation.proceed();
+
+        // 后置处理
+        long cost = System.currentTimeMillis() - start;
+        System.out.println("SQL 执行耗时: " + cost + "ms");
+        return result;
+    }
+}
+```
+
+## 三、@Intercepts 与 @Signature 注解 🔴
+
+### 3.1 注解定义
+
+```java
+@Intercepts({
+    @Signature(
+        type = StatementHandler.class,
+        method = "prepare",
+        args = {Connection.class, Integer.class}
+    ),
+    @Signature(
+        type = StatementHandler.class,
+        method = "parameterize",
+        args = {Statement.class}
+    )
+})
+public class SqlLogPlugin implements Interceptor {
+    // ...
+}
+```
+
+### 3.2 args 参数详解
+
+```java
+// Executor.query 的方法签名
+// args 必须是精确的参数类型顺序
+List<E> query(MappedStatement ms, Object parameter, RowBounds rowBounds,
+              ResultHandler resultHandler, CacheKey cacheKey, BoundSql boundSql);
+// 对应的 @Signature args:
+args = {MappedStatement.class, Object.class, RowBounds.class,
+        ResultHandler.class, CacheKey.class, BoundSql.class}
+
+// StatementHandler.prepare 的方法签名
+Statement prepare(Connection connection, Integer transactionTimeout);
+// 对应的 @Signature args:
+args = {Connection.class, Integer.class}
+
+// ParameterHandler.getParameterObject 的方法签名
+Object getParameterObject();
+// 对应的 @Signature args:
+args = {}  // 无参数
+
+// ResultSetHandler.handleResultSets 的方法签名
+List<Object> handleResultSets(Statement stmt) throws SQLException;
+// 对应的 @Signature args:
+args = {Statement.class}
+```
+
+:::warning ⚠️
+**args 必须是精确类型，不能用父类替代**。例如 `RowBounds.class` 不能写成 `Object.class`。类型写错会导致插件无法匹配，方法不会被拦截。
+:::
+
+## 四、插件编写模板与生产案例 🔴
+
+### 4.1 通用模板
+
+```java
+@Intercepts({
+    @Signature(
+        type = StatementHandler.class,
+        method = "prepare",
+        args = {Connection.class, Integer.class}
+    )
+})
+public class PerformanceLogPlugin implements Interceptor {
+    private Properties properties;
+
+    @Override
+    public Object intercept(Invocation invocation) throws Throwable {
+        StatementHandler sh = (StatementHandler) invocation.getTarget();
+        // 1. 拿到被代理对象的实际类型（用于区分 Simple/Prepared/Callable）
+        MetaObject metaObject = SystemMetaObject.forObject(sh);
+        String sql = sh.getBoundSql().getSql();
+        String type = metaObject.getValue("delegate.type").toString();
+
+        // 2. 前置：记录开始时间
+        long start = System.currentTimeMillis();
+
+        // 3. 执行原方法
+        Object result = invocation.proceed();
+
+        // 4. 后置：记录耗时
+        long cost = System.currentTimeMillis() - start;
+        if (cost > Long.parseLong(properties.getProperty("slowThreshold", "100"))) {
+            log.warn("Slow SQL detected: {}ms - {}", cost, sql);
+        }
+        return result;
+    }
+
+    @Override
+    public void setProperties(Properties properties) {
+        this.properties = properties;
+    }
+}
+```
+
+### 4.2 分页插件（完整示例）
+
+```java
+@Intercepts({
+    @Signature(type = StatementHandler.class, method = "prepare",
+               args = {Connection.class, Integer.class}),
+    @Signature(type = StatementHandler.class, method = "query",
+               args = {Statement.class, ResultHandler.class})
+})
+public class PageHelperPlugin implements Interceptor {
+    private static final String PAGE = "_PAGE";
+    private static final String COUNT = "_COUNT";
+
+    @Override
+    public Object intercept(Invocation invocation) throws Throwable {
+        StatementHandler sh = (StatementHandler) invocation.getTarget();
+        MetaObject metaObject = SystemMetaObject.forObject(sh);
+        BoundSql boundSql = sh.getBoundSql();
+
+        // 检查 ThreadLocal 中是否有分页参数
+        Page<?> page = (Page<?>) metaObject.getValue("delegate.boundSql.parameter._PAGE");
+        if (page == null) {
+            return invocation.proceed();
+        }
+
+        // 1. 查询总数
+        String countSql = "SELECT COUNT(*) " + removeSelect(removeOrders(boundSql.getSql()));
+        Connection conn = (Connection) invocation.getArgs()[0];
+        PreparedStatement ps = conn.prepareStatement(countSql);
+        // 设置 count 参数...
+        ResultSet rs = ps.executeQuery();
+        if (rs.next()) {
+            page.setTotal(rs.getLong(1));
+        }
+
+        // 2. 改写 SQL，追加 limit
+        String pageSql = boundSql.getSql() + " LIMIT " +
+            page.getOffset() + ", " + page.getPageSize();
+        metaObject.setValue("delegate.boundSql.sql", pageSql);
+
+        // 3. 执行原方法
+        return invocation.proceed();
+    }
+
+    private String removeSelect(String sql) { /* 去掉 SELECT */ }
+    private String removeOrders(String sql) { /* 去掉 ORDER BY */ }
+}
+```
+
+### 4.3 配置文件
+
+```xml
+<!-- mybatis-config.xml -->
+<plugins>
+    <plugin interceptor="com.xxx.plugin.PageHelperPlugin">
+        <property name="dialect" value="mysql"/>
+    </plugin>
+    <plugin interceptor="com.xxx.plugin.SqlLogPlugin">
+        <property name="slowThreshold" value="200"/>
+    </plugin>
+</plugins>
+```
+
+## 五、执行顺序详解 🟡
+
+### 5.1 配置顺序 vs 执行顺序
+
+```xml
+<!-- 配置顺序：PageHelperPlugin 在前，SqlLogPlugin 在后 -->
+<plugins>
+    <plugin interceptor="com.xxx.plugin.PageHelperPlugin"/>
+    <plugin interceptor="com.xxx.plugin.SqlLogPlugin"/>
+</plugins>
+```
+
+```java
+// pluginAll 的执行
+// 第一轮：PageHelperPlugin 包装原始 Executor
+executor = PageHelperPlugin.plugin(executor);
+// 结果：PageHelperPlugin(Executor)
+
+// 第二轮：SqlLogPlugin 包装 PageHelperPlugin 包装的结果
+executor = SqlLogPlugin.plugin(PageHelperPlugin(Executor));
+// 结果：SqlLogPlugin(PageHelperPlugin(Executor))
+
+// 执行时：
+// 1. SqlLogPlugin.intercept 先执行
+// 2. SqlLogPlugin 调用 invocation.proceed()
+// 3. 触发 PageHelperPlugin.intercept
+// 4. PageHelperPlugin 调用 invocation.proceed()
+// 5. 触发原始 Executor.query
+```
+
+**结论**：配置在**后面**的插件先执行，配置在**前面**的插件后执行。配置顺序和包装顺序相反。
+
+### 5.2 实际场景验证
+
+```java
+// 验证：查看包装后的实际类型
+SqlSessionFactory factory = ...;
+SqlSession session = factory.openSession();
+Executor executor = ((DefaultSqlSession) session).getExecutor();
+
+// 如果有插件，打印 class
+System.out.println(executor.getClass().getName());
+// 输出可能是：com.xxx.plugin.SqlLogPlugin$Proxy4
+// 说明是嵌套代理，SqlLogPlugin 在最外层
+```
+
+## 六、❌ 错误示范
+
+### 翻车点一：args 类型写错
+
+```java
+// 错误：参数类型写错了
+@Signature(type = StatementHandler.class,
+          method = "prepare",
+          args = {Connection.class})  // 缺少 Integer.class
+
+// 正确：必须精确匹配方法签名
+@Signature(type = StatementHandler.class,
+          method = "prepare",
+          args = {Connection.class, Integer.class})
+```
+
+### 翻车点二：拦截了不该拦截的方法
+
+```java
+// 错误：在 ParameterHandler 的 getParameterObject 中做了耗时操作
+@Signature(type = ParameterHandler.class,
+          method = "getParameterObject",
+          args = {})
+public Object intercept(Invocation invocation) {
+    // 每次获取参数都做复杂计算，影响性能
+    return invocation.proceed();
+}
+
+// 正确：只在必要时拦截，减少不必要的开销
+```
+
+### 翻车点三：proceed 调用位置错误
+
+```java
+// 错误：没有调用 proceed，导致原方法不执行
+public Object intercept(Invocation invocation) {
+    log.info("Before SQL execution");
+    // 忘记调用 invocation.proceed()，SQL 不会执行！
+    return null;  // 返回 null 会导致 NPE
+}
+
+// 正确：先调用 proceed 获取结果，再做后置处理
+public Object intercept(Invocation invocation) {
+    log.info("Before SQL execution");
+    Object result = invocation.proceed();  // 必须调用
+    log.info("After SQL execution");
+    return result;
+}
+```
+
+### 翻车点四：混淆四大拦截点
+
+**候选人原话**："插件可以拦截 ResultSetHandler 来做结果集脱敏..."
+
+实际上可以，但需要在 `handleResultSets` 中拦截。常见混淆是把 `ResultSetHandler` 和 `StatementHandler.query` 混淆——前者是结果映射阶段，后者是 JDBC 查询执行阶段。
+
+## 七、标准回答
+
+### P5 级别：能说出四大拦截点
+
+> MyBatis 有四大拦截点：Executor、StatementHandler、ParameterHandler、ResultSetHandler。可以通过实现 Interceptor 接口并使用 @Intercepts/@Signature 注解来编写插件，拦截指定的方法执行前后做一些处理。
+
+### P6 级别：能讲清插件链原理和执行顺序
+
+> 插件链基于 JDK 动态代理实现。Configuration 在创建 Executor、StatementHandler 等组件时，调用 `InterceptorChain.pluginAll(target)` 遍历所有注册的拦截器，每个拦截器的 `plugin` 方法返回包装后的代理对象。由于是层层嵌套包装，配置在后面的插件先执行（最外层先进入），配置在前面的插件后执行（最里层最后进入）。
+>
+> `Plugin.wrap` 会根据 `@Signature` 匹配被代理对象的方法签名，只对匹配的方法创建代理。如果方法不在 @Signature 声明中，直接透传到原对象。
+
+【面试官心理】
+P6 能答出嵌套代理和执行顺序的原理，已经超过了 90% 的候选人。我通常会追问："如果我想让插件执行顺序反过来，怎么做？"能答出"把插件配置顺序反过来，或在 plugin 方法中返回不同的代理对象"的，说明对插件机制有深入理解。
+
+### P7 级别：能从架构设计角度分析
+
+> MyBatis 的插件机制是一个非常优雅的设计：基于 JDK 动态代理而非字节码增强，侵入性低，可插拔。Plugin.wrap 只对匹配的方法创建代理，避免了不必要的性能开销。Invocation.proceed() 的设计让拦截器可以控制方法的执行时机（前/后/替代），非常灵活。生产中，插件常用于分页、SQL 日志、性能监控、数据脱敏等横切关注点。
+
+## 八、追问升级 🟡
+
+### 追问1：如何获取被代理对象的原始类型？
+
+```java
+// 使用 MetaObject 获取被代理对象的实际类型
+StatementHandler sh = (StatementHandler) invocation.getTarget();
+MetaObject metaObject = SystemMetaObject.forObject(sh);
+
+// 获取原始类型
+Class<?> rawType = metaObject.getValue("delegate.type");  // PreparedStatementHandler.class
+
+// 获取 SQL
+String sql = sh.getBoundSql().getSql();
+```
+
+### 追问2：插件可以拦截 private 方法吗？
+
+**不能**。JDK 动态代理只能拦截接口方法，无法拦截 private/protected/final 方法。如果需要更强的拦截能力（如拦截 private 方法），需要使用字节码增强工具（如 ASM、Javassist），但这已经超出了 MyBatis 插件机制的范畴。
+
+### 追问3：如何实现插件间的数据传递？
+
+```java
+// 使用 ThreadLocal 或请求上下文
+public class RequestContext {
+    private static final ThreadLocal<Map<String, Object>> context =
+        new ThreadLocal<>();
+
+    public static void put(String key, Object value) {
+        context.get().put(key, value);
+    }
+
+    public static Object get(String key) {
+        return context.get().get(key);
+    }
+}
+
+// 插件A：设置上下文
+public Object intercept(Invocation inv) {
+    RequestContext.put("userId", getUserIdFromArgs());
+    return inv.proceed();
+}
+
+// 插件B：读取上下文
+public Object intercept(Invocation inv) {
+    Object userId = RequestContext.get("userId");
+    // 使用 userId
+    return inv.proceed();
+}
+```
+
+【面试官心理】
+能答出"使用 ThreadLocal 在插件间传递数据"的候选人，说明有插件协作的实战经验。如果追问"ThreadLocal 在插件场景下有什么风险？"能答出"如果插件异步执行后 ThreadLocal 中的数据还没清理，会导致内存泄漏"的，说明对并发安全有深刻理解，这是 P7 级别的加分项。

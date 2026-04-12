@@ -1,0 +1,348 @@
+---
+title: RedLock 算法
+description: Redis 官方分布式锁算法的五节点实现，逐行拆解 RedLock 的加锁、解锁、时钟漂移处理与故障转移逻辑。
+---
+
+## 背景故事
+
+2016年2月，Redis 作者 Antirez 在博客上发布了一篇文章，介绍了一种新的分布式锁算法：RedLock。
+
+然后 Martin Kleppmann（Cambridge 教授，《Designing Data-Intensive Applications》作者）立刻写了一篇长文，逐条反驳 Antirez 的算法设计有严重缺陷。
+
+Antirez 又写了反驳文章回应 Kleppmann 的质疑。
+
+这场学术级别的"隔空论战"持续了数周，在分布式系统社区引发了激烈讨论。
+
+两个业界顶级大佬，对于同一个算法的正确性产生了根本性分歧——这本身就说明了 RedLock 的复杂性。
+
+今天这篇，我们不站队，先把 RedLock 的**设计**和**实现**讲清楚。批评和争议，留到下篇文章。
+
+## 一、RedLock 的核心思想
+
+RedLock 解决的是单节点 Redis 分布式锁的数据丢失问题：
+
+```
+单节点 Redis 锁的问题：
+  主节点写入锁 → 主节点宕机 → 从节点晋升 → 锁数据丢失 → 两个客户端持有同一把锁
+
+RedLock 的解决思路：
+  不要依赖单节点，在 N 个独立 Redis 节点上分别加锁
+  只有当超过 N/2 + 1 个节点加锁成功，才算真正拿到锁
+  即使部分节点宕机，只要多数节点存活，锁仍然有效
+```
+
+### 五节点部署
+
+```java
+// 标准的 RedLock 需要 5 个独立 Redis 节点
+List<RedissonClient> nodes = Arrays.asList(
+    redisson1,  // 节点1
+    redisson2,  // 节点2
+    redisson3,  // 节点3
+    redisson4,  // 节点4
+    redisson5   // 节点5
+);
+
+RLock lock = new RedissonRedLock(nodes);
+lock.tryLock(10, 30, TimeUnit.SECONDS);
+```
+
+五节点的设计基于多数派共识（Majority Quorum）：5 个节点中至少 3 个成功，才能认为锁有效。任意 2 个节点宕机，系统仍能正常工作。
+
+## 二、RedLock 加锁流程
+
+### 逐节点加锁 + 快速失败
+
+```java
+public boolean tryLock(long waitTime, long leaseTime, TimeUnit unit) {
+    long startTime = System.nanoTime();
+    long ttl = unit.toNanos(leaseTime);
+    long remainingTime = ttl;
+    int failedAttempts = 0;
+
+    List<RLock> synchronizedSubLocks = new ArrayList<>();
+
+    // 1. 在所有节点上逐个尝试加锁
+    for (RLock node : locks) {
+        try {
+            // 等待获取锁的最大时间（单节点）
+            long nodeWaitTime = Math.min(remainingTime, 10000L);
+            boolean acquired = node.tryLock(nodeWaitTime, leaseTime, unit);
+
+            if (acquired) {
+                synchronizedSubLocks.add(node);
+                // 计算剩余等待时间
+                remainingTime -= (System.nanoTime() - startTime);
+                if (remainingTime <= 0) {
+                    break; // 等待时间耗尽
+                }
+            } else {
+                failedAttempts++;
+            }
+        } catch (Exception e) {
+            failedAttempts++;
+        }
+    }
+
+    // 2. 检查是否获得多数票
+    if (synchronizedSubLocks.size() >= (locks.size() / 2 + 1)) {
+        return true; // 拿到锁
+    }
+
+    // 3. 未获得多数票，释放所有已获得的锁
+    for (RLock acquired : synchronizedSubLocks) {
+        acquired.unlock();
+    }
+    return false;
+}
+```
+
+关键设计点：
+
+1. **单节点超时 10ms**：每个节点最多等待 10ms，超过就放弃，快速失败
+2. **计算剩余等待时间**：总等待时间由调用者控制，每个节点只能分到总时间的一部分
+3. **未获得多数票立即释放**：如果只有 2/5 节点成功，不算拿到锁，立即全部释放
+
+### 加锁时间线示例
+
+```
+场景：5节点 RedLock，客户端 C1 和 C2 同时抢锁
+
+T0:   C1 开始在节点1-5上逐个加锁
+T3:   C1 在节点1上成功 (N1=成功)
+T5:   C1 在节点2上成功 (N2=成功)
+T7:   C1 在节点3上成功 (N3=成功) → 3/5 >= 3，满足多数派！
+T7:   C1 停止加锁，锁获取成功
+T7:   C2 开始加锁，只能在节点4、5上尝试
+
+注意：C2 在 T7 时开始，但节点4、5 此时可能还有空位
+     C2 需要等 C1 释放后（30秒后）才能拿到3个节点
+```
+
+## 三、RedLock 解锁流程
+
+```java
+public void unlock() {
+    // 1. 在所有节点上释放锁
+    List<Future<Long>> futures = new ArrayList<>();
+    for (RLock lock : locks) {
+        futures.add(executor.submit(() -> {
+            try {
+                lock.unlock();
+                return 1L;
+            } catch (Exception e) {
+                return 0L;
+            }
+        }));
+    }
+
+    // 2. 等待所有解锁操作完成（最多10秒）
+    for (Future<Long> future : futures) {
+        try {
+            future.get(10, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            // 单节点解锁失败不影响整体
+            log.warn("Failed to unlock on a node", e);
+        }
+    }
+}
+```
+
+:::tip 💡
+RedLock 解锁的设计是**尽力而为**：即使部分节点解锁失败（如节点恰好宕机），也不会影响整体正确性。因为这些节点的锁会在 TTL 后自动过期，不会永久持有。
+:::
+
+## 四、时钟漂移处理
+
+RedLock 论文中最关键的设计考量是**时钟漂移**（Clock Drift）。
+
+### 时钟漂移的问题
+
+```
+假设：
+  - C1 在 5 个节点的锁 TTL 都是 10 秒
+  - 但节点3的时钟比实际时间快了 5 秒
+  - 节点3的锁实际在 15 秒后才过期
+
+T0:   C1 在节点1-5上全部拿到锁（每个节点显示剩余 TTL=10s）
+T10:  节点1、2、4、5的锁过期
+T12:  C2 在节点1上拿到锁
+T15:  节点3的锁过期
+T15:  C2 在节点3上拿到锁
+T15:  此时 C1 仍在临界区（假设业务执行到 T15）
+      但 C2 已经在节点1、3上拿到了锁
+```
+
+时钟漂移导致不同节点的 TTL 过期时间不一致。理论上，C1 在 T15 时应该检查自己是否还持有多数派锁，但实际上 C1 的代码没有这个检查。
+
+### RedLock 的应对措施
+
+```java
+// Redisson RedLock 对时钟漂移的处理
+// 1. 在加锁时记录开始时间
+long startTime = System.nanoTime();
+
+// 2. 计算剩余可用时间
+long remainingTime = ttl - (System.nanoTime() - startTime);
+
+// 3. 单节点加锁时使用剩余时间作为超时
+boolean acquired = node.tryLock(Math.max(remainingTime, 0), leaseTime, unit);
+
+// 4. 检查是否在有效期内获得多数票
+if (synchronizedSubLocks.size() >= (locks.size() / 2 + 1)) {
+    // 再次检查：从开始到现在的时间是否超过 TTL
+    long elapsed = System.nanoTime() - startTime;
+    if (elapsed < ttl) {
+        return true; // 真正拿到锁
+    } else {
+        // 已超过 TTL，视为锁获取失败，释放所有锁
+        unlock();
+        return false;
+    }
+}
+```
+
+【架构权衡】
+
+RedLock 对时钟漂移的处理是"事后检查"：加锁成功后，再检查总耗时是否超过 TTL。如果超过，视为锁获取失败并释放所有锁。
+
+这个设计虽然不能完全消除时钟漂移的影响，但将危害限制在了一个 TTL 周期内。相比之下，Kleppmann 的批评是：这种检查方式假设所有节点的时钟速率一致，但在现实中，不同步的 NTP 服务可能导致时钟漂移持续存在。
+
+## 五、网络延迟的影响
+
+### 加锁时的网络延迟
+
+```java
+// 网络延迟分析
+// 单节点尝试加锁的超时设置为 10ms，但网络往返延迟可能 > 10ms
+
+// 场景：网络延迟 15ms
+T0:   C1 发送 SET 命令到节点1
+T15:  节点1 收到 SET 命令（延迟 15ms > 10ms 超时，C1 放弃等待）
+T16:  节点1 执行 SET，成功
+T16:  C1 在节点1上失败（但锁实际上被拿到了）
+T18:  C2 在节点2上拿到锁
+T18:  此时 C1 只在节点3-5上拿到了锁（3/5 < 3，不满足多数派）
+```
+
+当网络延迟超过 10ms 时，加锁操作可能"超时失败"，但实际上命令已经在 Redis 端执行成功了。这种现象叫做 **logical lock acquisition**（逻辑上已加锁，但客户端感知为失败）。
+
+### 实际影响
+
+这种"伪失败"不会破坏 RedLock 的正确性（因为 C1 没有把节点1计入成功数），但会导致**加锁成功率下降**。
+
+:::warning ⚠️
+RedLock 对网络质量要求很高。在跨机房、跨地域部署时，单节点加锁超时建议设为 50~100ms，而不是标准的 10ms。但超时时间越长，总等待时间也越长，锁获取的 latency 越高。这是性能和可靠性的又一次 trade-off。
+:::
+
+## 六、Redisson RedLock 完整代码
+
+```java
+public class RedissonRedLock implements RedLock {
+    private final RedissonClient[] redissonClients;
+    private final String[] lockNames;
+    private final int lockCount;
+
+    public RedissonRedLock(RedissonClient... redissonClients) {
+        this.redissonClients = redissonClients;
+        this.lockNames = new String[redissonClients.length];
+        Arrays.fill(lockNames, "");
+    }
+
+    public RedissonRedLock(List<RLock> locks) {
+        this.lockCount = locks.size();
+        this.redissonClients = null; // 由 RedLock 自己管理连接
+    }
+
+    @Override
+    public boolean tryLock(long waitTime, long leaseTime, TimeUnit unit) {
+        long startTime = System.currentTimeMillis();
+        long remainTime = unit.toMillis(waitTime);
+        long lockWaitTime = Math.min(remainTime / this.lockCount, 1000L);
+
+        List<RLock> acquiredLocks = new ArrayList<>(lockCount);
+
+        // 在所有节点上尝试获取锁
+        for (RLock lock : locks) {
+            boolean acquired;
+            try {
+                if (lock.tryLock(lockWaitTime, leaseTime, unit)) {
+                    acquired = true;
+                    acquiredLocks.add(lock);
+                } else {
+                    acquired = false;
+                }
+            } catch (Exception e) {
+                acquired = false;
+            }
+
+            if (acquired && acquiredLocks.size() > lockCount / 2) {
+                // 获得多数票
+                break;
+            }
+
+            // 计算剩余时间
+            long elapsed = System.currentTimeMillis() - startTime;
+            remainTime = unit.toMillis(waitTime) - elapsed;
+            if (remainTime <= 0) {
+                break;
+            }
+        }
+
+        // 检查是否获得有效锁
+        if (acquiredLocks.size() < lockCount / 2 + 1) {
+            // 未获得多数票，释放所有锁
+            for (RLock lock : acquiredLocks) {
+                lock.unlock();
+            }
+            return false;
+        }
+
+        return true;
+    }
+
+    @Override
+    public void unlock() {
+        for (RLock lock : locks) {
+            try {
+                lock.unlock();
+            } catch (Exception e) {
+                // 单节点失败不影响整体
+            }
+        }
+    }
+}
+```
+
+## 七、RedLock vs 单节点 Redis 锁
+
+| 维度 | 单节点 Redis 锁 | RedLock（5节点） |
+|------|----------------|------------------|
+| 容错能力 | 0（单点故障即失效） | N/2 个节点故障仍可用 |
+| 性能 | 最高（单次 SETNX） | 约 1/5 的单节点性能（需要 5 次 SETNX） |
+| 延迟 | 低（单次 RTT） | 高（多次 RTT，取最长路径） |
+| 正确性 | 依赖单节点可靠性 | 依赖多数派共识 |
+| 实现复杂度 | 低 | 高（5 个独立部署的 Redis） |
+| 运维成本 | 低 | 高（需要维护 5 个 Redis 实例） |
+
+【架构权衡】
+
+RedLock 不是银弹。它的正确性建立在以下假设上：
+
+1. **5个节点相互独立**：不能在同一台物理机上，不能共享存储，不能有共同的网络链路
+2. **时钟同步**：虽然有事后检查，但极端时钟漂移仍可能导致问题
+3. **网络分区概率低**：如果 3 个节点同时网络分区，系统将无法获取锁（保守设计）
+
+如果你有 5 个独立的 Redis 节点，RedLock 是一个可靠的分布式锁方案。但运维成本（5个实例 + 监控 + 故障转移）是相当高的。大多数场景下，单节点 Redis 锁 + 主从自动切换已经够用。
+
+## 八、工程代价评估
+
+| 维度 | 评估 |
+|------|------|
+| 开发成本 | 高（需要部署 5 个独立 Redis 节点） |
+| 运维成本 | 高（5 节点维护、监控、故障转移） |
+| 排障复杂度 | 高（跨节点的锁状态一致性难以追踪） |
+| 扩展性 | 中（增加节点意味着增加 majority 阈值） |
+| 性能 | 中（延迟 = max(5节点RTT)，吞吐约 1/5 单节点） |
+
+RedLock 解决了单节点 Redis 锁的容错问题，但付出了运维复杂度和性能的代价。下一篇文章，我们来看 Kleppmann 对 RedLock 的批评——为什么很多分布式系统专家认为 RedLock 根本不应该被使用。

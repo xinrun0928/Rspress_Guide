@@ -1,0 +1,451 @@
+---
+title: @Transactional 失效场景汇总
+description: 8大 @Transactional 失效场景的根因分析与正确用法，覆盖所有面试中会被追问的边界情况。
+---
+
+# @Transactional 失效场景汇总
+
+上周有个学员给我看他的面试回放，他在美团二面时当场社死了。
+
+面试官问："你的订单服务里用了 @Transactional 注解，为什么数据还是出现了脏数据？"
+
+他愣了三秒，说："我...我用了注解，应该生效了吧？"
+
+面试官："那你检查过哪些场景下 @Transactional 会失效吗？"
+
+他："...没有。"
+
+最后这轮面试没过。
+
+【面试官心理】
+@Transactional 是 Spring 中最容易被用错、也最容易被面试官追问的注解之一。90%的候选人在简历上写着"熟练使用 Spring 事务"，但真正能说清楚8种失效场景的不到30%。这道题是筛选有没有踩过坑、有没有深入研究过源码的试金石。
+
+## 一、8大失效场景全景 🔴
+
+### 1.1 ❌ 错误示范
+
+**候选人原话**："@Transactional 就是开启事务，出了问题会回滚。"
+
+**问题诊断**：
+- 不知道 Spring 事务基于 AOP 代理实现
+- 不知道哪些操作会绕过代理
+- 不知道异常类型对回滚的影响
+
+### 1.2 失效场景速查表
+
+| 序号 | 失效场景 | 根因 | 解决方案 |
+|------|----------|------|----------|
+| 1 | `private` 方法 | 代理无法拦截 `private` 方法 | 改为 `public` 方法 |
+| 2 | 同类内部调用（`this`） | `this` 不走代理，直接调目标方法 | 注入自身或用 `AopContext.currentProxy()` |
+| 3 | 异常被 `catch` 吞掉 | 代理捕获不到异常，不回滚 | 重新抛出或使用 `TransactionAspectSupport.currentTransactionStatus().setRollbackOnly()` |
+| 4 | 异常类型不匹配 | 默认只回滚 `RuntimeException` 和 `Error` | 配置 `rollbackFor = Exception.class` |
+| 5 | `propagation` 配置错误 | `REQUIRED_NEW` 在同一线程中挂起外部事务 | 改用 `REQUIRED` 或确保跨线程 |
+| 6 | 类未被 Spring 管理 | `new` 的对象不是代理 | 使用注入的 Bean 或手动开启事务 |
+| 7 | 多数据源未指定 `transactionManager` | 默认事务管理器不匹配 | 指定 `transactionManager` 属性 |
+| 8 | 多线程场景 | 子线程事务与主线程独立 | 使用编程式事务或 `TransactionTemplate` |
+
+## 二、逐场景深度解析 🟡
+
+### 2.1 private 方法 —— 代理的盲区
+
+```java
+@Service
+public class OrderService {
+
+    @Transactional
+    public void createOrder(Order order) {
+        // 这个方法会被代理拦截
+        saveOrder(order);
+        updateInventory(order.getProductId());
+    }
+
+    @Transactional
+    private void saveOrder(Order order) {
+        // 警告：private 方法上的 @Transactional 会失效！
+        // Spring AOP 基于 CGLIB/JDK 代理
+        // 代理只能拦截 public 方法
+        orderMapper.insert(order);
+    }
+}
+```
+
+**为什么失效？**
+
+Spring AOP 的代理机制中，无论是 JDK 动态代理还是 CGLIB 代理，都只能拦截 **public 方法**。`private` 方法不是虚方法的一部分，代理子类无法重写。
+
+```java
+// CGLIB 代理的原理：生成目标类的子类
+// 子类无法 override private 方法
+public class OrderService$$EnhancerBySpringCGLIB$$ extends OrderService {
+    @Override  // 编译报错！private 方法不能被 override
+    private void saveOrder(Order order) {
+        // ...
+    }
+}
+```
+
+【面试官心理】
+这道追问我是想看候选人是否理解"Spring AOP 的底层实现"。知道 private 方法失效的占60%，能解释出"代理是基于继承/接口，无法 override private 方法"这个原因的只有20%。
+
+### 2.2 同类内部调用 —— 最隐蔽的陷阱
+
+```java
+@Service
+public class UserService {
+
+    @Transactional
+    public void register(User user) {
+        // 走代理
+        validate(user);       // 正常，代理方法调用
+        saveUser(user);       // 走代理
+        sendEmail(user);      // 走代理
+    }
+
+    @Transactional(rollbackFor = Exception.class)
+    public void sendEmail(User user) {
+        // 异常！
+        throw new RuntimeException("邮件服务挂了");
+    }
+
+    private void validate(User user) {
+        // 不走代理！直接内部调用
+        // this.validate(user)，绕过了代理
+        if (user.getName() == null) {
+            throw new IllegalArgumentException("用户名不能为空");
+        }
+    }
+}
+```
+
+**为什么失效？**
+
+当 `register` 调用 `sendEmail` 时，走的是 `this.sendEmail()`，这是**目标对象的方法调用**，而不是代理对象的方法调用。代理对象被绕过了，事务根本没开启。
+
+```java
+// 代理对象调用（正确）
+OrderService proxy = (OrderService) applicationContext.getBean("orderService");
+proxy.register(user);  // 代理对象，事务开启
+
+// 内部方法调用（错误）
+this.register(user);   // this 是目标对象，绕过了代理
+```
+
+**三种解决方式**：
+
+```java
+// 方案一：注入自身
+@Service
+public class UserService {
+    @Autowired
+    private UserService self;  // 注入自身代理
+
+    @Transactional
+    public void register(User user) {
+        self.sendEmail(user);  // 通过代理调用
+    }
+
+    @Transactional
+    public void sendEmail(User user) {
+        // ...
+    }
+}
+
+// 方案二：开启 expose-proxy
+// application.yml
+spring:
+  aop:
+    proxy-target-class: true
+    expose-proxy: true
+
+// 代码中
+((UserService) AopContext.currentProxy()).sendEmail(user);
+
+// 方案三：拆到两个 Bean（推荐）
+@Service
+public class EmailService {
+    @Transactional
+    public void sendEmail(User user) {
+        // ...
+    }
+}
+
+@Service
+public class UserService {
+    @Autowired
+    private EmailService emailService;
+
+    public void register(User user) {
+        emailService.sendEmail(user);  // 跨 Bean 调用，走代理
+    }
+}
+```
+
+:::warning ⚠️
+同类内部调用是 @Transactional 失效最隐蔽的场景，80%的生产 Bug 都栽在这个坑上。很多开发者在自测时发现没问题，是因为测试用例直接注入了 Bean —— 也就是代理对象。但上线后，如果业务代码中出现了内部调用，事务就不生效了。
+:::
+
+### 2.3 异常被 catch 吞掉
+
+```java
+@Transactional
+public void createOrder(Order order) {
+    try {
+        orderMapper.insert(order);
+        inventoryService.decreaseStock(order.getProductId());
+    } catch (Exception e) {
+        // 错误做法：catch 后吞掉异常
+        log.error("创建订单失败", e);
+        // 事务管理器认为没有异常，不回滚！
+    }
+}
+```
+
+Spring 事务基于异常判断是否回滚。catch 之后异常就没了，事务管理器认为方法正常执行完毕，提交了。
+
+**正确的做法**：
+
+```java
+@Transactional
+public void createOrder(Order order) {
+    try {
+        orderMapper.insert(order);
+        inventoryService.decreaseStock(order.getProductId());
+    } catch (Exception e) {
+        log.error("创建订单失败", e);
+        // 方式一：重新抛出
+        throw new RuntimeException("创建订单失败", e);
+
+        // 方式二：手动标记回滚
+        // TransactionAspectSupport.currentTransactionStatus().setRollbackOnly();
+    }
+}
+```
+
+### 2.4 异常类型不匹配
+
+```java
+@Transactional  // 默认只回滚 RuntimeException 和 Error
+public void createOrder(Order order) throws Exception {
+    // 业务校验
+    if (order.getAmount() <= 0) {
+        throw new Exception("订单金额必须大于0");  // checked exception，不回滚！
+    }
+    orderMapper.insert(order);
+}
+```
+
+**根因**：Spring 默认只对未检查异常（unchecked）进行回滚：
+
+```java
+// TransactionInterceptor.java 核心逻辑
+// 默认只处理 RuntimeException 和 Error
+if (伤痕 instanceof RuntimeException ||伤痕 instanceof Error) {
+    resultCode = TransactionAspectSupport.rollbackOn(ex);
+}
+```
+
+**正确的做法**：
+
+```java
+@Transactional(rollbackFor = Exception.class)
+public void createOrder(Order order) throws Exception {
+    if (order.getAmount() <= 0) {
+        throw new Exception("订单金额必须大于0");
+    }
+    orderMapper.insert(order);
+}
+
+// 或者更精确地指定
+@Transactional(rollbackFor = {BusinessException.class, SystemException.class})
+```
+
+### 2.5 propagation 配置错误
+
+```java
+@Service
+public class OrderService {
+    @Autowired
+    private InventoryService inventoryService;
+
+    @Transactional
+    public void createOrder(Order order) {
+        orderMapper.insert(order);
+        // 开启新事务
+        inventoryService.decreaseStock(order.getProductId());
+    }
+}
+
+@Service
+public class InventoryService {
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void decreaseStock(String productId) {
+        // 这个方法开启了一个新事务
+        // 如果它抛异常，不会影响 OrderService 的事务！
+        // 因为 REQUIRED_NEW 会挂起外部事务
+        throw new RuntimeException("库存不足");
+    }
+}
+```
+
+**根因**：`REQUIRES_NEW` 会**挂起**外部事务，创建新的独立事务。外层事务已经暂停了，所以无论新事务成功还是失败，外层都感知不到。
+
+| 传播行为 | 外层事务 | 内层事务 | 适用场景 |
+|----------|----------|----------|----------|
+| `REQUIRED` | 使用外层事务 | 加入外层事务 | 正常业务 |
+| `REQUIRES_NEW` | 挂起 | 创建新事务 | 日志记录（不影响主业务） |
+| `NESTED` | 使用外层事务 | 创建 savepoint | 需要部分回滚 |
+
+### 2.6 类未被 Spring 管理
+
+```java
+@Service
+public class OrderService {
+
+    public void createOrder(Order order) {
+        // 错误：new 出来的对象不是 Spring Bean
+        OrderValidator validator = new OrderValidator();
+        validator.validate(order);  // validate 里的 @Transactional 不生效
+
+        orderMapper.insert(order);
+    }
+}
+
+public class OrderValidator {
+    @Transactional
+    public void validate(Order order) {
+        // 这个事务永远不生效
+        // 因为 OrderValidator 不是 Spring 管理的
+    }
+}
+```
+
+`new` 出来的对象不受 Spring 容器管理，Spring AOP 根本没有机会为其创建代理。
+
+### 2.7 多数据源未指定 transactionManager
+
+```java
+@Configuration
+public class DataSourceConfig {
+    @Bean
+    public DataSource transactionDataSource() {
+        return new DataSourceTransactionManager(dataSource());
+    }
+
+    @Bean
+    public DataSource otherDataSource() {
+        return DruidDataSourceFactory.createDataSource(props);
+    }
+}
+
+@Service
+public class ReportService {
+
+    @Transactional(transactionManager = "transactionDataSource")
+    public void generateReport() {
+        // 指定了正确的事务管理器
+        jdbcTemplate.execute("INSERT INTO report (...)");
+    }
+
+    @Transactional  // 没指定，找不到匹配的事务管理器
+    public void doSomething() {
+        // 事务可能不生效
+    }
+}
+```
+
+### 2.8 多线程场景
+
+```java
+@Transactional
+public void createOrder(Order order) {
+    orderMapper.insert(order);
+
+    // 异步发送通知，新线程中执行
+    new Thread(() -> {
+        // 这个线程的事务是独立的！
+        // 与 createOrder 的事务无关
+        notificationService.notify(order);
+    }).start();
+}
+```
+
+每个线程都有自己独立的事务上下文，子线程的事务不会继承主线程的事务。
+
+## 三、生产避坑 🔴
+
+### 3.1 真实事故场景
+
+2024年双十一，我们订单系统出现了2000多笔订单数据不一致。
+
+排查了4个小时，发现是开发者在 `OrderService` 内部调用了 `inventoryService.validateAndDecrease()`，而这个方法也加了 `@Transactional`：
+
+```java
+// OrderService.java
+@Transactional
+public void createOrder(Order order) {
+    orderMapper.insert(order);
+    inventoryService.validateAndDecrease(order.getProductId());  // 走代理
+    paymentService.processPayment(order);  // 走代理
+}
+
+// InventoryService.java
+@Transactional(propagation = Propagation.REQUIRES_NEW)
+public void validateAndDecrease(String productId) {
+    // 扣库存
+    // 这个方法在独立事务中运行
+    // 如果失败，createOrder 的事务感知不到！
+    // 因为 REQUIRED_NEW 挂起了 OrderService 的事务
+}
+```
+
+`inventoryService` 用了 `REQUIRES_NEW`，当库存不足抛异常时，`OrderService` 的事务感知不到，订单照常插入，但库存没扣。
+
+**排查方法**：
+
+```bash
+# 查看事务日志
+spring.transaction日志级别=DEBUG
+
+# 查看数据库锁
+SELECT * FROM information_schema.INNODB_LOCKS;
+SELECT * FROM information_schema.INNODB_TRX;
+```
+
+## 四、工程选型 🟢
+
+### 4.1 事务使用的最佳实践
+
+1. **优先使用构造器注入或 @RequiredArgsConstructor**，确保依赖不可变
+2. **类上统一加 @Transactional**，方法上细粒度控制 `rollbackFor`
+3. **内部方法调用用注入自身**：`@Autowired private XxxService self;`
+4. **统一指定 transactionManager**：避免多数据源下的歧义
+5. **非必要不用 REQUIRES_NEW**：除非你确定需要独立事务
+
+【面试官心理】
+这道题我通常会追问："既然 @Transactional 有这么多坑，为什么 Spring 不设计成更安全的默认值？" 能答出"性能开销"和"向后兼容"这两个点的，通常是有架构思维的候选人。
+
+:::tip 💡
+阿里内部规范要求：@Transactional 必须指定 `rollbackFor = Exception.class`，并且方法必须是 `public`。这是为了避免团队成员踩坑。
+:::
+
+## 五、面试追问链 🔴
+
+**第一层：基本用法**
+面试官问："@Transactional 怎么用？"
+候选人答："在方法或类上加注解，开启事务..."
+考察点：基本使用
+
+**第二层：失效场景**
+面试官追问："哪些场景下 @Transactional 会失效？"
+候选人答："private 方法、内部调用..."（可能漏掉几个）
+考察点：踩坑深度
+
+**第三层：源码原理**
+面试官追问："Spring 是怎么实现事务的？为什么能捕获异常？"
+候选人答：...（可能说不清楚）
+考察点：底层理解
+
+**第四层：生产问题**
+面试官追问："如果线上发现数据不一致，怎么排查是不是事务问题？"
+候选人答：...（生产经验）
+考察点：工程经验

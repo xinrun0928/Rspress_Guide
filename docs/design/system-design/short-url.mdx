@@ -1,0 +1,439 @@
+---
+title: 短链系统设计
+description: 从ID生成算法到存储选型，从Redis缓存到高可用设计，深度剖析短链系统如何支撑每日百亿次跳转请求。
+---
+
+# 短链系统设计
+
+## 一个URL缩短的故事
+
+2019年，我接手了一个短链系统。上线第一天，数据库就报警了——2000条数据撑不住每秒 10 万次查询。
+
+问题出在哪里？
+
+```java
+// 上线代码
+public String shorten(String longUrl) {
+    String shortCode = generateCode();
+    // 直接用数据库查询是否存在
+    while (urlDao.existsByCode(shortCode)) {
+        shortCode = generateCode(); // 碰撞了？
+    }
+    urlDao.save(new ShortUrl(shortCode, longUrl));
+    return shortCode;
+}
+```
+
+问题：每生成一个短码，都要查询一次数据库。10万 QPS = 10万次数据库查询，数据库直接爆炸。
+
+**短链系统的核心问题：如何在海量请求下，高效地生成唯一 ID、快速查询、保证高可用？**
+
+---
+
+## 二、需求澄清🔴
+
+### 2.1 核心指标
+
+| 指标 | 数值 |
+|------|------|
+| DAU | 1 亿 |
+| 日新增短链 | 1000 万 |
+| 日点击量 | 100 亿 |
+| 峰值 QPS（点击） | 120 万 |
+| 峰值 QPS（创建） | 12 万 |
+
+### 2.2 功能需求
+
+```
+✅ 核心功能：
+- 长链 → 短链（创建）
+- 短链 → 长链（跳转）
+
+❌ 排除（简化）：
+- 自定义短链
+- 短链过期
+- 点击统计分析
+```
+
+---
+
+## 三、ID 生成算法🔴
+
+### 3.1 Base62 编码
+
+短链的本质是一个 62 进制的数字。
+
+```
+字符集：0-9, a-z, A-Z = 62 个字符
+长度 6 位：62^6 = 568 亿种组合
+长度 7 位：62^7 = 3521 亿种组合
+```
+
+```java
+public class Base62Util {
+    private static final String CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    private static final int BASE = CHARS.length();
+
+    // 数字 → Base62 字符串
+    public static String encode(long num) {
+        StringBuilder sb = new StringBuilder();
+        while (num > 0) {
+            int remainder = (int) (num % BASE);
+            sb.append(CHARS.charAt(remainder));
+            num /= BASE;
+        }
+        return sb.reverse().toString();
+    }
+
+    // Base62 字符串 → 数字
+    public static long decode(String str) {
+        long num = 0;
+        for (int i = 0; i < str.length(); i++) {
+            num = num * BASE + CHARS.indexOf(str.charAt(i));
+        }
+        return num;
+    }
+}
+```
+
+### 3.2 ID 生成方案对比
+
+| 方案 | 原理 | 优点 | 缺点 |
+|------|------|------|------|
+| 哈希算法 | MD5/SHA 截取 | 简单 | 碰撞、不可逆 |
+| 随机数 | 随机生成 | 简单 | 碰撞概率高 |
+| 分布式ID | 雪花算法 | 趋势递增 | 需要 ID 生成器 |
+| 自增ID | 数据库自增 | 简单 | 单点、无法分布式 |
+
+### 3.3 推荐方案：分布式ID + Base62
+
+```java
+@Service
+class IdGenerator {
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+
+    /**
+     * Redis INCR 生成全局唯一 ID
+     */
+    public long generateId() {
+        String key = "shorturl:id:generator";
+        Long id = redisTemplate.opsForValue().increment(key);
+        return id;
+    }
+
+    public String generateShortCode(long id) {
+        // 使用固定字母打头，避免 Decode 后与普通数字混淆
+        return "a" + Base62Util.encode(id);
+    }
+}
+```
+
+**为什么用 Redis 而不用雪花算法？**
+- 短链 ID 不需要趋势递增（只要唯一）
+- Redis INCR 更简单，性能更高
+- 可以批量预生成，减少网络开销
+
+---
+
+## 四、存储设计🔴
+
+### 4.1 数据库设计
+
+```sql
+CREATE TABLE short_urls (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    short_code VARCHAR(10) NOT NULL UNIQUE,
+    long_url TEXT NOT NULL,
+    user_id BIGINT DEFAULT 0,
+    expire_at TIMESTAMP NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    status TINYINT DEFAULT 1,
+    INDEX idx_short_code (short_code),
+    INDEX idx_created_at (created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+### 4.2 Redis 缓存设计
+
+```java
+@Service
+class ShortUrlService {
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+
+    private static final String SHORT_URL_PREFIX = "shorturl:";
+    private static final String LONG_URL_PREFIX = "longurl:";
+
+    /**
+     * 创建短链
+     */
+    public String create(String longUrl) {
+        // 1. 检查长链是否已存在（用于去重）
+        String shortCode = checkLongUrlExists(longUrl);
+        if (shortCode != null) {
+            return shortCode;
+        }
+
+        // 2. 生成新短链
+        long id = idGenerator.generateId();
+        shortCode = idGenerator.generateShortCode(id);
+
+        // 3. 写入数据库
+        shortUrlDao.save(new ShortUrl(shortCode, longUrl));
+
+        // 4. 写入缓存
+        String shortUrl = "https://t.cn/" + shortCode;
+        redisTemplate.opsForValue().set(
+            SHORT_URL_PREFIX + shortCode,
+            longUrl,
+            Duration.ofDays(30)
+        );
+        redisTemplate.opsForValue().set(
+            LONG_URL_PREFIX + hash(longUrl),
+            shortCode,
+            Duration.ofDays(30)
+        );
+
+        return shortCode;
+    }
+
+    /**
+     * 根据短码获取长链
+     */
+    public String resolve(String shortCode) {
+        // 1. 先查缓存
+        String longUrl = redisTemplate.opsForValue().get(
+            SHORT_URL_PREFIX + shortCode
+        );
+        if (longUrl != null) {
+            return longUrl;
+        }
+
+        // 2. 缓存未命中，查数据库
+        ShortUrl shortUrl = shortUrlDao.findByCode(shortCode);
+        if (shortUrl != null) {
+            // 回填缓存
+            redisTemplate.opsForValue().set(
+                SHORT_URL_PREFIX + shortCode,
+                shortUrl.getLongUrl(),
+                Duration.ofDays(30)
+            );
+            return shortUrl.getLongUrl();
+        }
+
+        return null;
+    }
+}
+```
+
+### 4.3 多级缓存
+
+```
+L1: Nginx 本地缓存（LRU, 1万条, TTL 5分钟）
+    ↓ 未命中
+L2: Redis 集群（1000万条, TTL 30天）
+    ↓ 未命中
+L3: MySQL（持久化存储）
+```
+
+```nginx
+# Nginx 缓存配置
+proxy_cache_path /tmp/nginx_cache levels=1:2 keys_zone=short_url:10m
+                 max_size=1g inactive=5m use_temp_path=off;
+
+location / {
+    proxy_cache short_url;
+    proxy_cache_key $scheme$request_uri;
+    proxy_cache_valid 200 5m;  # 200 响应缓存 5 分钟
+    proxy_pass http://backend;
+}
+```
+
+---
+
+## 五、跳转优化🟡
+
+### 5.1 302 vs 301
+
+| 类型 | 含义 | 适用场景 |
+|------|------|----------|
+| 301 | 永久重定向 | 短链永久不变的场景，浏览器会缓存 |
+| 302 | 临时重定向 | 短链会变化、需要统计点击的场景 |
+
+**短链系统推荐 302**：
+1. 301 会被浏览器缓存，导致短链变化后仍然跳转旧地址
+2. 302 每次都经过服务端，可以做统计
+
+```java
+@RestController
+class RedirectController {
+    @GetMapping("/{shortCode}")
+    public ResponseEntity<Void> redirect(@PathVariable String shortCode) {
+        String longUrl = shortUrlService.resolve(shortCode);
+
+        if (longUrl == null) {
+            return ResponseEntity.notFound().build();
+        }
+
+        // 302 临时重定向
+        return ResponseEntity.status(HttpStatus.FOUND)
+            .location(URI.create(longUrl))
+            .build();
+    }
+}
+```
+
+### 5.2 异步统计
+
+```java
+@RestController
+class RedirectController {
+    @GetMapping("/{shortCode}")
+    public ResponseEntity<Void> redirect(@PathVariable String shortCode) {
+        String longUrl = shortUrlService.resolve(shortCode);
+
+        // 异步记录点击
+        mqTemplate.asyncSend("shorturl:click:topic",
+            new ClickMessage(shortCode, Instant.now()));
+
+        return ResponseEntity.status(HttpStatus.FOUND)
+            .location(URI.create(longUrl))
+            .build();
+    }
+}
+```
+
+---
+
+## 六、高可用设计🟡
+
+### 6.1 缓存雪崩
+
+```java
+// ❌ 错误：大量缓存同时过期
+redisTemplate.opsForValue().set(
+    SHORT_URL_PREFIX + shortCode,
+    longUrl,
+    Duration.ofDays(30) // 30 天后同时过期
+);
+
+// ✅ 正确：过期时间加随机值
+redisTemplate.opsForValue().set(
+    SHORT_URL_PREFIX + shortCode,
+    longUrl,
+    Duration.ofDays(30 + random.nextInt(7)) // 30-37 天随机
+);
+```
+
+### 6.2 缓存击穿
+
+```java
+// ❌ 错误：热点数据过期时大量请求击穿到数据库
+String longUrl = redisTemplate.opsForValue().get(key);
+if (longUrl == null) {
+    longUrl = dao.findByCode(shortCode);
+    redisTemplate.opsForValue().set(key, longUrl, Duration.ofDays(30));
+}
+
+// ✅ 正确：加锁防止击穿
+public String resolve(String shortCode) {
+    String key = SHORT_URL_PREFIX + shortCode;
+
+    String longUrl = redisTemplate.opsForValue().get(key);
+    if (longUrl != null) {
+        return longUrl;
+    }
+
+    // Redis SETNX 分布式锁
+    String lockKey = "lock:" + key;
+    String lockValue = UUID.randomUUID().toString();
+
+    if (Boolean.TRUE.equals(
+            redisTemplate.opsForValue().setIfAbsent(lockKey, lockValue,
+                Duration.ofSeconds(5)))) {
+        try {
+            longUrl = dao.findByCode(shortCode);
+            if (longUrl != null) {
+                redisTemplate.opsForValue().set(key, longUrl, Duration.ofDays(30));
+            }
+        } finally {
+            redisTemplate.delete(lockKey);
+        }
+    }
+
+    return longUrl;
+}
+```
+
+### 6.3 多级降级
+
+```
+Redis 全挂了？
+    ↓
+    Nginx 缓存撑住热点数据
+    ↓
+    MySQL 直接查询（降级到最慢模式）
+    ↓
+    返回友好的错误页面
+```
+
+---
+
+## 七、容量规划🟡
+
+### 7.1 存储计算
+
+```
+每天新增：1000 万条
+每条数据：short_code(10B) + long_url(2KB) + 索引(20B) ≈ 2.5KB
+
+一年存储：
+1000万 × 2.5KB × 365 ≈ 9.1 TB
+
+加上备份（3副本）：
+9.1 TB × 3 ≈ 27.3 TB
+```
+
+### 7.2 缓存计算
+
+```
+热点数据：最近 7 天的访问
+7天 × 1000万 × 2.5KB ≈ 175 GB
+
+Redis 集群（每节点 32GB）：
+175 GB / 32 GB ≈ 6 节点
+```
+
+### 7.3 QPS 计算
+
+```
+日点击量：100 亿次
+平均 QPS：100亿 / 86400 ≈ 12万
+峰值 QPS：12万 × 10（峰值系数）≈ 120万
+
+Redis 单节点 QPS：10-20万
+需要的 Redis 节点：120万 / 15万 ≈ 8 节点
+```
+
+【架构权衡】
+短链系统的核心矛盾是"读取量远大于写入量"。所有优化都围绕读取展开：多级缓存减少数据库压力、Nginx 本地缓存减少 Redis 压力、异步统计减少同步开销。
+
+---
+
+## 八、面试总结
+
+### 8.1 核心追问
+
+1. **"短链ID怎么生成？"** —— Redis INCR + Base62
+2. **"如何保证短链不碰撞？"** —— 全局唯一 ID
+3. **"Redis 挂了怎么办？"** —— 多级降级
+4. **"如何设计多级缓存？"** —— Nginx + Redis + MySQL
+
+### 8.2 级别差异
+
+| 级别 | 期望回答 |
+|------|----------|
+| P5 | 能说出基本原理和 Redis 缓存 |
+| P6 | 能说出 ID 生成算法、多级缓存 |
+| P7 | 能设计完整的高可用方案，包括降级、容灾 |

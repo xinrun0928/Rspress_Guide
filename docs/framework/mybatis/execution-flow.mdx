@@ -1,0 +1,412 @@
+---
+title: MyBatis 执行流程全解析
+description: 从一次 select 调用出发，逐行拆解 MyBatis 的执行链路，覆盖源码层面，直击面试追问。
+---
+
+候选人小李去美团面L7，面试官看了他简历上写的"深入了解 MyBatis 框架原理"，问道：
+
+"来，给我走一遍 MyBatis 执行一条 select 语句的完整流程。从你调用 mapper.findById(1) 开始，到返回结果为止。"
+
+小李说："就是调用 SqlSession，然后查缓存，然后执行 SQL，最后返回结果。"
+
+面试官眉头一皱："那缓存是怎么查的？Executor 里面做了什么？StatementHandler 是怎么创建的？BoundSql 里的 SQL 怎么拼出来的？"
+
+小张开始语无伦次，在每个环节都只能说个大概...
+
+【面试官心理】
+这道题是 MyBatis 面试的核心题，能完整走通的人不超过 30%。我追问的每个细节都是有目的的：BoundSql 是动态 SQL 的载体，StatementHandler 的创建过程涉及 MyBatis 的插件机制，ResultSet 的处理过程体现了结果映射的灵活性。能把这条路走通的人，基本都看过源码。
+
+## 一、从一次调用开始 🔴
+
+先看最常见的代码：
+
+```java
+SqlSession sqlSession = sqlSessionFactory.openSession();
+UserMapper mapper = sqlSession.getMapper(UserMapper.class);
+User user = mapper.findById(1L);
+```
+
+这一行 `mapper.findById(1L)` 背后，到底发生了什么？
+
+```mermaid
+flowchart TD
+    A[mapper.findById(1L)] --> B[MapperProxy.invoke]
+    B --> C[MapperMethod.execute]
+    C --> D[SqlSession.selectOne]
+    D --> E[CachingExecutor.query]
+    E --> F[查二级缓存]
+    F -->|未命中| G[SimpleExecutor.query]
+    G --> H[prepareStatement 创建 PreparedStatement]
+    H --> I[StatementHandler 创建]
+    I --> J[ParameterHandler.setParameters]
+    J --> K[JDBC 执行]
+    K --> L[ResultSetHandler.handleResultSets]
+    L --> M[返回 User 对象]
+```
+
+## 二、Step 1 — getMapper 是怎么工作的？
+
+先别急着往下跳，`sqlSession.getMapper(UserMapper.class)` 这一步就已经有东西了。
+
+```java
+// DefaultSqlSession.getMapper
+public <T> T getMapper(Class<T> type) {
+    return configuration.getMapper(type, this);
+}
+
+// Configuration.getMapper
+public <T> T getMapper(Class<T> type, SqlSession sqlSession) {
+    // 从 mapperRegistry 中获取 MapperProxyFactory
+    MapperProxyFactory<T> mapperProxyFactory =
+        (MapperProxyFactory<T>) knownMappers.get(type);
+    if (mapperProxyFactory == null) {
+        throw new BindingException("...");
+    }
+    // 创建代理对象
+    return mapperProxyFactory.newInstance(sqlSession);
+}
+
+// MapperProxyFactory.newInstance
+protected T newInstance(MapperProxy<T> mapperProxy) {
+    return (T) Proxy.newProxyInstance(
+        mapperProxyFactory.getClass().getClassLoader(),
+        new Class[]{mapperProxyFactory.getMapperInterface()},
+        mapperProxy
+    );
+}
+```
+
+所以 `getMapper` 返回的是一个 `MapperProxy`。这个代理对象持有 `SqlSession` 的引用。当你调用 `mapper.findById(1L)` 时，代理拦截了这个调用。
+
+:::tip 💡
+为什么 MyBatis 要用代理？因为它想让你写接口而不是实现类。代理在调用方法时，根据方法名 + 参数去 Configuration 里找到对应的 SQL 语句，然后执行。这就是"接口即 SQL"的精髓。
+:::
+
+## 三、Step 2 — MapperProxy 拦截了什么？
+
+```java
+public class MapperProxy<T> implements InvocationHandler {
+    private final SqlSession sqlSession;
+    private final Map<Method, MapperMethod> methodCache;  // 缓存已解析的 MapperMethod
+
+    @Override
+    public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+        // 如果是 Object 方法（equals/toString），直接调用
+        if (Object.class.equals(method.getDeclaringClass())) {
+            return method.invoke(this, args);
+        }
+        // 从缓存获取或新建 MapperMethod
+        final MapperMethod mapperMethod = cachedMapperMethod(method);
+        // 执行 MapperMethod
+        return mapperMethod.execute(sqlSession, args);
+    }
+}
+```
+
+`MapperMethod.execute` 根据 SQL 类型（select/update/insert/delete）分发到不同的 SqlSession 方法：
+
+```java
+public Object execute(SqlSession sqlSession, Object[] args) {
+    Object result;
+    switch (command.getType()) {
+        case SELECT:
+            // 处理返回结果
+            result = sqlSession.selectOne(command.getName(), args);
+            break;
+        case INSERT:
+            result = rowsAffected = sqlSession.insert(command.getName(), args);
+            break;
+        case UPDATE:
+            result = rowsAffected = sqlSession.update(command.getName(), args);
+            break;
+        case DELETE:
+            result = rowsAffected = sqlSession.delete(command.getName(), args);
+            break;
+    }
+    return result;
+}
+```
+
+## 四、Step 3 — SqlSession 怎么找到 SQL？
+
+```java
+// DefaultSqlSession.selectOne
+public <E> List<E> selectList(String statement, Object parameter) {
+    MappedStatement ms = configuration.getMappedStatement(statement);
+    return executor.query(ms, parameter, RowBounds.DEFAULT, Executor.NO_RESULT_HANDLER);
+}
+```
+
+关键在 `MappedStatement`：
+
+```java
+// MappedStatement 包含了 SQL 的所有元信息
+public final class MappedStatement {
+    private String id;                    // namespace + methodName
+    private SqlCommandType commandType;   // SELECT/INSERT/UPDATE/DELETE
+    private SqlSource sqlSource;           // SQL 语句来源（动态 SQL 解析后）
+    private BoundSql boundSql;            // 绑定后的 SQL（包含参数映射）
+    private Cache cache;                  // 二级缓存
+    private ParameterMap parameterMap;     // 参数映射
+    private List<ResultMap> resultMaps;    // 结果映射
+    // ...
+}
+```
+
+## 五、Step 4 — Executor 查询流程 🔴
+
+```java
+// CachingExecutor.query
+public <E> List<E> query(MappedStatement ms, Object parameter, RowBounds rowBounds,
+                          ResultHandler resultHandler, CacheKey cacheKey, BoundSql boundSql) {
+    // 1. 查二级缓存
+    BoundSql msBoundSql = ms.getBoundSql(parameter);
+    CacheKey key = createCacheKey(ms, parameter, rowBounds, msBoundSql);
+    if (ms.hasCache()) {
+        Cache cache = ms.getCache();
+        // 从TransactionalCacheManager中获取（后面讲缓存会详细说）
+        ...
+    }
+    // 2. 缓存未命中，委托给被包装的 Executor
+    return delegate.query(ms, parameter, rowBounds, resultHandler, cacheKey, boundSql);
+}
+
+// SimpleExecutor.doQuery —— 核心方法
+public <E> List<E> doQuery(MappedStatement ms, Object parameter, RowBounds rowBounds,
+                            ResultHandler resultHandler, BoundSql boundSql) {
+    // 1. 获取数据库连接
+    Connection connection = transaction.getConnection();
+    // 2. 创建 StatementHandler（这里是插件链的入口）
+    StatementHandler handler = configuration.newStatementHandler(
+        this, ms, parameter, rowBounds, resultHandler, boundSql);
+    // 3. 预处理：创建 PreparedStatement 并设置参数
+    Statement stmt = prepareStatement(handler, connection);
+    // 4. 执行查询并处理结果
+    return handler.<E>query(stmt, resultHandler);
+}
+
+// 关键：prepareStatement 方法
+private Statement prepareStatement(StatementHandler handler, Connection connection) {
+    // 这里会触发 ParameterHandler 设置参数
+    handler.parameterize(connection.prepareStatement(sql));
+    return stmt;
+}
+```
+
+**面试官心理追问**：为什么 PreparedStatement 的创建要包装在 prepareStatement 方法里？
+
+因为 `connection.prepareStatement(sql)` 需要数据库连接，而连接是从 Transaction 获取的。这个方法封装了"获取连接 → 创建 Statement → 设置参数"的全流程。
+
+## 六、Step 5 — StatementHandler 的创建和插件链
+
+```java
+// Configuration.newStatementHandler
+public StatementHandler newStatementHandler(Executor executor, MappedStatement ms,
+                                             Object parameter, RowBounds rowBounds,
+                                             ResultHandler resultHandler, BoundSql boundSql) {
+    // 创建基础 StatementHandler（这里走了路由）
+    StatementHandler handler = new RoutingStatementHandler(executor, ms, parameter,
+                                                             rowBounds, resultHandler, boundSql);
+
+    // 插件在这里拦截！层层包装
+    handler = (StatementHandler) interceptorChain.pluginAll(handler);
+    return handler;
+}
+```
+
+`RoutingStatementHandler` 是一个路由处理器，它根据 `StatementType` 决定用哪个具体的 Handler：
+
+```java
+public class RoutingStatementHandler implements StatementHandler {
+    private final StatementHandler delegate;
+
+    public RoutingStatementHandler(Executor executor, MappedStatement ms, Object parameter,
+                                    RowBounds rowBounds, ResultHandler resultHandler,
+                                    BoundSql boundSql) {
+        // 根据 ms.getStatementType() 选择具体实现
+        switch (ms.getStatementType()) {
+            case STATEMENT:
+                delegate = new SimpleStatementHandler(executor, ms, parameter, rowBounds, resultHandler, boundSql);
+                break;
+            case PREPARED:
+                delegate = new PreparedStatementHandler(executor, ms, parameter, rowBounds, resultHandler, boundSql);
+                break;
+            case CALLABLE:
+                delegate = new CallableStatementHandler(executor, ms, parameter, rowBounds, resultHandler, boundSql);
+                break;
+            default:
+                throw new ExecutorException("...");
+        }
+    }
+}
+```
+
+:::warning ⚠️
+面试高频翻车点：很多人不知道 RoutingStatementHandler 的存在，以为直接 new 的是 PreparedStatementHandler。RoutingStatementHandler 是 MyBatis 3.4.6 引入的，之前版本是直接判断 StatementType 然后 new 对应的实现类。
+:::
+
+## 七、Step 6 — ParameterHandler 设置参数
+
+```java
+// PreparedStatementHandler.parameterize
+public void parameterize(Statement statement) throws SQLException {
+    // 委托给 ParameterHandler
+    parameterHandler.setParameters((PreparedStatement) statement);
+}
+
+// DefaultParameterHandler.setParameters
+public void setParameters(PreparedStatement ps) {
+    // 遍历 BoundSql 中的每个参数
+    List<ParameterMapping> parameterMappings = boundSql.getParameterMappings();
+    for (int i = 0; i < parameterMappings.size(); i++) {
+        ParameterMapping pm = parameterMappings.get(i);
+        Object value;
+        // 从参数对象中取出对应的值
+        if (boundSql.hasAdditionalParameters()) {
+            value = boundSql.getAdditionalParameter(pm.getProperty());
+        } else if (parameterObject == null) {
+            value = null;
+        } else {
+            // 这里用了 TypeHandlerRegistry 来找到正确的 TypeHandler
+            value = typeHandlerRegistry.getTypeHandler(pm.getJavaType(), pm.getJdbcType())
+                                       .getResult(rs, pm.getProperty());
+        }
+        // 使用对应的 TypeHandler 写入 PreparedStatement
+        typeHandler.setParameter(ps, i + 1, value, pm.getJdbcTypeIndex());
+    }
+}
+```
+
+## 八、Step 7 — ResultSetHandler 处理结果
+
+```java
+// PreparedStatementHandler.query
+public <E> List<E> query(Statement statement, ResultHandler resultHandler) throws SQLException {
+    PreparedStatement ps = (PreparedStatement) statement;
+    ps.execute();  // 执行 SQL
+    return resultSetHandler.<E>handleResultSets(ps);  // 处理结果集
+}
+
+// DefaultResultSetHandler.handleResultSets
+public List<Object> handleResultSets(Statement statement) throws SQLException {
+    final List<Object> multipleResults = new ArrayList<>();
+    int resultSetCount = 0;
+
+    // JDBC 允许一次返回多个 ResultSet
+    ResultSetWrapper rsw = new ResultSetWrapper(ps.getResultSet(), configuration);
+
+    // 遍历 ResultMap（一个查询可能对应多个 ResultMap）
+    for (ResultMap resultMap : resultMaps) {
+        Object resultObject = resultSetHandler.wrapDefaultResultObject(rsw, resultMap,
+                                                                         resultHandler,
+                                                                         resultMappingContext);
+        multipleResults.add(resultObject);
+        resultSetCount++;
+    }
+    return multipleResults;
+}
+```
+
+## 九、❌ 错误示范
+
+### 翻车点一：说成了一条直线
+
+> "就是调用 getMapper 获取代理对象，然后执行 SQL，返回结果。"
+
+完全没有细节，面试官随便追问一个环节就崩。
+
+### 翻车点二：混淆了 BoundSql 和 MappedStatement
+
+> "SQL 存在 MappedStatement 里，BoundSql 就是绑定参数的..."
+
+BoundSql 是 MappedStatement 经过"参数绑定"后的产物，不是一回事。BoundSql 包含了经过 `#{}`/`${}` 解析后的最终 SQL 和参数映射。
+
+### 翻车点三：不知道插件链在哪个环节介入
+
+> "插件在 Executor 执行前拦截..."
+
+插件拦截点在 `StatementHandler` 的创建阶段，具体来说是 `configuration.newStatementHandler()` 的时候，调用 `interceptorChain.pluginAll(handler)`，所有插件对 handler 层层包装。
+
+## 十、标准回答
+
+### P5 级别：能走通主流程
+
+> 调用 `mapper.findById(1L)` 时，MyBatis 首先通过 JDK 动态代理获取 `MapperProxy` 对象。代理的 `invoke` 方法根据方法名找到对应的 `MappedStatement`，然后调用 `SqlSession.selectOne`。SqlSession 将查询委托给 `Executor`（先查二级缓存，未命中则走 SimpleExecutor）。Executor 通过 `StatementHandler` 创建 `PreparedStatement`，`ParameterHandler` 负责设置参数，JDBC 执行后 `ResultSetHandler` 将结果映射成 Java 对象返回。
+
+### P6 级别：能说出关键节点和源码细节
+
+> 关键流程节点：① `getMapper` 返回 `MapperProxy`（JDK 动态代理）；② `MapperProxy.invoke` 找到 `MapperMethod` 并执行；③ `MapperMethod.execute` 根据 SQL 类型分发到 `SqlSession` 的对应方法；④ `CachingExecutor` 先查二级缓存，缓存未命中则委托 `SimpleExecutor`；⑤ `StatementHandler`（由 `RoutingStatementHandler` 根据 StatementType 选择具体实现）创建 `PreparedStatement`；⑥ `ParameterHandler` 通过 `TypeHandlerRegistry` 获取对应的 `TypeHandler` 设置参数；⑦ JDBC 执行后 `ResultSetHandler` 通过 `ResultMapping` 将 `ResultSet` 映射成对象。**BoundSql** 是 MappedStatement 经过 `#{}`/`${}` 解析后的产物，包含最终 SQL 和参数映射信息。
+
+### P7 级别：能讲清设计模式和扩展机制
+
+> 整个执行链路体现了 MyBatis 的分层架构和可插拔设计。MapperProxy 用 JDK 动态代理实现了"接口即 SQL"；CachingExecutor 用装饰器模式在不修改 SimpleExecutor 的情况下透明添加了二级缓存；`InterceptorChain.pluginAll` 用责任链模式让插件可以拦截 `StatementHandler`、`ParameterHandler`、`ResultSetHandler`、`Executor` 四类组件的任意方法。生产中容易踩的坑是：插件的拦截顺序是逆序的（最后添加的先拦截），而且插件必须正确处理 `InvocationContext.proceed()` 否则后续链会断裂。
+
+【面试官心理】
+面试官追问执行流程，其实是在验证三个能力：①你有没有看过源码；②你能不能把一个完整流程讲清楚而不是只说片段；③你能否理解 MyBatis 的设计意图。P6 的标准是能把主要节点串起来，P7 的标准是能讲清楚"为什么这么设计"和"哪些点可以扩展"。
+
+## 十一、追问升级 🟡
+
+### 追问1：BoundSql 是什么？它和 MappedStatement 的区别是什么？
+
+**BoundSql** 是 MappedStatement 经过动态 SQL 解析后的产物：
+
+```java
+public class BoundSql {
+    private final String sql;                    // 最终的 SQL（#{} 被替换为 ?）
+    private final List<ParameterMapping> parameterMappings;  // 参数映射
+    private final Object parameterObject;        // 原始参数对象
+    private final Map<String, Object> additionalParameters;  // 额外参数（_parameter, _databaseId 等）
+}
+```
+
+MappedStatement 里的 SQL 是这样的：`SELECT * FROM user WHERE id = #{id}`
+
+BoundSql 里的 SQL 是这样的：`SELECT * FROM user WHERE id = ?`
+
+区别：BoundSql 是运行时产物，包含了占位符和参数映射；MappedStatement 是编译时配置，包含了原始 SQL 和元信息。
+
+### 追问2：插件拦截的是哪个对象？
+
+MyBatis 插件可以拦截四类对象：
+
+| 拦截对象 | 可拦截方法 | 常见用途 |
+| --- | --- | --- |
+| `Executor` | update、query、flushStatements、close | SQL 日志、慢查询记录、分页 |
+| `StatementHandler` | prepare、parameterize、query、update、batch | SQL 改写、性能监控 |
+| `ParameterHandler` | getParameterObject、setParameters | 参数加密解密 |
+| `ResultSetHandler` | handleResultSets、handleOutputParameters | 结果集处理 |
+
+## 十二、生产避坑
+
+### 坑一：插件拦截顺序导致的问题
+
+```java
+// 插件执行顺序是逆序（后进先出）
+@Intercepts({
+    @Signature(type = StatementHandler.class, method = "query", args = {Statement.class, ResultHandler.class})
+})
+public class PluginA implements Interceptor { }  // 先执行
+
+@Intercepts({
+    @Signature(type = StatementHandler.class, method = "query", args = {Statement.class, ResultHandler.class})
+})
+public class PluginB implements Interceptor { }  // 后执行，但先拦截
+
+// 配置顺序：<plugin ref="PluginA"/> 在前，<plugin ref="PluginB"/> 在后
+// 实际执行顺序：PluginB.proceed() -> PluginA.proceed() -> 原始方法 -> PluginA.after() -> PluginB.after()
+```
+
+:::warning ⚠️
+如果插件没有正确调用 `invocation.proceed()`，整个调用链就断了，SQL 不会执行。这是生产中最容易出的插件 bug。
+:::
+
+### 坑二：StatementHandler 插件拦截不到原始 SQL
+
+因为 `RoutingStatementHandler` 先创建，然后被插件包装。所以你拦截到的是已经被路由后的具体 `PreparedStatementHandler`。如果需要获取原始 SQL，应该从 `BoundSql` 中取：
+
+```java
+// 正确方式：从 Invocation 中获取 BoundSql
+StatementHandler sh = (StatementHandler) invocation.getTarget();
+BoundSql boundSql = sh.getBoundSql();
+String sql = boundSql.getSql();
+```

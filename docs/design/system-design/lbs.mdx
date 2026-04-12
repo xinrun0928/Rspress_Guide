@@ -1,0 +1,381 @@
+---
+title: LBS附近的人系统设计
+description: 从Geohash到向量索引，从Redis到Elasticsearch，深入剖析如何设计一个支持千万级用户、低延迟的附近的人查询系统。
+---
+
+# LBS附近的人系统设计
+
+## 一个附近的人的性能问题
+
+2020年，我们社交 App 的"附近的人"功能被投诉了一整天。
+
+问题：用户刷新"附近的人"，加载需要 10 秒。
+
+排查发现：
+
+```sql
+-- 噩梦般的 SQL
+SELECT user_id, lat, lon,
+       (6371 * acos(cos(radians(?)) * cos(radians(lat))
+       * cos(radians(lon) - radians(?)) + sin(radians(?))
+       * sin(radians(lat)))) AS distance
+FROM user_locations
+HAVING distance < 5  -- 5公里
+ORDER BY distance
+LIMIT 50;
+```
+
+这个 SQL 在百万用户表上全表扫描，每次计算 `acos`，性能灾难。
+
+**附近的人系统的核心问题是：如何在海量数据中快速找到指定半径内的所有点？**
+
+---
+
+## 二、地理位置索引方案🔴
+
+### 2.1 Geohash 算法
+
+```
+Geohash：将经纬度编码成字符串
+
+编码原理：
+1. 地球分成两个区间（经度、纬度）
+2. 不断二分，确定每位的值
+3. 交错编码经度和纬度
+
+精度：
+- Geohash 长度 6：约 ±0.61km 误差
+- Geohash 长度 7：约 ±0.15km 误差
+- Geohash 长度 8：约 ±0.04km 误差
+```
+
+```java
+public class GeoHashUtil {
+    private static final String BASE32 = "0123456789bcdefghjkmnpqrstuvwxyz";
+
+    public static String encode(double lat, double lon, int precision) {
+        double minLat = -90, maxLat = 90;
+        double minLon = -180, maxLon = 180;
+
+        StringBuilder geohash = new StringBuilder();
+        boolean isEven = true;
+        int bit = 0;
+        int ch = 0;
+
+        while (geohash.length() < precision) {
+            if (isEven) {
+                double mid = (minLon + maxLon) / 2;
+                if (lon >= mid) {
+                    ch |= (1 << (4 - bit));
+                    minLon = mid;
+                } else {
+                    maxLon = mid;
+                }
+            } else {
+                double mid = (minLat + maxLat) / 2;
+                if (lat >= mid) {
+                    ch |= (1 << (4 - bit));
+                    minLat = mid;
+                } else {
+                    maxLat = mid;
+                }
+            }
+
+            isEven = !isEven;
+            bit++;
+
+            if (bit == 5) {
+                geohash.append(BASE32.charAt(ch));
+                bit = 0;
+                ch = 0;
+            }
+        }
+
+        return geohash.toString();
+    }
+
+    // 获取相邻的 9 个 Geohash（覆盖周围区域）
+    public static List<String> getNeighborHashes(String geohash) {
+        List<String> hashes = new ArrayList<>();
+        // 上、下、左、右及四角
+        String base = geohash.substring(0, geohash.length() - 1);
+
+        for (String suffix : new String[]{"", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
+                "b", "c", "d", "e", "f", "g", "h", "j", "k", "m", "n", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z"}) {
+            hashes.add(base + suffix);
+        }
+
+        return hashes;
+    }
+}
+```
+
+### 2.2 Redis GEO 命令
+
+```java
+@Service
+class LBSService {
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+
+    private static final String GEO_KEY = "lbs:locations";
+
+    /**
+     * 添加用户位置
+     */
+    public void updateLocation(Long userId, double lat, double lon) {
+        redisTemplate.opsForGeo().add(
+            GEO_KEY,
+            new Point(lon, lat),  // 注意：Redis 先经度后纬度
+            userId.toString()
+        );
+    }
+
+    /**
+     * 查询附近的人
+     */
+    public List<NearbyUser> getNearbyUsers(Long userId, double radiusKm, int limit) {
+        // 1. 获取自己的位置
+        List<Point> positions = redisTemplate.opsForGeo()
+            .position(GEO_KEY, userId.toString());
+
+        if (positions == null || positions.isEmpty() || positions.get(0) == null) {
+            return Collections.emptyList();
+        }
+
+        Point myPosition = positions.get(0);
+
+        // 2. 查询附近的人
+        GeoResults<RedisGeoCommands.GeoLocation<String>> results =
+            redisTemplate.opsForGeo().radius(
+                GEO_KEY,
+                new Circle(myPosition, new Distance(radiusKm, Metrics.KILOMETERS)),
+                RedisGeoCommands.GeoRadiusCommandArgs.newGeoRadiusArgs()
+                    .includeDistance()
+                    .includeCoordinates()
+                    .sortAscending()
+                    .limit(limit)
+            );
+
+        // 3. 过滤自己和距离为 0 的
+        return results.getContent().stream()
+            .filter(r -> !r.getContent().getName().equals(userId.toString()))
+            .map(r -> new NearbyUser(
+                Long.parseLong(r.getContent().getName()),
+                r.getContent().getPoint().getY(), // 纬度
+                r.getContent().getPoint().getX(), // 经度
+                r.getDistance().getValue()
+            ))
+            .collect(Collectors.toList());
+    }
+}
+```
+
+### 2.3 Redis GEO 的限制
+
+Redis GEO 的限制：
+1. 单个 key 不超过 1 亿个成员
+2. 半径查询性能随数据量下降
+3. 不支持复杂查询（如按性别、年龄筛选）
+
+---
+
+## 三、Geohash + MySQL 方案🔴
+
+### 3.1 数据库设计
+
+```sql
+CREATE TABLE user_locations (
+    user_id BIGINT PRIMARY KEY,
+    latitude DECIMAL(10, 8) NOT NULL,
+    longitude DECIMAL(11, 8) NOT NULL,
+    geohash VARCHAR(12) NOT NULL,
+    gender TINYINT,
+    age INT,
+    last_active_at TIMESTAMP,
+    INDEX idx_geohash (geohash),
+    INDEX idx_last_active (last_active_at)
+) ENGINE=InnoDB;
+```
+
+### 3.2 查询实现
+
+```java
+@Service
+class GeoSearchService {
+    @Autowired
+    private JdbcTemplate jdbcTemplate;
+
+    public List<UserLocation> searchNearby(
+            double lat, double lon, double radiusKm, int limit) {
+
+        // 1. 计算当前点的 Geohash
+        String centerHash = GeoHashUtil.encode(lat, lon, 6);
+
+        // 2. 获取周围 9 个 Geohash
+        List<String> neighborHashes = GeoHashUtil.getNeighborHashes(centerHash);
+
+        // 3. 查询（先按 Geohash 过滤，再按距离排序）
+        String sql = """
+            SELECT user_id, latitude, longitude,
+                   (6371 * acos(cos(radians(?)) * cos(radians(latitude))
+                   * cos(radians(longitude) - radians(?)) + sin(radians(?))
+                   * sin(radians(latitude)))) AS distance
+            FROM user_locations
+            WHERE geohash IN (?)
+              AND last_active_at > DATE_SUB(NOW(), INTERVAL 7 DAY)
+            HAVING distance < ?
+            ORDER BY distance
+            LIMIT ?
+        """;
+
+        return jdbcTemplate.query(sql,
+            (rs, rowNum) -> new UserLocation(
+                rs.getLong("user_id"),
+                rs.getDouble("latitude"),
+                rs.getDouble("longitude"),
+                rs.getDouble("distance")
+            ),
+            lat, lon, lat, radiusKm, limit
+        );
+    }
+}
+```
+
+---
+
+## 四、Elasticsearch 方案🟡
+
+### 4.1 索引设计
+
+```json
+{
+  "mappings": {
+    "properties": {
+      "location": {
+        "type": "geo_point"
+      },
+      "user_id": { "type": "long" },
+      "gender": { "type": "keyword" },
+      "age": { "type": "integer" },
+      "last_active_at": { "type": "date" }
+    }
+  }
+}
+```
+
+### 4.2 查询
+
+```java
+@Service
+class ElasticsearchLBSService {
+    @Autowired
+    private ElasticsearchRestTemplate template;
+
+    public List<UserLocation> searchNearby(
+            double lat, double lon, double radiusKm) {
+
+        GeoDistanceQueryBuilder distanceQuery =
+            new GeoDistanceQueryBuilder("location")
+                .point(lat, lon)
+                .distance(radiusKm, DistanceUnit.KILOMETERS);
+
+        NativeQuery query = NativeQuery.builder()
+            .withQuery(q -> q.geoDistance(distanceQuery))
+            .withSort(SortBuilders.geoDistanceSort("location")
+                .point(lat, lon)
+                .order(SortOrder.ASC))
+            .withMaxResults(100)
+            .build();
+
+        SearchHits<UserLocation> hits = template.search(query, UserLocation.class);
+
+        return hits.getSearchHits().stream()
+            .map(SearchHit::getContent)
+            .collect(Collectors.toList());
+    }
+}
+```
+
+---
+
+## 五、性能优化🟡
+
+### 5.1 冷热数据分离
+
+```java
+@Service
+class LBSOptimizationService {
+    /**
+     * 只查询最近活跃的用户
+     */
+    public List<UserLocation> searchActiveUsers(...) {
+        // 优先查询最近 7 天活跃的用户
+        String sql = """
+            SELECT * FROM user_locations
+            WHERE geohash IN (?)
+              AND last_active_at > DATE_SUB(NOW(), INTERVAL 7 DAY)  -- 只查活跃用户
+            ORDER BY distance
+            LIMIT 100
+        """;
+    }
+}
+```
+
+### 5.2 分页缓存
+
+```java
+@Service
+class NearbyUserCacheService {
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+
+    /**
+     * 缓存附近的人结果
+     */
+    public void cacheNearbyUsers(Long userId, List<NearbyUser> users) {
+        String key = "nearby:" + userId + ":" + System.currentTimeMillis() / 300000; // 5分钟粒度
+
+        for (int i = 0; i < users.size(); i++) {
+            redisTemplate.opsForZSet().add(
+                key,
+                JSON.toJSONString(users.get(i)),
+                i // 按排名作为分数
+            );
+        }
+        redisTemplate.expire(key, Duration.ofMinutes(5));
+    }
+
+    public List<NearbyUser> getCachedNearbyUsers(Long userId, int page, int size) {
+        String keyPattern = "nearby:" + userId + ":*";
+
+        // 查找最近的缓存 key
+        Set<String> keys = redisTemplate.keys(keyPattern);
+        if (keys == null || keys.isEmpty()) {
+            return null;
+        }
+
+        String key = keys.iterator().next();
+        long start = (long) page * size;
+        long end = start + size - 1;
+
+        Set<String> cached = redisTemplate.opsForZSet().range(key, start, end);
+        return cached.stream()
+            .map(s -> JSON.parseObject(s, NearbyUser.class))
+            .collect(Collectors.toList());
+    }
+}
+```
+
+【架构权衡】
+附近的人系统的核心矛盾是"查询精度 vs 查询性能"。Geohash 可以快速过滤，但需要二次距离计算；Redis GEO 操作简单，但不支持复杂筛选；Elasticsearch 功能强大，但资源消耗大。选择取决于业务需求。
+
+---
+
+## 六、面试总结
+
+| 级别 | 期望回答 |
+|------|----------|
+| P5 | 能说出 Geohash 算法和 Redis GEO 命令 |
+| P6 | 能设计 Geohash + MySQL 方案 |
+| P7 | 能对比各方案优缺点，知道性能优化策略 |

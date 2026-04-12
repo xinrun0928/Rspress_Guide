@@ -1,0 +1,323 @@
+---
+title: PostgreSQL 特性与 MySQL 深度对比
+description: 从面试场景出发，拆解 PostgreSQL 相比 MySQL 的核心优势：MVCC、TOAST、GIST索引、窗口函数、FDW等，帮你从"会用MySQL"升级到"理解数据库选型"。
+---
+
+候选人小陈坐在字节跳动的面试间，简历上写着"熟悉 MySQL，有三年数据库优化经验"。面试官翻到项目经历那页，问了一句：
+
+"你们团队为什么选 MySQL 而不是 PostgreSQL？"
+
+小陈愣了一下："因为...大家都用 MySQL？"
+
+面试官放下简历，换了个问法："那你了解 PostgreSQL 吗？它和 MySQL 最大的区别是什么？"
+
+小陈支支吾吾，最后只憋出一句："PostgreSQL 是更'重'的数据库？"
+
+这就是今天要解决的问题。PostgreSQL 不是一个"更重的 MySQL"，它是一套完全不同的设计哲学。如果你只会 MySQL，在面试官眼里，你的数据库知识是瘸腿的。
+
+## 一、MVCC 机制：谁才是真正的"无锁读" 🔴
+
+### 1.1 问题拆解
+
+面试官追问："MySQL 的 InnoDB 也有 MVCC，它们有什么区别？"
+
+这道题是高频送命题——看起来简单，能答对的不到 30%。
+
+### 1.2 错误示范
+
+**候选人原话**："PostgreSQL 用 MVCC 可以实现快照读，MySQL 不行。"
+
+**问题诊断**：
+- InnoDB 的 REPEATABLE-READ 就是基于 MVCC 实现的，这说明候选人根本不了解 InnoDB
+- 把 MVCC 当成了 PostgreSQL 独有的特性
+- 完全不知道两种 MVCC 实现机制的差异
+
+**面试官内心 OS**："又是一个只会背名词的，我先挖个坑试试。"
+
+### 1.3 标准回答
+
+先说结论：**两种数据库都实现了 MVCC，但实现机制完全不同，带来的并发能力和性能特征也完全不同。**
+
+**MySQL/InnoDB 的 MVCC**：
+
+```sql
+-- InnoDB 为每一行增加了两个隐藏列
+-- DB_TRX_ID: 事务ID
+-- DB_ROLL_PTR: 回滚指针（指向undo log）
+-- 读取时：创建 ReadView，遍历所有可见版本
+```
+
+InnoDB 的 MVCC 基于**事务 ID + 回滚指针 + Undo Log 链**。读取时需要遍历版本链，最坏情况是 `O(n)`。MVCC 只在 `READ COMMITTED` 和 `REPEATABLE READ` 隔离级别生效，`SERIALIZABLE` 会退化为锁。
+
+**PostgreSQL 的 MVCC**：
+
+```sql
+-- PostgreSQL 在表行头存储的是
+-- xmin: 创建这行的事务ID
+-- xmax: 删除/更新这行的事务ID
+-- cmin/cmax: 命令ID（同一事务内的多条语句）
+-- 读取时：直接根据事务ID对比，无需遍历版本链
+```
+
+PostgreSQL 的 MVCC 基于**行级事务状态字段**。读取时根据当前事务 ID 和行的 `xmin/xmax` 直接判断可见性，复杂度是 `O(1)`。**PostgreSQL 的 MVCC 是真正的无锁读取，不会因为并发写入而阻塞读操作。**
+
+关键区别在于写操作的影响范围：
+
+| 维度 | MySQL/InnoDB | PostgreSQL |
+| --- | --- | --- |
+| 版本存储 | Undo Log（共享池） | 行头字段（每行独立） |
+| 读放大 | 读取可能需要遍历版本链 | 直接定位，O(1) |
+| 空间回收 | 需要 purge 线程 | VACUUM 清理 |
+| 并发写入 | 同一行会竞争 | 真正并行，无行锁竞争 |
+| 写入放大 | 写入时维护版本链 | 写入时更新行头，更轻量 |
+
+### 1.4 追问升级
+
+**追问一**："PostgreSQL 的 VACUUM 是做什么的？和 MySQL 的 purge 有什么区别？"
+
+这是 P6/P7 分水岭。MySQL 的 purge 是后台线程自动运行，InnoDB 会尽量避免清理仍在使用的 undo log。PostgreSQL 的 VACUUM 则是**显式清理机制**，它将死元组标记为可重用空间，但不立即归还操作系统。这意味着：
+- PostgreSQL 表文件不会频繁膨胀
+- 但表膨胀（bloat）会成为问题，需要定期 VACUUM 或 autovacuum
+
+```sql
+-- 查看表膨胀
+SELECT schemaname, tablename,
+       pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename)) AS total_size,
+       pg_size_pretty(pg_relation_size(schemaname||'.'||tablename)) AS table_size
+FROM pg_stat_user_tables
+ORDER BY pg_total_relation_size(schemaname||'.'||tablename) DESC;
+```
+
+**追问二**："MySQL 8.0 也在改进 MVCC，你知道它做了什么吗？"
+
+MySQL 8.0 引入了 **undo log 页级别压缩** 和 **purge 的改进**，但本质上仍然是基于 undo log 的版本链。PostgreSQL 的实现更简洁——每行数据自包含版本信息，不需要额外的 undo log 链。
+
+【面试官心理】
+我问 MySQL 和 PostgreSQL 的 MVCC 区别，其实不是在考知识点。我是在看你有没有真正理解"多版本并发控制"这四个字背后，不同实现路线带来的工程取舍。知道两种实现差异的，说明你动手研究过源码或者踩过坑；只能说出"都有 MVCC" 的，基本是背的。
+
+## 二、索引类型：MySQL 的 B+Tree vs PostgreSQL 的 GIST 🔴
+
+### 2.1 问题拆解
+
+面试官问："PostgreSQL 的 GIST 索引是什么？什么场景下用它？"
+
+这道题能答出来的人更少——大概只有 10%。
+
+### 2.2 错误示范
+
+**候选人原话**："GIST 是通用搜索树，用来加速全文检索？"
+
+**问题诊断**：
+- GIST 不是"通用搜索树"，是 Generalized Search Tree（通用索引结构）
+- 全文检索用的不是 GIST，而是 GIN（ Generalized Inverted Index）
+- 混淆了不同的索引类型
+
+### 2.3 标准回答
+
+PostgreSQL 的索引体系比 MySQL 丰富得多：
+
+| 索引类型 | PostgreSQL | MySQL |
+| --- | --- | --- |
+| B-Tree | ✅ | ✅（主索引） |
+| Hash | ✅ | ✅ |
+| GiST | ✅（独有） | ❌ |
+| GIN | ✅（独有） | ❌ |
+| BRIN | ✅（独有） | ❌ |
+| 全文索引 | ✅（RUM等扩展） | ✅（InnoDB FTS） |
+| 空间索引 | ✅（PostGIS） | ✅（InnoDB Spatial） |
+
+**GIST（Generalized Search Tree）** 是 PostgreSQL 的杀手锏。它的核心思想是：**索引结构本身不关心数据类型，由数据类型的操作符类（opclass）决定索引行为**。
+
+```sql
+-- PostGIS 空间索引示例
+CREATE EXTENSION postgis;
+CREATE TABLE buildings (
+    id SERIAL PRIMARY KEY,
+    geom GEOMETRY(Polygon, 4326)
+);
+CREATE INDEX idx_buildings_geom ON buildings USING GIST (geom);
+
+-- 查询某点500米范围内的建筑
+SELECT * FROM buildings
+WHERE ST_DWithin(geom, ST_SetSRID(ST_MakePoint(116.4, 39.9), 4326)::geography, 500);
+```
+
+GIST 索引用于：几何/地理数据、全文搜索、范围查询、JSON/JSONB 数据、模糊匹配。
+
+**BRIN（Block Range Index）** 是另一个 MySQL 没有的东西——它专为**顺序写入的大表**设计。比如日志表，数据按时间顺序写入，BRIN 索引记录每个数据块的范围区间，查询时跳过不相关的块。
+
+```sql
+-- 十亿行日志表，建立 BRIN 索引只需几十KB
+CREATE TABLE app_logs (
+    id BIGSERIAL,
+    created_at TIMESTAMP NOT NULL,
+    level TEXT,
+    message TEXT
+);
+CREATE INDEX idx_logs_created ON app_logs USING BRIN (created_at);
+
+-- 查询某时间范围：BRIN 自动跳过不相关的数据块
+SELECT * FROM app_logs WHERE created_at BETWEEN '2024-01-01' AND '2024-01-02';
+```
+
+### 2.4 追问升级
+
+**追问**："既然 GIST 这么强大，为什么 MySQL 不实现一个？"
+
+这道题是 P7 区分点。MySQL 的哲学是"简单可靠"，B+Tree 索引已经能覆盖 90% 的业务场景。GIST 的代价是实现复杂度高、索引体积大、维护成本高。MySQL 选择把 B+Tree 做到极致，而不是引入一个"全能但复杂"的索引类型。这不是技术落后，是工程权衡。
+
+【面试官心理】
+问 GIST 索引，我其实在试探两件事：第一，你有没有跳出 MySQL 的舒适区，真正了解过其他数据库；第二，你有没有"索引是为数据类型服务"这个认知——这个认知一旦有了，你理解 PostgreSQL 的 FDW、custom types、扩展系统就顺理成章了。
+
+## 三、TOAST 与列存储：MySQL 没有的"大字段处理" 🟡
+
+### 3.1 问题拆解
+
+面试官问："PostgreSQL 的 TOAST 是什么？MySQL 怎么处理大字段？"
+
+### 3.2 核心原理
+
+TOAST（The Oversized-Attribute Storage Technique）是 PostgreSQL 处理**行存储限制**的方案。PostgreSQL 的行大小硬限制是 **8192 字节**，超过这个大小的列（如 TEXT、JSONB、BLOB），会自动压缩并存储到独立的 TOAST 表中。
+
+```sql
+-- 查看表的 TOAST 表
+SELECT relname, reltuples, relpages
+FROM pg_class
+WHERE relname LIKE '%toast%';
+
+-- TOAST 存储策略（列级控制）
+CREATE TABLE documents (
+    id SERIAL PRIMARY KEY,
+    title TEXT,           -- 默认 inline（行内）
+    content TEXT STORAGE EXTENDED,  -- 优先 TOAST，可压缩
+    metadata JSONB STORAGE MAIN    -- 优先行内，不压缩
+);
+```
+
+TOAST 的四种存储策略：`PLAIN`（禁止压缩/TOAST）、`EXTENDED`（压缩+TOAST）、`EXTERNAL`（不压缩但允许TOAST）、`MAIN`（优先行内）。
+
+MySQL 处理大字段的方式完全不同——InnoDB 的 BLOB 和 TEXT 类型直接存储在行溢出页，通过指针链接。这没有错，但 PostgreSQL 的 TOAST 系统更精细化：可以按列配置存储策略、自动压缩、按需读取（不读 TOAST 列就不加载）。
+
+### 3.3 追问升级
+
+**追问**："TOAST 会影响索引吗？"
+
+会的。**PostgreSQL 的 B-Tree 索引只能索引列的前 `index_max` 字节**（默认 2704 字节）。对于超长 TEXT 列的索引，PostgreSQL 会报错而不是隐式截断。MySQL 也有类似限制（InnoDB 索引最大 767 字节），但处理方式不同。
+
+【面试官心理】
+TOAST 这个问题我一般用来试探"细节控"——愿意深入了解数据库存储引擎的人，才会在面试中主动研究 TOAST。这个问题答得好，说明你不是一个只会在 ORM 层 CRUD 的工程师。
+
+## 四、窗口函数与 CTEs：MySQL 8.0 才追上的差距 🟡
+
+### 4.1 问题拆解
+
+面试官问："你需要在 SQL 中计算'每个部门的工资排名'和'部门平均工资'，怎么写？"
+
+### 4.2 错误示范
+
+**候选人原话**："用 GROUP BY 查平均工资，再 JOIN 回去查排名。"
+
+```sql
+-- 小陈的写法（两表 JOIN，效率低，可维护性差）
+SELECT e.*, d.avg_salary
+FROM employees e
+JOIN (
+    SELECT department_id, AVG(salary) as avg_salary
+    FROM employees GROUP BY department_id
+) d ON e.department_id = d.department_id
+ORDER BY e.department_id, e.salary DESC;
+```
+
+**问题诊断**：这种方式在多维度聚合时需要多次 JOIN，SQL 复杂度爆炸。MySQL 8.0 之前根本没有窗口函数，很多人被迫用 JOIN 或子查询绕开。
+
+### 4.3 标准回答
+
+PostgreSQL 从很早就支持窗口函数，MySQL 8.0 才引入。这是 PostgreSQL 在数据分析领域的核心优势：
+
+```sql
+-- 窗口函数：一条 SQL 搞定排名和均值
+SELECT
+    employee_id,
+    department_id,
+    salary,
+    RANK() OVER (PARTITION BY department_id ORDER BY salary DESC) AS dept_rank,
+    AVG(salary) OVER (PARTITION BY department_id) AS dept_avg_salary,
+    salary - AVG(salary) OVER (PARTITION BY department_id) AS salary_vs_avg
+FROM employees;
+
+-- CTEs（Common Table Expressions）：用 WITH 写递归查询
+-- 递归 CTE：查组织架构树
+WITH RECURSIVE org_tree AS (
+    SELECT id, name, manager_id, 1 AS level
+    FROM employees WHERE manager_id IS NULL
+    UNION ALL
+    SELECT e.id, e.name, e.manager_id, ot.level + 1
+    FROM employees e
+    JOIN org_tree ot ON e.manager_id = ot.id
+)
+SELECT * FROM org_tree ORDER BY level, id;
+```
+
+CTEs 让复杂查询可读性大幅提升，递归 CTE 更是解决了树形结构查询的老大难问题。
+
+【面试官心理】
+问窗口函数，我其实在考你的"SQL 思维层次"。只会 JOIN 和 GROUP BY 的人是初级水平；能用窗口函数在一个 SELECT 里搞定多维度聚合的，是中级水平；能用 CTEs 写递归查询的，是中高级。MySQL 8.0 之后也有这些功能，但 PostgreSQL 的优化器对窗口函数的处理更成熟。
+
+## 五、FDW：PostgreSQL 的"跨界连接"能力 🟢
+
+### 5.1 核心原理
+
+FDW（Foreign Data Wrapper）是 PostgreSQL 的外部数据包装器——它让你可以用 SQL 查询**任何外部数据源**，MongoDB、MySQL、Redis、CSV 文件、REST API，统统可以。
+
+```sql
+-- 安装 mysql_fdw 扩展
+CREATE EXTENSION mysql_fdw;
+
+-- 创建外部服务器
+CREATE SERVER mysql_server FOREIGN DATA WRAPPER mysql_fdw
+OPTIONS (host '192.168.1.100', port '3306');
+
+-- 映射 MySQL 用户
+CREATE USER MAPPING FOR postgres SERVER mysql_server
+OPTIONS (username 'app', password 'secret');
+
+-- 直接在 PostgreSQL 中查询 MySQL 数据
+SELECT p.id, p.name, o.order_count
+FROM products p
+JOIN (
+    SELECT product_id, COUNT(*) as order_count
+    FROM mysql_server.mydb.orders
+    GROUP BY product_id
+) o ON p.id = o.product_id;
+```
+
+这意味着你可以用 PostgreSQL 的查询能力"穿透"到 MySQL，JOIN 两边数据，在同一个事务里完成操作。MySQL 完全做不到这件事。
+
+## 六、生产避坑：两者各自的天坑
+
+:::warning ⚠️
+**MySQL 生产避坑**：
+1. **主从延迟**：大事务、跨库操作、binlog row 格式都会放大延迟。解决方案：用 GTID 定位延迟源、读写分离配合延迟回放。
+2. **InnoDB 行锁竞争**：范围锁在 REPEATABLE-READ 下会锁住整个区间，导致死锁。
+3. **DDL 阻塞**：MySQL 5.7 的 ALTER TABLE 会锁全表，MySQL 8.0 的 Instant ADD COLUMN 也有限制。
+
+**PostgreSQL 生产避坑**：
+1. **VACUUM 不及时**：长事务会阻止 VACUUM 清理，导致表膨胀。一个 `SELECT * FROM big_table` 不提交，就能让你的数据库膨胀到硬盘爆满。
+2. **连接数开销**：PostgreSQL 是进程模型，每条连接一个 OS 进程，高并发下连接管理是瓶颈。必须用 PgBouncer 做连接池。
+3. **索引膨胀**：频繁更新的列上建 B-Tree 索引，索引体积可能比表还大。
+:::
+
+## 七、工程选型：什么场景选谁
+
+| 场景 | 推荐 | 理由 |
+| --- | --- | --- |
+| 互联网高并发 OLTP | MySQL + 读写分离 | 生态成熟，运维简单 |
+| 复杂数据分析 | PostgreSQL | 窗口函数、CTEs、扩展生态 |
+| GIS/空间数据 | PostgreSQL + PostGIS | GIST 索引无可替代 |
+| 数据仓库/ETL | PostgreSQL + FDW | 统一查询层 |
+| 强事务 + 水平扩展 | TiDB（见后续章节） | 分布式 ACID |
+| 信创/政府项目 | 达梦/ GaussDB | 国产化要求 |
+
+:::tip 💡
+选 PostgreSQL 而不是 MySQL 的信号：你的团队有数据工程师、需要处理复杂报表、涉及空间数据、有跨数据源查询需求。
+:::

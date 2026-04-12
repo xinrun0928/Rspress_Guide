@@ -1,0 +1,292 @@
+---
+title: 配置中心设计
+description: 从本地配置到配置中心，从配置变更推拉到灰度发布，深入剖析如何设计一个支持高可用、实时生效的配置中心系统。
+---
+
+# 配置中心设计
+
+## 一个配置改错的代价
+
+2022年，我们团队有一次线上事故：
+
+开发同学想修改一个超时配置，在配置文件中把 `timeout=1000` 改成了 `timeout=100`。
+
+然后他重启了服务。
+
+结果：线上 100 个服务实例中，有 50 个重启后配置生效，但另外 50 个因为重启失败还是旧配置。系统行为不一致，持续了两个小时才排查出来。
+
+**配置中心的核心问题是：如何让配置变更实时生效，并且可回滚、可灰度、可审计？**
+
+---
+
+## 二、本地配置 vs 配置中心🔴
+
+### 2.1 本地配置的痛点
+
+```properties
+# application.yml
+spring:
+  datasource:
+    url: jdbc:mysql://localhost:3306/test
+    username: root
+    password: password
+
+# 问题：
+# 1. 配置分散在各个服务中，无法统一管理
+# 2. 配置变更需要重启服务
+# 3. 配置修改没有审计记录
+# 4. 无法灰度发布配置
+# 5. 无法回滚配置
+```
+
+### 2.2 配置中心架构
+
+```
+┌─────────────────────────────────────────────────┐
+│              配置管理 Console                      │
+│         （配置发布、版本管理、灰度发布）              │
+└──────────────────────┬──────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────┐
+│              配置中心服务端                        │
+│         （配置存储、变更推送、版本管理）              │
+└──────────────────────┬──────────────────────────┘
+                       │
+         ┌─────────────┼─────────────┐
+         ▼             ▼             ▼
+    ┌─────────┐  ┌─────────┐  ┌─────────┐
+    │ Service1 │  │ Service2 │  │ Service3 │
+    └─────────┘  └─────────┘  └─────────┘
+```
+
+---
+
+## 三、配置中心核心功能🔴
+
+### 3.1 配置存储
+
+```sql
+CREATE TABLE config (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    app VARCHAR(64) NOT NULL,           -- 应用名
+    env VARCHAR(32) NOT NULL,           -- 环境：dev/test/prod
+    `group` VARCHAR(64) NOT NULL,      -- 配置分组
+    `key` VARCHAR(128) NOT NULL,       -- 配置键
+    value TEXT NOT NULL,               -- 配置值
+    version INT NOT NULL DEFAULT 0,   -- 版本号
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uk_app_env_group_key (app, env, `group`, `key`)
+);
+
+CREATE TABLE config_history (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    config_id BIGINT NOT NULL,
+    old_value TEXT,
+    new_value TEXT NOT NULL,
+    operator VARCHAR(64) NOT NULL,
+    operate_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_config_id (config_id)
+);
+```
+
+### 3.2 配置推送
+
+```java
+@Service
+class ConfigService {
+    @Autowired
+    private ConfigDao configDao;
+    @Autowired
+    private ConfigPublisher publisher;
+
+    /**
+     * 发布配置
+     */
+    public Config publish(String app, String env, String group,
+                         String key, String value, String operator) {
+        // 1. 获取旧配置
+        Config oldConfig = configDao.find(app, env, group, key);
+
+        // 2. 更新配置
+        Config config = configDao.upsert(app, env, group, key, value);
+
+        // 3. 记录历史
+        configHistoryDao.save(oldConfig, config, operator);
+
+        // 4. 推送变更
+        publisher.publish(app, env, group, key, value, config.getVersion());
+
+        return config;
+    }
+}
+```
+
+### 3.3 配置订阅（客户端）
+
+```java
+@Component
+class ConfigClient {
+    private final Map<String, String> configs = new ConcurrentHashMap<>();
+    private final Map<String, Consumer<String>> listeners = new ConcurrentHashMap<>();
+
+    @Autowired
+    private ConfigCenterClient configCenterClient;
+
+    @PostConstruct
+    public void init() {
+        // 1. 拉取全量配置
+        Map<String, String> allConfigs = configCenterClient.pullAll("app-name", "prod");
+        configs.putAll(allConfigs);
+
+        // 2. 订阅配置变更
+        configCenterClient.subscribe("app-name", "prod", (key, value) -> {
+            configs.put(key, value);
+
+            // 触发监听器
+            Consumer<String> listener = listeners.get(key);
+            if (listener != null) {
+                listener.accept(value);
+            }
+        });
+    }
+
+    public String get(String key) {
+        return configs.get(key);
+    }
+
+    public void addListener(String key, Consumer<String> listener) {
+        listeners.put(key, listener);
+    }
+}
+```
+
+---
+
+## 四、Apollo 配置中心🟡
+
+### 4.1 Apollo 核心概念
+
+```
+Apollo 四大核心概念：
+
+1. App（应用）
+   - 应用标识，如 "order-service"
+
+2. Environment（环境）
+   - dev / test /uat / prod
+
+3. Cluster（集群）
+   - 机房、区域，如 "bj" / "sh"
+
+4. Namespace（命名空间）
+   - 配置分组，如 "application" / "spring"
+```
+
+### 4.2 Apollo 客户端使用
+
+```java
+@Configuration
+@EnableApolloConfig
+class ApolloConfig {
+}
+
+@RestController
+class ConfigController {
+    @ApolloConfig
+    private Config config;
+
+    @RequestMapping("/config/{key}")
+    public String getConfig(@PathVariable String key) {
+        return config.getProperty(key, "default");
+    }
+}
+
+// 配置变更监听
+@ApolloConfigChangeListener
+private Config changeListener;
+
+@PostConstruct
+public void init() {
+    changeListener.addChangeListener(changeEvent -> {
+        for (String key : changeEvent.changedKeys()) {
+            System.out.println("配置变更: " + key + " = " +
+                config.getProperty(key, null));
+        }
+    });
+}
+```
+
+---
+
+## 五、生产避坑🟡
+
+### 5.1 配置热更新
+
+```java
+// ❌ 错误：配置硬编码
+class BadService {
+    private static final int TIMEOUT = 1000; // 硬编码，无法动态修改
+}
+
+// ✅ 正确：使用 @Value 动态注入
+class GoodService {
+    @Value("${api.timeout:1000}")
+    private int timeout;
+
+    @Value("${api.retry:3}")
+    private int retry;
+
+    // Spring 会在配置变更时自动刷新
+}
+
+// ✅ 或者：使用配置对象
+@Configuration
+@ConfigurationProperties(prefix = "api")
+class ApiConfig {
+    private int timeout = 1000;
+    private int retry = 3;
+}
+```
+
+### 5.2 配置回滚
+
+```java
+@Service
+class ConfigRollbackService {
+    @Autowired
+    private ConfigHistoryDao historyDao;
+
+    /**
+     * 回滚配置到指定版本
+     */
+    public void rollback(Long configId, int targetVersion, String operator) {
+        // 1. 获取目标版本配置
+        Config targetConfig = historyDao.findByVersion(configId, targetVersion);
+
+        // 2. 发布目标版本
+        configService.publish(
+            targetConfig.getApp(),
+            targetConfig.getEnv(),
+            targetConfig.getGroup(),
+            targetConfig.getKey(),
+            targetConfig.getValue(),
+            operator
+        );
+    }
+}
+```
+
+【架构权衡】
+配置中心的核心价值是**配置的统一管理和实时生效**。对于小型团队，本地配置可能更简单；对于中大型团队，配置中心是必须的。
+
+---
+
+## 六、面试总结
+
+| 级别 | 期望回答 |
+|------|----------|
+| P5 | 能说出配置中心的基本架构 |
+| P6 | 能说出 Apollo 的使用方式 |
+| P7 | 能设计配置变更推送机制 |

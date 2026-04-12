@@ -1,0 +1,320 @@
+---
+title: Redis 缓存淘汰策略（LRU/LFU/TTL）
+description: 从内存打满导致写失败的场景出发，拆解Redis 8种淘汰策略、采样算法与选型逻辑。
+---
+
+候选人小孙在美团的一面中，面试官问道：
+
+"Redis 内存满了怎么办？有哪些淘汰策略？"
+
+小孙说："有 LRU、LFU...还有按时间过期？"面试官追问："Redis 4.0 之后的 LRU 和之前有什么区别？"
+
+小李愣了一下，说："不太记得了..."
+
+面试官继续："volatile-lru 和 allkeys-lru 有什么区别？"
+
+小孙说："一个是有过期时间的，一个是没有的？"
+
+面试官点点头，又问："那 sampling 算法是什么？"
+
+小孙彻底卡住。
+
+【面试官心理】
+这道题我用来区分"背概念"和"真正理解淘汰机制"的候选人。知道 LRU/LFU 区别的占 40%，能说清 volatile 和 allkeys 区别的占 30%，能解释 sampling 算法的占 10%。淘汰策略是 Redis 生产环境中的核心配置，选错了轻则性能下降，重则服务崩溃。
+
+## 一、Redis 内存管理 🔴
+
+### 1.1 问题拆解
+
+Redis 的内存是有限的，当内存满了之后，新的写入会被拒绝：
+
+```c
+// redis.conf
+maxmemory 2gb  // 最大内存 2GB
+maxmemory-policy noeviction  // 淘汰策略
+
+// 查看内存使用
+redis-cli INFO memory | grep used_memory_human
+```
+
+### 1.2 触发淘汰的时机
+
+```mermaid
+graph TD
+    A["客户端执行写命令"]
+    B["检查 used_memory > maxmemory?"}
+    C["执行淘汰策略"]
+    D{"淘汰后空间够?"}
+    E["执行写命令"]
+    F["返回 OOM 错误"]
+
+    A --> B
+    B -->|是| C --> D
+    D -->|是| E
+    D -->|否| F
+    B -->|否| E
+
+    style F fill:#ff6b6b
+```
+
+【面试官心理】
+我问他内存满了怎么办，其实是在考察他对 Redis 内存管理机制的理解程度。很多候选人知道 maxmemory，但不知道它是怎么触发的，以及淘汰过程是同步还是异步的。
+
+## 二、8种淘汰策略 🔴
+
+### 2.1 策略分类
+
+Redis 6.0 支持 8 种淘汰策略：
+
+| 策略 | 说明 | 适用场景 |
+| --- | --- | --- |
+| `noeviction` | 不淘汰，新写入返回错误 | 数据不容许丢失 |
+| `volatile-lru` | 从有过期时间的 key 中淘汰 LRU | 缓存有 TTL |
+| `volatile-lfu` | 从有过期时间的 key 中淘汰 LFU | 热点数据有 TTL |
+| `volatile-random` | 从有过期时间的 key 中随机淘汰 | 不在乎热点 |
+| `volatile-ttl` | 从有过期时间的 key 中淘汰 TTL 最小的 | 优先淘汰快过期的 |
+| `allkeys-lru` | 从所有 key 中淘汰 LRU | 缓存无 TTL |
+| `allkeys-lfu` | 从所有 key 中淘汰 LFU | 热点数据无 TTL |
+| `allkeys-random` | 从所有 key 中随机淘汰 | 无差别淘汰 |
+
+### 2.2 volatile vs allkeys
+
+```
+volatile-xxx: 只淘汰有过期时间的 key
+  优点：明确区分"缓存数据"和"永久数据"
+  缺点：如果所有 key 都没有 TTL，可能退化为 noeviction
+
+allkeys-xxx: 从所有 key 中淘汰
+  优点：不会因为无 TTL 而拒绝写入
+  缺点：可能误删永久数据（如 Session）
+```
+
+### 2.3 LRU vs LFU vs Random vs TTL
+
+| 策略 | 核心指标 | 优点 | 缺点 |
+| --- | --- | --- | --- |
+| **LRU** | 最近访问时间 | 简单，淘汰冷数据 | 可能误杀"刚访问的大对象" |
+| **LFU** | 访问频率 | 淘汰真正冷的数据 | 需要维护计数器，开销稍大 |
+| **Random** | 无 | 无状态，最快 | 完全不考虑热点，可能淘汰热数据 |
+| **TTL** | 剩余存活时间 | 优先淘汰快过期的 | 不考虑访问频率 |
+
+【面试官心理】
+四种淘汰指标是面试的基础。能说出四种区别的占 50%，能解释 LRU 和 LFU 各自优缺点的占 20%。LFU 是 Redis 4.0 才引入的，很多候选人还在用 LRU。
+
+## 三、LRU 算法详解 🔴
+
+### 3.1 朴素 LRU 的问题
+
+如果用标准的 LRU，需要维护一个按访问时间排序的双向链表：
+
+```
+查询 key → 移动到链表头 → O(n)
+淘汰 → 从链表尾删除 → O(1)
+```
+
+Redis 的问题是：**每次访问都需要更新链表，O(n) 复杂度不可接受**。
+
+### 3.2 Redis 的 LRU 实现：近似 LRU
+
+```c
+// Redis 用抽样代替全量排序
+#define LRU_BITS 24
+#define LRU_CLOCK_SIZE (1 << LRU_BITS)
+
+typedef struct redisObject {
+    unsigned type:4;
+    unsigned encoding:4;
+    unsigned lru:LRU_BITS;  // 24 位，存储 LRU 时钟
+    int refcount;
+    void *ptr;
+} robj;
+
+// LRU 时钟 = Unix 时间戳的低 24 位（精确到秒）
+// 每秒更新一次全局 lru_clock
+```
+
+```c
+// 淘汰时的 LRU 采样算法
+unsigned long evictionPoolSize = 16;
+
+while (mem_freed < mem_to_free) {
+    // 采样 16 个 key
+    for (int i = 0; i < evictionPoolSize; i++) {
+        key = getRandomKey();
+        sample_lru = getObjectLRU(key);
+
+        // 放入淘汰池（按 LRU 时间排序）
+        insertionSort(evictionPool, sample_lru, key);
+    }
+
+    // 淘汰 LRU 最老的 key
+    evicted_key = evictionPool[0];
+    deleteKey(evicted_key);
+}
+```
+
+### 3.3 近似 LRU vs 精确 LRU
+
+```
+朴素 LRU：每次访问 O(log n)（需要更新有序结构）
+Redis LRU：每次访问 O(1)，淘汰时 O(n)（采样 16 个并排序）
+
+Redis 用"不精确"换"高性能"
+```
+
+:::tip 💡
+**记忆口诀**：Redis 的 LRU 不是真正的 LRU，是"近似 LRU"。采样 16 个 key，按 LRU 时间排序，淘汰最老的那个。如果 16 个里最好的选择也不够好，可以增大 `maxmemory-samples` 配置。
+:::
+
+### 3.4 ❌ 错误示范
+
+**候选人原话**："Redis 的 LRU 就是把最久没访问的数据淘汰掉。"
+
+**问题诊断**：
+- 不知道 Redis 的 LRU 是"近似"算法
+- 不理解采样机制
+- 不知道 LRU_BITS 的存储方式
+
+**面试官内心 OS**："这个候选人肯定没有看过 Redis 源码，只是在网上扫了一眼 LRU 的概念。"
+
+## 四、LFU 算法详解 🟡
+
+### 4.1 LFU vs LRU
+
+| 维度 | LRU | LFU |
+| --- | --- | --- |
+| 指标 | 最近访问时间 | 访问频率 |
+| 优势 | 淘汰"冷数据" | 淘汰"低频数据" |
+| 劣势 | 可能误杀"一次性大对象" | 需要维护计数器 |
+| 适用 | 数据访问相对均匀 | 有明确的热点数据 |
+
+### 4.2 LFU 的衰减机制
+
+如果一个数据曾经很热，但现在很久没访问了，应该被淘汰。LFU 需要**衰减**：
+
+```c
+// Redis 4.0 LFU 实现
+// LFU 计数器 = 16 位（高 8 位：访问次数，低 8 位：访问时间衰减）
+
+// 计数器衰减：每 N 分钟，访问次数减半
+lfu_decay_time = (now - obj->lru) / LFU_DECAY_TIME
+
+// 计算新的访问次数
+new_count = lfu_counter / (lfu_decay_time + 1)
+```
+
+### 4.3 LFU 的冷启动问题
+
+新进入 Redis 的 key，访问次数是 0。如果用 LFU，它会在第一批被淘汰——即使它可能是热数据。
+
+解决方案：**访问次数不是从 0 开始，而是从一个较高的初始值开始**。
+
+```c
+// redis.conf
+lfu-init-packet 100  // 新 key 的初始 LFU 值
+```
+
+【面试官心理】
+LFU 是 Redis 4.0 的新特性。能说出 LFU 和 LRU 区别的占 20%，能解释衰减机制的占 5%，能说出冷启动问题的占 3%。LFU 是一个更"聪明"的淘汰策略，但在某些场景下可能不如 LRU。
+
+## 五、生产选型 🔴
+
+### 5.1 场景一：纯缓存，TTL 统一
+
+```c
+// 场景：所有数据都是缓存，有统一 TTL
+// 策略：volatile-lru
+maxmemory 8gb
+maxmemory-policy volatile-lru
+maxmemory-samples 5  // 减少采样数，提高性能
+```
+
+**为什么不用 allkeys-lru？** 因为所有 key 都有 TTL，volatile-lru 只会淘汰有 TTL 的 key，不会误删永久数据。
+
+### 5.2 场景二：缓存 + 永久数据混合
+
+```c
+// 场景：热点数据无 TTL，永久数据有 TTL
+// 策略：allkeys-lru
+maxmemory 8gb
+maxmemory-policy allkeys-lru
+
+// 配合：永久数据用单独的 key 前缀
+// 如：永久数据用 "perm:xxx"，热点数据用 "cache:xxx"
+```
+
+### 5.3 场景三：超高热点数据
+
+```c
+// 场景：热点数据访问频率差异极大
+// 策略：volatile-lfu 或 allkeys-lfu
+maxmemory 8gb
+maxmemory-policy allkeys-lfu
+lfu-init-packet 100
+```
+
+### 5.4 场景四：不允许丢失任何数据
+
+```c
+// 场景：Redis 作为数据库，不允许淘汰
+// 策略：noeviction
+maxmemory 8gb
+maxmemory-policy noeviction
+// 需要足够的内存 + 数据分片扩展
+```
+
+【面试官心理】
+生产选型是淘汰策略最核心的考点。能说出不同场景选不同策略的占 30%，能给出具体配置的占 10%。选错淘汰策略可能导致：缓存命中率下降（random）、热点数据被淘汰（LRU 误杀大对象）、数据丢失（noeviction 但内存不足）。
+
+## 六、生产避坑
+
+:::warning ⚠️
+生产中的三大翻车点：
+
+1. **maxmemory 设置过小**：Redis 作为缓存时，内存逐渐增长，最终达到 maxmemory，大量请求被 OOM 拒绝。解决方案：监控 `used_memory_human` 和 `maxmemory_human`，设置告警。
+
+2. **淘汰策略选错**：用 allkeys-random 导致热点数据被淘汰，命中率骤降。解决方案：分析业务数据的访问模式，选择合适的淘汰策略。
+
+3. **maxmemory-samples 过大**：采样数过大（如 100），导致淘汰过程消耗过多 CPU。解决方案：默认 5 即可，高内存压力时可调大。
+:::
+
+**排查方法**：
+
+```bash
+# 查看内存使用和淘汰统计
+redis-cli INFO stats | grep -E "evicted_keys|keyspace"
+
+# 查看淘汰策略
+redis-cli CONFIG GET maxmemory-policy
+
+# 模拟淘汰
+redis-cli MEMORY STATS
+
+# 动态修改淘汰策略（无需重启）
+redis-cli CONFIG SET maxmemory-policy allkeys-lru
+
+# 查看哪些 key 被淘汰最多
+# 需要开启 slowlog 分析
+redis-cli SLOWLOG GET 10
+```
+
+```bash
+# 监控淘汰事件
+# 在 redis.conf 中开启
+notify-keyspace-events El
+
+# 订阅淘汰事件
+redis-cli PSUBSCRIBE '__keyevent@0__:evicted'
+```
+
+:::tip 💡
+生产最佳实践：
+- 预估数据量：总数据量 / 0.7 = 所需 maxmemory（考虑 30% 内存碎片和 overhead）
+- 监控指标：`evicted_keys > 0` → 说明淘汰策略在工作了，可能需要扩容
+- LRU vs LFU：业务有明确热点的用 LFU，数据分布均匀的用 LRU
+- maxmemory-samples：默认 5，数据量大且淘汰频繁时可调大到 10
+- 淘汰过程是同步的，会阻塞主线程！
+:::
+
+【面试官心理】
+这道题我想最终验证的是候选人的"生产经验"。能把 8 种淘汰策略背出来的占 40%，能解释 LRU 采样算法的占 20%，能在生产环境中正确选型的占 10%。淘汰策略选错了轻则性能下降，重则 OOM 导致服务不可用，这是一个需要认真对待的配置项。

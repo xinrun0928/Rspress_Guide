@@ -1,0 +1,523 @@
+---
+title: 分布式ID生成器设计
+description: 从数据库自增到雪花算法，从号段模式到多时钟解决方案，深入剖析如何生成全局唯一、有序、可量产的分布式ID。
+---
+
+# 分布式ID生成器设计
+
+## 一个订单ID的灾难
+
+2022年，我们团队遇到了一个诡异的 bug：同一秒钟内下的两个订单，ID 是一样的。
+
+排查发现，一位同学把雪花算法的实现改错了：
+
+```java
+// 他改的代码
+public class SnowflakeIdGenerator {
+    private long lastTimestamp = -1;
+
+    public synchronized long nextId() {
+        long timestamp = timeGen();
+
+        if (timestamp < lastTimestamp) {
+            throw new RuntimeException("Clock moved backwards");
+        }
+
+        if (timestamp == lastTimestamp) {
+            // 同一毫秒内，序列号自增
+            sequence = (sequence + 1) & sequenceMask;
+            if (sequence == 0) {
+                // 序列号溢出，等待下一毫秒
+                timestamp = tilNextMillis(lastTimestamp);
+            }
+        } else {
+            sequence = 0; // ❌ BUG：这里应该是 0
+        }
+
+        lastTimestamp = timestamp;
+        return (timestamp << 22) | (datacenterId << 17) | (workerId << 12) | sequence;
+    }
+}
+```
+
+他把 `sequence = 0` 写在了 `else` 分支外，导致同一毫秒内所有 ID 的序列号部分全是 0。
+
+**分布式 ID 看似简单，但要保证唯一性、趋势递增、高性能、低延迟，并不容易。**
+
+---
+
+## 二、分布式ID的核心要求🔴
+
+### 2.1 五大要求
+
+| 要求 | 说明 |
+|------|------|
+| 全局唯一 | 不同机器、不同时间生成的 ID 不能重复 |
+| 趋势递增 | 新生成的 ID 比旧的 ID 大（有利于索引） |
+| 高性能 | 每秒能生成几十万甚至几百万 ID |
+| 可度量 | ID 中包含时间信息，可反解 |
+| 高可用 | 多节点部署，无单点故障 |
+
+### 2.2 常用方案对比
+
+| 方案 | 唯一性 | 趋势递增 | 性能 | 实现复杂度 |
+|------|--------|----------|------|------------|
+| UUID | ✅ | ❌ | 高 | 低 |
+| 数据库自增 | ✅ | ✅ | 低 | 低 |
+| Redis INCR | ✅ | ✅ | 高 | 低 |
+| 雪花算法 | ✅ | ✅ | 高 | 中 |
+| 号段模式 | ✅ | ✅ | 高 | 中 |
+| 百度 UidGenerator | ✅ | ✅ | 高 | 高 |
+
+---
+
+## 三、雪花算法（Snowflake）🔴
+
+### 3.1 算法原理
+
+```
+64 位 ID 结构：
+
+┌────────┬────────┬────────┬────────┬────────┬────────┐
+│  1bit  │ 41bit  │ 10bit  │ 12bit  │
+│  符号位 │ 时间戳  │ 机器ID  │ 序列号  │
+└────────┴────────┴────────┴────────┘
+
+- 1 bit：符号位，固定为 0
+- 41 bit：时间戳（毫秒），可支持 69 年
+- 10 bit：机器 ID（5 datacenter + 5 worker）
+- 12 bit：序列号，每毫秒最多 4096 个
+
+计算：
+最大值 = 2^41 - 1 ≈ 69 年
+机器容量 = 2^10 = 1024 台
+序列容量 = 2^12 = 4096 个/毫秒
+```
+
+### 3.2 标准实现
+
+```java
+public class SnowflakeIdGenerator {
+
+    // 初始时间戳（2024-01-01）
+    private final long twepoch = 1704067200000L;
+
+    // 机器 ID 相关
+    private final long workerIdBits = 5L;
+    private final long datacenterIdBits = 5L;
+    private final long maxWorkerId = ~(-1L << workerIdBits);
+    private final long maxDatacenterId = ~(-1L << datacenterIdBits);
+
+    // 序列号相关
+    private final long sequenceBits = 12L;
+    private final long workerIdShift = sequenceBits;
+    private final long datacenterIdShift = sequenceBits + workerIdBits;
+    private final long timestampLeftShift = sequenceBits + workerIdBits + datacenterIdBits;
+    private final long sequenceMask = ~(-1L << sequenceBits);
+
+    private final long workerId;
+    private final long datacenterId;
+    private long sequence = 0L;
+    private long lastTimestamp = -1L;
+
+    public SnowflakeIdGenerator(long workerId, long datacenterId) {
+        if (workerId > maxWorkerId || workerId < 0) {
+            throw new IllegalArgumentException("workerId 超出范围");
+        }
+        if (datacenterId > maxDatacenterId || datacenterId < 0) {
+            throw new IllegalArgumentException("datacenterId 超出范围");
+        }
+        this.workerId = workerId;
+        this.datacenterId = datacenterId;
+    }
+
+    public synchronized long nextId() {
+        long timestamp = timeGen();
+
+        // 时钟回拨处理
+        if (timestamp < lastTimestamp) {
+            long offset = lastTimestamp - timestamp;
+            if (offset <= 5) {
+                // 偏差小于 5ms，等待回拨时间
+                try {
+                    wait(offset << 2);
+                    timestamp = timeGen();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            } else {
+                throw new RuntimeException("时钟回拨过大");
+            }
+        }
+
+        // 同一毫秒内序列号自增
+        if (timestamp == lastTimestamp) {
+            sequence = (sequence + 1) & sequenceMask;
+            if (sequence == 0) {
+                // 序列号溢出，等待下一毫秒
+                timestamp = tilNextMillis(lastTimestamp);
+            }
+        } else {
+            sequence = 0;
+        }
+
+        lastTimestamp = timestamp;
+
+        return ((timestamp - twepoch) << timestampLeftShift)
+                | (datacenterId << datacenterIdShift)
+                | (workerId << workerIdShift)
+                | sequence;
+    }
+
+    private long tilNextMillis(long lastTimestamp) {
+        long timestamp = timeGen();
+        while (timestamp <= lastTimestamp) {
+            timestamp = timeGen();
+        }
+        return timestamp;
+    }
+
+    private long timeGen() {
+        return System.currentTimeMillis();
+    }
+}
+```
+
+### 3.3 雪花算法的改进
+
+```java
+/**
+ * 改良版雪花算法：解决时钟回拨问题
+ */
+public class ImprovedSnowflakeIdGenerator {
+    private final long workerId;
+    private long sequence = 0L;
+    private long lastTimestamp = -1L;
+
+    // Ring Buffer 解决时钟回拨
+    private final AtomicLong[] ringBuffer = new AtomicLong[32];
+    private int ringIndex = 0;
+
+    public ImprovedSnowflakeIdGenerator(long workerId) {
+        this.workerId = workerId;
+        for (int i = 0; i < ringBuffer.length; i++) {
+            ringBuffer[i].set(0);
+        }
+    }
+
+    public long nextId() {
+        long timestamp = System.currentTimeMillis();
+
+        // 时钟回拨
+        if (timestamp < lastTimestamp) {
+            // 从 Ring Buffer 中取一个备用 ID
+            int index = (ringIndex++) & 31;
+            long id = ringBuffer[index].get();
+            if (id != 0) {
+                return id;
+            }
+            throw new RuntimeException("时钟回拨，且无备用 ID");
+        }
+
+        if (timestamp == lastTimestamp) {
+            sequence = (sequence + 1) & 4095;
+            if (sequence == 0) {
+                timestamp = tilNextMillis(lastTimestamp);
+            }
+        } else {
+            // 保存当前时间戳对应的 ID
+            sequence = 0;
+        }
+
+        lastTimestamp = timestamp;
+        long id = buildId(timestamp, sequence);
+
+        // 如果 Ring Buffer 中对应位置有值，说明是备用 ID
+        if (ringBuffer[ringIndex & 31].get() == 0) {
+            ringBuffer[ringIndex & 31].set(id);
+        }
+
+        return id;
+    }
+}
+```
+
+---
+
+## 四、号段模式🔴
+
+### 4.1 原理
+
+```
+传统雪花：    每个请求生成一个 ID
+号段模式：    每次从数据库取一批 ID（号段），内存中分配
+
+优势：
+- 减少数据库交互（批量获取）
+- 本地分配，性能更高
+- 可支持高并发
+```
+
+### 4.2 实现
+
+```java
+@Service
+class SegmentIdGenerator {
+    private final AtomicLong current = new AtomicLong(0);
+    private final AtomicLong max = new AtomicLong(0);
+
+    @Autowired
+    private IdSegmentDao idSegmentDao;
+
+    @PostConstruct
+    public void init() {
+        refresh();
+    }
+
+    /**
+     * 获取下一个 ID
+     */
+    public long nextId() {
+        long id = current.incrementAndGet();
+
+        if (id >= max.get()) {
+            refresh();
+            return nextId();
+        }
+
+        return id;
+    }
+
+    /**
+     * 刷新号段
+     */
+    private synchronized void refresh() {
+        // Double Check
+        if (current.get() >= max.get()) {
+            IdSegment segment = idSegmentDao.getNextSegment();
+            max.set(segment.getEnd());
+            current.set(segment.getStart() - 1);
+        }
+    }
+}
+```
+
+### 4.3 数据库表设计
+
+```sql
+CREATE TABLE id_segments (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    biz_tag VARCHAR(50) NOT NULL,
+    max_id BIGINT NOT NULL,
+    step INT NOT NULL,
+    version INT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uk_biz_tag (biz_tag)
+);
+
+-- 初始数据
+INSERT INTO id_segments (biz_tag, max_id, step, version) VALUES ('order', 1000, 10000, 0);
+```
+
+### 4.4 号段模式 vs 雪花算法
+
+| 维度 | 雪花算法 | 号段模式 |
+|------|----------|----------|
+| 依赖 | 时钟 | 数据库 |
+| 性能 | ~1000万/秒 | ~100万/秒 |
+| 趋势递增 | ✅ | ✅ |
+| 唯一性 | ✅ | ✅ |
+| 复杂度 | 中 | 中 |
+| 时钟回拨 | 需要处理 | ❌ 无此问题 |
+
+---
+
+## 五、Redis INCR 方案🟡
+
+### 5.1 原理
+
+```java
+@Service
+class RedisIdGenerator {
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+
+    private static final String ID_KEY_PREFIX = "id:generator:";
+
+    public long nextId(String bizType) {
+        String key = ID_KEY_PREFIX + bizType;
+        return redisTemplate.opsForValue().increment(key);
+    }
+}
+```
+
+### 5.2 批量获取优化
+
+```java
+@Service
+class RedisBatchIdGenerator {
+    private static final int BATCH_SIZE = 1000;
+
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+
+    private final Map<String, AtomicLong> localCache = new ConcurrentHashMap<>();
+    private final Map<String, Long> localMax = new ConcurrentHashMap<>();
+
+    public long nextId(String bizType) {
+        AtomicLong current = localCache.computeIfAbsent(
+            bizType, k -> new AtomicLong(0));
+        Long max = localMax.get(bizType);
+
+        if (current.get() >= max) {
+            refreshBatch(bizType);
+            current.set(localCache.get(bizType).get());
+            max = localMax.get(bizType);
+        }
+
+        return current.incrementAndGet();
+    }
+
+    private void refreshBatch(String bizType) {
+        String key = ID_KEY_PREFIX + bizType;
+        Long newMax = redisTemplate.opsForValue().increment(key, BATCH_SIZE);
+        localMax.put(bizType, newMax);
+        localCache.get(bizType).set(newMax - BATCH_SIZE);
+    }
+}
+```
+
+---
+
+## 六、百度 UidGenerator🟡
+
+### 6.1 核心思想
+
+UidGenerator 是百度开源的分布式 ID 生成器，核心思路：**把雪花算法中的时间戳改为"当前秒数"，增加单位时间内可生成的 ID 数量**。
+
+```java
+// UidGenerator 配置
+@Bean
+public UidGenerator uidGenerator() {
+    // 1926 年开始，支持到 2087 年
+    CachedUidGenerator uidGenerator = new CachedUidGenerator();
+    uidGenerator.setTimeBits(28);     // 28 秒时间戳（秒）
+    uidGenerator.setWorkerBits(22);  // 22 位机器 ID
+    uidGenerator.setSeqBits(13);      // 13 位序列号
+    uidGenerator.setEpochStr("2024-01-01");
+    return uidGenerator;
+}
+```
+
+### 6.2 Ring Buffer
+
+```java
+// UidGenerator 使用 Ring Buffer 预生成 ID
+public class CachedUidGenerator {
+    private RingBuffer<Long> ringBuffer;
+
+    // 后台线程持续填充 Buffer
+    @Scheduled(fixedDelay = 1)
+    public void scheduleFillBuffer() {
+        // 持续填充 ID 到 Ring Buffer
+    }
+
+    public long getUID() {
+        return ringBuffer.take();
+    }
+}
+```
+
+---
+
+## 七、时钟回拨问题🔴
+
+### 7.1 什么是时钟回拨
+
+```
+时钟回拨：系统时间被调回，导致新生成的时间戳小于之前的时间戳
+
+场景：
+1. NTP 服务同步时间
+2. 虚拟机挂起/恢复
+3. 容器漂移
+4. 手动调整系统时间
+```
+
+### 7.2 解决方案
+
+```java
+// 方案一：等待回拨时间过去
+public class SnowflakeWithWait {
+    public synchronized long nextId() {
+        long timestamp = System.currentTimeMillis();
+
+        if (timestamp < lastTimestamp) {
+            // 等待时钟追上
+            while (timestamp < lastTimestamp) {
+                timestamp = System.currentTimeMillis();
+            }
+        }
+
+        // ... 其余逻辑
+    }
+}
+
+// 方案二：使用备用 ID
+public class SnowflakeWithFallback {
+    private final BlockingQueue<Long> fallbackIds = new LinkedBlockingQueue<>(1000);
+
+    public synchronized long nextId() {
+        long timestamp = System.currentTimeMillis();
+
+        if (timestamp < lastTimestamp) {
+            // 从备用队列取一个 ID
+            Long fallbackId = fallbackIds.poll();
+            if (fallbackId != null) {
+                return fallbackId;
+            }
+            throw new RuntimeException("时钟回拨且无备用 ID");
+        }
+
+        // ... 其余逻辑
+    }
+}
+
+// 方案三：拒绝回拨时间的服务
+public class SnowflakeWithReject {
+    public synchronized long nextId() {
+        long timestamp = System.currentTimeMillis();
+
+        if (timestamp < lastTimestamp) {
+            throw new RuntimeException(
+                "Clock moved backwards. Refusing to generate id for "
+                + (lastTimestamp - timestamp) + " milliseconds"
+            );
+        }
+
+        // ... 其余逻辑
+    }
+}
+```
+
+【架构权衡】
+时钟回拨问题没有完美的解决方案。等待方案会阻塞请求，拒绝方案会抛出异常，备用 ID 方案会消耗内存。选择哪种方案取决于业务对 ID 连续性的要求。
+
+---
+
+## 八、面试总结
+
+### 8.1 核心追问
+
+1. **"雪花算法的 64 位是怎么分配的？"** —— 1符号 + 41时间 + 10机器 + 12序列
+2. **"雪花算法有什么问题？"** —— 时钟回拨、依赖时钟
+3. **"号段模式的优势是什么？"** —— 减少数据库交互、高性能
+4. **"如何解决时钟回拨？"** —— 等待、拒绝、备用 ID
+
+### 8.2 级别差异
+
+| 级别 | 期望回答 |
+|------|----------|
+| P5 | 能说出雪花算法的基本原理 |
+| P6 | 能实现雪花算法，知道时钟回拨问题 |
+| P7 | 能对比各种方案，知道号段模式、UidGenerator |

@@ -1,0 +1,518 @@
+---
+title: 秒杀系统设计
+description: 从流量控制到库存扣减，从下单流程到超时处理，深度剖析秒杀系统如何应对瞬间百万 QPS 的流量冲击，以及生产环境的实战经验。
+---
+
+# 秒杀系统设计
+
+## 一次 618 的惨烈教训
+
+2022年618大促，我们团队满怀信心地部署了秒杀系统。结果，开抢的瞬间，数据库被打爆了 3 次，服务器重启了 5 次，故障持续了整整 2 小时。
+
+复盘发现，问题出在一行代码上：
+
+```java
+// 订单服务：超卖事故
+public void createOrder(Long userId, Long goodsId, int quantity) {
+    // ❌ 没有加锁，竞态条件导致超卖
+    Goods goods = goodsDao.selectById(goodsId);
+    if (goods.getStock() >= quantity) {
+        goods.setStock(goods.getStock() - quantity);
+        goodsDao.update(goods);
+        orderDao.create(userId, goodsId, quantity);
+    }
+}
+```
+
+10 个并发请求同时读取到 stock=1，都通过了校验，导致超卖了 9 件。
+
+**秒杀系统的本质是：如何在极端流量下，保证数据一致性和系统可用性。**
+
+---
+
+## 二、秒杀系统的核心挑战🔴
+
+### 2.1 流量特征
+
+| 特征 | 描述 |
+|------|------|
+| 瞬时峰值 | 平时 100 QPS，秒杀时 100万 QPS |
+| 读多写少 | 99% 是查询库存，1% 是下单 |
+| 库存有限 | 商品数量少（100件），但想买的人多（100万） |
+| 地域集中 | 抢购时间窗口集中（几秒内） |
+| 攻击风险 | 恶意刷单、黄牛 |
+
+### 2.2 核心矛盾
+
+```
+核心矛盾：库存有限 vs 流量巨大
+
+100件商品
+100万人抢购
+=
+99.99% 的请求必然失败
+=
+如何优雅地让 99.99% 的请求快速失败？
+=
+如何保证 0.01% 的成功请求数据正确？
+```
+
+---
+
+## 三、系统架构设计🔴
+
+### 3.1 分层流量控制
+
+```
+用户请求
+    ↓
+CDN（静态资源）+ WAF（防刷）
+    ↓
+API Gateway（限流、熔断）
+    ↓
+┌─────────────────────────────────────┐
+│          秒杀服务集群                 │
+│  ┌─────────┐    ┌─────────┐        │
+│  │ Service │    │ Service │  ...   │
+│  └────┬────┘    └────┬────┘        │
+└────────┼─────────────┼──────────────┘
+         ↓              ↓
+┌────────┴────────┬────┴────────────┐
+│                 │                  │
+↓                 ↓                  ↓
+Redis           MQ                 MySQL
+(库存缓存)      (异步下单)         (持久化)
+```
+
+### 3.2 多层拦截策略
+
+```
+L0: CDN 拦截 - 静态资源、已过期活动
+L1: API Gateway - 限流、IP黑名单、用户黑名单
+L2: 秒杀服务 - 验证码、风控检查
+L3: Redis 库存 - 快速扣减、用户重复购买拦截
+L4: MQ 消息队列 - 异步下单、流量削峰
+L5: 数据库 - 最终库存扣减
+```
+
+每一层拦截掉大部分无效流量，减轻下一层的压力。
+
+---
+
+## 四、库存扣减设计🔴
+
+### 4.1 Redis 原子扣减
+
+```java
+@Service
+class SeckillService {
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+
+    /**
+     * Redis Lua 脚本保证原子性
+     */
+    public Long tryDeductStock(Long goodsId) {
+        String key = "seckill:stock:" + goodsId;
+
+        // Lua 脚本：检查库存并扣减
+        String script = """
+            local stock = redis.call('GET', KEYS[1])
+            if not stock or tonumber(stock) <= 0 then
+                return -1
+            end
+            redis.call('DECR', KEYS[1])
+            return redis.call('GET', KEYS[1])
+        """;
+
+        return redisTemplate.execute(
+            new DefaultRedisScript<>(script, Long.class),
+            Collections.singletonList(key)
+        );
+    }
+
+    /**
+     * 预热库存到 Redis
+     */
+    public void preloadStock(Long goodsId, int stock) {
+        String key = "seckill:stock:" + goodsId;
+        redisTemplate.opsForValue().set(key, String.valueOf(stock));
+    }
+}
+```
+
+### 4.2 Lua 脚本的必要性
+
+```java
+// ❌ 错误：普通命令不能保证原子性
+String stock = redisTemplate.opsForValue().get(key);
+if (Integer.parseInt(stock) > 0) {
+    redisTemplate.opsForValue().decrement(key); // 并发时出问题
+}
+
+// ✅ 正确：Lua 脚本保证检查+扣减的原子性
+// 同一 Lua 脚本中，检查和扣减是不可分割的
+```
+
+### 4.3 超卖问题解决方案
+
+```java
+// 方案一：乐观锁
+Goods goods = goodsDao.selectById(goodsId);
+if (goods.getStock() >= quantity) {
+    int affected = goodsDao.updateStockOptimistic(goodsId, goods.getVersion());
+    if (affected == 0) {
+        throw new OptimisticLockException("库存更新失败");
+    }
+}
+
+// 方案二：分布式锁（悲观锁）
+RLock lock = redissonClient.getLock("seckill:lock:" + goodsId);
+try {
+    if (lock.tryLock(5, 10, TimeUnit.SECONDS)) {
+        Goods goods = goodsDao.selectById(goodsId);
+        if (goods.getStock() >= quantity) {
+            goodsDao.decreaseStock(goodsId, quantity);
+        }
+    }
+} finally {
+    lock.unlock();
+}
+
+// 方案三：Redis Lua 脚本（最佳方案）
+// 参见 4.1
+```
+
+| 方案 | 性能 | 一致性 | 适用场景 |
+|------|------|--------|----------|
+| 乐观锁 | 高 | 强一致 | 并发不高 |
+| 分布式锁 | 中 | 强一致 | 中等并发 |
+| Redis Lua | 最高 | 最终一致 | 高并发 |
+
+---
+
+## 五、流量削峰设计🟡
+
+### 5.1 消息队列异步下单
+
+```java
+@Service
+class SeckillService {
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+    @Autowired
+    private RocketMQTemplate rocketMQTemplate;
+
+    public Result<String> seckill(Long userId, Long goodsId) {
+        // 1. 检查用户是否已购买
+        String boughtKey = "seckill:bought:" + goodsId + ":" + userId;
+        if (Boolean.TRUE.equals(redisTemplate.hasKey(boughtKey))) {
+            return Result.error("已购买过");
+        }
+
+        // 2. Redis 原子扣减库存
+        Long remaining = tryDeductStock(goodsId);
+        if (remaining < 0) {
+            return Result.error("库存不足");
+        }
+
+        // 3. 发送下单消息到 MQ
+        OrderMessage message = new OrderMessage(userId, goodsId, remaining);
+        rocketMQTemplate.asyncSend("seckill:order:topic", message, new SendCallback() {
+            @Override
+            public void onSuccess(SendResult result) {
+                // 发送成功
+            }
+
+            @Override
+            public void onException(Throwable e) {
+                // 发送失败，回补库存
+                restoreStock(goodsId);
+            }
+        });
+
+        // 4. 返回抢购成功
+        return Result.success("抢购成功");
+    }
+}
+```
+
+### 5.2 消费者处理下单
+
+```java
+@Component
+@RocketMQMessageListener(
+    topic = "seckill:order:topic",
+    consumerGroup = "seckill-order-consumer",
+    concurrency = "20"
+)
+class OrderConsumer {
+    @Autowired
+    private OrderService orderService;
+
+    public void onMessage(OrderMessage message) {
+        try {
+            // 1. 创建订单
+            orderService.createOrder(message.getUserId(),
+                                   message.getGoodsId());
+
+            // 2. 标记用户已购买
+            markUserBought(message.getGoodsId(), message.getUserId());
+
+        } catch (Exception e) {
+            // 失败重试，最终死信队列处理
+            throw new RuntimeException(e);
+        }
+    }
+}
+```
+
+### 5.3 限流策略
+
+```java
+@Configuration
+class RateLimitConfig {
+    @Bean
+    public FilterRegistrationBean<RateLimitFilter> rateLimitFilter() {
+        FilterRegistrationBean<RateLimitFilter> bean = new FilterRegistrationBean<>();
+        bean.setFilter(new RateLimitFilter());
+        bean.addUrlPatterns("/seckill/*");
+        return bean;
+    }
+}
+
+class RateLimitFilter implements Filter {
+    private final RedissonClient redisson = RedissonClientSingleton.get();
+
+    @Override
+    public void doFilter(ServletRequest request, ServletResponse response,
+                        FilterChain chain) throws IOException, ServletException {
+        HttpServletRequest req = (HttpServletRequest) request;
+        String userId = req.getHeader("X-User-Id");
+
+        // 基于用户 ID 的令牌桶限流
+        String key = "seckill:ratelimit:user:" + userId;
+        RRateLimiter limiter = redisson.getRateLimiter(key);
+        limiter.trySetRate(RateType.OVERALL, 100, 1, RateIntervalUnit.MINUTES);
+
+        if (!limiter.tryAcquire()) {
+            ((HttpServletResponse) response).setStatus(429);
+            response.getWriter().write("请求太频繁");
+            return;
+        }
+
+        chain.doFilter(request, response);
+    }
+}
+```
+
+---
+
+## 六、库存回补机制🟡
+
+### 6.1 下单超时回补
+
+```java
+@Service
+class StockRestoreService {
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+
+    /**
+     * 定时扫描超时未支付的订单，回补库存
+     */
+    @Scheduled(fixedDelay = 5000)
+    public void restoreTimeoutOrders() {
+        // 查询超时订单（10分钟未支付）
+        List<Order> timeoutOrders = orderDao.findTimeoutOrders(
+            Instant.now().minus(10, ChronoUnit.MINUTES)
+        );
+
+        for (Order order : timeoutOrders) {
+            // 回补 Redis 库存
+            String stockKey = "seckill:stock:" + order.getGoodsId();
+            redisTemplate.opsForValue().increment(stockKey);
+
+            // 标记订单取消
+            orderService.cancelOrder(order.getId());
+
+            // 清除用户购买标记
+            String boughtKey = "seckill:bought:" + order.getGoodsId()
+                             + ":" + order.getUserId();
+            redisTemplate.delete(boughtKey);
+        }
+    }
+}
+```
+
+### 6.2 MQ 发送失败回补
+
+```java
+// 发送失败时回补库存
+rocketMQTemplate.asyncSend("seckill:order:topic", message, new SendCallback() {
+    @Override
+    public void onSuccess(SendResult result) {
+        // 发送成功
+    }
+
+    @Override
+    public void onException(Throwable e) {
+        log.error("MQ 发送失败，需要回补库存", e);
+        // 回补 Redis 库存
+        restoreStock(message.getGoodsId());
+    }
+});
+```
+
+---
+
+## 七、热点数据处理🟡
+
+### 7.1 多级缓存
+
+```
+L1: 本地缓存（Caffeine）
+    - 容量：1000 条
+    - TTL：1 秒
+    - 命中率：90%
+
+L2: Redis 集群
+    - 容量：全量库存
+    - 命中率：99.9%
+
+L3: MySQL
+    - 最终数据源
+```
+
+```java
+@Service
+class GoodsService {
+    private final Cache<Integer, GoodsStock> localCache;
+
+    public GoodsStock getStock(Long goodsId) {
+        // L1: 本地缓存
+        GoodsStock cached = localCache.getIfPresent(goodsId);
+        if (cached != null) {
+            return cached;
+        }
+
+        // L2: Redis
+        String redisStock = redisTemplate.opsForValue().get("seckill:stock:" + goodsId);
+        if (redisStock != null) {
+            GoodsStock stock = new GoodsStock(goodsId, Integer.parseInt(redisStock));
+            localCache.put(goodsId, stock);
+            return stock;
+        }
+
+        // L3: MySQL
+        return dao.getStock(goodsId);
+    }
+}
+```
+
+### 7.2 数据预加载
+
+```java
+@Configuration
+class DataPreloadRunner implements ApplicationRunner {
+    @Autowired
+    private List<SeckillGoods> seckillGoods;
+
+    @Override
+    public void run(ApplicationArguments args) {
+        // 秒杀开始前，提前将库存加载到 Redis
+        for (SeckillGoods goods : seckillGoods) {
+            redisTemplate.opsForValue().set(
+                "seckill:stock:" + goods.getGoodsId(),
+                String.valueOf(goods.getStock())
+            );
+        }
+    }
+}
+```
+
+---
+
+## 八、生产避坑清单🟡
+
+### 8.1 超卖问题
+
+```java
+// ❌ 致命错误：先查后改
+Goods goods = goodsDao.selectById(goodsId);
+if (goods.getStock() >= quantity) {
+    goods.setStock(goods.getStock() - quantity);
+    goodsDao.update(goods); // 并发时超卖
+}
+
+// ✅ 正确：直接扣减，数据库保证原子性
+// MySQL UPDATE WHERE 条件中包含库存检查
+int affected = goodsDao.updateStock(goodsId, quantity);
+if (affected == 0) {
+    throw new StockException("库存不足");
+}
+
+// UPDATE goods SET stock = stock - #{quantity}
+// WHERE id = #{goodsId} AND stock >= #{quantity}
+```
+
+### 8.2 重复购买
+
+```java
+// ❌ 没有拦截重复购买
+public Result seckill(Long userId, Long goodsId) {
+    // 任何用户都可以无限购买
+    deductStock(goodsId);
+}
+
+// ✅ 用 Redis Set 拦截
+public Result seckill(Long userId, Long goodsId) {
+    String key = "seckill:bought:" + goodsId;
+    Long added = redisTemplate.opsForSet().add(key, userId.toString());
+    if (added == 0) {
+        return Result.error("已购买过");
+    }
+    // 设置过期时间（防止内存泄漏）
+    redisTemplate.expire(key, Duration.ofHours(24));
+}
+```
+
+### 8.3 资源预热
+
+```java
+// ❌ 活动开始了才开始加载数据
+public void handleRequest(Long goodsId) {
+    Goods goods = dao.selectById(goodsId); // 活动开始时才查数据库，晚了
+}
+
+// ✅ 提前预热
+@PostConstruct
+public void init() {
+    // 活动开始前 10 分钟预热
+    // 1. 加载库存到 Redis
+    // 2. 预热热点数据到本地缓存
+    // 3. 预编译 Lua 脚本
+}
+```
+
+【架构权衡】
+秒杀系统的核心矛盾是"库存有限 vs 流量巨大"。所有优化都围绕这个矛盾展开：多级拦截减少无效流量、Redis 原子操作保证一致性、MQ 削峰保证可用性。过度设计（引入太多组件）反而增加复杂度，降低可靠性。
+
+---
+
+## 九、面试总结
+
+### 9.1 核心追问
+
+1. **"如何解决超卖问题？"** —— Redis Lua、乐观锁、分布式锁
+2. **"如何防止刷单？"** —— 限流、验证码、用户购买标记
+3. **"Redis 挂了怎么办？"** —— 多级缓存降级
+4. **"MQ 发送失败怎么处理？"** —— 回补库存、重试机制
+
+### 9.2 级别差异
+
+| 级别 | 期望回答 |
+|------|----------|
+| P5 | 能说出基本的秒杀流程和 Redis 库存扣减 |
+| P6 | 能说出 Lua 脚本、MQ 削峰、多级限流 |
+| P7 | 能设计完整的秒杀方案，包括容灾、降级、监控 |

@@ -1,0 +1,379 @@
+---
+title: Redis 分布式锁（SETNX + Lua）
+description: 用 SETNX 原子获取锁、Lua 脚本安全释放，剖析 Redis 分布式锁的最标准实现与五个致命误区。
+---
+
+## 事故背景
+
+2024年黑五大促，我们的支付系统出现了一个诡异的 bug：同一笔订单被重复扣款了 7 次。
+
+7 次扣款，全部成功。用户发现时已经多付了 6 倍的钱。
+
+排查了 3 个小时，真相令人震惊：代码里确实有分布式锁，但 unlock 逻辑写成了这样：
+
+```java
+// 错误代码：先判断后删除，不是原子操作
+String value = redis.get("lock:order:123");
+if ("client-abc".equals(value)) {
+    redis.del("lock:order:123");
+}
+```
+
+问题出在哪里？Redis 的 GET 和 DEL 是两个独立的命令，不是原子的。在第 1 次扣款完成后，客户端 A 执行 `get` 返回了正确的值，但在 `del` 之前，时钟刚好推进了 100ms（锁刚好过期），客户端 B 重新拿到了锁。客户端 A 的 `del` 把客户端 B 的锁删了。客户端 B 和 C 同时进入临界区，7 次扣款就这么来的。
+
+这是 Redis 分布式锁最经典的翻车场景之一。今天这篇，我们来把 Redis 分布式锁的正确实现讲透。
+
+## 一、最简实现
+
+Redis 分布式锁的核心是 SETNX（SET if Not eXists）—— 只有 key 不存在时才能设置成功。
+
+### 基本版
+
+```java
+public class RedisDistLock {
+    private Jedis jedis;
+
+    public boolean tryLock(String key, String value, long expireMs) {
+        // SET key value NX PX 30000
+        // NX: 只有 key 不存在才设置
+        // PX: 过期时间 30000 毫秒
+        String result = jedis.set(key, value, "NX", "PX", String.valueOf(expireMs));
+        return "OK".equals(result);
+    }
+
+    public void unlock(String key, String value) {
+        // 释放锁：只能删除自己持有的锁
+        String current = jedis.get(key);
+        if (value.equals(current)) {
+            jedis.del(key);
+        }
+    }
+}
+```
+
+这段代码看起来正确，但藏着三个致命问题，我们逐一拆解。
+
+## 二、问题一：释放锁的竞态条件
+
+### 先判断后删除 = 非原子操作
+
+```java
+// ❌ 错误：get 和 del 之间存在时间窗口
+String current = jedis.get(key);
+if (value.equals(current)) {
+    jedis.del(key);
+}
+
+// ✅ 正确：使用 Lua 脚本原子执行
+String script =
+    "if redis.call('get', KEYS[1]) == ARGV[1] then " +
+    "    return redis.call('del', KEYS[1]) " +
+    "else " +
+    "    return 0 " +
+    "end";
+
+jedis.eval(script, 1, key, value);
+```
+
+```
+时间线分析（错误版本的 unlock）：
+T0:  客户端 A 获取锁，value="A"
+T30: 锁自动过期
+T31: 客户端 B 获取锁，value="B"
+T32: 客户端 A 执行 get，返回 "B"（锁已过期！）
+T33: 客户端 A 执行 del，删除了客户端 B 的锁！
+T34: 客户端 C 获取锁，value="C"
+T35: 客户端 B 进入临界区（锁已被 A 删了，但 B 不知道）
+T36: 客户端 C 也进入临界区
+→ 两个客户端同时在临界区
+```
+
+### Lua 脚本保证原子性
+
+```lua
+-- unlock.lua：只有锁的持有者才能删除锁
+if redis.call('get', KEYS[1]) == ARGV[1] then
+    return redis.call('del', KEYS[1])
+else
+    return 0
+end
+```
+
+Redis 的 Lua 脚本执行是原子的——整个脚本要么全部执行，要么全部不执行，中间不会有其他命令插入。GET + DEL 的两步操作在 Lua 脚本中变成了一步。
+
+【架构权衡】
+
+为什么不能用 WATCH + MULTI 替代 Lua？
+
+```java
+// WATCH + MULTI 的方式
+jedis.watch(key);
+String current = jedis.get(key);
+if (value.equals(current)) {
+    Transaction tx = jedis.multi();
+    tx.del(key);
+    tx.exec(); // 如果 WATCH 之后 key 被修改，返回 null
+}
+jedis.unwatch();
+```
+
+WATCH + MULTI 的问题在于：**在高竞争场景下，事务会频繁失败（返回 null）**，导致大量重试。虽然逻辑上可行，但性能和稳定性远不如 Lua 脚本。
+
+## 三、问题二：锁的可重入性
+
+### 基本版不支持可重入
+
+```java
+// ❌ 基本版：同一个线程多次获取会失败
+public void outer() {
+    lock.lock();
+    inner();  // 这里会卡死，因为同一个线程无法重入
+    lock.unlock();
+}
+
+public void inner() {
+    lock.lock();  // 永远等待！
+    // ...
+    lock.unlock();
+}
+```
+
+### 支持可重入的实现
+
+```java
+// 基于 ThreadLocal + 引用计数实现可重入
+private ThreadLocal<Map<String, Integer>> holdCount = ThreadLocal.withInitial(HashMap::new);
+
+public boolean tryLock(String key, String value, long expireMs) {
+    Map<String, Integer> counts = holdCount.get();
+    Integer current = counts.get(key);
+
+    if (current != null && current > 0 && value.equals(jedis.get(key))) {
+        // 可重入：自己持有锁，直接增加计数
+        counts.put(key, current + 1);
+        return true;
+    }
+
+    // 尝试获取锁
+    String result = jedis.set(key, value, "NX", "PX", String.valueOf(expireMs));
+    if ("OK".equals(result)) {
+        counts.put(key, 1);
+        return true;
+    }
+    return false;
+}
+
+public void unlock(String key) {
+    Map<String, Integer> counts = holdCount.get();
+    Integer current = counts.get(key);
+
+    if (current == null || current <= 0) {
+        return; // 没有持有锁
+    }
+
+    if (current == 1) {
+        // 最后一次，释放锁
+        String script = "if redis.call('get', KEYS[1]) == ARGV[1] then " +
+                        "    redis.call('del', KEYS[1]) " +
+                        "    return 1 " +
+                        "else " +
+                        "    return 0 " +
+                        "end";
+        jedis.eval(script, 1, key, threadLocalValue.get(key));
+        counts.remove(key);
+    } else {
+        // 可重入，减少计数
+        counts.put(key, current - 1);
+    }
+}
+```
+
+:::details 📖 点击展开：可重入锁的分布式标识问题
+
+在单机 JVM 中，用 `Thread.currentThread().getId()` 可以唯一标识一个线程。但在分布式环境中，锁值需要在多个节点之间共享，所以需要用全局唯一标识（如 UUID + 线程 ID）。
+
+```java
+private String generateLockValue() {
+    return UUID.randomUUID().toString() + ":" + Thread.currentThread().getId();
+}
+```
+
+这样即使同一个 JVM 中的多个线程尝试获取同一把锁，也能区分开来。
+
+:::
+
+## 四、问题三：SETNX 的性能与网络延迟
+
+### 自旋 vs 退避
+
+```java
+// ❌ 错误：纯自旋，不做任何等待
+public boolean tryLock(String key, String value, long expireMs) {
+    while (!jedis.set(key, value, "NX", "PX", String.valueOf(expireMs)).equals("OK")) {
+        // CPU 空转，高并发下会导致 Redis CPU 飙升
+    }
+    return true;
+}
+
+// ✅ 正确：带退避的重试
+public boolean tryLock(String key, String value, long expireMs, int maxRetries) {
+    for (int i = 0; i < maxRetries; i++) {
+        if (jedis.set(key, value, "NX", "PX", String.valueOf(expireMs)).equals("OK")) {
+            return true;
+        }
+        // 指数退避 + 随机 jitter
+        long delay = Math.min(10L * (1 << i) + new Random().nextInt(5), 200);
+        try {
+            Thread.sleep(delay);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+    }
+    return false;
+}
+```
+
+【架构权衡】
+
+锁获取策略的选择取决于业务对延迟的容忍度：
+
+| 场景 | 策略 | 理由 |
+|------|------|------|
+| 扣库存（不允许等待） | 失败立即返回，降级处理 | 库存不足时快速失败，用户体验更好 |
+| 分布式任务调度（可等待） | 指数退避 + 最大重试 | 任务不紧急，等待锁合理 |
+| 悲观业务（必须拿到锁） | 自旋 + 超时 | 业务逻辑要求必须串行化 |
+| 扣款/支付（不允许失败） | 降级 + 人工补偿 | 支付失败比等待更严重 |
+
+## 五、完整实现代码
+
+```java
+public class RedisDistributedLock implements AutoCloseable {
+    private final JedisPool jedisPool;
+    private final String key;
+    private final String value;
+    private final long expireMs;
+    private final ThreadLocal<String> threadValue = new ThreadLocal<>();
+
+    private static final String UNLOCK_SCRIPT =
+        "if redis.call('get', KEYS[1]) == ARGV[1] then " +
+        "    return redis.call('del', KEYS[1]) " +
+        "else " +
+        "    return 0 " +
+        "end";
+
+    public RedisDistributedLock(JedisPool jedisPool, String key, long expireMs) {
+        this.jedisPool = jedisPool;
+        this.key = key;
+        this.value = UUID.randomUUID().toString();
+        this.expireMs = expireMs;
+    }
+
+    @Override
+    public boolean tryLock() {
+        return tryLock(3); // 默认重试 3 次
+    }
+
+    public boolean tryLock(int maxRetries) {
+        try (Jedis jedis = jedisPool.getResource()) {
+            for (int i = 0; i < maxRetries; i++) {
+                String result = jedis.set(key, value, "NX", "PX", String.valueOf(expireMs));
+                if ("OK".equals(result)) {
+                    threadValue.set(value);
+                    return true;
+                }
+
+                long delay = Math.min(10L * (1 << i) + new Random().nextInt(5), 200);
+                try {
+                    Thread.sleep(delay);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return false;
+                }
+            }
+        }
+        return false;
+    }
+
+    @Override
+    public void unlock() {
+        String v = threadValue.get();
+        if (v == null) {
+            return; // 没有持有锁
+        }
+
+        try (Jedis jedis = jedisPool.getResource()) {
+            jedis.eval(UNLOCK_SCRIPT, 1, key, v);
+        } finally {
+            threadValue.remove();
+        }
+    }
+
+    // 使用方式
+    public static void main(String[] args) {
+        JedisPool pool = new JedisPool("localhost", 6379);
+        try (RedisDistributedLock lock = new RedisDistributedLock(pool, "order:123", 30000)) {
+            if (lock.tryLock()) {
+                // 临界区
+                processOrder();
+            } else {
+                throw new RuntimeException("无法获取锁，请稍后重试");
+            }
+        }
+    }
+}
+```
+
+:::tip 💡
+`AutoCloseable` 接口让锁可以用 try-with-resources 语法，确保锁一定被释放。这是防止锁泄漏的最佳实践。
+:::
+
+## 六、主从哨兵模式下的坑
+
+```
+场景：Redis 主从架构 + 哨兵自动切换
+
+T0:  客户端 A 在主节点写入锁，SET key=lock value=A NX PX 30000
+T1:  主节点数据同步到从节点（异步复制）
+T2:  主节点宕机，哨兵切换从节点为主节点
+T3:  客户端 B 在新主节点写入锁，SET key=lock value=B NX PX 30000 —— 成功！
+T4:  客户端 A 和客户端 B 同时持有同一把锁
+```
+
+异步复制的延迟是 Redis 主从模式的致命缺陷。在主节点宕机后，如果锁数据还没同步到从节点，新主节点会丢失这把锁。两个客户端可能同时持有同一把锁。
+
+这是单节点 Redis 分布式锁的根本性局限。解决方案有两个：
+
+1. **RedLock 算法**：用多个独立 Redis 节点，必须超过半数节点成功才算拿锁成功
+2. **切换到 etcd / ZooKeeper**：使用 Raft 共识算法保证强一致性
+
+【架构权衡】
+
+对于大多数业务场景（对数据一致性要求不极端严格），Redis 主从模式下的分布式锁已经够用。只要避免极端情况（恰好在主节点宕机的那个窗口抢锁），99.9% 的场景下锁是可靠的。
+
+但如果你的业务是**金融交易、库存扣减、库存超卖**这类对一致性要求极高的场景，Redis 锁不够——必须用 RedLock 或者 etcd。
+
+:::warning ⚠️
+Redis 分布式锁最大的误解是"用了 Redis 就是分布式的"。实际上，单节点 Redis 锁是"单机锁"——它依赖于 Redis 本身的单进程原子性，但 Redis 本身的持久化、主从复制、故障切换都可能破坏这个原子性。分布式锁的正确性取决于整个系统的故障模型，而不仅仅是锁操作本身。
+:::
+
+## 七、生产避坑清单
+
+1. **锁值必须全局唯一**：用 UUID.randomUUID() + 线程 ID，不要用固定字符串
+2. **释放锁必须用 Lua 脚本**：不能用 get + del 的分离操作
+3. **必须处理拿锁失败**：无脑重试会放大竞争，正确做法是指数退避 + 最大重试次数
+4. **锁的 TTL 要大于业务执行时间**：否则锁会提前过期，导致其他客户端"闯进"临界区
+5. **主从模式下有数据丢失风险**：如果业务无法容忍双写，需要使用 RedLock 或 etcd
+6. **不要在锁内调用有副作用的远程服务**：一旦超时，锁会持有时间过长，引发级联故障
+
+## 八、工程代价评估
+
+| 维度 | 评估 |
+|------|------|
+| 开发成本 | 低~中（需要正确实现 SETNX + Lua + 重试 + 续期） |
+| 运维成本 | 低（Redis 是成熟的缓存服务，托管方案多） |
+| 排障复杂度 | 中等（锁竞争、锁超时的线上问题需要 trace ID 串联） |
+| 扩展性 | 好（Redis Cluster 支持水平扩展） |
+| 性能 | 高（Redis 单实例可达 10万+ QPS） |
+
+Redis 分布式锁是生产环境中最常用的方案——性能好、实现简单、生态成熟。但它有一个致命弱点：**锁过期后业务还没执行完怎么办？** 这个问题我们下一篇文章专门讲。

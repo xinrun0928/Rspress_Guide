@@ -1,0 +1,379 @@
+---
+title: Kafka 消息可靠性保证
+description: acks 参数的三档配置、ISR 机制、故障恢复流程，从生产到消费的全链路可靠性设计。
+---
+
+# Kafka 消息可靠性保证
+
+候选人小孙在字节三面中被问到："Kafka怎么保证消息不丢失？你们线上遇到过消息丢失吗？"
+
+小孙说："我们配置了副本数3，应该不会丢。"
+
+面试官追问："副本数3就一定不丢吗？如果3个副本里有2个挂了怎么办？"
+
+小孙愣了一下："那就从剩下的那个副本恢复..."
+
+面试官追问："那如果剩下的那个副本数据也是旧的呢？什么叫ISR？为什么ISR里副本数会变少？"
+
+小孙彻底答不上来了，支支吾吾说："ISR就是...跟ZooKeeper有关？"
+
+面试官没说话，在本子上写了几笔。
+
+【面试官心理】
+
+这道题是Kafka可靠性的核心问题，也是生产事故的高发区。90%的候选人知道"副本数=3"，但90%都不知道ISR的概念和unclean leader election的危害。配置副本数只是第一步，真正保证可靠性的还有`min.insync.replicas`、`acks=all`、`unclean.leader.election.enable`等一整套配置。这道题能答到ISR机制和事务语义的，基本都有生产踩坑经验。
+
+## 一、核心问题：Kafka 消息可靠性配置 🔴
+
+### 1.1 问题拆解
+
+**第一层：怎么用？**
+面试官问："Kafka有哪些配置可以保证消息不丢失？"
+候选人答："设置acks=all，副本数replication.factor=3..."
+考察点：基本配置项
+
+**第二层：底层机制**
+面试官追问："acks=all具体是什么概念？所有副本都确认了才算成功？"
+候选人答："...应该是Broker确认？"
+考察点：ACK机制与ISR
+
+**第三层：边界条件**
+面试官追问："ISR是什么？为什么ISR副本数会变少？如果ISR只剩1个，还能保证可靠性吗？"
+候选人答：...（P5/P6分水岭）
+考察点：ISR机制的核心理解
+
+**第四层：Exactly-Once**
+面试官追问："Kafka的Exactly-Once是怎么实现的？它和At-Least-Once、At-Most-Once有什么区别？"
+候选人答：...（P7区分点）
+考察点：Kafka事务机制
+
+### 1.2 错误示范
+
+**候选人原话 A**："Kafka消息不会丢，因为它是持久化的，存在磁盘上。"
+
+**问题诊断**：
+- 混淆了"持久化"和"可靠传输"
+- 持久化只是保证Broker重启后数据还在，不保证传输过程不丢
+- 磁盘故障、Broker宕机、网络抖动都可能导致消息丢失
+
+**候选人原话 B**："我们配置了副本数3，数据有3份备份，不可能丢。"
+
+**问题诊断**：
+- 副本只是数据冗余，不是可靠传输的充分条件
+- 如果写入时只等Leader确认就返回，Follower还没同步完就宕机，数据照样丢
+- 不理解`acks`和`min.insync.replicas`的配合使用
+
+**候选人原话 C**："Kafka有事务消息，用了事务就能保证消息不丢不重。"
+
+**问题诊断**：
+- 混淆了Kafka事务和RocketMQ事务的概念
+- Kafka事务是针对Producer端的幂等语义，不是Consumer端的可靠消费
+- 没有真正理解Kafka事务的适用范围
+
+### 1.3 标准回答
+
+Kafka的消息可靠性由三套机制共同保障：Producer端的ACK策略、Broker端的副本同步机制、Consumer端的手动提交。
+
+**第一层：Producer端的ACK策略 —— 消息发送的三个等级**
+
+```java
+// Kafka Producer的三种ACK配置
+props.put("acks", "0");    // Fire-and-Forget，发送后不等待确认
+props.put("acks", "1");    // 只等Leader确认
+props.put("acks", "all");  // 等ISR中所有副本确认
+```
+
+**`acks=0`**：Producer发出去就不管了，网络抖动直接丢消息
+- 吞吐最高，可靠性最低
+- 适用于：日志采集等允许少量丢失的场景
+
+**`acks=1`**：等Leader副本确认写入成功就返回
+- 性能和数据安全的平衡点
+- 问题：如果Leader在同步到Follower之前宕机，Follower当上Leader后数据丢失
+- 适用于：一般互联网场景
+
+**`acks=all`（`-1`）**：等ISR中所有副本都确认写入成功才返回
+- 可靠性最高，但延迟最大
+- 必须配合`min.insync.replicas >= 2`
+- 适用于：订单、支付等高可靠场景
+
+```java
+// 高可靠生产者配置
+Properties props = new Properties();
+props.put("bootstrap.servers", "kafka1:9092,kafka2:9092,kafka3:9092");
+props.put("acks", "all");                          // 所有ISR确认
+props.put("retries", Integer.MAX_VALUE);            // 无限重试
+props.put("enable.idempotence", "true");           // 幂等生产者
+props.put("max.in.flight.requests.per.connection", "5"); // 防止乱序
+```
+
+**第二层：ISR机制 —— 副本同步的核心概念**
+
+ISR（In-Sync Replicas，同步副本集合）是Kafka可靠性保证的核心。理解ISR，就理解了一半的Kafka可靠性。
+
+```
+ISR的定义：
+副本满足以下两个条件时，属于ISR集合：
+1. 与Leader保持同步（追上Leader的最新消息）
+2. 心跳未超时（超过 session.timeout.ms 未响应则被移出ISR）
+
+ISR动态变化：
+Broker-1 (Leader)   → ISR = {Broker-1, Broker-2, Broker-3}
+Broker-2 (Follower) → 同步中，跟上最新offset
+Broker-3 (Follower) → 宕机了，被移出ISR
+
+当Broker-3恢复后，会从High Watermark开始追数据，追上后再加入ISR。
+```
+
+ISR机制回答了面试官常问的问题："为什么副本数设了3，还是可能丢消息？"
+
+```
+场景分析：
+  Topic配置：replication.factor=3, min.insync.replicas=2
+  当前ISR：{Broker-1, Broker-2}（Broker-3已掉线）
+
+Producer发消息：
+  acks=all → 等待ISR中所有副本确认
+  当前ISR只有2个 → 只要Broker-1和Broker-2确认就返回
+
+问题来了：
+  如果Broker-1宕机，Broker-2成为Leader
+  Broker-2的数据是完整的（因为在ISR内）
+  Broker-3的数据落后，Broker-3上的消息丢失！
+```
+
+所以，`min.insync.replicas=2` 意味着：即使3个副本中有1个掉线，消息仍然安全。但如果3个副本中有2个同时掉线，整个Topic就不可写了（`No leader in ISR`）。
+
+```properties
+# Broker端关键配置
+default.replication.factor=3          # 默认副本数3
+min.insync.replicas=2                # ISR最小副本数
+unclean.leader.election.enable=false  # 不允许从非ISR选Leader
+```
+
+:::warning ⚠️
+
+`unclean.leader.election.enable=false`（默认值true，2.5.0+默认false）是一个极易被忽略但极其重要的配置。如果设为true，当所有ISR副本都挂了，Kafka会从非ISR的"落后"副本中选一个当Leader。这些落后副本没有完整数据，新Leader上位后，之前确认过的消息就"消失"了——对应用层来说就是消息丢失。金融级场景必须设为false，宁可不可用也不能丢数据。
+
+:::
+
+**第三层：Consumer端的可靠性保证 —— 手动提交offset**
+
+Consumer端的可靠性由offset管理决定：
+
+```java
+// 错误方式：自动提交（消息可能丢失）
+props.put("enable.auto.commit", "true");
+props.put("auto.commit.interval.ms", "5000");
+
+// 正确方式：手动提交（消息处理成功后再提交）
+props.put("enable.auto.commit", "false");
+
+while (true) {
+    ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(1000));
+
+    for (ConsumerRecord<String, String> record : records) {
+        try {
+            processMessage(record);  // 处理业务逻辑
+            consumer.commitSync();   // 处理成功后手动提交
+        } catch (Exception e) {
+            // 处理失败：记录并重试，不提交offset
+            // 下次poll时这条消息会被重新投递
+            retryWithBackoff(record);
+        }
+    }
+}
+```
+
+手动提交的核心逻辑：先处理业务，再提交offset。如果处理失败，不提交offset，下次poll时会重新拉取这条消息。
+
+【面试官心理】
+
+这道题的考察深度取决于候选人的段位。P5能说出acks和副本配置；P6能解释ISR机制和unclean leader election；P7能从CAP理论解释Kafka的权衡——Kafka选择的是CP（一致性+分区容忍），在极端情况下（多数副本挂掉）选择不可用而不是丢数据。能说出这个理论高度的候选人凤毛麟角。
+
+### 1.4 追问升级
+
+**P6/P7 差距拉开点：**
+
+面试官问："Kafka的Exactly-Once和RocketMQ的事务消息有什么区别？"
+
+这道题的分水岭：
+- P5：不知道两者区别
+- P6：知道Kafka有幂等生产者+RocketMQ有事务消息，但说不清各自的能力边界
+- P7：能说出Kafka的Exactly-Once只解决Producer端重复问题，不解决Consumer端重复消费问题；RocketMQ事务消息能保证"本地事务+消息发送"的原子性，但消费端仍需幂等
+
+## 二、延伸问题：Exactly-Once 语义 🟡
+
+### 2.1 Kafka 的三种消息语义
+
+| 语义 | 含义 | 重复 | 丢失 | 实现方式 |
+| --- | --- | --- | --- | --- |
+| At-Most-Once | 至多一次 | 不 | 可能 | 自动提交offset后处理 |
+| At-Least-Once | 至少一次 | 可能 | 不 | 处理后提交offset |
+| Exactly-Once | 恰好一次 | 不 | 不 | 幂等生产者+事务 |
+
+**At-Most-Once**（`acks=0`，自动提交）：
+```
+消息发送后不等待确认 → Consumer先提交offset → 再处理消息
+如果Consumer处理消息时宕机 → offset已提交，消息丢失
+```
+
+**At-Least-Once**（`acks=all`，手动提交）：
+```
+消息发送后等ISR确认 → Consumer先处理消息 → 再提交offset
+如果Consumer处理消息时宕机 → offset未提交，消息会重投
+→ 这是Kafka的默认模式
+```
+
+**Exactly-Once**：
+Kafka的Exactly-Once实际上是通过"幂等生产者+事务"实现的：
+
+```java
+// 开启Exactly-Once
+props.put("enable.idempotence", "true");    // 幂等生产者
+props.put("transactional.id", "order-producer-001"); // 事务ID
+
+// 事务使用
+producer.initTransactions();
+producer.beginTransaction();
+for (Order order : orders) {
+    ProducerRecord<String, String> record =
+        new ProducerRecord<>("order-topic", order.getId(), order.toJson());
+    producer.send(record);
+}
+producer.commitTransaction();  // 全部成功或全部失败
+```
+
+幂等生产者的工作原理：
+- 每个Producer有一个PID（Producer ID）
+- 每条消息带一个Sequence Number
+- Broker端记录每个PID+Partition的最新Sequence Number
+- 重复消息会被Broker识别并丢弃
+
+:::warning ⚠️
+
+Kafka的Exactly-Once只解决Producer端发送重复的问题，不解决Consumer端消费重复的问题。Consumer宕机重启后，如果使用的是手动提交+重试，仍然可能重复消费同一条消息。幂等性必须在Consumer端通过业务去重实现。
+
+:::
+
+## 三、生产避坑：Kafka 可靠性的常见故障
+
+### 3.1 坑一：配置正确但网络抖动导致消息堆积
+
+**场景**：所有配置都正确，但网络抖动导致ISR频繁收缩，生产者消息发不出去。
+
+**排查思路**：
+```bash
+# 查看ISR变化
+kafka-topics.sh --describe --topic order-events --bootstrap-server kafka1:9092
+
+# 查看生产者的发送错误
+# 日志关键词：NotEnoughReplicasException、TimeoutException
+```
+
+**解决方案**：
+- 增大`retries`和`retry.backoff.ms`
+- 监控ISR数量，设置告警阈值
+- 网络抖动期间，MQ会限流保护，可用性降低但数据不丢
+
+### 3.2 坑二：Consumer消费失败后无限重试导致消息卡住
+
+**场景**：某条消息处理失败后放入重试队列，无限重试但一直没成功，导致后续消息全部卡住。
+
+**问题诊断**：
+- Consumer使用单线程顺序消费
+- 死信消息卡住，后面的消息无法消费
+
+**解决方案**：
+- 异步消费：用线程池并行处理多条消息
+- 死信队列：将处理失败的消息投递到DLQ（Dead Letter Queue），不影响后续消费
+- 重试上限：超过N次仍失败则投递DLQ，人工介入
+
+```java
+// 死信队列处理示例
+for (ConsumerRecord<String, String> record : records) {
+    int retryCount = 0;
+    while (retryCount < 3) {
+        try {
+            processMessage(record);
+            break; // 成功则跳出重试循环
+        } catch (TransientException e) {
+            retryCount++;
+            Thread.sleep(1000L * retryCount); // 指数退避
+        } catch (FatalException e) {
+            // 不可重试的异常，直接投递死信队列
+            sendToDeadLetterQueue(record);
+            break;
+        }
+    }
+}
+```
+
+### 3.3 坑三：副本同步滞后导致数据丢失假象
+
+**场景**：Broker-3落后太多，Leader上的消息在ISR收缩后被"截断"，应用层发现部分消息"消失"了。
+
+**根因**：ISR收缩时，Leader会截断比新ISR更多的数据，确保一致性。
+
+```
+例如：ISR={1,2,3}
+Broker-3因网络慢，跟不上Leader（log end offset滞后）
+Broker-3被移出ISR → ISR={1,2}
+如果Broker-1宕机，Broker-2成为新Leader
+Broker-2的HW（High Watermark）= 10000
+Broker-1上的数据可能到12000，但只有10000之前的数据对Consumer可见
+→ Consumer看不到10000~12000的数据，感觉像是丢失了
+```
+
+**解决方案**：监控`EndOffset - HW`的差值，及时发现同步滞后。
+
+## 四、工程选型：可靠性与性能的权衡
+
+### 4.1 场景化配置策略
+
+| 场景 | acks | retries | min.insync.replicas | idempotence |
+| --- | --- | --- | --- | --- |
+| 日志采集 | 0 | 0 | 1 | false |
+| 监控告警 | 1 | 3 | 2 | false |
+| 订单支付 | all | MAX | 2 | true |
+| 金融交易 | all | MAX | 3 | true |
+
+### 4.2 监控指标
+
+Kafka可靠性必须配合监控，以下是核心指标：
+
+```bash
+# Consumer Lag（最关键）
+kafka-consumer-groups.sh --group order-consumer --describe --bootstrap-server kafka1:9092
+# LAG越大，说明消费速度跟不上生产速度，消息积压越严重
+
+# ISR大小
+# 每个分区的ISR应该等于replication.factor，有变化立即告警
+
+# UnderReplicatedPartitions
+# 该值>0说明有副本处于非同步状态，数据存在丢失风险
+```
+
+```yaml
+# Prometheus告警规则
+- alert: KafkaConsumerLagHigh
+  expr: kafka_consumer_lag_seconds > 300
+  for: 5m
+  labels:
+    severity: critical
+  annotations:
+    summary: "Consumer lag超过5分钟，消息积压严重"
+
+- alert: KafkaUnderReplicatedPartitions
+  expr: kafka_server_replicas_under_min_isr > 0
+  for: 1m
+  labels:
+    severity: warning
+  annotations:
+    summary: "存在未达到最小ISR要求的分区"
+```
+
+【面试官心理】
+
+面试官问这道题，归根结底是想确认两件事：第一，你知不知道Kafka的可靠性机制；第二，你有没有在生产环境踩过可靠性相关的坑。能说出"ISR+unclean leader election"这个组合拳的，说明认真看过源码。能说出监控指标和告警阈值的，说明真正做过生产运维。P7候选人甚至能说出Kafka的可靠性保证在CAP理论中的位置，以及如何根据业务场景做权衡。
+

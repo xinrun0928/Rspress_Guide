@@ -1,0 +1,328 @@
+---
+title: Redis 锁过期续期问题
+description: 看门狗机制实现锁自动续期，剖析 TTL 设计、续期频率与网络分区下的边界行为。
+---
+
+## 事故背景
+
+2024年618大促，我们有一个库存同步任务，锁设计的 TTL 是 30 秒，预期执行时间 10 秒。结果大促期间由于数据库负载高，实际执行时间飙升到 45 秒。
+
+问题来了：第 30 秒锁自动过期，其他任务拿到了同一把锁，两个任务同时执行。结果是同一批库存被同步了两次，库存表里出现了大量重复记录。
+
+DBA 花了 2 个小时清理脏数据，开发团队被通报批评。
+
+这个故事的根因很明确：**锁的 TTL 设短了，业务执行时间超过了 TTL**。
+
+但更根本的问题是：为什么 TTL 要提前设死？如果业务执行时间不可预估，应该怎么办？
+
+这就是"看门狗"（Watchdog）机制诞生的原因。今天这篇，我们来把锁续期的所有问题全部讲透。
+
+## 一、为什么需要续期
+
+分布式锁的 TTL 是一个矛盾体：
+
+- **TTL 太长**：节点故障后，其他节点要等很久（等于 TTL）才能拿到锁，系统恢复慢
+- **TTL 太短**：业务还没执行完，锁就过期了，其他节点闯入临界区
+
+```
+理想状态：锁的存活时间 = 业务执行时间
+
+实际状态：
+  - 业务时间不可预估（DB 慢、GC 暂停、网络抖动）
+  - 预估时间可能错误（10 秒 → 45 秒）
+  - 不同调用时间差异大（缓存命中 5ms，缓存穿透 500ms）
+```
+
+看门狗机制的核心思想是：**不要提前设死 TTL，而是让锁的持有者在后台持续续期，只要它还活着，就不让锁过期**。
+
+## 二、看门狗机制原理
+
+### 自动续期的实现
+
+```java
+// 看门狗：后台线程不断续期锁
+public class Watchdog {
+    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
+    private volatile boolean running = true;
+    private final long lockExpireMs;
+
+    public void startAutoRenew(String key, String value) {
+        // 每隔 (expireMs / 3) 毫秒续期一次
+        // Redis 官方 Redisson 选择 1/3 作为续期间隔
+        long period = lockExpireMs / 3;
+
+        scheduler.scheduleAtFixedRate(() -> {
+            if (!running) return;
+
+            try (Jedis jedis = jedisPool.getResource()) {
+                // 检查锁是否还被自己持有
+                String current = jedis.get(key);
+                if (value.equals(current)) {
+                    // 续期：重新设置 TTL
+                    jedis.pexpire(key, lockExpireMs);
+                } else {
+                    // 锁已被释放或被其他客户端持有，停止续期
+                    running = false;
+                }
+            } catch (Exception e) {
+                // 续期失败，记录日志但不中断
+                log.warn("Lock renewal failed: {}", key, e);
+            }
+        }, period, period, TimeUnit.MILLISECONDS);
+    }
+
+    public void stop() {
+        running = false;
+    }
+}
+```
+
+为什么是 1/3？
+
+```
+假设 TTL = 30 秒，续期间隔 = 10 秒
+
+T0:  拿到锁，开始续期
+T10: 续期成功，TTL 重置为 30 秒
+T20: 续期成功，TTL 重置为 30 秒
+T30: 业务执行完成，释放锁
+
+如果业务在 T25 秒时卡住（超过 30 秒），T30 时：
+  - 第 3 次续期会失败（因为锁已经过期了）
+  - 其他客户端会拿到锁
+  - 但当前客户端的续期线程会发现锁已丢失，停止续期
+```
+
+【架构权衡】
+
+续期间隔的选择是一个trade-off：
+
+- **续期间隔太小**：频繁续期增加 Redis 负担，同时业务端 CPU 和网络开销增加
+- **续期间隔太大**：锁已经过期，但续期线程还没来得及续上，窗口期扩大
+
+Redis 官方 Redisson 的选择是 `expire / 3`：既不太频繁（最多 2/3 expire 才续期一次），也不太稀疏（至少每 expire/3 时间单位续期一次）。
+
+```
+最坏情况分析：
+  TTL = 30s, 续期间隔 = 10s
+  最坏情况：业务在 T30 - epsilon 秒时持有了锁，但 T30 时锁刚好过期
+           T30 时看门狗续期失败，其他客户端抢到锁
+           → 临界区重叠时间 <= 1 个续期间隔 = 10s
+```
+
+## 三、Redisson 看门狗实现
+
+Redisson 是 Java 生态中最成熟的 Redis 锁库，它的看门狗实现是工业级标准。
+
+### 基本使用
+
+```xml
+<dependency>
+    <groupId>org.redisson</groupId>
+    <artifactId>redisson</artifactId>
+    <version>3.27.0</version>
+</dependency>
+```
+
+```java
+Config config = new Config();
+config.useSingleServer().setAddress("redis://127.0.0.1:6379");
+RedissonClient redisson = Redisson.create(config);
+
+RLock lock = redisson.getLock("order:123");
+
+// tryLock 内部自动启动看门狗续期
+// 等待 0 秒（不等待，立即失败），锁自动续期
+boolean acquired = lock.tryLock(0, 30, TimeUnit.SECONDS);
+
+try {
+    // 临界区：锁会自动续期，只要当前线程持有
+    processOrder();
+} finally {
+    lock.unlock(); // 解锁后看门狗自动停止
+}
+```
+
+### Redisson 看门狗的细节
+
+```java
+// Redisson 源码简化版
+public boolean tryLock(long waitTime, long leaseTime, TimeUnit unit) {
+    long time = unit.toMillis(waitTime);
+
+    // 1. 获取锁
+    if (!tryAcquire(-1, leaseTime, unit, null)) {
+        return false;
+    }
+
+    // 2. leaseTime = -1 时启动看门狗（自动续期模式）
+    if (leaseTime == -1) {
+        scheduleAutoRenewal();
+    }
+    return true;
+}
+
+// 看门狗续期任务
+private void scheduleAutoRenewal() {
+    long innerInterval = commandExecutor.getConnectionManager().getCfg().getLockWatchdogTimeout() / 3;
+    // 默认 LockWatchdogTimeout = 30000ms，续期间隔 = 10000ms
+
+    renewalTimer.schedule(new Runnable() {
+        @Override
+        public void run() {
+            // 检查锁是否还被自己持有
+            if (isHeldByCurrentThread()) {
+                // 续期到初始的 LockWatchdogTimeout
+                renewExpiration();
+            } else {
+                cancelRenewal();
+            }
+        }
+    }, innerInterval, innerInterval);
+}
+```
+
+:::tip 💡
+Redisson 的 `tryLock(0, 30, TimeUnit.SECONDS)` 有两个含义：
+1. `waitTime = 0`：获取锁失败时立即返回，不等待
+2. `leaseTime = 30`：锁的 TTL 为 30 秒，但在持有过程中自动续期
+
+如果要禁用看门狗（手动控制 TTL），传 `leaseTime = 30` 且 `waitTime > 0`，Redisson 不会启动续期线程。
+:::
+
+## 四、续期机制的边界问题
+
+### 问题一：续期线程本身可能失败
+
+```java
+scheduler.scheduleAtFixedRate(() -> {
+    try {
+        String current = jedis.get(key);
+        if (value.equals(current)) {
+            jedis.pexpire(key, lockExpireMs); // 可能因为网络抖动失败
+        }
+    } catch (JedisConnectionException e) {
+        // Redis 连接断开，续期失败
+        log.error("Renewal failed: connection lost");
+    }
+}, period, period, TimeUnit.MILLISECONDS);
+```
+
+续期失败的原因：
+- Redis 连接超时
+- Redis 主从切换
+- 网络分区
+- Redis 负载过高导致命令延迟
+
+### 问题二：进程被 Kill 后看门狗线程消失
+
+```
+T0:  客户端 A 获取锁，启动看门狗
+T10: 操作系统 OOM 或被 Kill，进程被终止
+T11: 看门狗线程消失，锁在 T30 过期
+T31: 客户端 B 获取锁，进入临界区
+```
+
+看门狗线程依赖于 JVM 进程，JVM 崩溃时看门狗也会消失。此时只能依赖 TTL 机制兜底——TTL 仍然是最后的安全网。
+
+### 问题三：锁持有者崩溃 vs 锁持有者主动放弃
+
+```
+场景 A：客户端崩溃（看门狗线程消失）
+  → 依赖 TTL 释放锁，延迟 = TTL
+
+场景 B：客户端主动放弃（网络分区）
+  → 看门狗线程无法检测到网络不可达，锁不会立即释放
+  → 直到 TTL 过期才能被其他客户端获取
+```
+
+场景 B 是分布式锁的经典难题：**如何区分"进程崩溃"和"进程正常但网络不通"**？
+
+答案是：**无法区分**。这就是 CAP 定理的体现——在网络分区时，我们必须在可用性和一致性之间做选择。
+
+【架构权衡】
+
+续期机制的核心假设是：**持有锁的客户端是健康的**。如果客户端本身已经不健康（GC 停顿、网络分区、进程 hang），续期线程也可能受影响。
+
+因此，续期机制的最佳实践是：
+
+1. **TTL 作为兜底**：不管续期多可靠，TTL 始终要设置。续期是加速恢复，TTL 是最后防线
+2. **续期 TTL 不小于业务最大执行时间**：即使续期完全失效，TTL 也能覆盖业务执行
+3. **业务层幂等**：任何依赖分布式锁做互斥的业务，都必须支持重复执行时的幂等性
+
+## 五、最佳实践：手动 TTL vs 看门狗
+
+### 手动 TTL（适合执行时间可预估的场景）
+
+```java
+// 手动控制 TTL，不使用看门狗
+RLock lock = redisson.getLock("order:123");
+
+// leaseTime != -1，不启动看门狗
+boolean acquired = lock.tryLock(10, 30, TimeUnit.SECONDS);
+// 等待 10 秒，TTL 固定为 30 秒，不会自动续期
+
+try {
+    processOrder(); // 必须在 30 秒内完成
+} finally {
+    lock.unlock();
+}
+```
+
+### 看门狗（适合执行时间不可预估的场景）
+
+```java
+// 看门狗模式，锁自动续期
+RLock lock = redisson.getLock("order:123");
+
+// leaseTime = -1，启动看门狗
+boolean acquired = lock.tryLock(10, -1, TimeUnit.SECONDS);
+// 等待 10 秒，无限 TTL，看门狗自动续期
+
+try {
+    batchProcess(); // 可能运行很长时间（分钟级别）
+} finally {
+    lock.unlock();
+}
+```
+
+:::warning ⚠️
+看门狗模式下，如果业务执行时间异常长（比如 10 分钟），看门狗会每 10 秒续期一次，持续 10 分钟。这在高并发场景下可能导致 Redis 连接被长期占用。生产环境中，看门狗模式要设置一个最大持有时间限制：
+
+```java
+// 设置最大持有时间 5 分钟，防止异常情况
+config.setLockWatchdogTimeout(300000);
+
+// 或者在业务层设置最大重试/续期次数
+```
+:::
+
+## 六、生产避坑清单
+
+1. **不要把 TTL 当成业务超时**：TTL 是锁的存活时间，不是业务超时。业务超时应该单独控制
+2. **看门狗 + 业务幂等必须同时做**：即使锁续期正常，网络抖动、业务异常、GC 暂停都可能导致锁丢失，业务必须能处理"重复执行"
+3. **续期线程池要独立**：不要和业务线程共用线程池，防止业务满载时续期线程也被拖慢
+4. **Redis 断连时的续期行为要测试**：模拟 Redis 断连、Master/Slave 切换、主从选举等场景，确保锁行为符合预期
+5. **watchdog timeout 要设合理值**：Redisson 默认 30 秒，适合大多数场景。如果业务需要长持有锁（如批处理 1 小时），需要调大这个值
+
+## 七、与其他方案的对比
+
+| 维度 | 手动 TTL | 看门狗自动续期 |
+|------|----------|----------------|
+| TTL 可靠性 | 稳定，不依赖客户端进程 | 依赖客户端进程健康 |
+| 适用场景 | 执行时间可预估 | 执行时间不可预估 |
+| 风险 | TTL 过期后其他客户端闯入 | 进程崩溃时和手动 TTL 一样 |
+| 性能开销 | 无额外开销 | 后台线程定期续期 |
+
+## 八、工程代价评估
+
+| 维度 | 评估 |
+|------|------|
+| 开发成本 | 中等（需要正确实现续期逻辑，或使用 Redisson） |
+| 运维成本 | 低（Redis + 续期线程池） |
+| 排障复杂度 | 高（锁续期失败导致的重入问题很难追踪） |
+| 扩展性 | 好（每个客户端独立续期自己的锁，不冲突） |
+
+锁续期是分布式锁中最容易被忽略的细节。大多数人以为"SETNX + TTL"就够了，但真正生产环境中，锁过期业务未完成的场景发生频率远超预期。看门狗机制是解决这个问题的标准方案。
+
+下篇文章我们来看 RedLock——Redis 官方提出的多节点分布式锁算法，看看它如何解决单节点 Redis 锁的数据丢失问题。

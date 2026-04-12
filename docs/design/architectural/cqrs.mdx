@@ -1,0 +1,190 @@
+---
+title: CQRS命令查询职责分离
+description: 从读写分离到命令查询分离，深入剖析CQRS如何通过分离读写模型来解决复杂查询问题，以及在DDD和事件驱动架构中的实战应用。
+---
+
+# CQRS命令查询职责分离
+
+## 一个报表查询的灾难
+
+2021年，我们电商系统的订单报表页面加载需要 30 秒。
+
+```sql
+SELECT o.id, o.user_id, u.name, u.email,
+       GROUP_CONCAT(p.name) as products,
+       o.status, o.amount, o.created_at,
+       s.name as shipping_status,
+       (SELECT COUNT(*) FROM order_comments c WHERE c.order_id = o.id) as comment_count
+FROM orders o
+JOIN users u ON o.user_id = u.id
+JOIN order_items oi ON o.id = oi.order_id
+JOIN products p ON oi.product_id = p.id
+LEFT JOIN shipping s ON o.id = s.order_id
+WHERE o.created_at BETWEEN ? AND ?
+GROUP BY o.id
+ORDER BY o.created_at DESC
+LIMIT 20 OFFSET 2000;
+```
+
+这个查询涉及 6 个表 JOIN，对于千万级订单表，每次翻页都要全表扫描。
+
+**CQRS 的思路：为什么读和写要用同一个数据模型？**
+
+---
+
+## 二、CQRS 核心🔴
+
+### 2.1 核心思想
+
+```
+传统架构：
+  Command（增删改） → 同一个数据库 ← Query（查询）
+
+CQRS：
+  Command → 写模型（优化写入）→ 存储
+                    ↓
+              同步/异步
+                    ↓
+  Query  ← 读模型（优化读取）← 视图
+```
+
+### 2.2 简单实现
+
+```java
+// 写模型：聚合
+class OrderAggregate {
+    public void addItem(Product product, int quantity) {
+        // 写入优化：校验、状态管理
+        if (this.status != OrderStatus.DRAFT) {
+            throw new OrderCannotModifyException();
+        }
+        this.items.add(new OrderItem(product, quantity));
+        this.totalAmount = calculateTotal();
+    }
+}
+
+// 读模型：DTO
+record OrderListDTO(
+    Long orderId,
+    String userName,
+    String status,
+    BigDecimal amount,
+    int itemCount,
+    LocalDateTime createdAt
+) {}
+
+record OrderDetailDTO(
+    Long orderId,
+    String userName,
+    String userEmail,
+    String userPhone,
+    String status,
+    BigDecimal amount,
+    List<OrderItemDTO> items,
+    ShippingInfoDTO shipping,
+    List<CommentDTO> comments,
+    LocalDateTime createdAt,
+    LocalDateTime paidAt
+) {}
+```
+
+### 2.3 同步机制
+
+```java
+// 方式一：事件驱动同步
+@EventListener
+class OrderProjectionUpdater {
+    @Autowired
+    private JdbcTemplate jdbcTemplate;
+
+    @Async
+    @EventListener
+    public void handle(OrderCreatedEvent event) {
+        jdbcTemplate.update(
+            "INSERT INTO order_read_model (id, user_id, status, amount, created_at) " +
+            "VALUES (?, ?, ?, ?, ?)",
+            event.getOrderId(), event.getUserId(), event.getStatus(),
+            event.getAmount(), event.getCreatedAt()
+        );
+    }
+}
+
+// 方式二：同步写入
+class CreateOrderUseCase {
+    public Order execute(CreateOrderCommand cmd) {
+        Order order = new Order(cmd.getUserId(), cmd.getItems());
+        orderRepository.save(order);
+
+        // 同步写入读模型
+        OrderListDTO dto = toDTO(order);
+        readModelRepository.save(dto);
+
+        return order;
+    }
+}
+```
+
+---
+
+## 三、读写分离的进阶设计🟡
+
+### 3.1 物化视图
+
+```sql
+-- 创建物化视图
+CREATE MATERIALIZED VIEW order_summary_mv AS
+SELECT
+    o.id as order_id,
+    o.user_id,
+    u.name as user_name,
+    o.status,
+    o.amount,
+    COUNT(oi.id) as item_count,
+    o.created_at
+FROM orders o
+JOIN users u ON o.user_id = u.id
+LEFT JOIN order_items oi ON o.id = oi.order_id
+GROUP BY o.id;
+
+-- 刷新视图
+REFRESH MATERIALIZED VIEW order_summary_mv;
+```
+
+### 3.2 数据库双写
+
+```java
+@Service
+class OrderService {
+    @Autowired
+    private JdbcTemplate writeDbTemplate;  // 写库
+    @Autowired
+    private JdbcTemplate readDbTemplate;   // 读库
+
+    public void createOrder(Order order) {
+        // 写库
+        writeDbTemplate.update(
+            "INSERT INTO orders (...) VALUES (...)",
+            order.getId(), order.getAmount()
+        );
+
+        // 读库（可能有延迟）
+        readDbTemplate.update(
+            "INSERT INTO order_read_model (...) VALUES (...)",
+            order.getId(), order.getAmount()
+        );
+    }
+}
+```
+
+【架构权衡】
+CQRS 的代价是数据一致性问题（读模型可能有延迟）和系统复杂度增加。只在确实有复杂查询或高并发读场景时才使用。
+
+---
+
+## 四、面试总结
+
+| 级别 | 期望回答 |
+|------|----------|
+| P5 | 能说出 CQRS 的基本概念 |
+| P6 | 能分析读写分离的同步机制 |
+| P7 | 能设计完整的 CQRS 方案 |

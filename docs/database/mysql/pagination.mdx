@@ -1,0 +1,276 @@
+---
+title: 分页查询优化实战
+description: 从一道生产事故出发，拆解 MySQL 深度分页的问题与优化方案。
+---
+
+2024年双十一零点，用户反馈：翻到第 100 页时，加载要 5 秒。
+
+开发同学一看日志，是这条 SQL：
+
+```sql
+SELECT * FROM orders WHERE user_id = '1001' ORDER BY create_time DESC LIMIT 9900, 20;
+```
+
+扫描了 9920 行，只返回 20 行。
+
+【面试官心理】
+分页查询优化是 MySQL 面试的高频题。能说出 OFFSET 性能问题的占 70%，能提出游标分页解决方案的占 30%，能说清原理并正确实现的占 10%。
+
+## 一、深度分页的问题 🔴
+
+### 1.1 OFFSET 的性能陷阱
+
+```sql
+-- ❌ 深度分页：OFFSET 越大，性能越差
+SELECT * FROM orders
+WHERE user_id = '1001'
+ORDER BY create_time DESC
+LIMIT 9900, 20;
+
+-- MySQL 执行过程：
+-- 1. 扫描 9920 行
+-- 2. 丢弃前 9900 行
+-- 3. 返回后 20 行
+```
+
+| 页码 | OFFSET | 扫描行数 | 耗时 |
+| --- | --- | --- | --- |
+| 第 1 页 | 0 | 20 | 1ms |
+| 第 50 页 | 980 | 1000 | 10ms |
+| 第 100 页 | 1980 | 2000 | 50ms |
+| 第 500 页 | 9980 | 10000 | 200ms |
+| 第 1000 页 | 19980 | 20000 | 1000ms |
+
+### 1.2 ❌ 错误理解
+
+**候选人原话**："分页查询用 LIMIT 就行，LIMIT 1000 表示每页 1000 条。"
+
+**问题诊断**：
+- 混淆了 LIMIT 的含义
+- 不理解 OFFSET 越大扫描行数越多
+- 没有意识到深度分页的性能问题
+
+## 二、游标分页（推荐）🔴
+
+### 2.1 原理
+
+游标分页用上一次查询的最后一条记录的 ID 作为锚点，避免扫描已跳过的行。
+
+```sql
+-- ✅ 游标分页：第一页
+SELECT * FROM orders
+WHERE user_id = '1001'
+ORDER BY create_time DESC, id DESC
+LIMIT 20;
+-- 返回最后一条: create_time='2024-11-10', id=9999
+
+-- ✅ 游标分页：第二页
+SELECT * FROM orders
+WHERE user_id = '1001'
+  AND (create_time < '2024-11-10' OR (create_time = '2024-11-10' AND id < 9999))
+ORDER BY create_time DESC, id DESC
+LIMIT 20;
+```
+
+### 2.2 游标分页实现
+
+```java
+// 游标分页对象
+public class CursorPage<T> {
+    private List<T> data;
+    private String nextCursor;  // 下一页游标
+    private boolean hasMore;
+}
+
+// 游标分页查询
+public CursorPage<Order> getOrders(Long userId, String cursor, int pageSize) {
+    // 解析游标
+    Order lastOrder = null;
+    if (cursor != null) {
+        lastOrder = decodeCursor(cursor);
+    }
+
+    // 构建查询
+    LambdaQueryWrapper<Order> wrapper = new LambdaQueryWrapper<>();
+    wrapper.eq(Order::getUserId, userId);
+    wrapper.orderByDesc(Order::getCreateTime, Order::getId);
+
+    if (lastOrder != null) {
+        wrapper.and(w -> w
+            .lt(Order::getCreateTime, lastOrder.getCreateTime())
+            .or()
+            .eq(Order::getCreateTime, lastOrder.getCreateTime())
+                .lt(Order::getId, lastOrder.getId())
+        );
+    }
+
+    wrapper.last("LIMIT " + (pageSize + 1));
+    List<Order> orders = orderMapper.selectList(wrapper);
+
+    // 判断是否有下一页
+    boolean hasMore = orders.size() > pageSize;
+    if (hasMore) {
+        orders = orders.subList(0, pageSize);
+    }
+
+    // 生成游标
+    String nextCursor = null;
+    if (hasMore && !orders.isEmpty()) {
+        Order last = orders.get(orders.size() - 1);
+        nextCursor = encodeCursor(last);
+    }
+
+    return new CursorPage<>(orders, nextCursor, hasMore);
+}
+
+// 游标编码
+private String encodeCursor(Order order) {
+    return Base64.encode(order.getId() + "_" + order.getCreateTime().getTime());
+}
+
+// 游标解码
+private Order decodeCursor(String cursor) {
+    String decoded = Base64.decode(cursor);
+    String[] parts = decoded.split("_");
+    Long id = Long.parseLong(parts[0]);
+    Date createTime = new Date(Long.parseLong(parts[1]));
+    return orderMapper.selectById(id);
+}
+```
+
+### 2.3 API 设计
+
+```java
+// 前端请求
+// GET /api/orders?userId=1001&cursor=xxx&pageSize=20
+
+// 后端响应
+{
+    "data": [...],
+    "nextCursor": "eyJpZCI6IDk5OTksImNyZWF0ZVRpbWUiOiAyMDI0LTExLTEwIDEyOjAwOjAwfQ==",
+    "hasMore": true
+}
+```
+
+## 三、延迟关联 🟡
+
+### 3.1 原理
+
+延迟关联先查询索引拿到 ID，再关联获取完整数据。
+
+```sql
+-- ✅ 延迟关联
+SELECT o.id, o.order_no, o.amount, o.status, o.create_time, u.name, u.phone
+FROM orders o
+INNER JOIN (
+    SELECT id FROM orders
+    WHERE user_id = '1001'
+    ORDER BY create_time DESC
+    LIMIT 9900, 20
+) AS t ON o.id = t.id
+JOIN users u ON o.user_id = u.id;
+```
+
+### 3.2 对比
+
+| 方法 | 扫描行数 | 是否支持跳页 |
+| --- | --- | --- |
+| OFFSET | OFFSET + LIMIT | 支持 |
+| 游标分页 | LIMIT | 不支持 |
+| 延迟关联 | OFFSET + LIMIT | 支持 |
+
+```sql
+-- 延迟关联的执行过程：
+-- 1. 子查询只扫描索引，WHERE user_id='1001' LIMIT 9900, 20
+-- 2. 扫描 9920 行（但只取 id）
+-- 3. 用 id 关联 users 表
+-- 比直接 SELECT * 快很多
+```
+
+## 四、覆盖索引 + 子查询 🟡
+
+### 4.1 索引覆盖
+
+```sql
+-- 如果只查少量字段，可以用覆盖索引优化
+ALTER TABLE orders ADD INDEX idx_user_time_cover (
+    user_id, create_time DESC, id, order_no, amount, status
+);
+
+-- 只查索引覆盖的字段
+SELECT id, order_no, amount, status, create_time
+FROM orders
+WHERE user_id = '1001'
+ORDER BY create_time DESC
+LIMIT 9900, 20;
+-- 不需要回表，只扫描索引
+```
+
+### 4.2 记录已读位置
+
+```java
+// 前端记录已浏览位置
+// 用户浏览到第 5 页后，记录当前位置
+localStorage.setItem('lastViewedOrder', JSON.stringify({
+    id: 9999,
+    createTime: '2024-11-10 12:00:00'
+}));
+
+// 重新打开时，从记录位置继续
+```
+
+## 五、生产避坑 🟡
+
+### 5.1 禁止不带 LIMIT 的查询
+
+```sql
+-- ❌ 危险：无 LIMIT 的查询
+SELECT * FROM orders WHERE user_id = '1001';
+-- 可能返回数十万行，撑爆内存
+
+-- ✅ 强制 LIMIT
+SELECT * FROM orders WHERE user_id = '1001' LIMIT 1000;
+```
+
+### 5.2 限制最大 OFFSET
+
+```java
+// 限制最大页码
+public static final int MAX_PAGE_SIZE = 100;
+
+public List<Order> getOrders(Long userId, int page, int pageSize) {
+    if (pageSize > MAX_PAGE_SIZE) {
+        pageSize = MAX_PAGE_SIZE;
+    }
+    // ...
+}
+```
+
+### 5.3 监控慢分页
+
+```sql
+-- 监控深度分页
+SELECT
+    SUBSTRING_INDEX(digest_text, 'LIMIT', 1) AS sql_pattern,
+    COUNT_STAR AS exec_count,
+    AVG_TIMER_WAIT / 1000000000000 AS avg_time_sec,
+    DIGEST_TEXT
+FROM performance_schema.events_statements_summary_by_digest
+WHERE digest_text LIKE '%LIMIT%'
+ORDER BY avg_time_sec DESC
+LIMIT 10;
+```
+
+## 六、面试追问链 🟡
+
+**第一层**：深度分页有什么问题？
+- 候选人：OFFSET 越大扫描行数越多
+
+**第二层**：怎么优化？
+- 候选人：游标分页
+
+**第三层**：游标分页怎么实现？
+- 候选人：用 ID 或时间作为游标
+
+**第四层**：游标分页支持跳页吗？
+- 候选人：不支持，需要前端配合

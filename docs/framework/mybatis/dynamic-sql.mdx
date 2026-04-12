@@ -1,0 +1,524 @@
+---
+title: MyBatis 动态 SQL 原理
+description: if/where/foreach/set 标签的解析机制，SqlNode 树形结构，OGNL 表达式与边界情况全覆盖。
+---
+
+候选人小孙在面试美团P6时，面试官看了看他的项目经验，写了这么一段代码：
+
+```java
+@Select("<script>" +
+    "SELECT * FROM user " +
+    "<where>" +
+    "  <if test='name != null'>AND name = #{name}</if>" +
+    "  <if test='age != null'>AND age = #{age}</if>" +
+    "</where>" +
+    "</script>")
+List<User> findByCondition(User user);
+```
+
+面试官问："这个 `<where>` 标签的作用是什么？如果我传入的 user 对象 name 为 null，age 不为 null，最终生成的 SQL 是什么？"
+
+小孙说："where 标签会自动加 where 关键字，age 不为 null 时会生成 `SELECT * FROM user WHERE age = ?`。"
+
+面试官追问："那如果 name 和 age 都不为 null 呢？"
+
+小孙说："`SELECT * FROM user WHERE name = ? AND age = ?`。"
+
+面试官继续追问："如果只有 name 为 null 呢？"
+
+小孙愣了一下："那就不应该有 where 了吧...但实际生成的可能是 `SELECT * FROM user AND age = ?`？"
+
+面试官笑了："这个场景下 MyBatis 会怎么处理？"
+
+小孙彻底卡住了。
+
+【面试官心理】
+这道题我用来筛选"会用"和"理解原理"的候选人。90% 的候选人知道 `<where>` 标签会自动处理 AND/OR，但只有 20% 的人知道它底层是一个 TrimSqlNode，知道 IfSqlNode 和 WhereSqlNode 的解析顺序和树形结构的更少。这道题能答到源码层面的，是真正理解 MyBatis 动态 SQL 的。
+
+## 一、动态 SQL 的核心体系
+
+MyBatis 的动态 SQL 核心是 **SqlNode 树形结构**。每个动态标签对应一个 SqlNode，解析后形成一棵 AST，遍历这棵树就能得到最终的 SQL。
+
+```mermaid
+graph TD
+    A[MixedSqlNode<br/>根节点] --> B[IfSqlNode<br/>test="name != null"]
+    A --> C[IfSqlNode<br/>test="age != null"]
+    A --> D[WhereSqlNode<br/>包装子节点]
+    D --> E[MixedSqlNode]
+    E --> F[IfSqlNode<br/>test="status != null"]
+    F --> G[TrimSqlNode<br/>prefix="WHERE"<br/>prefixOverrides="AND|OR"]
+```
+
+### 1.1 SqlNode 接口体系 🔴
+
+```java
+public interface SqlNode {
+    boolean apply(DynamicContext context);
+}
+
+// 所有动态标签都实现 SqlNode
+public class IfSqlNode implements SqlNode {
+    private final ExpressionEvaluator evaluator;
+    private final String test;      // OGNL 表达式
+    private final SqlNode contents; // 子节点
+
+    @Override
+    public boolean apply(DynamicContext context) {
+        // 关键：用 OGNL 评估表达式
+        if (evaluator.evaluateBoolean(test, context.getBindings())) {
+            return contents.apply(context);
+        }
+        return true;  // 条件不满足，不追加内容，但继续处理后续节点
+    }
+}
+
+public class WhereSqlNode extends TrimSqlNode {
+    // WhereSqlNode 本质上是一个特殊的 TrimSqlNode
+    // prefix = "WHERE", prefixOverrides = "AND|OR|\\s+AND|\\s+OR"
+    // suffixOverrides 默认为空
+}
+
+public class SetSqlNode extends TrimSqlNode {
+    // SetSqlNode 本质上也是一个 TrimSqlNode
+    // prefix = "SET", prefixOverrides 为空
+    // suffix = ",", suffixOverrides = ","
+}
+```
+
+### 1.2 DynamicSqlSource vs RawSqlSource 🔴
+
+```java
+// 动态 SQL 源（包含 <if>/<where>/<foreach> 等标签）
+public class DynamicSqlSource implements SqlSource {
+    private final SqlNode rootSqlNode;
+
+    @Override
+    public BoundSql getBoundSql(Object parameterObject) {
+        DynamicContext context = new DynamicContext(parameterObject);
+        // 遍历 SqlNode 树，拼接 SQL
+        rootSqlNode.apply(context);
+        // 处理 ${} 替换和 #{} 占位符
+        SqlSourceBuilder sqlSourceParser = new SqlSourceBuilder(configuration);
+        SqlSource sqlSource = sqlSourceParser.parse(
+            context.getSql(),
+            parameterObject.getClass(),
+            context.getBindings()
+        );
+        return sqlSource.getBoundSql(parameterObject);
+    }
+}
+
+// 静态 SQL 源（没有动态标签）
+public class RawSqlSource implements SqlSource {
+    private final SqlSource sqlSource;
+
+    @Override
+    public BoundSql getBoundSql(Object parameterObject) {
+        return sqlSource.getBoundSql(parameterObject);
+    }
+}
+```
+
+:::tip 💡
+MyBatis 在 XML 解析阶段就会判断：Mapper 方法的 SQL 是否包含动态标签。如果不包含，直接创建 `RawSqlSource`，性能更好。如果包含，创建 `DynamicSqlSource`，每次执行时都要解析。
+:::
+
+## 二、OGNL 表达式求值 🔴
+
+动态标签的 `test` 属性使用 OGNL 表达式，MyBatis 用 `ExpressionEvaluator` 来求值：
+
+```java
+public class ExpressionEvaluator {
+    public boolean evaluateBoolean(String expression, Object parameter) {
+        // OGNL 表达式评估
+        Object value = OgnlCache.getValue(expression, parameter);
+        // 关键：MyBatis 的 truthy 规则
+        // null、Boolean.FALSE、Number.ZERO、CharSequence.EMPTY、Collection.EMPTY、Map.EMPTY 都是 false
+        return Boolean.TRUE.equals(value) || (value instanceof Number && ((Number) value).doubleValue() != 0);
+    }
+}
+```
+
+### 2.1 test 表达式的常见问题
+
+```java
+// 问题1：test 中的空字符串判断
+// <if test="name != ''">
+// 注意：test="name != null" 不会自动排除空字符串！
+// 空字符串 != null 为 true，会进入 if 块
+
+// 问题2：字符串的 length 判断
+// <if test="name != null and name.length > 0">
+// 更好的写法：
+// <if test="name != null and !name.isEmpty()">
+
+// 问题3：集合的非空判断
+// <if test="ids != null and ids.size > 0">
+// 或
+// <if test="ids != null and !ids.isEmpty()">
+// 或（最简洁）
+// <if test="ids != null and ids">
+// OGNL 中非空集合自动转为 true
+```
+
+### 2.2 parameterObject 的绑定
+
+```java
+// DynamicContext 的 bindings 包含两个键
+public class DynamicContext {
+    public static final String PARAMETER_OBJECT_KEY = "param1";  // 单参数
+    // 如果是 @Param 注解，会注册多个键
+
+    public void bind(String name, Object value) {
+        bindings.put(name, value);  // 可以手动注册额外变量
+    }
+}
+
+// 在 OGNL 中可以直接引用
+// <if test="id == param1.id">  -- 单参数直接用字段
+// <if test="id == _parameter.id">  -- _parameter 是 param1 的别名
+// <if test="id == @com.xxx.MyEnum@A">  -- 调用静态方法
+```
+
+## 三、核心标签深度解析 🔴
+
+### 3.1 Where 标签 — 智能 trim
+
+```java
+// WhereSqlNode 本质上就是 TrimSqlNode
+public class WhereSqlNode extends TrimSqlNode {
+    public WhereSqlNode(Configuration configuration, SqlNode contents) {
+        super(configuration, contents, "WHERE", "AND|OR|\\s+AND|\\s+OR",
+              null, null);  // suffix 和 suffixOverrides 都是 null
+    }
+}
+
+// TrimSqlNode 的 apply 逻辑
+public class TrimSqlNode implements SqlNode {
+    private final SqlNode contents;
+    private final String prefix;    // 追加前缀
+    private final String suffix;    // 追加后缀
+    private final List<String> prefixOverrides; // 要去掉的前缀模式
+    private final List<String> suffixOverrides; // 要去掉的后缀模式
+
+    @Override
+    public boolean apply(DynamicContext context) {
+        contents.apply(context);  // 先让子节点处理
+        String sql = context.getSql();
+
+        // 去掉多余的前缀（关键！）
+        sql = applyOverrides(sql, prefixOverrides);
+        if (sql.length() > 0) {
+            sql = (prefix == null ? "" : prefix + " ") + sql;
+        }
+
+        // 去掉多余的后缀
+        sql = applyOverrides(sql, suffixOverrides);
+        if (sql.length() > 0) {
+            sql = sql + (suffix == null ? "" : " " + suffix);
+        }
+
+        context.setSql(sql);
+        return true;
+    }
+
+    private String applyOverrides(String sql, List<String> overrides) {
+        for (String pattern : overrides) {
+            // 使用正则去掉匹配的前缀
+            sql = sql.replaceFirst("(?i)" + pattern + " ", "");
+        }
+        return sql;
+    }
+}
+```
+
+**Where 标签的工作流程**：
+
+```java
+// 输入 SQL（子节点拼接后的结果）
+String input = "  AND name = #{name}   AND age = #{age}  ";
+
+// 第一步：去掉 AND/OR 前缀
+sql = "name = #{name}   AND age = #{age}";
+
+// 第二步：追加 WHERE 前缀
+sql = "WHERE name = #{name}   AND age = #{age}";
+
+// 最终结果
+sql = "WHERE name = #{name} AND age = #{age}";
+```
+
+:::warning ⚠️
+**注意**：Where 标签只会去掉 SQL **开头**的 AND/OR。如果 AND/OR 出现在中间（比如子查询的 WHERE 条件中），不会被去掉。这是很多候选人踩的坑。
+:::
+
+### 3.2 ForEach 标签 — 批量处理
+
+```xml
+<select id="findByIds" resultType="User">
+    SELECT * FROM user WHERE id IN
+    <foreach collection="ids" item="id" open="(" separator="," close=")">
+        #{id}
+    </foreach>
+</select>
+```
+
+```java
+// ForEachSqlNode.apply
+public class ForEachSqlNode implements SqlNode {
+    private final ExpressionEvaluator evaluator;
+    private final String collectionExpr;  // 表达式，如 "ids"
+    private final SqlNode contents;        // 子节点
+    private final String open, close, separator;
+
+    @Override
+    public boolean apply(DynamicContext context) {
+        // 求值 collectionExpr，得到集合
+        Iterable<?> iterable = evaluator.evaluateIterable(collectionExpr,
+            context.getBindings());
+
+        if (!iterable.iterator().hasNext()) {
+            // 集合为空，直接返回，不追加任何内容
+            return true;
+        }
+
+        boolean first = true;
+        context.appendSql(open);  // 追加 "("
+        for (Object item : iterable) {
+            if (!first) {
+                context.appendSql(separator);  // 追加 ","
+            }
+            // 关键：为每个元素创建新的 binding
+            context.bind("item", item);  // item 可以直接在子节点中使用
+            contents.apply(context);
+            first = false;
+        }
+        context.appendSql(close);  // 追加 ")"
+        return true;
+    }
+}
+```
+
+**常见翻车点**：
+
+```java
+// 翻车1：collection 属性写错
+// <foreach collection="idList">  // 错！应该是 ids，不是 idList
+// 实际上，如果参数是 List，MyBatis 会自动推断 collection 名
+// 但如果是数组或自定义对象，需要显式指定
+
+// 翻车2：空集合导致语法错误
+List<Long> ids = new ArrayList<>();
+// 如果 ids 为空，生成的 SQL 是 "WHERE id IN ()" —— 语法错误！
+// ForEachSqlNode 会判断集合为空时直接返回，不追加内容
+// 但如果 where/in 块中有其他内容，可能导致问题
+
+// 翻车3：item 的作用域
+// item 只在 foreach 标签内部可用，不能在外部使用
+```
+
+### 3.3 Set 标签 — 智能更新
+
+```xml
+<update id="updateUser">
+    UPDATE user
+    <set>
+        <if test="name != null">name = #{name},</if>
+        <if test="email != null">email = #{email},</if>
+        <if test="age != null">age = #{age},</if>
+    </set>
+    WHERE id = #{id}
+</update>
+```
+
+```java
+// SetSqlNode 本质上也是 TrimSqlNode
+public class SetSqlNode extends TrimSqlNode {
+    public SetSqlNode(Configuration configuration, SqlNode contents) {
+        // suffixOverrides = "," —— 自动去掉末尾的逗号
+        super(configuration, contents, "SET", null, null, ",");
+    }
+}
+```
+
+**Set 标签的工作流程**：
+
+```java
+// 输入（子节点拼接）
+String input = "name = #{name},  email = #{email},  age = #{age},";
+
+// 第一步：去掉末尾的逗号
+sql = "name = #{name},  email = #{email},  age = #{age}";
+
+// 第二步：追加 SET 前缀
+sql = "SET name = #{name},  email = #{email},  age = #{age}";
+
+// 最终结果
+sql = "SET name = #{name}, email = #{email}, age = #{age} WHERE id = #{id}";
+```
+
+:::tip 💡
+**关键**：Set 标签的 suffixOverrides 是 `,`，意思是把 SQL **末尾**的逗号去掉。但它不会去掉中间的逗号。如果所有字段都不为 null，最后一个逗号会被去掉；如果只有部分字段不为 null，中间的逗号也会保留（因为逗号不在末尾了）。
+:::
+
+### 3.4 Trim 标签 — 通用智能处理
+
+Trim 是 Where 和 Set 的通用版本：
+
+```xml
+<!-- 去掉开头多余的 AND/OR，加上 WHERE -->
+<trim prefix="WHERE" prefixOverrides="AND|OR">
+    <if test='name != null'>AND name = #{name}</if>
+    <if test='age != null'>AND age = #{age}</if>
+</trim>
+
+<!-- 去掉末尾多余的逗号，加上 SET -->
+<trim prefix="SET" suffixOverrides=",">
+    <if test="name != null">name = #{name},</if>
+    <if test="email != null">email = #{email},</if>
+</trim>
+```
+
+## 四、Choose/When/Otherwise — 条件分支
+
+```xml
+<select id="findByCondition" resultType="User">
+    SELECT * FROM user
+    <where>
+        <choose>
+            <when test='type == "VIP"'>
+                AND level >= 3
+            </when>
+            <when test='type == "NEW"'>
+                AND create_time > DATE_SUB(NOW(), INTERVAL 7 DAY)
+            </when>
+            <otherwise>
+                AND status = 'ACTIVE'
+            </otherwise>
+        </choose>
+    </where>
+</select>
+```
+
+```java
+// ChooseSqlNode：类似于 switch-case
+public class ChooseSqlNode implements SqlNode {
+    private final SqlNode defaultSqlNode;
+    private final List<SqlNode> ifSqlNodes;
+
+    @Override
+    public boolean apply(DynamicContext context) {
+        // 按顺序评估每个 when 的条件
+        for (SqlNode sqlNode : ifSqlNodes) {
+            if (sqlNode.apply(context)) {
+                return true;  // 第一个匹配的 when 完成后就返回
+            }
+        }
+        // 所有 when 都不匹配，执行 otherwise
+        if (defaultSqlNode != null) {
+            return defaultSqlNode.apply(context);
+        }
+        return true;
+    }
+}
+```
+
+## 五、❌ 错误示范
+
+### 翻车点一：不知道 Where 标签底层是 TrimSqlNode
+
+**候选人原话**："Where 标签就是自动加 WHERE 关键字..."
+
+实际上 Where 标签会去掉 SQL 开头的 `AND|OR`，但不会去掉中间的。如果 SQL 是 `WHERE name = #{name} OR age = #{age}`，Where 标签不会处理中间的 OR。
+
+### 翻车点二：OGNL 表达式判断字符串为空
+
+```xml
+<!-- 错误写法：不会排除空字符串 -->
+<if test="name != null">AND name = #{name}</if>
+
+<!-- 正确写法：同时判断 null 和空字符串 -->
+<if test="name != null and name != ''">AND name = #{name}</if>
+
+<!-- 更简洁的写法：使用 length 或 isEmpty -->
+<if test="name != null and !name.isEmpty()">AND name = #{name}</if>
+```
+
+### 翻车点三：foreach 的 collection 属性搞混
+
+```java
+// 错误：参数是数组，但 collection 写的是单数形式
+@Select("<script>SELECT * FROM user WHERE id IN " +
+    "<foreach collection='id' item='i' open='(' separator=',' close=')'>" +
+    "#{i}</foreach></script>")
+List<User> findByIds(Long[] ids);
+
+// 正确：数组用 array，List 用 list，或显式指定
+@Select("<script>SELECT * FROM user WHERE id IN " +
+    "<foreach collection='array' item='i' open='(' separator=',' close=')'>" +
+    "#{i}</foreach></script>")
+List<User> findByIds(Long[] ids);
+
+// 或使用 @Param 注解明确命名
+@Select("<script>SELECT * FROM user WHERE id IN " +
+    "<foreach collection='ids' item='i' open='(' separator=',' close=')'>" +
+    "#{i}</foreach></script>")
+List<User> findByIds(@Param("ids") Long[] ids);
+```
+
+### 翻车点四：set 标签后仍有多余逗号
+
+```xml
+<!-- 如果只有 email 不为 null，生成的 SQL 是 -->
+<!-- UPDATE user SET email = #{email}, WHERE id = #{id} —— 语法错误！ -->
+
+<!-- 实际上 SetSqlNode 会自动去掉末尾的逗号 -->
+<!-- 所以结果是 -->
+<!-- UPDATE user SET email = #{email} WHERE id = #{id} -->
+
+<!-- 但如果 where/set 标签中的条件都不满足，会生成 -->
+<!-- UPDATE user SET WHERE id = #{id} —— 语法错误！ -->
+```
+
+## 六、标准回答
+
+### P5 级别：能说出标签作用
+
+> MyBatis 的动态 SQL 标签包括 if、where、foreach、set、choose 等。if 标签用于条件判断，where 标签用于自动处理 WHERE 关键字和多余的 AND/OR，foreach 用于批量处理，set 用于 UPDATE 语句中自动处理逗号。
+
+### P6 级别：能讲清 SqlNode 树形结构和 OGNL 表达式
+
+> 每个动态标签对应一个 SqlNode，解析后形成树形结构。遍历这棵树，每个 SqlNode 的 apply 方法决定是否将自己的 SQL 片段追加到上下文中。Where 标签本质上是 TrimSqlNode，prefix = "WHERE"，prefixOverrides = "AND|OR|\\s+AND|\\s+OR"，自动去掉开头的 AND/OR 并追加 WHERE。ForEach 标签会对集合迭代，每次迭代都会绑定 item 到上下文中供子节点使用。OGNL 表达式在 test 属性中求值，遵循 MyBatis 的 truthy 规则：null、false、零值、空字符串、空集合都视为 false。
+
+【面试官心理】
+P6 能答出 SqlNode 树形结构和 TrimSqlNode 的 prefixOverrides 机制，已经超过了 80% 的候选人。我通常会追问："foreach 标签中，如果 collection 为空集合会怎样？" 能答出"不会生成任何内容，避免了 IN () 的语法错误"的，说明真的看过源码。
+
+### P7 级别：能从解析性能角度分析
+
+> 动态 SQL 的解析发生在两次：构建时和运行时。构建时解析 SqlNode 树（这一步在 XML 解析时完成），运行时遍历 SqlNode 树拼接 SQL。对于没有动态标签的 SQL，MyBatis 直接创建 RawSqlSource，跳过运行时解析，性能更好。生产中如果动态 SQL 非常复杂，可以考虑预编译 SQL 片段或使用 MyBatis-Plus 的 Lambda 查询来提升可维护性。
+
+## 七、追问升级 🟡
+
+### 追问1：${} 和 #{} 的区别是什么？
+
+- `#{}` 使用 `PreparedStatement` 的占位符 `?`，参数以安全的方式设置，防止 SQL 注入
+- `${}` 是直接字符串替换，存在 SQL 注入风险，但可以用于动态表名、列名等场景
+
+### 追问2：Bind 标签有什么用？
+
+```xml
+<!-- Bind 标签用于创建 OGNL 表达式中可用的变量 -->
+<select id="findByName" resultType="User">
+    <bind name="pattern" value="'%' + name + '%'"/>
+    SELECT * FROM user WHERE name LIKE #{pattern}
+</select>
+```
+
+### 追问3：Trim 和 Where/Set 哪个更通用？
+
+Trim 是最通用的，Where 和 Set 都是 Trim 的特例：
+- Where = Trim(prefix="WHERE", prefixOverrides="AND|OR|\\s+AND|\\s+OR")
+- Set = Trim(prefix="SET", suffixOverrides=",")
+
+【面试官心理】
+如果候选人能说出"动态 SQL 的解析是一次性的，SqlNode 树在 Mapper 初始化时就构建好了，运行时只需要遍历"的，说明对 MyBatis 的生命周期有全局理解。这是 P7 级别的加分项。

@@ -1,0 +1,294 @@
+---
+title: 评论系统设计
+description: 从树形评论到分页展示，从热点评论到反垃圾，深入剖析如何设计一个支持亿级评论量、高性能、高可用的评论系统。
+---
+
+# 评论系统设计
+
+## 一个评论列表的加载噩梦
+
+2021年，我们的视频网站评论区被用户投诉了：
+
+视频 A 有 50 万条评论。用户点开评论区，页面加载需要 15 秒。
+
+排查发现：
+
+```sql
+-- 噩梦般的评论查询
+SELECT c.*, u.name, u.avatar,
+       (SELECT COUNT(*) FROM comments c2 WHERE c2.reply_to = c.id) as reply_count
+FROM comments c
+JOIN users u ON c.user_id = u.id
+WHERE c.video_id = ? AND c.reply_to IS NULL
+ORDER BY c.created_at DESC
+LIMIT 20 OFFSET 10000;
+```
+
+这个查询在 50 万条评论上执行，需要全表扫描 + 子查询 + JOIN。
+
+**评论系统的核心问题是：如何在海量评论数据下实现快速查询？**
+
+---
+
+## 二、评论系统整体架构🔴
+
+### 2.1 数据模型
+
+```sql
+CREATE TABLE comments (
+    id BIGINT PRIMARY KEY,
+    video_id BIGINT NOT NULL,
+    user_id BIGINT NOT NULL,
+    reply_to BIGINT DEFAULT NULL,    -- 回复哪条评论，NULL 表示一级评论
+    root_id BIGINT DEFAULT NULL,      -- 根评论 ID，用于聚合
+    content TEXT NOT NULL,
+    like_count INT DEFAULT 0,
+    reply_count INT DEFAULT 0,         -- 回复数
+    status TINYINT DEFAULT 1,          -- 1=正常, 0=删除
+    created_at TIMESTAMP,
+    INDEX idx_video_created (video_id, created_at DESC),
+    INDEX idx_reply_to (reply_to),
+    INDEX idx_root_id (root_id)
+);
+
+CREATE TABLE comment_likes (
+    id BIGINT PRIMARY KEY,
+    comment_id BIGINT NOT NULL,
+    user_id BIGINT NOT NULL,
+    created_at TIMESTAMP,
+    UNIQUE KEY uk_comment_user (comment_id, user_id)
+);
+```
+
+### 2.2 评论存储策略
+
+```
+一级评论（直接回复视频）：
+  → 存储在 video_comments 表
+
+二级评论（回复一级评论）：
+  → 存储在同一表，通过 reply_to 关联
+
+三级评论（回复二级评论）：
+  → 统一存储，通过 root_id 聚合
+```
+
+---
+
+## 三、评论列表查询🔴
+
+### 3.1 一级评论分页
+
+```java
+@Service
+class CommentService {
+    @Autowired
+    private CommentDao commentDao;
+
+    /**
+     * 获取一级评论（分页）
+     */
+    public Page<CommentVO> getRootComments(Long videoId, int page, int size) {
+        int offset = (page - 1) * size;
+
+        List<Comment> comments = commentDao.findRootComments(
+            videoId, offset, size
+        );
+
+        // 批量获取用户信息
+        Set<Long> userIds = comments.stream()
+            .map(Comment::getUserId)
+            .collect(Collectors.toSet());
+        Map<Long, User> userMap = userDao.findByIds(userIds)
+            .stream()
+            .collect(Collectors.toMap(User::getId, u -> u));
+
+        // 转换为 VO
+        List<CommentVO> vos = comments.stream()
+            .map(c -> toVO(c, userMap.get(c.getUserId())))
+            .collect(Collectors.toList());
+
+        long total = commentDao.countRootComments(videoId);
+
+        return new Page<>(vos, page, size, total);
+    }
+}
+```
+
+### 3.2 二级评论（回复列表）
+
+```java
+@Service
+class CommentService {
+    /**
+     * 获取回复列表
+     */
+    public List<CommentVO> getReplies(Long commentId, int limit) {
+        // 直接查询回复，不做分页（回复数通常有限）
+        List<Comment> replies = commentDao.findReplies(commentId, limit);
+
+        Set<Long> userIds = replies.stream()
+            .map(Comment::getUserId)
+            .collect(Collectors.toSet());
+        Map<Long, User> userMap = userDao.findByIds(userIds)
+            .stream()
+            .collect(Collectors.toMap(User::getId, u -> u));
+
+        return replies.stream()
+            .map(c -> toVO(c, userMap.get(c.getUserId())))
+            .collect(Collectors.toList());
+    }
+}
+```
+
+---
+
+## 四、热点评论优先🟡
+
+### 4.1 热度计算
+
+```java
+@Service
+class HotCommentService {
+    /**
+     * 计算评论热度
+     */
+    public double calculateHotScore(Comment comment) {
+        // 热度 = 点赞数 × 1.0 + 回复数 × 2.0 + 时间衰减
+        long likeScore = comment.getLikeCount() * 1.0;
+        long replyScore = comment.getReplyCount() * 2.0;
+        long timeScore = calculateTimeScore(comment.getCreatedAt());
+
+        return likeScore + replyScore + timeScore;
+    }
+
+    /**
+     * 时间衰减
+     * 新评论权重高，旧评论权重逐渐降低
+     */
+    private long calculateTimeScore(long timestamp) {
+        long hours = (System.currentTimeMillis() - timestamp) / 3600000;
+        return Math.max(0, 1000 - hours * 10);
+    }
+}
+```
+
+### 4.2 热点评论展示
+
+```java
+@Service
+class CommentService {
+    /**
+     * 获取评论列表（混合排序）
+     */
+    public List<CommentVO> getComments(Long videoId, String sort, int page, int size) {
+        if ("hot".equals(sort)) {
+            // 热点优先
+            return getHotComments(videoId, page, size);
+        } else {
+            // 时间倒序
+            return getRootComments(videoId, page, size).getRecords();
+        }
+    }
+
+    /**
+     * 热点评论
+     */
+    public List<CommentVO> getHotComments(Long videoId, int page, int size) {
+        // 从 Redis 缓存获取热点评论 ID 列表
+        String hotKey = "comment:hot:" + videoId;
+        List<Long> hotCommentIds = redisTemplate.opsForList()
+            .range(hotKey, 0, 99);
+
+        if (hotCommentIds == null || hotCommentIds.isEmpty()) {
+            return getRootComments(videoId, page, size).getRecords();
+        }
+
+        // 分页
+        int start = (page - 1) * size;
+        int end = start + size;
+        if (start >= hotCommentIds.size()) {
+            // 热点评论不够，从数据库补充
+            return getRootComments(videoId, page, size).getRecords();
+        }
+
+        List<Long> pageIds = hotCommentIds.subList(
+            start, Math.min(end, hotCommentIds.size())
+        );
+
+        return commentDao.findByIds(pageIds).stream()
+            .map(this::toVO)
+            .collect(Collectors.toList());
+    }
+}
+```
+
+---
+
+## 五、反垃圾评论🟡
+
+### 5.1 敏感词过滤
+
+```java
+@Service
+class SpamFilterService {
+    private final Trie sensitiveWordsTrie = new Trie();
+
+    @PostConstruct
+    public void init() {
+        // 加载敏感词库
+        List<String> words = loadSensitiveWords();
+        sensitiveWordsTrie.insertAll(words);
+    }
+
+    /**
+     * 敏感词检测
+     */
+    public FilterResult check(String content) {
+        List<String> found = sensitiveWordsTrie.findAll(content);
+
+        if (!found.isEmpty()) {
+            return new FilterResult(false, "包含敏感词: " + found);
+        }
+
+        return new FilterResult(true, null);
+    }
+}
+```
+
+### 5.2 频率限制
+
+```java
+@Service
+class RateLimitService {
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+
+    /**
+     * 检查评论频率
+     */
+    public boolean checkRateLimit(Long userId) {
+        String key = "comment:rate:" + userId;
+        Long count = redisTemplate.opsForValue().increment(key);
+
+        if (count == 1) {
+            redisTemplate.expire(key, Duration.ofSeconds(60));
+        }
+
+        return count <= 10; // 60 秒内最多 10 条
+    }
+}
+```
+
+【架构权衡】
+评论系统的核心挑战是**海量数据 + 多维度排序**。解决方案包括：热点评论缓存、读写分离、ElasticSearch 搜索。
+
+---
+
+## 六、面试总结
+
+| 级别 | 期望回答 |
+|------|----------|
+| P5 | 能设计评论的数据模型 |
+| P6 | 能说出热点评论的实现方式 |
+| P7 | 能设计完整的评论系统架构 |

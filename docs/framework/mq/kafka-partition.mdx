@@ -1,0 +1,368 @@
+---
+title: Kafka 分区与消费者组
+description: 分区分配策略、Rebalance 触发条件、消费者组状态机，从 Consumer Group 视角深度理解 Kafka。
+---
+
+# Kafka 分区与消费者组
+
+候选人小林在阿里P6面试中被问到："Kafka消费者组的重平衡是什么？什么情况下会触发？"
+
+小林想了想："就是消费者变多或变少的时候，会重新分配分区吧。"
+
+面试官追问："什么时候会触发重平衡？Heartbeat超时设多少合理？为什么重平衡期间消息会卡住？"
+
+小林说："好像默认是10秒？我不太确定..."
+
+面试官继续追问："分区数和消费者数的关系是什么？是不是消费者数超过分区数就浪费了？"
+
+小林点头："是的，消费者多也没用。"
+
+面试官又问："那如果分区数设了100，但实际只有20个消费者，消费不过来的消息会怎样？"
+
+小林彻底答不上来了。
+
+【面试官心理】
+
+这道题我考察的是候选人对Kafka并发模型的完整理解。重平衡是Kafka Consumer Group的核心机制，也是生产环境的高频事故源。90%的候选人知道"消费者变化会触发重平衡"，但不知道"Session超时"、"Rebalance超时"、"分区再分配"的完整生命周期，更不知道重平衡期间消费者的状态变化和消息处理的影响。不了解重平衡机制的候选人，在生产环境中遇到消息消费延迟时，连排查方向都找不到。
+
+## 一、核心问题：Kafka 分区的分配机制 🔴
+
+### 1.1 问题拆解
+
+**第一层：怎么用？**
+面试官问："Kafka的分区是怎么工作的？为什么要有分区？"
+候选人答："分区可以并行消费，一个分区只能被一个消费者消费..."
+考察点：基本概念
+
+**第二层：分配策略**
+面试官追问："Partition怎么分配给Consumer的？有哪些策略？"
+候选人答：...（拉开点1）
+考察点：分配算法
+
+**第三层：消费者组机制**
+面试官追问："消费者组是怎么管理的？Group Coordinator在哪里？"
+候选人答：...（拉开点2）
+考察点：组协调机制
+
+**第四层：重平衡与故障转移**
+面试官追问："消费者挂了怎么处理？重平衡的流程是什么？"
+候选人答：...（P6/P7分水岭）
+考察点：容错机制
+
+### 1.2 错误示范
+
+**候选人原话 A**："分区数等于消费者数就不会有浪费，每个消费者都能分到一个分区。"
+
+**问题诊断**：
+- 只知其一不知其二。分区数固定后，消费者数变化会导致频繁重平衡
+- 忽略了消费者数小于分区数时，部分分区闲置的情况
+- 没有理解分区数对吞吐量的直接影响
+
+**候选人原话 B**："重平衡就是消费者重新连接，系统会自动把分区分配好。"
+
+**问题诊断**：
+- 不知道重平衡期间消费者会stop-the-world，所有消息暂停消费
+- 不知道心跳机制、Session超时、JoinGroup、SyncGroup等完整流程
+- 缺乏对生产故障的预判能力
+
+**候选人原话 C**："分区数越多越好，可以无限增加并行度。"
+
+**问题诊断**：
+- 忽略了分区数过多带来的元数据压力（每次请求都要从Leader Broker获取元数据）
+- 不知道Consumer个数不能超过分区数的硬限制
+- 没有容量规划思维
+
+### 1.3 标准回答
+
+**1. 分区的本质：并行消费的最小单位**
+
+```
+Topic: order-events (4个分区)
+
+消费者组 A（3个消费者）：
+  Consumer-1 → Partition-0, Partition-3
+  Consumer-2 → Partition-1
+  Consumer-3 → Partition-2
+
+消费者组 B（2个消费者）：
+  Consumer-4 → Partition-0, Partition-2
+  Consumer-5 → Partition-1, Partition-3
+```
+
+关键规则：
+- 一个Partition同时只会被一个Consumer消费（保证顺序消费的基础）
+- 一个Consumer可以消费多个Partition
+- 消费者数超过分区数时，多余的消费者处于空闲状态
+- 不同消费者组之间相互独立，每个组都能消费全量消息
+
+**2. 分区分配策略：三种算法各有适用**
+
+Kafka支持三种分区分配策略，由`partition.assignment.strategy`配置：
+
+**Range策略（默认）**：
+```java
+// 按主题维度分配，每个消费者分配连续的分区范围
+// 主题A有4个分区，消费者C1、C2
+// C1分到分区0、1，C2分到分区2、3
+// 问题：如果主题多，可能导致分配不均
+```
+
+**RoundRobin策略**：
+```java
+// 将所有主题的分区放在一起轮询分配
+// 问题：可能导致同一消费者同时消费多个主题的分区，顺序保证被打破
+```
+
+**StickyAssignor策略（推荐）**：
+```java
+// 在保证负载均衡的前提下，尽量保持原有的分配关系不变
+// 核心价值：重平衡时最小化分区迁移，减少Rebalance的开销
+// Kafka 2.4+ 默认使用
+```
+
+:::tip 💡
+
+生产环境推荐使用StickyAssignor。它的核心优势是：当Consumer加入或离开时，尽量只迁移必要的分区，而不是全局重新分配。这对避免重复消费和保持消费状态至关重要。
+
+:::
+
+**3. 消费者组的协调机制：Group Coordinator**
+
+Kafka用Group Coordinator管理Consumer Group的状态：
+
+```
+Consumer Group 的状态流转：
+
+Stable（正常运行）→ Consumer正常消费，定期发送心跳
+        ↓
+Preparing Rebalance（准备重平衡）→ 有Consumer加入/离开/超时
+        ↓
+Awaiting Sync（等待同步）→ 各Consumer提交候选方案
+        ↓
+Stable（重新平衡完成）→ 新的分区分配生效
+
+重平衡期间的4个关键参数：
+
+1. heartbeat.interval.ms = 3000ms
+   → 心跳间隔，越小越快检测到故障，但增加网络开销
+
+2. session.timeout.ms = 45000ms
+   → Session超时，超过这个时间没收到心跳，判定为离线
+   → 必须 > 3 × heartbeat.interval.ms
+
+3. max.poll.interval.ms = 300000ms（5分钟）
+   → 两次poll之间的最大间隔，用于处理耗时任务
+   → 如果超过这个时间没poll，Consumer会被踢出组
+
+4. rebalance.timeout.ms = session.timeout.ms
+   → 重平衡的最大超时时间
+```
+
+```java
+// 消费者配置示例
+Properties props = new Properties();
+props.put("bootstrap.servers", "kafka1:9092,kafka2:9092");
+props.put("group.id", "order-consumer");
+props.put("partition.assignment.strategy", "org.apache.kafka.clients.consumer.StickyAssignor");
+props.put("enable.auto.commit", "false");
+props.put("auto.offset.reset", "earliest");
+props.put("heartbeat.interval.ms", "3000");      // 心跳间隔3秒
+props.put("session.timeout.ms", "45000");        // Session超时45秒
+props.put("max.poll.interval.ms", "300000");     // 最大poll间隔5分钟
+props.put("max.poll.records", "500");             // 单次最多拉取500条
+```
+
+【面试官心理】
+
+我追问重平衡的完整流程，不是想听背书。我最关心的是候选人能不能说出"PrepareRebalance → AwaitingSync → Stable"这三个状态之间的转换条件，以及各个超时参数的合理配置。知道参数名字是基本功，知道为什么这样设计、什么场景下要调整，才是真正理解的。
+
+### 1.4 追问升级
+
+**P6/P7 差距拉开点：**
+
+面试官问："如果一个Consumer处理消息很慢（比如每条消息耗时30秒），应该调大max.poll.interval.ms还是调小？"
+
+这道题的分水岭：
+- P5：不知道该调哪个
+- P6：知道要调大max.poll.interval.ms，但不能解释原因
+- P7：能说出完整的推理链——处理慢→单次poll的消息量要减少→poll次数减少→max.poll.interval.ms必须能覆盖两次poll之间的时间
+
+## 二、延伸问题：分区数规划 🟡
+
+### 2.1 问题拆解
+
+**面试官问："Topic的分区数怎么规划？是不是越多越好？"**
+
+这道题考察的是容量规划和性能调优能力。
+
+### 2.2 标准回答
+
+分区数规划需要综合考虑以下因素：
+
+**分区数的计算公式**：
+
+```
+分区数 = max(消费者数量, 期望吞吐量 / 单消费者吞吐)
+
+例如：
+  单消费者消费速度 = 5万条/秒
+  期望总吞吐量 = 30万条/秒
+  → 至少需要 30 / 5 = 6 个分区（如果消费者数>=6）
+```
+
+**分区数过多的副作用**：
+
+1. **元数据压力**：每个Producer/Consumer请求都需要携带所有Partition的元数据
+```properties
+# Kafka Broker端：每次请求携带的元数据大小
+metadata.max.age.ms = 300000  # 元数据缓存时间
+# Partition越多，Broker的内存压力越大
+```
+
+2. **选举时间变长**：Controller重新选举Leader时，需要遍历所有分区
+   - 100个分区：选举时间小于1秒
+   - 1000个分区：选举时间约10秒
+   - 10000个分区：选举时间可达分钟级
+
+3. **文件描述符压力**：每个分区对应一个.log文件，OS的文件描述符有限制
+
+4. **重平衡延迟加剧**：Consumer变更时，需要重新分配更多分区
+
+**实战建议**：
+
+```properties
+# 分区数规划参考
+# 初期保守：按预估吞吐量的1.5倍设置分区数
+分区数 = ceil(预估QPS * 峰值倍数 / 单分区消费能力)
+
+# 中期扩容：Kafka支持在线增加分区数（只能增不能减）
+bin/kafka-topics.sh --alter --topic order-events --partitions 10 --bootstrap-server kafka1:9092
+
+# 重要原则：分区数设好后难以缩减，初期要留有余量但不要过度
+```
+
+:::warning ⚠️
+
+Kafka增加分区数不会影响已有数据的存储位置，但会改变新消息的路由规则。如果消费者是按Partition维度保存状态的，增加分区后要注意状态迁移问题。另外，分区数增加后，如果消费者数不变，每个消费者处理的分区数会变少，消费能力实际上是提升的（因为并行度增加了）。
+
+:::
+
+## 三、生产避坑：消费者组的常见故障
+
+### 3.1 坑一：重平衡风暴（Rebalance Storm）
+
+**场景**：多个消费者处理时间差异大，部分Consumer触发Session超时，导致整个Group反复重平衡。
+
+**根因**：一个Consumer处理慢 → Session超时 → Group触发Rebalance → 新Consumer接手 → 新Consumer也处理慢 → 又超时 → 循环往复
+
+**症状**：
+```
+[Consumer-1] 心跳超时，触发Rebalance
+[Consumer-2] 加入Group，重新分配Partition
+[Consumer-3] 正在处理的消息被中断，重新处理
+[Consumer-1] 重连，继续处理...
+→ 消息重复消费3次，消费延迟从秒级变成分钟级
+```
+
+**解决方案**：
+
+1. 合理设置超时参数：`session.timeout.ms`不能太小，要大于最大处理时间
+2. 监控`consumer_lag`：消费者滞后超过阈值立即告警
+3. 使用StickyAssignor：减少不必要的分区迁移
+4. 消费者端做限流：处理速度跟不上时主动暂停消费，而不是超时
+
+### 3.2 坑二：Consumer数超过分区数
+
+**场景**：Topic有4个分区，但部署了8个Consumer实例。
+
+**结果**：4个Consumer空转，浪费资源且增加维护复杂度。
+
+**解决方案**：
+- 监控Consumer Group的成员数量：`kafka-consumer-groups.sh --describe --group xxx`
+- 如果Consumer数大于分区数，要么减少Consumer实例，要么增加分区数
+- 分区数增加后，要同步增加Consumer实例才能提升消费能力
+
+### 3.3 坑三：消息顺序错乱
+
+**场景**：业务要求消息按订单号顺序处理，但消费结果错乱了。
+
+**根因**：一个订单的消息分布在多个分区，而消费者组内每个分区由不同Consumer处理。
+
+**解决方案**：
+
+1. **方案一：单分区保证**（最简单）
+   ```
+   生产时指定Partition：按订单ID hash到固定Partition
+   消费时单个Consumer消费该Partition的全部消息
+   ```
+
+2. **方案二：顺序消息表**（灵活但有延迟）
+   ```
+   每条消息带序号，消费前查表判断序号是否连续
+   不连续则等待或放入重试队列
+   ```
+
+3. **方案三：按订单锁**（分布式场景）
+   ```
+   消费时对订单ID加分布式锁
+   同一订单的消息只能被一个Consumer处理
+   ```
+
+:::warning ⚠️
+
+Kafka只保证单个Partition内的顺序性，不保证跨Partition的顺序。如果业务需要全局顺序，有两种选择：单Partition（牺牲吞吐）或应用层顺序控制。不要幻想靠MQ本身保证跨Partition的顺序，这是不可能的。
+
+:::
+
+## 四、工程选型：分区策略设计
+
+### 4.1 生产者分区策略
+
+```java
+// 三种分区策略的代码示例
+
+// 1. 默认策略：按key的hash分配
+producer.send(new ProducerRecord("order-events", orderId, orderMessage));
+// orderId.hashCode() % numPartitions → 相同key一定到同一分区
+
+// 2. 指定分区
+producer.send(new ProducerRecord("order-events", 2, orderId, orderMessage));
+// 直接指定Partition-2
+
+// 3. 自定义分区器
+public class OrderIdPartitioner implements Partitioner {
+    @Override
+    public int partition(String topic, Object key, byte[] keyBytes,
+                         Object value, byte[] valueBytes, Cluster cluster) {
+        // 按订单ID的最后一位取模，保证同一订单的消息在同一分区
+        // 且分布比直接hash更均匀
+        String orderId = (String) key;
+        return Integer.parseInt(orderId.substring(orderId.length() - 1)) % 10;
+    }
+}
+```
+
+### 4.2 分区数 vs 消费者数的最佳实践
+
+```
+公式：
+消费者数 = ceil(分区数)
+分区数 = ceil(生产者峰值吞吐 / 单Consumer处理能力)
+
+案例分析：
+  生产峰值：100万条/秒
+  单Consumer处理能力：10万条/秒
+  → 至少需要 10 个分区
+  → 至少需要 10 个Consumer实例
+  → 消费者数 = 分区数 = 10
+
+如果Consumer处理速度不均匀（最慢的拖后腿）：
+  最慢Consumer：8万条/秒
+  → 需要 ceil(100/8) = 13 个分区/消费者
+  → 额外的3个作为容错冗余
+```
+
+【面试官心理】
+
+这道题我能快速判断候选人是"背过"还是"做过"。说"分区数=消费者数"的只是基本操作，能说出"吞吐=分区数×单Consumer吞吐"的才是真正理解的，能考虑到"Consumer处理不均匀需要加冗余"的，是踩过坑的。P7候选人甚至能说出"消费者数量应该略大于最慢Consumer的吞吐量除以总吞吐"这种精确的容量规划思路。
+

@@ -1,0 +1,278 @@
+---
+title: COUNT 查询优化深度解析
+description: 从一道面试题出发，拆解 MySQL COUNT(*) 的执行原理与优化方案。
+---
+
+候选人小张在阿里 P6 面试中，面试官问：
+
+"SELECT COUNT(*) FROM orders WHERE status = 1 执行很慢，怎么优化？"
+
+小张说："可以加索引。"
+
+面试官追问："加了索引还是慢怎么办？"
+
+小张说："...那就用缓存？"
+
+面试官继续追问："COUNT(*) 和 COUNT(1) 有什么区别？"
+
+小张答不上来了。
+
+【面试官心理】
+这道题我用来测试候选人对 COUNT 执行原理的理解深度。能说出加索引的占 60%，能讲清 COUNT 原理的占 20%，能提出完整优化方案的占 10%。
+
+## 一、COUNT(*) 的执行原理 🔴
+
+### 1.1 COUNT(*) 的语义
+
+```
+COUNT(*) 统计的是结果集的行数
+COUNT(column) 统计的是 column IS NOT NULL 的行数
+```
+
+### 1.2 InnoDB 的 COUNT(*) 实现
+
+```sql
+SELECT COUNT(*) FROM orders WHERE status = 1;
+```
+
+MySQL InnoDB 执行 COUNT(*) 的过程：
+
+```
+1. 全表扫描（或索引扫描）
+2. 每读一行，计数器 +1
+3. 返回计数
+```
+
+### 1.3 不同 COUNT 的区别
+
+| 类型 | 语义 | 性能 |
+| --- | --- | --- |
+| COUNT(*) | 统计行数（含 NULL） | 最快 |
+| COUNT(1) | 统计结果集行数 | 略慢（需判断 1 IS NOT NULL） |
+| COUNT(column) | 统计 column IS NOT NULL 的行数 | 取决于 column 是否可为空 |
+| COUNT(DISTINCT column) | 统计 column 非空且不重复的行数 | 最慢 |
+
+```sql
+-- 实际测试：COUNT(*) 和 COUNT(1) 性能几乎相同
+-- MySQL 优化器会自动优化 COUNT(1) 为 COUNT(*)
+
+-- 但语义不同：
+-- COUNT(*) 包含 NULL 行
+-- COUNT(column) 不包含 NULL 行
+```
+
+### 1.4 ❌ 错误理解
+
+**候选人原话**："COUNT(*) 会把每行数据都读取出来，所以慢。"
+
+**问题诊断**：
+- 不理解 InnoDB 用的是计数器，不是真的读数据
+- 但扫描行数确实很多，这就是慢的原因
+
+## 二、COUNT 慢的原因 🔴
+
+### 2.1 全表扫描
+
+```sql
+-- status 没有索引
+EXPLAIN SELECT COUNT(*) FROM orders WHERE status = 1;
+```
+
+| type | key | rows | Extra |
+| --- | --- | --- | --- |
+| ALL | NULL | 5000000 | Using where |
+
+MySQL 需要扫描 500 万行才能得到结果。
+
+### 2.2 索引扫描
+
+```sql
+-- status 有索引
+ALTER TABLE orders ADD INDEX idx_status (status);
+
+EXPLAIN SELECT COUNT(*) FROM orders WHERE status = 1;
+```
+
+| type | key | rows | Extra |
+| --- | --- | --- | --- |
+| ref | idx_status | 1000000 | Using index |
+
+索引扫描只扫描满足条件的行，不需要回表。
+
+## 三、优化方案 🟡
+
+### 3.1 方案一：覆盖索引
+
+```sql
+-- 创建覆盖索引
+ALTER TABLE orders ADD INDEX idx_status_cover (status, id);
+
+-- 验证优化
+EXPLAIN SELECT COUNT(*) FROM orders WHERE status = 1;
+```
+
+| type | key | rows | Extra |
+| --- | --- | --- | --- |
+| ref | idx_status_cover | 1000000 | Using index |
+
+Using index 表示完全在索引中完成，不需要回表。
+
+### 3.2 方案二：维护计数器
+
+```sql
+-- ❌ 每次查询都 COUNT
+SELECT COUNT(*) FROM orders WHERE status = 1;  -- 500ms
+
+-- ✅ 定时更新计数器表
+CREATE TABLE order_stats (
+    status INT PRIMARY KEY,
+    count BIGINT DEFAULT 0,
+    updated_at TIMESTAMP
+);
+
+-- 定时任务更新
+UPDATE order_stats SET count = (
+    SELECT COUNT(*) FROM orders WHERE status = 1
+), updated_at = NOW()
+WHERE status = 1;
+
+-- 查询计数器
+SELECT count FROM order_stats WHERE status = 1;  -- 1ms
+```
+
+### 3.3 方案三：Redis 计数器
+
+```java
+// 写入时更新计数器
+public void createOrder(Order order) {
+    orderMapper.insert(order);
+    // 更新 Redis 计数器
+    redis.opsForHash().increment("order:stats", "status_" + order.getStatus(), 1);
+    redis.opsForHash().increment("order:stats", "total", 1);
+}
+
+// 查询时读 Redis
+public long getOrderCount(int status) {
+    Object count = redis.opsForHash().get("order:stats", "status_" + status);
+    return count == null ? 0 : Long.parseLong(count.toString());
+}
+```
+
+### 3.4 方案四：异步统计
+
+```sql
+-- 创建统计表
+CREATE TABLE order_count (
+    id INT PRIMARY KEY,
+    status INT,
+    date DATE,
+    count BIGINT,
+    INDEX idx_status (status),
+    INDEX idx_date (date)
+);
+
+-- 定时任务按天统计
+INSERT INTO order_count (id, status, date, count)
+SELECT 1, status, DATE(create_time), COUNT(*)
+FROM orders
+WHERE DATE(create_time) = '2024-11-11'
+GROUP BY status
+ON DUPLICATE KEY UPDATE count = VALUES(count);
+
+-- 查询某天的统计
+SELECT SUM(count) FROM order_count WHERE date = '2024-11-11' AND status = 1;
+```
+
+## 四、不同 COUNT 场景的选择 🟡
+
+### 4.1 精确计数
+
+```sql
+-- 需要精确数字时，只能用 COUNT(*)
+SELECT COUNT(*) FROM orders;  -- 总订单数，必须精确
+```
+
+### 4.2 近似计数
+
+```sql
+-- 不需要精确数字时，可以用 EXPLAIN 近似
+EXPLAIN SELECT COUNT(*) FROM orders WHERE status = 1;
+-- rows 就是估算值
+
+-- MySQL 8.0+ 可以直接查询统计信息
+SELECT TABLE_ROWS FROM information_schema.TABLES
+WHERE TABLE_NAME = 'orders' AND TABLE_SCHEMA = 'db_name';
+-- 估算值，不精确
+```
+
+### 4.3 去重计数
+
+```sql
+-- COUNT(DISTINCT)
+SELECT COUNT(DISTINCT user_id) FROM orders WHERE status = 1;
+-- 需要扫描所有满足条件的行
+-- 性能较差
+
+-- 优化：创建联合索引
+ALTER TABLE orders ADD INDEX idx_status_user (status, user_id);
+SELECT COUNT(DISTINCT user_id) FROM orders WHERE status = 1;
+-- Using index 可以减少扫描
+```
+
+## 五、生产避坑 🟡
+
+### 5.1 COUNT(*) 和 COUNT(column) 的坑
+
+```sql
+-- orders 表有 remark 列，有些行是 NULL
+-- COUNT(*) 统计所有行
+-- COUNT(remark) 只统计 remark IS NOT NULL 的行
+
+SELECT COUNT(*) FROM orders;        -- 100
+SELECT COUNT(remark) FROM orders;  -- 95（有些行 remark 是 NULL）
+```
+
+### 5.2 COUNT(*) 在 InnoDB 和 MyISAM 的区别
+
+| 存储引擎 | COUNT(*) 优化 | 原因 |
+| --- | --- | --- |
+| MyISAM | 有专门计数器 | 表级锁，计数器可靠 |
+| InnoDB | 无专门计数器 | 行级锁，MVCC，计数器不可靠 |
+
+```sql
+-- MyISAM 的 COUNT(*) 极快
+-- 因为维护了 meta 信息
+
+-- InnoDB 的 COUNT(*) 需要扫描
+-- 因为 MVCC 可能返回不同结果
+```
+
+### 5.3 监控 COUNT 查询
+
+```sql
+-- 监控慢 COUNT
+SELECT
+    DIGEST_TEXT,
+    COUNT_STAR,
+    SUM_TIMER_WAIT / 1000000000000 AS total_sec
+FROM performance_schema.events_statements_summary_by_digest
+WHERE DIGEST_TEXT LIKE 'SELECT COUNT%'
+ORDER BY SUM_TIMER_WAIT DESC;
+```
+
+【面试官心理】
+能说出 MyISAM 和 InnoDB 在 COUNT 上差异的候选人，基本都理解两种存储引擎的区别。这是 P6 的水准。
+
+## 六、面试追问链 🟡
+
+**第一层**：COUNT(*) 怎么执行的？
+- 候选人：扫描行，计数
+
+**第二层**：COUNT(*) 和 COUNT(1) 区别？
+- 候选人：几乎一样，优化器会优化
+
+**第三层**：COUNT(*) 在 MyISAM 和 InnoDB 的区别？
+- 候选人：MyISAM 有专门计数器，InnoDB 需要扫描
+
+**第四层**：怎么优化 COUNT 查询？
+- 候选人：覆盖索引、维护计数器、Redis

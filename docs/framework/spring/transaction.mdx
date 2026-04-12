@@ -1,0 +1,372 @@
+---
+title: Spring 事务管理核心原理
+description: @Transactional 注解的代理机制、事务传播行为、隔离级别、超时与回滚规则，帮你拿下 Spring 事务高频面试题。
+---
+
+候选人小刘在面试美团时，面试官翻到简历上"负责过订单系统的数据库一致性设计"，开口问道：
+
+"Spring 事务的传播行为，你用过哪些？"
+
+小刘说："用过 REQUIRED 和 REQUIRES_NEW。"面试官追问："这两个有什么区别？什么时候用 REQUIRES_NEW？"
+
+小刘："REQUIRES_NEW 是开启新事务，REQUIRED 是加入已存在的事务。"
+
+面试官点点头，又问："那如果外层方法没有 @Transactional，内层方法用 REQUIRES_NEW，会怎样？"
+
+小刘停顿了两秒，说："应该...会报错？"面试官说不会，继续追问："Spring 事务是怎么实现的？TransactionInterceptor 的拦截逻辑是什么？"
+
+小刘彻底卡住。
+
+【面试官心理】
+Spring 事务是面试官最喜欢追问的领域，因为它既有原理深度（代理机制、传播行为），又有实战复杂度（嵌套事务、超时回滚）。答出 @Transactional 基本原理的是 P5，能讲清传播行为差异和回滚规则的是 P6，能说清 TransactionInterceptor 源码逻辑的是 P7。
+
+## 一、事务管理接口体系 🔴
+
+### 1.1 PlatformTransactionManager
+
+Spring 事务管理的核心是 `PlatformTransactionManager` 接口，所有事务操作都围绕它展开：
+
+```java
+public interface PlatformTransactionManager {
+    // 获取事务状态
+    TransactionStatus getTransaction(@Nullable TransactionDefinition definition)
+        throws TransactionException;
+
+    // 提交事务
+    void commit(TransactionStatus status) throws TransactionException;
+
+    // 回滚事务
+    void rollback(TransactionStatus status) throws TransactionException;
+}
+```
+
+Spring 为不同数据源提供了多种实现：
+
+| 实现类 | 适用场景 |
+| --- | --- |
+| `DataSourceTransactionManager` | JDBC 单数据源（最常用） |
+| `JpaTransactionManager` | JPA 持久化框架 |
+| `HibernateTransactionManager` | Hibernate ORM |
+| `JtaTransactionManager` | 分布式事务（两阶段提交） |
+
+:::tip 💡
+面试加分点：说出"Spring 5.x 之后引入了 `ReactiveTransactionManager` 接口体系"，用于响应式编程场景（Spirng WebFlux）。能提到这个的，基本都是 P7 候选人。
+:::
+
+### 1.2 TransactionDefinition 的五个维度
+
+每次开启事务，Spring 都需要知道这五个维度：
+
+| 维度 | 说明 | 常见取值 |
+| --- | --- | --- |
+| **传播行为** | 当前方法如何在事务中运行 | `REQUIRED`/`REQUIRES_NEW` 等 |
+| **隔离级别** | 并发事务之间的隔离程度 | `READ_COMMITTED`/`REPEATABLE_READ` 等 |
+| **超时时间** | 事务允许的最大执行时长 | `30`（秒），`-1` 表示不超时 |
+| **是否只读** | 优化器据此做读写分离 | `true`/`false` |
+| **回滚规则** | 哪些异常类型触发回滚 | `RuntimeException`/`Error` |
+
+## 二、@Transactional 注解的代理机制 🔴
+
+### 2.1 为什么内部调用不生效？
+
+这是 Spring 事务最经典、踩坑人数最多的"事故现场"：
+
+```java
+@Service
+public class OrderService {
+
+    public void createOrder() {
+        // ⚠️ 这里调用的是 this，不是代理对象！
+        // 所以 saveToDb 方法上的 @Transactional 不会生效！
+        this.saveToDb();
+    }
+
+    @Transactional
+    public void saveToDb() {
+        // 这个方法在 createOrder 的直接调用链中
+        // 永远不会有事务
+    }
+}
+```
+
+原因很简单：`@Transactional` 的本质是 Spring AOP 代理。`saveToDb()` 方法上的 `@Transactional` 之所以能生效，是因为外部调用时走了**代理对象**的方法。但 `createOrder()` 内部通过 `this` 调用 `saveToDb()`，走的是**目标对象本身**，代理被绕过了。
+
+### 2.2 TransactionInterceptor 拦截逻辑
+
+这是 P6/P7 的核心追问点。
+
+`@Transactional` 注解之所以能生效，是因为 Spring 为所有标注了 `@Transactional` 的 Bean 生成了代理，代理背后的拦截器就是 `TransactionInterceptor`。
+
+简化版源码逻辑：
+
+```java
+public class TransactionInterceptor {
+
+    private PlatformTransactionManager transactionManager;
+
+    @Override
+    public Object invoke(MethodInvocation invocation) throws Throwable {
+        // 1. 获取事务属性（@Transactional 注解上的配置）
+        TransactionAttributeSource tas = getTransactionAttributeSource();
+        TransactionAttribute txAttr = tas.getTransactionAttribute(
+            invocation.getMethod(), invocation.getThis().getClass()
+        );
+
+        // 2. 通过 TransactionManager 获取/创建事务
+        TransactionStatus txStatus = this.transactionManager.getTransaction(txAttr);
+
+        try {
+            // 3. 调用目标方法
+            Object result = invocation.proceed();
+            // 4. 正常结束，提交事务
+            this.transactionManager.commit(txStatus);
+            return result;
+        } catch (Throwable ex) {
+            // 5. 异常退出，根据回滚规则决定是否回滚
+            this.transactionManager.rollback(txStatus, ex);
+            throw ex;
+        }
+    }
+}
+```
+
+### 2.3 @Transactional 的配置细节
+
+```java
+@Transactional(
+    propagation = Propagation.REQUIRED,
+    isolation = Isolation.READ_COMMITTED,
+    timeout = 30,
+    readOnly = false,
+    rollbackFor = {RuntimeException.class, Error.class},
+    noRollbackFor = {BusinessException.class}
+)
+```
+
+**回滚规则的核心逻辑**：
+
+| 异常类型 | 默认行为 | 配置效果 |
+| --- | --- | --- |
+| `RuntimeException` | ✅ 自动回滚 | 默认，无需配置 |
+| `Error` | ✅ 自动回滚 | 默认，无需配置 |
+| `Checked Exception` | ❌ 默认不回滚 | 需配置 `rollbackFor` |
+| 自定义业务异常 | ❌ 默认不回滚 | 需配置 `noRollbackFor` 或 `rollbackFor` |
+
+:::warning ⚠️
+这个坑 90% 的候选人踩过：Spring 事务的默认回滚规则是**运行时异常**（RuntimeException 和 Error），对 Checked Exception 不回滚。所以在业务方法中抛出的业务异常（继承自 Exception 但非 RuntimeException），默认不会触发事务回滚！
+
+```java
+// ⚠️ 错误：Checked Exception 默认不回滚
+@Transactional
+public void transfer(String from, String to, BigDecimal amount) throws BusinessException {
+    if (balanceInsufficient(from, amount)) {
+        throw new BusinessException("余额不足"); // 不触发回滚！
+    }
+}
+
+// ✅ 正确：明确指定回滚规则
+@Transactional(rollbackFor = BusinessException.class)
+public void transfer(String from, String to, BigDecimal amount) throws BusinessException {
+    if (balanceInsufficient(from, amount)) {
+        throw new BusinessException("余额不足"); // 触发回滚
+    }
+}
+```
+:::
+
+## 三、TransactionTemplate vs @Transactional 🟡
+
+Spring 提供了两种编程式事务管理方式，很多候选人不知道它们的适用场景。
+
+### 3.1 TransactionTemplate（命令式）
+
+```java
+@Service
+public class AccountService {
+
+    @Autowired
+    private TransactionTemplate transactionTemplate;
+
+    public void transfer(String from, String to, BigDecimal amount) {
+        transactionTemplate.executeWithoutResult(status -> {
+            // 所有逻辑都在这个 lambda 里，自动被事务包裹
+            accountMapper.deduct(from, amount);
+            accountMapper.add(to, amount);
+            // 如果抛出任何 RuntimeException，自动回滚
+        });
+    }
+}
+```
+
+### 3.2 @Transactional（声明式）
+
+```java
+@Service
+public class AccountService {
+
+    @Transactional
+    public void transfer(String from, String to, BigDecimal amount) {
+        accountMapper.deduct(from, amount);
+        accountMapper.add(to, amount);
+    }
+}
+```
+
+| 维度 | TransactionTemplate | @Transactional |
+| --- | --- | --- |
+| 灵活性 | 高：可在代码中动态决定是否开启事务 | 低：基于注解，编译时静态 |
+| 可读性 | 一般：业务逻辑和事务代码混合 | 高：事务边界清晰分离 |
+| 适用场景 | 动态事务、细粒度控制、批量处理 | 常规业务方法 |
+| 异常处理 | 需要在 lambda 中主动处理 | 异常自动触发回滚 |
+| 传播行为 | 需要手动嵌套 `transactionTemplate.execute()` | 注解配置即可 |
+
+:::tip 💡
+面试加分点：能说出 TransactionTemplate 的核心优势是"可以在同一个方法内开启多个独立事务"。比如在一个方法中，需要对两条不同的数据做批量操作，其中一条失败不影响另一条，这种场景下 TransactionTemplate 比 @Transactional 更灵活。
+:::
+
+## 四、@Transactional 的失效场景 ⚠️
+
+### 4.1 内部调用（最常见）
+
+```java
+@Service
+public class UserService {
+    public void register() {
+        this.createUser(); // ⚠️ 走 this，不走代理
+    }
+
+    @Transactional
+    public void createUser() {
+        userMapper.insert();
+    }
+}
+```
+
+解决方案：注入自身代理对象
+
+```java
+@Service
+public class UserService {
+
+    @Autowired
+    private UserService self; // 注入代理对象
+
+    public void register() {
+        self.createUser(); // ✅ 走代理，事务生效
+    }
+
+    @Transactional
+    public void createUser() {
+        userMapper.insert();
+    }
+}
+```
+
+### 4.2 非 public 方法
+
+Spring AOP 不代理 non-public 方法。`@Transactional` 标注在 private 方法上等同于**没有任何效果**，且 Spring 不会报错。
+
+### 4.3 异常被 catch 吞掉
+
+```java
+@Transactional
+public void save(User user) {
+    try {
+        userMapper.insert(user);
+    } catch (Exception e) {
+        // ⚠️ 异常被吞掉了，Spring 看不到，不会回滚
+        log.error("保存失败", e);
+    }
+}
+```
+
+### 4.4 异常类型不匹配
+
+Checked Exception 默认不回滚。如果业务异常继承 `Exception` 但不是 `RuntimeException`，需要显式配置。
+
+## 五、标准回答
+
+**P5 级别**：
+> Spring 事务基于 AOP 代理实现。当方法标注了 @Transactional 注解后，Spring 会为这个 Bean 生成代理对象，在方法调用前后开启/提交或回滚事务。事务的传播行为决定了当前方法在已存在事务和不存在事务时分别如何处理。
+
+**P6 级别**：
+> Spring 事务的核心是 PlatformTransactionManager 接口和 TransactionInterceptor。TransactionInterceptor 在方法调用前通过 getTransaction() 获取或创建事务，根据传播行为决定是加入现有事务还是创建新事务。方法正常结束时调用 commit()，异常结束时根据 rollbackFor 规则决定是否回滚。需要特别注意内部调用（this 调用）会绕过代理导致事务失效，以及 private 方法无法被代理。
+
+**P7 级别**：
+> 从架构角度看，Spring 事务体系是一套设计优雅的拦截器链。TransactionInterceptor 继承了 TransactionAspectSupport，而 TransactionManager 体系（DataSourceTransactionManager/JtaTransactionManager 等）负责实际的资源管理。理解 REQUIRES_NEW 的挂起机制（Suspended Resources）是理解嵌套事务的关键——它会将当前线程绑定的事务对象临时保存，创建一个新的事务，执行完后再恢复。Spring 5.x 还引入了响应式事务管理（ReactiveTransactionManager），这是云原生和响应式架构的基础。
+
+## 六、追问升级
+
+**第一层**：@Transactional 注解标注在 private 方法上会怎样？
+
+答："不生效。"——考察 AOP 代理的原理理解。
+
+**第二层**：为什么 private 方法不生效？
+
+答："Spring AOP 通过代理拦截方法调用，private 方法在子类中不可见，无法被覆盖。"——考察 CGLIB 继承机制。
+
+**第三层**：事务方法中抛出了业务异常，但事务仍然回滚了，怎么排查？
+
+答："检查异常继承链，看是否是 RuntimeException，以及 rollbackFor 配置。"——考察回滚规则的实战理解。
+
+**第四层**：如果我需要在同一方法内对两个不同的数据源分别开启事务，该怎么设计？
+
+答："使用 JtaTransactionManager 或 TransactionTemplate 编程式管理，在方法内部手动开启两个事务。"——考察分布式事务和 Spring 多数据源事务管理能力。
+
+【面试官心理】
+Spring 事务这道题，我通常从"@Transactional 的原理"切入，然后追问传播行为、隔离级别、回滚规则、内部调用失效四个方向。能答到第三层的候选人基本都有 P6 水平，能答到第四层的，基本都在生产环境里踩过真实的坑。
+
+## 七、生产避坑
+
+**场景**：某电商系统在高峰期出现大量"超卖"问题，排查发现是事务隔离级别没配置。
+
+```java
+// ⚠️ 问题代码
+@Transactional
+public void placeOrder(Long skuId, Integer quantity) {
+    // 1. 查询当前库存
+    Integer stock = skuMapper.selectStock(skuId);
+    // 2. 判断是否足够
+    if (stock < quantity) {
+        throw new RuntimeException("库存不足");
+    }
+    // 3. 扣减库存
+    skuMapper.reduceStock(skuId, quantity);
+    // 4. 创建订单
+    orderMapper.createOrder(skuId, quantity);
+}
+```
+
+在高并发下，两个请求同时进入，`selectStock` 都读到 10，然后都通过了库存判断，两个请求都扣减成功——超卖了一倍。
+
+**根本原因**：MySQL 默认隔离级别是 `REPEATABLE_READ`，但在高并发读-读-写场景下，必须用悲观锁或乐观锁。
+
+**解决方案**：
+
+```java
+@Transactional
+public void placeOrder(Long skuId, Integer quantity) {
+    // ✅ 方案一：悲观锁（SELECT FOR UPDATE）
+    Integer stock = skuMapper.selectStockForUpdate(skuId);
+    if (stock < quantity) {
+        throw new RuntimeException("库存不足");
+    }
+    skuMapper.reduceStock(skuId, quantity);
+    orderMapper.createOrder(skuId, quantity);
+}
+
+// ✅ 方案二：乐观锁（版本号）
+@Transactional
+public void placeOrder(Long skuId, Integer quantity) {
+    Integer stock = skuMapper.selectStock(skuId);
+    if (stock < quantity) {
+        throw new RuntimeException("库存不足");
+    }
+    // update 返回影响行数，如果为0说明被其他事务更新了
+    int rows = skuMapper.reduceStockOptimistic(skuId, quantity, stock);
+    if (rows == 0) {
+        throw new RuntimeException("库存已被其他请求修改，请重试");
+    }
+    orderMapper.createOrder(skuId, quantity);
+}
+```

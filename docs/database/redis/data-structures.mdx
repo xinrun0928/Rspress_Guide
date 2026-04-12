@@ -1,0 +1,288 @@
+---
+title: Redis 数据结构与应用场景
+description: 从面试现场出发，逐层拆解 Redis 5种数据类型、底层编码与选型逻辑。
+---
+
+候选人小赵在字节跳动的二面中，面试官翻到简历上"熟练使用 Redis"这一行，开口问道：
+
+"Redis 支持哪些数据类型？"
+
+小赵脱口而出："String、Hash、List、Set、ZSet。"面试官点点头，追问："那它们的底层编码分别是什么？ZSet 什么时候会用 ziplist 而不是 skiplist？"
+
+小赵停顿了两秒，说："好像是压缩列表..."面试官继续："什么情况下会转成 skiplist？hash 的内层编码呢？"
+
+小赵开始语无伦次。
+
+【面试官心理】
+我问他数据类型，其实不是在考记忆力。我想知道的是：他有没有在生产环境中踩过数据类型的坑，能不能理解为什么 Redis 要设计这么多编码。知道五个类型的占80%，能说出编码转换条件的只有30%。这道题能答到最后的，基本都看过 Redis 源码或有过深度实战。
+
+## 一、String 🔴
+
+### 1.1 问题拆解
+
+**第一层：怎么用？**
+```c
+SET name "张三"
+GET name
+INCR view_count
+SETNX lock "token"   // 分布式锁
+SETEX session "abc" 300  // 带过期时间
+```
+
+**第二层：底层编码**
+String 的底层编码有三种：
+
+| 编码 | 说明 | 触发条件 |
+| --- | --- | --- |
+| `int` | 8字节长整型 | 存储的是整数，且 `<= 536870911` |
+| `embstr` | embedded String | 字符串长度 `<= 39` 字节 |
+| `raw` | SDS 动态字符串 | 字符串长度 `> 39` 字节 |
+
+```c
+// Redis 源码 (object.c)
+// embstr 上限原本是 39，Redis 7.0 后调整
+if (len <= 44 && server.arch_bits == 64) {
+    // embstr: redisObject + sdshdr 连续分配
+} else {
+    // raw: 两次内存分配
+}
+```
+
+**第三层：SDS 原理**
+String 底层用的是 SDS（Simple Dynamic String），不是 C 字符串。
+
+```c
+// SDS 结构 (sds.h)
+struct __attribute__ ((__packed__)) sdshdr8 {
+    uint8_t len;    // 已用长度
+    uint8_t alloc;  // 总分配空间
+    unsigned char flags;
+    char buf[];     // 柔性数组
+};
+```
+
+### 1.2 ❌ 错误示范
+
+**候选人原话**："Redis 的 String 就是简单的 key-value 存储，用 get/set 就够了。"
+
+**问题诊断**：
+- 混淆了 String 和简单字符串
+- 不知道 int/embstr/raw 三种编码的差异
+- 不理解 SDS 的空间预分配机制
+
+**面试官内心 OS**："这个候选人肯定只用过 String 做简单的缓存，根本没深入了解过 Redis 的内存优化机制。"
+
+### 1.3 标准回答
+
+String 最核心的考点是**编码选择和内存优化**。
+
+```
+value 是整数且 <= 536870911 → int 编码
+value 是字符串且 <= 39 字节 → embstr（一次分配，缓存友好）
+value 是字符串且 > 39 字节 → raw（两次分配）
+```
+
+**应用场景**：
+- 计数器：`INCR view_count`
+- 分布式锁：`SETNX lock token`
+- Session 存储：`SETEX session:user123 token TTL`
+- 限流：`INCR rate:ip:192.168.1.1`
+
+【面试官心理】
+String 是 Redis 最基本的数据类型，但恰恰是最好区分候选人深度的。只会 get/set 的占 80%，知道三种编码的占 40%，能说出 embstr 为什么是 39 字节的只有 10%。39 字节是 Redis 3.2 引入的优化——jemalloc 的最小分配单元是 32/64 字节，39 字节的 embstr 可以塞进 64 字节的块里。
+
+## 二、Hash 🔴
+
+### 2.1 问题拆解
+
+Hash 的底层编码有两种：`ziplist`（压缩列表）和 `hashtable`（哈希表）。
+
+```c
+// 触发条件（可配置）
+hash-max-ziplist-entries 512   // 字段数量 <= 512
+hash-max-ziplist-value 64      // 每个 value 长度 <= 64 字节
+```
+
+**为什么需要 ziplist？**
+当 hash 的字段数量少、每个 value 都很小时，用 ziplist 连续存储可以节省大量内存。但当数据量变大，ziplist 的插入/删除变成 O(n)，性能会严重退化。
+
+```c
+HSET user:1001 name "张三"
+HSET user:1001 age "28"
+HSET user:1001 city "北京"
+HGETALL user:1001
+```
+
+### 2.2 ❌ 错误示范
+
+**候选人原话**："Hash 和 String 没什么区别，都是 key-value。"
+
+**问题诊断**：
+- 完全不理解 Hash 的本质
+- 不知道 field-value 的意义
+- 混淆了 String 序列化和 Hash 的区别
+
+**面试官内心 OS**："这个候选人对 Redis 的理解还停留在表面，根本没理解不同数据结构的适用场景。"
+
+### 2.3 标准回答
+
+Hash 适合存储对象，比 String 序列化更高效：
+
+| 对比项 | String (JSON) | Hash |
+| --- | --- | --- |
+| 更新字段 | 需要反序列化 → 修改 → 序列化 | 直接 HSET 单个字段 |
+| 内存占用 | 全量序列化 | 只存储变化的字段 |
+| 适用场景 | 整个对象一次性读写 | 对象部分字段频繁更新 |
+| 编码 | embstr/raw | ziplist/hashtable |
+
+```c
+// String 序列化方式
+SET user:1001 "{\"name\":\"张三\",\"age\":28}"
+// 更新 age: 需要 GET → JSON.parse → 修改 → SET
+
+// Hash 方式
+HSET user:1001 name "张三" age 28
+// 更新 age: HSET user:1001 age 29  // O(1)
+```
+
+【面试官心理】
+Hash 这个题目我想考察的是他对"数据结构选型"的理解。用 String 存 JSON 还是用 Hash 存字段，这是在生产环境中每天都会遇到的选择。知道两者区别的占 60%，能在面试中结合场景讲清楚的占 30%。
+
+## 三、List 🟡
+
+### 3.1 问题拆解
+
+List 的底层编码有两种：`ziplist`（元素少时）和 `quicklist`（元素多时）。
+
+```c
+// 触发条件
+list-max-ziplist-size -2  // quicklist 节点中 ziplist 的最大 entry 数
+list-compress-depth 0     // 两端不压缩的节点数
+```
+
+Redis 3.2 之后统一使用 quicklist——它是 ziplist 的双向链表，每个节点是一个 ziplist。
+
+```c
+LPUSH msg:queue "消息1"
+LPUSH msg:queue "消息2"
+LRANGE msg:queue 0 -1
+BRPOP msg:queue 0  // 阻塞式弹出
+```
+
+**List vs Stream**
+很多人用 List 做消息队列，但 List 的问题是没有消息 ID、不支持消费组、不支持消息重试。Redis 5.0 引入 Stream 后，生产环境的消息队列更推荐 Stream。
+
+### 3.2 常见误区
+
+:::warning ⚠️
+用 List 做消息队列的三大隐患：
+1. 没有消息 ID，消息丢失无法追溯
+2. BRPOP 没有 ACK 机制，客户端崩溃会丢失消息
+3. 无法支持多个消费者重复消费同一消息
+
+Redis 5.0 之后推荐用 Stream 替代 List 做消息队列。
+:::
+
+【面试官心理】
+List 这个题型我想考察的是候选人是否知道"工具的边界"。知道 List 能做队列的占 80%，知道 List 不适合做可靠消息队列的占 40%，能说出 Stream 替代方案的只有 20%。
+
+## 四、Set 🟡
+
+### 4.1 问题拆解
+
+Set 的底层编码有两种：`intset`（全是整数时）和 `hashtable`（有字符串时）。
+
+```c
+// 触发条件
+set-max-intset-entries 512  // 元素数量 <= 512 且全为整数
+```
+
+```c
+SADD tags:article:1001 "Redis" "缓存" "面试"
+SISMEMBER tags:article:1001 "Redis"  // 判断是否存在
+SINTER tags:article:1001 tags:article:1002  // 交集
+```
+
+**典型场景**：
+- 标签系统：`SADD tags:article:{id} {tag}`
+- UV 统计：`SADD uv:2024-04-12 {user_ip}`
+- 关注列表：`SINTER user:1001:followers user:1002:followers`
+
+### 4.2 ❌ 错误示范
+
+**候选人原话**："Set 就是 Hash 去掉 value，hashtable 实现的。"
+
+**问题诊断**：
+- 只理解了实现，没理解使用场景
+- 不知道 intset 编码的存在
+- 混淆了 Set 和 Hash 的本质差异
+
+【面试官心理】
+Set 的考点在于"去重"和"集合运算"。知道 Set 能去重的占 70%，能在面试中讲清楚 SINTER 底层实现的占 20%，能结合业务场景（标签、UV、推荐系统）的只有 10%。
+
+## 五、ZSet 🔴
+
+### 5.1 问题拆解
+
+ZSet 的底层编码有两种：`ziplist`（元素少时）和 `skiplist + hashtable`（元素多时）。
+
+```c
+// 触发条件
+zset-max-ziplist-entries 128  // 元素数量 <= 128
+zset-max-ziplist-value 64     // 每个元素 value <= 64 字节
+```
+
+```c
+ZADD leaderboard:game:1001 100 "张三" 95 "李四" 88 "王五"
+ZREVRANGE leaderboard:game:1001 0 9 WITHSCORES
+ZINCRBY leaderboard:game:1001 10 "张三"  // 加分
+```
+
+### 5.2 为什么用跳表？
+
+这是 Redis 面试的高频深水区。跳表（Skip List）是一种"类二分查找"的有序链表，查询复杂度是 O(log n)，插入/删除也是 O(log n)。
+
+### 5.3 追问升级
+
+**面试官追问**：为什么 Redis 选择跳表而不是 B+Tree？
+
+这是 P6/P7 的分水岭：
+
+| 维度 | 跳表 | B+Tree |
+| --- | --- | --- |
+| 查询复杂度 | O(log n) | O(log n) |
+| 插入/删除 | O(log n)，只改局部指针 | O(log n)，需要分裂/合并页 |
+| 内存占用 | 约 1.5x 额外指针 | 约 0.5x 额外结构（页指针） |
+| 范围查询 | 只需找到起点，顺序遍历 | B+Tree 叶节点天然有序，更优 |
+| Redis 适用性 | 无锁设计，易于实现 | 需要锁或复杂并发控制 |
+
+Redis 选择跳表的核心原因：**简单、无锁、易实现**。B+Tree 的优势在于范围查询，但 Redis 的 ZSet 范围查询本身就依赖跳表遍历，实际差别不大。
+
+【面试官心理】
+ZSet 是 Redis 最复杂的数据结构，这道题我能看出候选人到底有没有深入理解 Redis 的设计哲学。知道 ziplist 和 skiplist 切换条件的占 50%，能解释为什么选跳表的占 20%，能说出 Redis 作者 antirez 当年选择跳表的权衡过程的只有 5%。
+
+## 六、生产避坑
+
+:::warning ⚠️
+生产环境中的三大翻车点：
+
+1. **Key 爆炸**：用 String 存了大量小对象，应该用 Hash 聚合
+2. **热 Key 问题**：某个 ZSet（如排行榜）QPS 过高，导致单节点成为瓶颈
+3. **编码退化**：ZSet 从 ziplist 退化为 skiplist 后内存暴涨，未做容量规划
+:::
+
+**排查方法**：
+```bash
+# 查看 Key 的编码类型
+DEBUG OBJECT key_name
+
+# 查看 Redis 内存使用 TOP
+redis-cli INFO memory | grep -E "used_memory_human|mem_fragmentation"
+
+# 扫描大 Key
+redis-cli --bigkeys
+redis-cli --scan --pattern "*" | head -1000 | xargs -L 200 redis-cli DEBUG OBJECT SIZE
+```
+
+【面试官心理】
+这道题我想最终验证的是候选人的"工程意识"。能讲清楚五种数据结构的占 60%，能说出编码切换条件和业务场景的占 30%，能在面试中主动提到生产避坑和排查方法的只有 10%。一个有深度的 Redis 候选人，应该既有原理理解，又有实战经验。
