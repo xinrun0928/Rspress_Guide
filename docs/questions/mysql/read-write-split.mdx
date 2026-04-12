@@ -1,0 +1,221 @@
+---
+title: 读写分离架构
+description: 从一道面试题出发，深入剖析 MySQL 读写分离的架构设计、主从延迟问题、以及如何在应用层实现读写分离。
+---
+
+# 读写分离架构
+
+面试官问："你们项目里用了读写分离吗？怎么实现的？"
+
+小陈说："用了，主库写，从库读。"
+
+面试官追问："主从延迟怎么处理？"
+
+小陈说："...延迟监控？"
+
+面试官继续追问："如果业务要求读最新写入的数据，能用从库吗？"
+
+小陈愣住了。
+
+读写分离是 MySQL 架构中最常见的高并发优化方案之一。但这不只是一道"加个从库"那么简单的事。主从延迟、写完就读、数据一致性——这些问题处理不好，读写分离反而会成为性能瓶颈。
+
+## 一、读写分离架构 🔴
+
+### 1.1 基本架构
+
+```
+┌─────────────┐
+│   Client    │
+└──────┬──────┘
+       │
+┌──────▼──────┐
+│   Router    │
+│  (中间件)   │
+└──────┬──────┘
+       │
+  ┌────┴────┐
+  ↓         ↓
+┌──────┐  ┌──────┐
+│主库  │  │从库1  │
+│(写)  │  │(读)   │
+└──────┘  └──────┘
+           ┌──────┐
+           │从库2  │
+           │(读)   │
+           └──────┘
+```
+
+### 1.2 读写分离的实现方式
+
+| 实现方式 | 优点 | 缺点 |
+| --- | --- | --- |
+| 应用层硬编码 | 灵活，性能高 | 代码侵入性强 |
+| ORM 框架配置 | 简单 | 不够灵活 |
+| 数据库中间件 | 透明，对应用无侵入 | 引入新组件 |
+| MySQL Proxy | 透明 | 性能损耗 |
+
+### 1.3 应用层实现
+
+```java
+// 伪代码：应用层读写分离
+public class DataSourceRouter {
+
+    public void write(Connection conn) {
+        // 强制路由到主库
+        conn.setMaster(true);
+    }
+
+    public void read(Connection conn) {
+        // 路由到从库（轮询或随机）
+        conn.setSlave(getLeastLoadedSlave());
+    }
+}
+
+// 使用示例
+public User getUserById(Long id) {
+    Connection conn = dataSource.read();  // 从库
+    return jdbc.query("SELECT * FROM users WHERE id = ?", id);
+}
+
+public void updateUser(User user) {
+    Connection conn = dataSource.write();  // 主库
+    jdbc.update("UPDATE users SET name=? WHERE id=?", user.getName(), user.getId());
+}
+```
+
+## 二、主从延迟问题 🔴
+
+### 2.1 延迟的原因
+
+```sql
+-- Master:
+INSERT INTO orders VALUES (...);  -- 1ms
+-- binlog 记录               -- 0.1ms
+-- Master 返回客户端          -- 总计 1.1ms
+
+-- Slave:
+-- IO 线程接收 binlog        -- 延迟取决于网络
+-- SQL 线程重放 SQL           -- 延迟取决于大事务
+-- 延迟可能是几毫秒到几秒
+```
+
+**常见原因**：
+1. **大事务**：主库一个事务操作 10 万行，从库需要重放很久
+2. **网络延迟**：binlog 传输延迟
+3. **从库性能差**：从库机器资源不足
+4. **从库配置差**：缺少索引导致重放慢
+
+### 2.2 延迟的影响
+
+```sql
+-- 场景：用户下单后立即查询订单
+-- 写入主库
+INSERT INTO orders VALUES (...);  -- 主库立即返回
+
+-- 立即读从库
+SELECT * FROM orders WHERE order_no = 'A001';  -- 从库还没同步，返回空！
+```
+
+### 2.3 ❌ 错误示范
+
+**候选人原话**："读写分离后，读从库、写主库，不会延迟。"
+
+**问题诊断**：太理想化。生产环境中主从延迟是常态，不是例外。
+
+**候选人原话 2**："从库延迟了就多等一会儿。"
+
+**问题诊断**：这不是解决方案，而且用户不会等。
+
+【面试官心理】
+主从延迟是读写分离的核心问题。我会问："用户下单后立即查订单查不到，你怎么办？"能说出"强制读主库"或"延迟确认"的候选人才是真正理解读写分离的。
+
+## 三、延迟解决方案 🟡
+
+### 3.1 强制读主库
+
+```java
+// 关键读操作，强制读主库
+public Order getOrderImmediately(Long orderId) {
+    // 下单后立即查询，强制读主库
+    Connection conn = dataSource.getMaster();  // 强制主库
+    return jdbc.query(conn, "SELECT * FROM orders WHERE id = ?", orderId);
+}
+```
+
+### 3.2 延迟确认机制
+
+```java
+// 用户下单后，显示"订单处理中"
+// 前端轮询或延迟几秒后再查询从库
+Thread.sleep(500);  // 等待主从同步
+return queryFromSlave(orderId);
+```
+
+### 3.3 GTID 追踪
+
+```sql
+-- 通过 GTID 判断从库是否已经同步到指定事务
+SHOW SLAVE STATUS\G;
+-- Executed_Gtid_Set: 显示从库已执行的所有 GTID
+-- 如果需要的 GTID 在 Executed_Gtid_Set 中，才读从库
+```
+
+## 四、生产避坑 🟡
+
+### 4.1 大事务是延迟元凶
+
+```sql
+-- ❌ 危险：大事务
+BEGIN;
+UPDATE orders SET status = 2 WHERE created_at < '2024-01-01';  -- 100 万行
+COMMIT;
+-- 主库执行：1 秒
+-- 从库重放：可能需要 30 秒甚至更长
+
+-- ✅ 安全：拆分为小事务
+WHILE (SELECT COUNT(*) FROM orders WHERE created_at < '2024-01-01' AND status = 1) > 0 DO
+    UPDATE orders SET status = 2
+    WHERE created_at < '2024-01-01' AND status = 1
+    LIMIT 1000;  -- 每批 1000 行
+END WHILE;
+```
+
+### 4.2 从库选择策略
+
+```java
+// 简单轮询
+private int slaveIndex = 0;
+public Slave getNextSlave() {
+    return slaves[slaveIndex++ % slaves.length];
+}
+
+// 最优选择（延迟最小的）
+public Slave getLeastDelayedSlave() {
+    return slaves.stream()
+        .min(Comparator.comparingLong(Slave::getDelay))
+        .orElse(master);  // 延迟太大则读主库
+}
+```
+
+### 4.3 监控告警
+
+```sql
+-- 监控主从延迟
+SHOW SLAVE STATUS\G;
+-- Seconds_Behind_Master: 延迟秒数
+
+-- 设置告警阈值
+-- 超过 5 秒告警
+-- 超过 30 秒自动切换读主库
+```
+
+【面试官心理】
+问读写分离的候选人里，能说清"哪些场景不能读写分离"的才是真正理解。金融交易类、写完就读的场景，都不适合读写分离。能说出这些边界条件的候选人，说明他有业务思维。
+
+---
+
+| 级别 | 考察重点 | 期望回答 |
+| --- | --- | --- |
+| P5 | 基本架构 | 主从架构、读写分离原理 |
+| P6 | 延迟问题 | 主从延迟原因、延迟监控、解决方案 |
+| P7 | 深度设计 | 延迟自动切换、主从一致性保证、业务场景选择 |

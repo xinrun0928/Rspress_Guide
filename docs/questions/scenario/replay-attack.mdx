@@ -1,0 +1,614 @@
+---
+title: 重放攻击防护方案
+description: 从一次重放攻击导致资金损失的事故出发，深度拆解重放攻击防护方案：Nonce机制、时间戳校验、签名防重放及常见问题处理。
+---
+
+# 重放攻击防护方案
+
+2020年某支付平台的API被黑客利用重放攻击薅了羊毛。
+
+黑客抓包获取了用户的支付请求，然后重复发送这个请求，导致同一个订单被支付了多次。
+
+技术团队排查后发现：支付接口没有做幂等性校验，同一个订单号可以重复扣款。
+
+更可怕的是：这个漏洞存在了整整三个月，黑客利用自动化脚本薅了平台近10万元的羊毛。
+
+**这次事件导致平台损失约10万元，用户投诉不断。**
+
+【面试官手记】
+
+重放攻击是API安全中最容易被忽视的问题。我面试过的候选人里，能说清楚"Nonce机制"的有30%，能说清楚"时间戳校验"的有40%，能说清楚"完整防护方案"的有20%。重放攻击的关键词是**Nonce + 时间戳 + 签名**。
+
+## 一、重放攻击的原理 🔴
+
+### 1.1 攻击原理
+
+```
+重放攻击原理：
+
+攻击场景：
+1. 黑客截获用户请求
+   POST /api/order/pay
+   {"orderId": "123", "amount": 100, "timestamp": "1704067200"}
+
+2. 黑客重复发送请求
+   POST /api/order/pay
+   {"orderId": "123", "amount": 100, "timestamp": "1704067200"}
+   → 服务器处理：订单123支付100元
+   → 用户实际只买了一件商品
+
+3. 黑客多次重放
+   → 服务器处理：订单123再次支付100元
+   → 用户被扣了多次钱！
+
+攻击影响：
+- 资金损失：重复扣款
+- 库存损失：重复发货
+- 资源浪费：重复创建订单
+- 数据污染：重复数据
+```
+
+### 1.2 攻击类型
+
+```
+重放攻击类型：
+
+1. 简单重放
+   - 直接重复发送截获的请求
+   - 最简单，也最容易防御
+
+2. 增强重放
+   - 修改截获请求的部分参数
+   - 比如修改金额
+
+3. 中间人攻击
+   - 截获并修改请求
+   - 配合签名伪造
+
+4. 时间无关重放
+   - 请求没有时间戳
+   - 永久有效
+```
+
+## 二、Nonce防重放 🔴
+
+### 2.1 Nonce机制原理
+
+```
+Nonce（Number used once）机制：
+
+原理：每个请求携带一个唯一标识，服务器记录已使用的Nonce，防止重复使用
+
+流程：
+1. 客户端生成唯一Nonce
+   - UUID
+   - 时间戳+随机数
+   - 业务唯一标识+时间戳
+
+2. 客户端发送请求
+   Header: X-Nonce: abc123xyz
+
+3. 服务器检查Nonce
+   - Redis: EXISTS nonce:abc123xyz
+   - 存在 → 拒绝请求
+   - 不存在 → 记录并处理
+
+4. 设置过期时间
+   - Redis: SETEX nonce:abc123xyz 300 "1"
+   - 5分钟内有效
+```
+
+### 2.2 Nonce实现
+
+```java
+// Nonce防重放实现
+@Service
+public class NonceService {
+
+    @Autowired
+    private RedisTemplate redisTemplate;
+
+    private static final String NONCE_PREFIX = "nonce:";
+    private static final int NONCE_EXPIRE_SECONDS = 300;  // 5分钟
+
+    /**
+     * 生成Nonce
+     * 格式：UUID + 时间戳
+     */
+    public String generateNonce() {
+        return UUID.randomUUID().toString().replace("-", "") +
+               "_" + System.currentTimeMillis();
+    }
+
+    /**
+     * 校验Nonce
+     * @return true=有效，false=重复
+     */
+    public boolean checkNonce(String nonce) {
+        if (nonce == null || nonce.isEmpty()) {
+            return false;
+        }
+
+        String key = NONCE_PREFIX + nonce;
+        Boolean exists = redisTemplate.hasKey(key);
+
+        if (Boolean.TRUE.equals(exists)) {
+            // Nonce已使用，是重放攻击
+            log.warn("检测到重放攻击，Nonce={}", nonce);
+            return false;
+        }
+
+        // 记录Nonce，设置过期时间
+        redisTemplate.opsForValue().set(key, "1", NONCE_EXPIRE_SECONDS, TimeUnit.SECONDS);
+        return true;
+    }
+
+    /**
+     * 使用注解简化调用
+     */
+    @Target(ElementType.METHOD)
+    @Retention(RetentionPolicy.RUNTIME)
+    public @interface Idempotent {
+        int expireSeconds() default 300;
+    }
+}
+```
+
+### 2.3 Nonce拦截器
+
+```java
+// Nonce校验拦截器
+@Component
+public class NonceInterceptor implements HandlerInterceptor {
+
+    @Autowired
+    private NonceService nonceService;
+
+    @Override
+    public boolean preHandle(HttpServletRequest request,
+                             HttpServletResponse response,
+                             Object handler) {
+        String nonce = request.getHeader("X-Nonce");
+
+        if (nonce == null || nonce.isEmpty()) {
+            response.setStatus(401);
+            writeJson(response, Result.fail(401, "缺少Nonce"));
+            return false;
+        }
+
+        if (!nonceService.checkNonce(nonce)) {
+            response.setStatus(401);
+            writeJson(response, Result.fail(401, "请求已使用过"));
+            return false;
+        }
+
+        return true;
+    }
+
+    private void writeJson(HttpServletResponse response, Result<?> result) {
+        try {
+            response.setContentType("application/json");
+            response.setCharacterEncoding("UTF-8");
+            response.getWriter().write(JSON.toJSONString(result));
+        } catch (IOException ignored) {}
+    }
+}
+```
+
+## 三、时间戳校验 🟡
+
+### 3.1 时间戳校验原理
+
+```
+时间戳校验原理：
+
+原理：请求必须携带时间戳，服务器校验请求是否在有效时间窗口内
+
+流程：
+1. 客户端生成时间戳
+   timestamp = System.currentTimeMillis() / 1000
+
+2. 客户端发送请求
+   Header: X-Timestamp: 1704067200
+
+3. 服务器校验
+   current - timestamp > 5分钟 → 拒绝
+   timestamp - current > 1分钟 → 拒绝
+
+4. 时间戳和Nonce结合
+   - 时间戳防过期
+   - Nonce防重放
+   - 两者结合更安全
+```
+
+### 3.2 时间戳实现
+
+```java
+// 时间戳校验
+@Service
+public class TimestampService {
+
+    private static final int TIME_WINDOW_SECONDS = 300;  // 5分钟窗口
+    private static final int MAX_DRIFT_SECONDS = 60;      // 最大时钟漂移
+
+    /**
+     * 校验时间戳
+     * @return true=有效，false=无效
+     */
+    public boolean checkTimestamp(String timestampStr) {
+        if (timestampStr == null || timestampStr.isEmpty()) {
+            return false;
+        }
+
+        try {
+            long timestamp = Long.parseLong(timestampStr);
+            long current = System.currentTimeMillis() / 1000;
+
+            // 请求时间晚于服务器（时钟漂移）
+            if (timestamp > current + MAX_DRIFT_SECONDS) {
+                log.warn("时间戳太新，timestamp={}, current={}", timestamp, current);
+                return false;
+            }
+
+            // 请求时间太旧（超过窗口）
+            if (current - timestamp > TIME_WINDOW_SECONDS) {
+                log.warn("时间戳过期，timestamp={}, current={}", timestamp, current);
+                return false;
+            }
+
+            return true;
+        } catch (NumberFormatException e) {
+            log.warn("时间戳格式错误: {}", timestampStr);
+            return false;
+        }
+    }
+
+    /**
+     * 生成时间戳
+     */
+    public String generateTimestamp() {
+        return String.valueOf(System.currentTimeMillis() / 1000);
+    }
+}
+```
+
+## 四、签名防重放 🟡
+
+### 4.1 签名机制
+
+```java
+// 签名生成与校验
+@Service
+public class SignService {
+
+    private static final String APP_SECRET = "your_app_secret_key";
+
+    /**
+     * 生成签名
+     * 签名 = MD5(参数排序 + 时间戳 + Nonce + Secret)
+     */
+    public String generateSign(String method, String uri,
+                                Map<String, String> params,
+                                String timestamp,
+                                String nonce) {
+        // 1. 按字典序排序参数
+        TreeMap<String, String> sorted = new TreeMap<>(params);
+        sorted.put("_timestamp", timestamp);
+        sorted.put("_nonce", nonce);
+
+        // 2. 拼接参数
+        StringBuilder sb = new StringBuilder();
+        for (Map.Entry<String, String> entry : sorted.entrySet()) {
+            if (entry.getValue() != null) {
+                sb.append(entry.getKey()).append("=").append(entry.getValue()).append("&");
+            }
+        }
+        sb.append("secret=").append(APP_SECRET);
+
+        // 3. MD5签名
+        return DigestUtils.md5Hex(sb.toString()).toUpperCase();
+    }
+
+    /**
+     * 校验签名
+     */
+    public boolean verifySign(HttpServletRequest request, String sign) {
+        String timestamp = request.getHeader("X-Timestamp");
+        String nonce = request.getHeader("X-Nonce");
+
+        if (timestamp == null || nonce == null || sign == null) {
+            return false;
+        }
+
+        // 获取所有参数
+        Map<String, String> params = getParams(request);
+
+        // 生成签名
+        String serverSign = generateSign(
+            request.getMethod(),
+            request.getRequestURI(),
+            params,
+            timestamp,
+            nonce
+        );
+
+        // 比较签名
+        return serverSign.equals(sign);
+    }
+}
+```
+
+### 4.2 完整防护方案
+
+```java
+// 完整防重放拦截器
+@Component
+public class SecureInterceptor implements HandlerInterceptor {
+
+    @Autowired
+    private TimestampService timestampService;
+
+    @Autowired
+    private NonceService nonceService;
+
+    @Autowired
+    private SignService signService;
+
+    @Override
+    public boolean preHandle(HttpServletRequest request,
+                             HttpServletResponse response,
+                             Object handler) {
+        // 1. 获取防重放头
+        String timestamp = request.getHeader("X-Timestamp");
+        String nonce = request.getHeader("X-Nonce");
+        String sign = request.getHeader("X-Sign");
+
+        // 2. 校验时间戳
+        if (!timestampService.checkTimestamp(timestamp)) {
+            response.setStatus(401);
+            writeJson(response, Result.fail(401, "请求已过期"));
+            return false;
+        }
+
+        // 3. 校验Nonce
+        if (!nonceService.checkNonce(nonce)) {
+            response.setStatus(401);
+            writeJson(response, Result.fail(401, "请求已使用过"));
+            return false;
+        }
+
+        // 4. 校验签名
+        if (!signService.verifySign(request, sign)) {
+            response.setStatus(401);
+            writeJson(response, Result.fail(401, "签名验证失败"));
+            return false;
+        }
+
+        return true;
+    }
+}
+```
+
+## 五、业务幂等性 🟡
+
+### 5.1 幂等注解
+
+```java
+// 幂等性注解
+@Retention(RetentionPolicy.RUNTIME)
+@Target(ElementType.METHOD)
+public @interface Idempotent {
+    String key() default "";              // 幂等Key
+    int expireSeconds() default 300;     // 过期时间
+    String errorMsg() default "请求已处理";
+}
+
+// 幂等性实现
+@Component
+public class IdempotentInterceptor implements HandlerInterceptor {
+
+    @Autowired
+    private RedisTemplate redisTemplate;
+
+    @Override
+    public boolean preHandle(HttpServletRequest request,
+                             HttpServletResponse response,
+                             Object handler) {
+        Method method = ((HandlerMethod) handler).getMethod();
+        Idempotent annotation = method.getAnnotation(Idempotent.class);
+        if (annotation == null) {
+            return true;
+        }
+
+        // 生成幂等Key
+        String key = generateKey(request, annotation.key());
+
+        // 尝试设置幂等标记
+        Boolean success = redisTemplate.opsForValue()
+            .setIfAbsent(key, "processing", annotation.expireSeconds(), TimeUnit.SECONDS);
+
+        if (!Boolean.TRUE.equals(success)) {
+            response.setStatus(200);  // 返回200而不是401，表示已处理
+            writeJson(response, Result.fail(200, annotation.errorMsg()));
+            return false;
+        }
+
+        return true;
+    }
+
+    private String generateKey(HttpServletRequest request, String keyPattern) {
+        // 支持占位符替换
+        if (keyPattern.contains("{orderId}")) {
+            String orderId = request.getParameter("orderId");
+            keyPattern = keyPattern.replace("{orderId}", orderId);
+        }
+        return "idempotent:" + keyPattern;
+    }
+}
+```
+
+### 5.2 支付幂等实现
+
+```java
+// 支付幂等实现
+@Service
+public class PaymentService {
+
+    @Autowired
+    private RedisTemplate redisTemplate;
+
+    @Transactional
+    public PaymentResult pay(PayRequest request) {
+        String idempotentKey = "payment:idempotent:" + request.getOrderId();
+
+        // 1. 检查幂等
+        String status = (String) redisTemplate.opsForValue().get(idempotentKey);
+        if ("success".equals(status)) {
+            return PaymentResult.success("订单已支付");
+        }
+
+        // 2. 检查是否处理中
+        if ("processing".equals(status)) {
+            throw new BizException("支付处理中");
+        }
+
+        // 3. 设置处理中标记
+        redisTemplate.opsForValue().set(idempotentKey, "processing", 30, TimeUnit.SECONDS);
+
+        try {
+            // 4. 执行支付
+            PaymentResult result = doPay(request);
+
+            // 5. 设置成功标记
+            redisTemplate.opsForValue().set(idempotentKey, "success", 24, TimeUnit.HOURS);
+
+            return result;
+        } catch (Exception e) {
+            // 6. 支付失败，删除标记
+            redisTemplate.delete(idempotentKey);
+            throw e;
+        }
+    }
+}
+```
+
+## 六、生产避坑 🟡
+
+### 6.1 重放攻击防护的五大坑
+
+**坑1：Nonce存储无过期时间**
+
+```
+问题：Nonce记录后永久存在
+场景：Redis内存持续增长
+解决方案：
+- 设置过期时间，如5分钟
+- 定期清理过期Nonce
+```
+
+**坑2：Nonce生成不唯一**
+
+```
+问题：Nonce可能重复
+场景：使用时间戳作为Nonce
+解决方案：
+- 使用UUID
+- 使用时间戳+随机数
+```
+
+**坑3：时间窗口设置过大**
+
+```
+问题：5分钟内重放有效
+场景：设置过长的时间窗口
+解决方案：
+- 时间窗口尽量小
+- 建议5分钟
+```
+
+**坑4：签名被截获**
+
+```
+问题：签名本身被截获重放
+场景：只校验签名不校验时间戳
+解决方案：
+- 时间戳+Nonce+签名三者结合
+```
+
+**坑5：业务幂等未做**
+
+```
+问题：只做了防重放，没做幂等性
+场景：请求被拒绝，但业务已处理
+解决方案：
+- 业务层做幂等性
+- 订单支付必须幂等
+```
+
+### 6.2 防重放检查清单
+
+```
+安全规范：
+- [ ] 使用Nonce防重放
+- [ ] 使用时间戳防过期
+- [ ] 使用签名防篡改
+- [ ] 业务层做幂等性
+
+配置规范：
+- [ ] Nonce过期时间设置合理
+- [ ] 时间窗口设置合理
+- [ ] 签名算法安全可靠
+
+监控规范：
+- [ ] 监控重放攻击次数
+- [ ] 监控Nonce重复率
+- [ ] 监控异常请求
+```
+
+## 七、真实面试回放 🟡
+
+> **面试官**：怎么防止重放攻击？
+>
+> **候选人**（小张）：三层防护：
+>
+> 一是Nonce。每个请求带唯一标识，Redis记录已使用的Nonce，设置5分钟过期。
+>
+> 二是时间戳。请求带时间戳，服务器校验请求是否在5分钟有效窗口内。
+>
+> 三是签名。参数加时间戳加Nonce做MD5签名，防止参数被篡改。
+>
+> 业务层还要做幂等性，比如支付接口用订单号做幂等Key。
+>
+> **面试官**：Nonce怎么生成？
+>
+> 小张：UUID加时间戳。
+>
+> UUID保证唯一性，时间戳用于日志追溯。
+>
+> **面试官**：Nonce过期时间怎么设置？
+>
+> 小张：看业务场景。
+>
+> 普通接口5分钟够用。
+>
+> 支付接口建议30秒到1分钟，因为支付本身处理很快。
+>
+> 【面试官手记】
+>
+> 小张这场面试的亮点：
+>
+> 1. 知道Nonce+时间戳+签名三层防护
+>
+> 2. 知道Nonce生成方法
+>
+> 3. 知道业务幂等性的重要性
+>
+> 重放攻击是P6工程师必备知识点，能完整回答的候选人，说明有安全意识。
+
+重放攻击防护的核心是**Nonce + 时间戳 + 签名 + 幂等**。记住三个要点：
+
+1. **Nonce防重放**：唯一标识，Redis存储，设置过期
+2. **时间戳防过期**：有效窗口，建议5分钟
+3. **签名防篡改**：参数+时间戳+Nonce+Secret签名
+
+重放攻击是API安全的基础攻击，必须做好防护。

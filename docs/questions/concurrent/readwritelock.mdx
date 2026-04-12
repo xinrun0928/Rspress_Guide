@@ -1,0 +1,302 @@
+---
+title: ReentrantReadWriteLock 读写锁
+description: 从读写锁的设计动机出发，深入剖析 ReentrantReadWriteLock 的实现：AQS 状态分片、读锁与写锁的交互、写锁饥饿问题、StampedLock 的乐观读，以及生产场景下的选型决策。
+---
+
+# ReentrantReadWriteLock 读写锁
+
+候选人小何在面试蚂蚁 P7 时，面试官问道：
+
+"ReentrantReadWriteLock 的读写锁是怎么实现的？读锁和写锁会相互阻塞吗？"
+
+小何说："读锁是共享锁，写锁是独占锁..."面试官追问："那高并发读场景下，写锁会不会饿死？"
+
+小何说："可能..."面试官继续追问："JDK 8 的 StampedLock 解决了什么问题？乐观读是什么？"
+
+小何答不上来了...
+
+## 一、核心问题：读写锁原理 🔴
+
+### 1.1 问题拆解
+
+```
+第一层：设计动机（为什么需要？）
+  "为什么需要读写锁？它解决了什么问题？"
+  考察点：读多写少场景、读写冲突模型
+
+第二层：AQS 状态分片（怎么实现？）
+  "ReentrantReadWriteLock 如何用 AQS 的 state 表示读写锁状态？"
+  考察点：状态分片、高16位读锁计数、低16位写锁计数
+
+第三层：写锁饥饿（有什么问题？）
+  "读写锁中，写锁会饿死吗？"
+  考察点：读写锁的公平性、写锁优先策略
+
+第四层：StampedLock（怎么进化？）
+  "JDK 8 的 StampedLock 是什么？乐观读比读写锁好在哪？"
+  考察点：版本号戳、乐观读、WriteReadLock 的区别
+```
+
+### 1.2 ❌ 错误示范
+
+**候选人原话 A**："读写锁允许多个线程同时读，所以比 ReentrantLock 性能好。"
+
+**问题诊断**：读写锁的性能优势只在**读多写少**场景下成立。在**写多读少**或**读写均衡**场景下，读写锁的开销（读锁计数器管理、写锁的独占获取）反而比普通互斥锁更差。
+
+**候选人原话 B**："ReentrantReadWriteLock 默认是公平的，不会饿死。"
+
+**问题诊断**：默认是非公平的。但即使公平模式下，写锁仍然可能"相对饿死"——因为读锁是共享的，一个写锁持有者释放后，可能同时被多个等待的读锁获取，写锁需要再次等待。
+
+### 1.3 标准回答
+
+#### P5 级别：读写锁的概念
+
+> **读写锁的设计动机**：
+>
+> 在读多写少场景中（如缓存、配置、只读数据），大量读操作之间互相不冲突，如果用互斥锁会导致无谓的等待。读写锁允许**并发读**，只将**写操作串行化**。
+>
+> **ReentrantReadWriteLock 的特性**：
+>
+> - **可重入**：读锁和写锁分别可重入（同一线程可以先获取读锁，再获取写锁；或先获取写锁，再获取读锁）
+> - **锁降级**：持有写锁时获取读锁（锁降级）
+> - **锁升级**：持有读锁时尝试获取写锁（**不支持**——会导致死锁）
+>
+> ```java
+> ReentrantReadWriteLock rwLock = new ReentrantReadWriteLock();
+> ReentrantReadWriteLock.ReadLock readLock = rwLock.readLock();
+> ReentrantReadWriteLock.WriteLock writeLock = rwLock.writeLock();
+>
+> // 锁降级：写锁 → 读锁（安全）
+> writeLock.lock();
+> try {
+>     doWrite();
+>     readLock.lock();   // 写锁降级为读锁
+>     try {
+>         doRead();
+>     } finally {
+>         readLock.unlock();  // 只释放读锁
+>     }
+> } finally {
+>     writeLock.unlock();
+> }
+> ```
+
+#### P6 级别：AQS 状态分片
+
+> **如何用单个 int state 表示读写锁**：
+>
+> ReentrantReadWriteLock 将 AQS 的 `state` 字段（int）分成两部分：
+>
+> - **高 16 位**：读锁计数（共享锁计数）
+> - **低 16 位**：写锁计数（独占锁计数，重入计数）
+>
+> ```java
+> // 获取读锁计数
+> static int sharedCount(int c) { return c >>> 16; }
+>
+> // 获取写锁计数
+> static int exclusiveCount(int c) { return c & 0xFFFF; }
+>
+> // state = 0x00010001 = 读锁:1, 写锁:1
+> // 高16位: 0x0001 = 1 个读锁
+> // 低16位: 0x0001 = 1 次重入
+> ```
+>
+> **写锁的 tryAcquire()**：
+>
+> ```java
+> protected final boolean tryAcquire(int acquires) {
+>     Thread current = Thread.currentThread();
+>     int c = getState();
+>     int w = exclusiveCount(c);  // 写锁计数
+>
+>     if (c != 0) {  // 已有锁
+>         if (w == 0 || current != getExclusiveOwnerThread()) {
+>             return false;  // 有读锁，或写锁被其他线程持有
+>         }
+>         // 当前线程持有写锁 → 重入
+>         if (w + acquires > (1 << 16) - 1) throw new Error("Maximum lock count exceeded");
+>         setState(c + acquires);
+>         return true;
+>     }
+>     // 无锁：检查是否需要阻塞（公平锁检查队列）
+>     if (writerShouldBlock() || !compareAndSetState(c, c + acquires)) {
+>         return false;
+>     }
+>     setExclusiveOwnerThread(current);
+>     return true;
+> }
+> ```
+>
+> **读锁的 tryAcquireShared()**：
+>
+> ```java
+> protected final int tryAcquireShared(int unused) {
+>     Thread current = Thread.currentThread();
+>     int c = getState();
+>     if (exclusiveCount(c) != 0 &&  // 有写锁持有者
+>         getExclusiveOwnerThread() != current) {
+>         return -1;  // 获取失败
+>     }
+>     // 读锁计数
+>     int r = sharedCount(c);
+>     if (!readerShouldBlock() &&  // 检查是否需要阻塞读
+>         r < SHARED_UNIT &&       // SHARED_UNIT = 1 << 16
+>         compareAndSetState(c, c + SHARED_UNIT)) {
+>         // 第一个获取读锁的线程：设置 firstReader, firstReaderHoldCount
+>         return 1;
+>     }
+>     // 重入读锁，或 CAS 失败（自旋）
+>     return fullTryAcquireShared(current);
+> }
+> ```
+
+#### P7 级别：写锁饥饿与 StampedLock
+
+> **写锁饥饿问题**：
+>
+> 即使使用公平锁，写锁也可能"相对饿死"：
+>
+> ```
+> 时间线：
+> T1: 线程A 获取写锁（state: W=1）
+> T2: 线程B,C,D 请求读锁（进入等待队列）
+> T3: 线程A 释放写锁（state: W=0）
+> T4: 线程B,C,D 同时获取读锁（state: R=3）
+> T5: 线程E 请求写锁（等待）
+> T6-Tn: 更多读请求到达，读锁一直被持有
+> ```
+>
+> 在这个场景中，线程 E 的写锁可能无限期等待。ReentrantReadWriteLock 提供了**写锁优先**选项：
+>
+> ```java
+> // 写锁优先的读锁获取
+> ReentrantReadWriteLock rw = new ReentrantReadWriteLock(true);  // 公平模式
+> // 公平模式下，新读请求检查 hasQueuedPredecessors()，
+> // 如果队列中有等待的写锁，新读锁请求会被阻塞
+> ```
+>
+> **StampedLock（JDK 8）**：
+>
+> StampedLock 提供了**乐观读**模式，解决读锁的性能问题：
+>
+> ```java
+> StampedLock sl = new StampedLock();
+>
+> // 悲观读（类似普通读锁）
+> long stamp = sl.readLock();
+> try {
+>     // 读取数据
+> } finally {
+>     sl.unlockRead(stamp);
+> }
+>
+> // 乐观读（不阻塞，性能更高）
+> long stamp = sl.tryOptimisticRead();  // 获取乐观版本号
+> // 读取数据
+> if (!sl.validate(stamp)) {  // 检查是否被写锁修改
+>     // 被修改：降级为悲观读
+>     stamp = sl.readLock();
+>     try {
+>         // 重新读取
+>     } finally {
+>         sl.unlockRead(stamp);
+>     }
+> }
+> ```
+>
+> **StampedLock 的优势**：
+>
+> | 对比 | ReentrantReadWriteLock | StampedLock |
+> | --- | --- | --- |
+> | 读锁获取 | 需要 CAS 操作 | tryOptimisticRead 直接返回版本号（无 CAS） |
+> | 乐观读 | 不支持 | 支持 |
+> | 写锁饥饿 | 存在 | 存在 |
+> | 模式 | 读/写 | 读/写/乐观读 |
+
+【面试官心理】
+这道题我能问到 P7 级别，是因为它涉及了 AQS 状态管理、读写锁的设计权衡、StampedLock 的版本号机制等多个层次。能说出 StampedLock 的乐观读验证机制（validate）的候选人说明他理解了版本号机制。能正确比较读写锁和 StampedLock 的候选人说明他有工程判断力。
+
+### 1.4 追问升级
+
+**追问 1：为什么读锁是共享锁但写锁持有时读锁不能获取？**
+
+> 因为读锁需要看到一致的数据。如果写锁持有者在修改数据（尚未提交），读锁获取到的数据可能是半成品。
+>
+> 写锁的独占性保证了：当写锁释放后，所有等待的读锁同时获取，它们看到的都是一致的完整数据。
+
+**追问 2：StampedLock 的乐观读能完全替代读写锁吗？**
+
+> **不能**。StampedLock 的乐观读只检查版本号，不加任何锁。如果在 `tryOptimisticRead()` 和 `validate()` 之间有写锁获取/释放，乐观读会失败（validate 返回 false）。但乐观读失败后降级为悲观读的开销比直接用读写锁更大（因为需要处理版本号转换）。
+>
+> StampedLock 更适合"读多写少、写操作轻量"的场景。
+
+## 二、StampedLock 的实现细节 🟡
+
+### 2.1 乐观读的性能优势
+
+> 乐观读不需要 CAS 操作，直接返回一个版本号：
+>
+> ```java
+> public long tryOptimisticRead() {
+>     return getState();  // 直接读取 state（版本号）
+> }
+>
+> public boolean validate(long stamp) {
+>     // 检查 state 是否变化
+>     return (getState() & SBITS) == (stamp & SBITS);
+> }
+> ```
+>
+> 性能差异：`tryOptimisticRead()` 约 5~10 纳秒，`readLock()` 的 CAS 约 30~50 纳秒。
+
+### 2.2 StampedLock 的坑
+
+```java
+StampedLock sl = new StampedLock();
+
+// 错误：忘记将 stamp 传递给 unlock
+long stamp = sl.readLock();
+try {
+    // 业务
+} finally {
+>    sl.unlock(stamp);  // ❌ stamp 不是 writeLock 的 stamp
+}
+```
+
+StampedLock 有三种 unlock 方法：`unlockRead()`、`unlockWrite()`、`unlock()`。必须使用对应类型的 unlock。
+
+## 三、生产避坑
+
+### 3.1 读写锁的写锁饿死
+
+**场景**：缓存系统使用读写锁，高并发读 + 间歇性写，写锁长时间无法获取。
+
+**解决方案**：使用 StampedLock 的乐观读 + 写锁；或在业务层面限制读锁持有时间。
+
+### 3.2 锁升级死锁
+
+```java
+ReentrantReadWriteLock rwLock = new ReentrantReadWriteLock();
+ReentrantReadWriteLock.ReadLock readLock = rwLock.readLock();
+ReentrantReadWriteLock.WriteLock writeLock = rwLock.writeLock();
+
+// 锁升级：读锁 → 写锁（死锁！）
+readLock.lock();
+try {
+    writeLock.lock();  // 死锁！当前线程持有读锁，写锁是独占的
+} finally {
+    readLock.unlock();
+    writeLock.unlock();
+}
+```
+
+**解决方案**：先释放读锁，再获取写锁（但中间有窗口期）；或使用 StampedLock。
+
+:::tip 💡
+面试加分点：能说出"JDK 15 将 StampedLock 的 `longueur()` 方法标记为 deprecated（因为它返回的是容量而非长度，容易误用）"，说明他对 JDK 的演进有实际关注。
+:::
+
+:::warning ⚠️
+面试陷阱：被问到"StampedLock 支持重入吗"，很多人会说"不支持"。准确答案是：StampedLock 支持**有限的**重入——读锁可重入获取读锁，写锁可重入获取写锁，但读锁不可重入获取写锁（不支持锁升级）。
+:::

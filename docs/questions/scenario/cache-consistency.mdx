@@ -1,0 +1,420 @@
+---
+title: 缓存一致性场景
+description: 从一个缓存和数据库不一致导致的数据错误出发，深度拆解缓存一致性的解决方案：Cache Aside、Read Through、Write Through模式对比及常见问题处理。
+---
+
+# 缓存一致性场景
+
+2021年某电商平台的商品价格出现了一个诡异的问题：用户在App上看到的价格是99元，但下单时显示的是199元。
+
+技术团队排查后发现：商品价格修改后，先更新了数据库，但缓存更新失败了。结果用户读取时读到的是旧价格（99元），下单时从数据库读取是新价格（199元）。
+
+**这次不一致持续了约2小时，影响了约1000个订单的金额统计，直接损失约5万元。**
+
+缓存和数据库的一致性，是分布式系统中最经典的问题之一。
+
+【面试官手记】
+
+缓存一致性是生产环境最常见的问题之一。我面试过的候选人里，能说清楚"Cache Aside模式"的不超过40%，能说清楚"先删缓存还是先更新数据库"的不超过20%。缓存一致性的关键是**根据业务场景选择合适的模式**。
+
+## 一、缓存一致性的三大模式 🔴
+
+### 1.1 Cache Aside
+
+```
+Cache Aside（旁路缓存）：最常用的模式
+
+读流程：
+1. 先查缓存
+2. 缓存命中 → 返回
+3. 缓存未命中 → 查数据库 → 写入缓存 → 返回
+
+写流程：
+1. 先更新数据库
+2. 再删除缓存（或更新缓存）
+
+适用场景：读多写少的场景
+```
+
+### 1.2 Read Through
+
+```
+Read Through（读穿透）：
+
+读流程：
+1. 查询缓存
+2. 缓存未命中 → cache provider 自动查询数据库
+3. 写入缓存并返回
+
+特点：应用层代码简单，缓存层自动处理
+
+适用场景：缓存命中率要求高的场景
+```
+
+### 1.3 Write Through
+
+```
+Write Through（写穿透）：
+
+写流程：
+1. 写入缓存
+2. cache provider 自动写入数据库
+3. 两者都成功才算成功
+
+特点：强一致性，但写入性能差
+
+适用场景：写多读多的场景
+```
+
+### 1.4 模式对比
+
+| 模式 | 一致性 | 性能 | 复杂度 | 适用场景 |
+| --- | --- | --- | --- | --- |
+| Cache Aside | 最终一致 | 高 | 低 | 读多写少 |
+| Read Through | 最终一致 | 高 | 中 | 读多写少 |
+| Write Through | 强一致 | 低 | 中 | 写多读多 |
+| Write Behind | 最终一致 | 最高 | 高 | 写多读少 |
+
+## 二、Cache Aside详解 🔴
+
+### 2.1 标准实现
+
+```java
+// Cache Aside模式实现
+
+public class ProductService {
+
+    @Autowired
+    private ProductDAO productDAO;
+
+    @Autowired
+    private RedisTemplate<String, Product> redisTemplate;
+
+    // 读取
+    public Product getProduct(Long productId) {
+        String cacheKey = "product:" + productId;
+
+        // 1. 查缓存
+        Product cached = redisTemplate.opsForValue().get(cacheKey);
+        if (cached != null) {
+            return cached;
+        }
+
+        // 2. 缓存未命中，查数据库
+        Product product = productDAO.selectById(productId);
+
+        // 3. 写入缓存
+        redisTemplate.opsForValue().set(cacheKey, product, 1, TimeUnit.HOURS);
+
+        return product;
+    }
+
+    // 更新
+    public void updateProduct(Product product) {
+        // 1. 先更新数据库
+        productDAO.update(product);
+
+        // 2. 删除缓存（不是更新！）
+        String cacheKey = "product:" + product.getId();
+        redisTemplate.delete(cacheKey);
+    }
+}
+```
+
+### 2.2 先删缓存还是先更新数据库
+
+```
+这是一个经典的争论问题：
+
+方案A：先删缓存，再更新数据库
+优点：缓存被删除，下次读会从数据库读到最新
+缺点：更新数据库时，有并发请求读到旧数据
+
+方案B：先更新数据库，再删缓存
+优点：数据库是主数据源，更可靠
+缺点：删除缓存失败时，会读到旧数据
+
+结论：推荐方案B（先更库，再删缓存）
+原因：缓存删除失败可以重试，但数据库脏写很难恢复
+```
+
+### 2.3 延迟双删
+
+```java
+// 延迟双删：解决并发问题
+
+public void updateProduct(Product product) {
+    // 1. 先删缓存
+    redisTemplate.delete("product:" + product.getId());
+
+    // 2. 更新数据库
+    productDAO.update(product);
+
+    // 3. 延迟N秒后再删一次缓存
+    // 延迟时间要大于读操作的时间
+    CompletableFuture.runAsync(() -> {
+        try {
+            Thread.sleep(5000);  // 5秒
+            redisTemplate.delete("product:" + product.getId());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    });
+}
+```
+
+## 三、常见问题处理 🟡
+
+### 3.1 缓存删除失败
+
+```java
+// 删除缓存失败的重试机制
+
+public void updateProduct(Product product) {
+    // 1. 更新数据库
+    productDAO.update(product);
+
+    // 2. 删除缓存（失败重试）
+    try {
+        redisTemplate.delete("product:" + product.getId());
+    } catch (Exception e) {
+        // 发送消息到MQ，异步重试删除
+        mqProducer.send("cache:invalidate", product.getId());
+    }
+}
+
+// MQ消费者处理删除
+@RabbitListener(queues = "cache:invalidate")
+public void handleCacheInvalidate(Long productId) {
+    int maxRetries = 3;
+    for (int i = 0; i < maxRetries; i++) {
+        try {
+            redisTemplate.delete("product:" + productId);
+            break;
+        } catch (Exception e) {
+            if (i == maxRetries - 1) {
+                // 告警，人工处理
+                alertService.alert("缓存删除失败");
+            }
+        }
+    }
+}
+```
+
+### 3.2 并发读问题
+
+```
+并发场景分析：
+
+时间线：
+T1: 线程A更新数据，删除缓存
+T2: 线程B读取数据，缓存未命中
+T3: 线程B查数据库（查到旧数据）
+T4: 线程B写入缓存（旧数据）
+T5: 线程A更新完成
+
+结果：缓存中是旧数据
+
+解决方案：延迟双删
+在T5之后，再删除一次缓存
+```
+
+### 3.3 缓存和数据同时更新
+
+```
+错误写法：同时更新缓存和数据库
+
+public void updateProduct(Product product) {
+    // 错误：两个都更新，无法保证原子性
+    productDAO.update(product);
+    redisTemplate.opsForValue().set(key, product);  // 失败怎么办？
+
+    // 如果这个成功而那个失败，数据就不一致了
+}
+
+正确写法：只更新数据库，删缓存
+public void updateProduct(Product product) {
+    productDAO.update(product);  // 主数据源
+    redisTemplate.delete(key);  // 删除缓存，让下次读取时重建
+}
+```
+
+## 四、一致性级别 🟡
+
+### 4.1 一致性级别对比
+
+```
+缓存一致性有四个级别：
+
+1. 强一致性
+   - 缓存和数据库完全一致
+   - 实现：分布式事务
+   - 代价：性能差
+   - 适用：资金类场景
+
+2. 实时一致性
+   - 延迟 < 1秒
+   - 实现：同步删除缓存
+   - 代价：中等
+   - 适用：订单、库存
+
+3. 最终一致性
+   - 延迟几秒到几分钟
+   - 实现：异步删除缓存
+   - 代价：低
+   - 适用：普通业务
+
+4. 弱一致性
+   - 可能读到旧数据
+   - 实现：TTL过期
+   - 代价：最低
+   - 适用：允许一定延迟的场景
+```
+
+### 4.2 场景选择
+
+```
+场景1：商品价格
+一致性要求：实时一致性
+选择方案：Cache Aside + 延迟双删
+
+场景2：用户余额
+一致性要求：强一致性
+选择方案：不给余额加缓存，直接读数据库
+
+场景3：商品浏览量
+一致性要求：弱一致性（最终一致）
+选择方案：缓存 + 异步刷数据库
+
+场景4：库存
+一致性要求：实时一致性
+选择方案：Redis库存 + 数据库库存 + 对账
+```
+
+## 五、生产避坑 🟡
+
+### 5.1 缓存一致性的五大坑
+
+**坑1：先更新缓存再更新数据库**
+
+```
+问题：缓存更新成功，数据库更新失败
+场景：数据不一致
+解决方案：
+- 永远不要先更新缓存
+- 只更新数据库，删缓存
+```
+
+**坑2：缓存删除失败没有重试**
+
+```
+问题：删除缓存失败，但没有处理
+场景：长期读到旧数据
+解决方案：
+- MQ消息重试
+- 或定时任务清理
+```
+
+**坑3：缓存穿透导致击穿数据库**
+
+```
+问题：缓存未命中，大量请求打到数据库
+场景：高并发 + 冷数据
+解决方案：
+- 布隆过滤器
+- 空值缓存
+```
+
+**坑4：缓存雪崩**
+
+```
+问题：大量缓存同时过期
+场景：瞬时流量打到数据库
+解决方案：
+- TTL加随机偏移
+- 热点数据永不过期
+```
+
+**坑5：缓存和数据库不在同一个事务**
+
+```
+问题：数据库事务提交成功，但MQ消息发送失败
+场景：数据不一致
+解决方案：
+- 用事务消息
+- 或本地消息表
+```
+
+### 5.2 一致性保障方案
+
+```
+方案1：定时对账
+- 每小时跑一次对账任务
+- 缓存 vs 数据库不一致时告警
+
+方案2：监控告警
+- 监控缓存命中率
+- 命中率突然下降说明可能有问题
+
+方案3：canal监听
+- 监听数据库变更日志
+- 自动同步更新缓存
+```
+
+## 六、真实面试回放 🟡
+
+> **面试官**：缓存和数据库的一致性怎么保证？
+>
+> **候选人**（小刘）：通常用Cache Aside模式。
+>
+> 读：先读缓存，命中返回；未命中读数据库，再写缓存。
+>
+> 写：先更新数据库，再删除缓存。
+>
+> **面试官**：为什么是删除缓存，不是更新缓存？
+>
+> 小刘：因为删除比更新简单。
+>
+> 更新缓存需要把新值写入缓存，但如果写入失败，数据就不一致了。
+>
+> 删除缓存的话，缓存没了一定会从数据库读，下次读到的是最新值。
+>
+> **面试官**：先更新数据库再删缓存，如果删缓存失败怎么办？
+>
+> 小刘：两个方案：
+>
+> 一是MQ消息重试。删除失败时发MQ，异步重试删除。
+>
+> 二是延迟双删。更新后延迟N秒再删一次，防止并发读导致的问题。
+>
+> **面试官**：哪些数据不适合放缓存？
+>
+> 小刘：三类数据：
+>
+> 一是频繁变更的数据。缓存命中率低，不如直接读数据库。
+>
+> 二是强一致性要求的数据。比如余额、库存，需要强一致的直接读数据库。
+>
+> 三是数据量特别大的数据。缓存成本高，性价比低。
+>
+> 【面试官手记】
+>
+> 小刘这场面试的亮点：
+>
+> 1. 知道Cache Aside模式
+>
+> 2. 知道为什么是删除缓存不是更新
+>
+> 3. 知道删除失败的处理方案
+>
+> 4. 知道哪些数据不适合缓存
+>
+> 缓存一致性是P6工程师必备技能，能完整回答的候选人，说明有实际项目经验。
+
+缓存一致性的核心是**Cache Aside + 正确处理失败**。记住三个要点：
+
+1. **Cache Aside**：读先查缓存，写先更库再删缓存
+2. **删除失败**：MQ消息重试 + 延迟双删
+3. **一致性级别**：根据业务选择强一致/最终一致
+
+缓存一致性没有银弹，关键是理解每种方案的trade-off。

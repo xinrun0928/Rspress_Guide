@@ -1,0 +1,557 @@
+---
+title: 构造器注入无法解决循环依赖
+description: 从源码层面解析为什么构造器注入会产生循环依赖，Setter 注入和字段注入的区别，以及 @Lazy 和重构的正确解决思路。
+---
+
+# 构造器注入无法解决循环依赖
+
+候选人小马在面试京东 P6 时，面试官问道：
+
+"构造器注入和 Setter 注入有什么区别？"
+
+小马说："都可以注入依赖，构造器注入更推荐，因为可以保证依赖不为 null。"
+
+面试官追问："那为什么说构造器注入无法解决循环依赖？"
+
+小马说："因为构造器是在创建对象时调用的..."
+
+面试官："那你具体说说这个过程，Spring 是在什么时候检测到循环依赖的？"
+
+小马说不清楚了。
+
+【面试官心理】
+这道题我用来测试候选人对 Spring 生命周期和循环依赖检测机制的理解深度。知道"构造器注入不能解决循环依赖"这个结论的人很多，但能说清楚"为什么不能"的人很少。能说清检测时机的，才是真正理解的。
+
+---
+
+## 一、核心问题 🔴
+
+### 1.1 问题拆解
+
+**第一层：基本现象**
+- "构造器注入和 Setter 注入哪个能解决循环依赖？"
+- "构造器注入循环依赖会报什么错？"
+
+**第二层：原理分析**
+- "为什么构造器注入无法解决循环依赖？"
+- "Spring 是在哪个阶段检测到循环依赖的？"
+
+**第三层：源码验证**
+- "构造器注入时，Bean 实例化的流程是什么？"
+- "populateBean 和构造器调用的先后顺序是什么？"
+
+**第四层：解决方案**
+- "如何解决构造器注入的循环依赖？"
+- "@Lazy 是怎么打破构造器注入的循环的？"
+
+### 1.2 ❌ 错误示范
+
+**候选人原话 A**："因为构造器注入的参数在构造时就要确定，所以无法解决循环依赖。"
+
+**问题诊断**：
+- 这个回答本身没错，但太笼统
+- 不理解 Spring 的 Bean 创建流程
+- 不知道 Spring 在什么时候检测循环依赖
+
+**候选人原话 B**："Settera 注入能解决循环依赖是因为属性填充在构造之后。"
+
+**问题诊断**：
+- 知道这个结论，但不知道为什么"属性填充在构造之后"就能解决
+- 不理解三级缓存的前提条件
+
+**候选人原话 C**："构造器注入有循环依赖就用 @Lazy，一劳永逸。"
+
+**问题诊断**：
+- 知道用 @Lazy，但不理解根本原因
+- 把 @Lazy 当成银弹，不推荐真正的重构
+
+### 1.3 标准回答
+
+#### P5 回答：现象描述
+
+构造器注入无法解决循环依赖，而 Setter 注入（@Autowired 打在 setter 方法或字段上）可以解决。
+
+```java
+// ❌ 构造器注入：循环依赖会失败
+@Service
+public class A {
+    private B b;
+    public A(B b) { // 构造器注入
+        this.b = b;
+    }
+}
+
+@Service
+public class B {
+    private A a;
+    public B(A a) { // 构造器注入
+        this.a = a;
+    }
+}
+// Spring 启动时报错：BeanCurrentlyInCreationException
+
+// ✅ Setter 注入：循环依赖可以解决
+@Service
+public class A {
+    private B b;
+    @Autowired
+    public void setB(B b) { // Setter 注入
+        this.b = b;
+    }
+}
+
+@Service
+public class B {
+    private A a;
+    @Autowired
+    public void setA(A a) { // Setter 注入
+        this.a = a;
+    }
+}
+// Spring 正常启动
+```
+
+### 1.4 追问升级
+
+**追问 1：构造器注入的 Bean 创建流程**
+
+这是理解"为什么不能解决循环依赖"的关键：
+
+```java
+// AbstractAutowireCapableBeanFactory.java
+
+// 1. 创建 Bean 实例 —— 构造器在这里被调用
+protected BeanWrapper createBeanInstance(String beanName, RootBeanDefinition mbd, Object[] args) {
+    Constructor<?>[] ctors = determineConstructorsFromBeanPostProcessors(mbd, beanName);
+    if (ctors != null) {
+        // 【关键】使用构造器自动装配
+        // 这里会调用 new A(b)，而 b 还不存在！
+        return autowireConstructor(beanName, mbd, ctors, args);
+    }
+    return instantiateBean(beanName, mbd);
+}
+
+// 2. 属性填充 —— 构造器调用之后才执行这里
+protected void populateBean(String beanName, RootBeanDefinition mbd, BeanWrapper bw) {
+    // 在这里注入 @Autowired 标注的属性
+    // 但构造器注入在步骤1就已经完成了！
+}
+
+// 3. 初始化
+protected Object initializeBean(String beanName, Object bean, RootBeanDefinition mbd) {
+    // @PostConstruct、InitializingBean 等
+}
+```
+
+关键洞察：**构造器注入发生在 `createBeanInstance()` 阶段，而属性填充发生在 `populateBean()` 阶段**。构造器调用时，Bean 甚至还没有被存入三级缓存，怎么可能被提前暴露？
+
+**追问 2：Spring 循环依赖检测时机**
+
+Spring 检测循环依赖有两条路径：
+
+```
+路径一：prototype 作用域（每次都报错）
+位置：AbstractBeanFactory.doGetBean()
+
+if (isPrototypeCurrentlyInCreation(beanName)) {
+    throw new BeanCurrentlyInCreationException(beanName);
+}
+
+路径二：singleton 作用域（通过三级缓存解决，不报错）
+位置：DefaultSingletonBeanRegistry.getSingleton()
+```
+
+对于构造器注入的循环依赖，问题在于：
+
+```
+A 开始创建
+├─ 调用构造器 new A(b)
+│   └─ 构造器需要参数 B
+│       └─ B 还没被创建（正在创建中）
+│           └─ B 开始创建
+│               └─ 调用构造器 new B(a)
+│                   └─ 构造器需要参数 A
+│                       └─ A 还没被创建（正在创建中）—— 循环了！
+│                           └─ 检测到 A 正在创建中
+│                               └─ 抛出 BeanCurrentlyInCreationException
+```
+
+但更准确地说，**构造器注入在调用构造函数时就已经卡住了**，甚至还没到 Spring 检测循环依赖的逻辑，因为 Java 虚拟机在执行 `new A()` 时就需要确定所有构造参数。
+
+```
+构造器注入循环依赖的本质问题：
+不是 Spring 检测到了循环依赖
+而是 Java 虚拟机在执行构造函数时发现：
+  "我正在创建对象 A，对象 A 的构造器需要参数 B"
+  "但对象 B 还没有被创建出来"
+  "而创建 B 又需要对象 A"
+  "死循环了"
+```
+
+**追问 3：Setter 注入是怎么解决循环依赖的？**
+
+这是对比理解的关键：
+
+```java
+// Setter 注入的 Bean 创建流程
+@Service
+public class A {
+    private B b;
+
+    @Autowired
+    public void setB(B b) {
+        this.b = b; // 【关键】setter 注入在构造之后
+    }
+}
+```
+
+```
+A 开始创建
+├─ 调用默认构造函数 new A() —— 此时 B 还没被注入
+├─ A 实例创建成功
+├─ 【存入三级缓存】singletonFactories.put("a", ObjectFactory)
+├─ 【属性填充】
+│   └─ 调用 setB()
+│       └─ 需要注入 B
+│           └─ getBean("b")
+│               ├─ B 不在一级缓存
+│               ├─ B 不在二级缓存
+│               ├─ B 开始创建
+│               │   ├─ 调用默认构造函数 new B() —— 此时 A 还没被注入
+│               │   ├─ 【存入三级缓存】singletonFactories.put("b", ObjectFactory)
+│               │   ├─ 【属性填充】
+│               │   │   └─ 调用 setA()
+│               │   │       └─ 需要注入 A
+│               │   │           └─ getBean("a")
+│               │   │               ├─ 【检测到 "a" 正在创建】
+│               │   │               ├─ 从三级缓存获取 A 的早期引用
+│               │   │               ├─ 存入二级缓存，删除三级缓存
+│               │   │               └─ 返回 A 早期引用给 B
+│               │   └─ B 完成属性填充
+│               └─ 返回 B 给 A
+├─ A 完成属性填充
+├─ A 完成初始化
+└─ A 存入一级缓存
+```
+
+关键区别：**Setter 注入在构造器调用之后才执行**，所以 Bean 可以在不完整的状态下被存入三级缓存，供其他 Bean 使用。
+
+**追问 4：@Lazy 是怎么打破构造器注入的循环的？**
+
+```java
+// 使用 @Lazy 打破构造器循环依赖
+@Service
+public class A {
+    private B b;
+
+    public A(@Lazy B b) { // 【关键】@Lazy 注解
+        this.b = b; // 注入的是一个代理对象，不是真正的 B
+    }
+}
+```
+
+@Lazy 的原理：
+
+```java
+// ContextAnnotationAutowireResolver.java
+public Object resolveLazyDependency(String dependencyType, String dependencyName) {
+    // 如果标注了 @Lazy，返回一个代理对象
+    return buildLazyResolvedDependency(
+        dependencyType, dependencyName,
+        () -> getBean(dependencyType, dependencyName) // 真正的 Bean 在使用时才获取
+    );
+}
+
+// 生成的代理对象
+public class B$$LazyProxy implements B {
+    private B delegate;
+
+    @Override
+    public void method() {
+        if (delegate == null) {
+            // 第一次使用时才真正获取 Bean
+            delegate = getBeanFactory().getBean(B.class);
+        }
+        delegate.method();
+    }
+}
+```
+
+```
+@Lazy 打破循环依赖的流程：
+A 开始创建
+├─ 调用构造器 new A(@Lazy B)
+│   └─ Spring 发现标注了 @Lazy
+│       └─ 注入一个 B 的代理对象（不是真正的 B）
+│           └─ 构造器可以正常执行！
+├─ A 实例创建成功
+├─ A 存入三级缓存
+├─ A 完成属性填充和初始化
+├─ A 存入一级缓存
+└─ A 正常启动
+
+当 A 真正调用 b.method() 时：
+├─ 调用 B 代理对象的 method()
+├─ 代理对象此时才去 getBean("b")
+│   └─ 创建真正的 B
+└─ 返回结果
+```
+
+:::tip 💡
+@Lazy 只能"打破"循环，让程序能正常启动，但并没有解决依赖关系问题。使用 @Lazy 后，A 持有的其实是 B 的代理，第一次调用时才会真正创建 B。如果 B 在创建时也需要 A，同样会有问题（除非 A 也标注了 @Lazy）。
+:::
+
+## 二、延伸问题 🟡
+
+### 2.1 字段注入的本质
+
+很多人以为字段注入（`@Autowired` 直接打在字段上）不需要构造器，所以也能解决循环依赖：
+
+```java
+@Service
+public class A {
+    @Autowired
+    private B b; // 字段注入
+}
+```
+
+但字段注入和 Setter 注入一样，都是在属性填充阶段（`populateBean`）完成的，所以也能解决循环依赖：
+
+```java
+// 字段注入的源码
+// AutowiredAnnotationBeanPostProcessor.postProcessProperties()
+InjectionMetadata metadata = findAutowiringMetadata(bean.getClass());
+metadata.inject(bean, beanName, pvs); // 反射设置字段值
+```
+
+```
+注入顺序：
+1. createBeanInstance() —— 调用构造器，创建实例
+2. populateBean() —— 填充属性（字段注入、Setter 注入都在这里）
+3. initializeBean() —— 初始化
+
+字段注入发生在步骤2，所以可以解决循环依赖。
+```
+
+但字段注入不推荐使用，因为：
+1. 无法在构造时检查依赖是否为 null
+2. 无法设置为 final
+3. 无法通过单元测试直接构造
+4. 违反单一职责原则
+
+### 2.2 构造器注入 vs 静态工厂方法 vs 实例工厂方法
+
+Spring 支持多种 Bean 创建方式，它们的循环依赖行为不同：
+
+```java
+// 静态工厂方法
+@Bean
+public A a() {
+    return new A(b());
+}
+
+// 实例工厂方法
+@Bean
+public A a(B b) { // 构造器注入形式
+    return new A(b);
+}
+
+// 配置类本身
+@Configuration
+public class AppConfig {
+    @Bean
+    public A a() {
+        return new A(b()); // 调用另一个 @Bean 方法
+    }
+}
+```
+
+:::warning ⚠️
+@Configuration 类中的 @Bean 方法调用是一个陷阱！直接调用 `b()` 不会走 Spring 容器，而是直接调用 Java 方法。这意味着：
+1. 不会触发 AOP 代理
+2. 如果有循环依赖，不会被三级缓存解决
+3. 可能会创建多个实例
+
+正确做法是使用 `@Autowired B b` 注入：
+```java
+@Configuration
+public class AppConfig {
+    @Autowired
+    private B b;
+
+    @Bean
+    public A a() {
+        return new A(this.b); // 使用注入的 b
+    }
+}
+```
+:::
+
+### 2.3 循环依赖和多构造器选择
+
+当 Bean 有多个构造器时，Spring 会尝试选择一个合适的构造器：
+
+```java
+@Service
+public class A {
+    private B b;
+    private String name;
+
+    // 构造器1：需要 B（可能触发循环依赖）
+    public A(B b) {
+        this.b = b;
+    }
+
+    // 构造器2：不需要 B（Spring 会优先选择这个来避免循环依赖）
+    public A(String name) {
+        this.name = name;
+    }
+}
+```
+
+Spring 的 `AutowiredAnnotationBeanPostProcessor.determineCandidateConstructors()` 会选择"最合适的"构造器，尽量避免循环依赖。但如果只有一个构造器且需要循环依赖的 Bean，那就无解了。
+
+## 三、生产避坑
+
+### 3.1 构造器注入 + Lombok 的坑
+
+使用 Lombok 的 `@RequiredArgsConstructor` 会生成构造器注入代码，如果存在循环依赖：
+
+```java
+@Service
+@RequiredArgsConstructor // Lombok 自动生成构造器
+public class A {
+    private final B b; // 构造器注入
+}
+
+@Service
+@RequiredArgsConstructor
+public class B {
+    private final A a; // 构造器注入 —— 循环依赖！
+}
+```
+
+Lombok 生成的代码等价于：
+```java
+public A(B b) {
+    this.b = b;
+}
+```
+
+解决方案：
+1. 重构代码，消除循环依赖
+2. 把其中一个改成 Setter 注入（混用注入方式虽然不推荐，但有时是务实的选择）
+3. 使用 `@Lazy`（临时方案）
+
+### 3.2 单元测试中的构造器注入
+
+Spring Boot 2.x 之后推荐使用构造器注入，这给单元测试带来了一些变化：
+
+```java
+@Service
+public class OrderService {
+    private final OrderRepository orderRepository;
+    private final PaymentService paymentService;
+
+    // 构造器注入（Spring Boot 推荐）
+    public OrderService(OrderRepository orderRepository, PaymentService paymentService) {
+        this.orderRepository = orderRepository;
+        this.paymentService = paymentService;
+    }
+}
+```
+
+单元测试：
+```java
+// 以前（字段注入时代）
+@RunWith(MockitoJUnitRunner.class)
+public class OrderServiceTest {
+    @Mock
+    private OrderRepository orderRepository;
+
+    @InjectMocks
+    private OrderService orderService; // Mockito 自动注入
+}
+
+// 现在（构造器注入时代）—— 更简单
+public class OrderServiceTest {
+    private OrderRepository orderRepository = mock(OrderRepository.class);
+    private PaymentService paymentService = mock(PaymentService.class);
+    private OrderService orderService = new OrderService(orderRepository, paymentService);
+}
+```
+
+构造器注入让单元测试更简单，因为可以直接通过构造函数构造，不需要反射或 Mockito 的 @InjectMocks。
+
+## 四、工程选型
+
+### 4.1 注入方式的选择建议
+
+| 场景 | 推荐方式 | 原因 |
+| --- | --- | --- |
+| 核心业务依赖，必需 | 构造器注入 | 保证依赖不为 null，符合 Immutable |
+| 可选依赖 | Setter 注入 | 可以不注入，有默认值 |
+| 配置属性 | @Value | 专门用于配置注入 |
+| 第三方 Bean | @Bean + 参数 | 配置显式 |
+| 测试代码 | 构造器直接构造 | 最简单，不需要 Spring 容器 |
+
+### 4.2 消除循环依赖的正确方式
+
+使用 @Lazy 只是"打补丁"，正确的做法是消除循环依赖：
+
+**方式一：重构为单向依赖**
+```java
+// 之前：循环依赖
+A → B → A
+
+// 重构后：引入中间层 C
+A → C ← B
+```
+
+**方式二：使用事件机制**
+```java
+@Service
+public class A {
+    @Autowired
+    private ApplicationEventPublisher publisher;
+
+    public void doSomething() {
+        publisher.publishEvent(new SomethingHappenedEvent());
+    }
+
+    @EventListener
+    public void handleEvent(AnotherEvent event) {
+        // 响应 B 发来的事件
+    }
+}
+```
+
+**方式三：提取公共依赖到新 Bean**
+```java
+// 之前：A 和 B 都依赖对方的状态
+// 重构后：提取公共状态到 Context
+@Service
+public class Context {
+    private Map<String, Object> sharedState = new ConcurrentHashMap<>();
+}
+
+@Service
+public class A {
+    private final Context context; // 不再依赖 B
+}
+
+@Service
+public class B {
+    private final Context context; // 不再依赖 A
+}
+```
+
+## 五、面试总结
+
+构造器注入无法解决循环依赖，这个问题的本质在于：**构造器调用发生在 Bean 创建的最早阶段，早于三级缓存的介入**。
+
+P5 候选人能说出"构造器注入在创建时就需要参数，而参数 Bean 还没创建"。
+P6 候选人能画出完整的时序图，说清构造器调用和属性填充的先后顺序。
+P7 候选人能说出 Java 构造函数在执行时就需要所有参数这个根本原因，能说清 @Lazy 打破循环的原理（注入代理对象），能给出重构消除循环依赖的方案。
+
+记住，面试官追问"为什么"，不是想听结论，而是想听你能不能把这个"为什么"的链条串起来。

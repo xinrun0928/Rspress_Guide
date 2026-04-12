@@ -1,0 +1,306 @@
+---
+title: Condition 条件队列
+description: 从 await/signal 机制出发，深入剖析 Condition 的实现：AQS 条件队列与 CLH 队列的分离、单条件 vs 多条件、signal vs signalAll 的区别，以及生产场景下的精确唤醒模式。
+---
+
+# Condition 条件队列
+
+候选人小林在面试京东 P6 时，面试官问道：
+
+"synchronized 有 wait/notify，ReentrantLock 的 Condition 有什么优势？"
+
+小林说："Condition 可以创建多个..."面试官追问："Condition 和 wait/notify 的底层实现有什么区别？signal 和 signalAll 什么时候用？"
+
+小林答不上来了...
+
+## 一、核心问题：Condition 原理 🔴
+
+### 1.1 问题拆解
+
+```
+第一层：优势对比（为什么需要？）
+  "Condition 相比 Object.wait/notify 有什么优势？"
+  考察点：多条件队列、精确唤醒、公平锁支持
+
+第二层：底层实现（怎么做到？）
+  "Condition 的 await/signal 底层是怎么实现的？"
+  考察点：Condition 队列与 CLH 队列的转换
+
+第三层：signal vs signalAll（怎么选？）
+  "什么时候用 signal？什么时候用 signalAll？"
+  考察点：惊群效应、精确唤醒、生产陷阱
+
+第四层：多条件场景（怎么用？）
+  "BoundedBuffer 如何用多个 Condition 实现精确的生产者-消费者？"
+  考察点：单条件 vs 多条件的设计差异
+```
+
+### 1.2 ❌ 错误示范
+
+**候选人原话 A**："Condition 比 wait/notify 快，所以应该总用 Condition。"
+
+**问题诊断**：两者在性能上差异很小（都依赖 LockSupport.park/unpark）。Condition 的优势在于功能（多条件队列、精确唤醒），不在于性能。
+
+**候选人原话 B**："signalAll 比 signal 更安全，应该总用 signalAll。"
+
+**问题诊断**：signalAll 有惊群效应——所有等待线程被唤醒后竞争锁，大量线程竞争失败后再次等待，造成不必要的上下文切换。应该根据条件语义选择。
+
+### 1.3 标准回答
+
+#### P5 级别：功能优势
+
+> **Object.wait/notify 的局限**：
+>
+> 每个 Object 只有一个 Wait Set，无法区分不同条件。生产者-消费者场景下，"队列不满"和"队列不空"是两种不同的等待条件：
+>
+> ```java
+> // 用 Object.wait/notify 实现（单条件，效率低）
+> synchronized (buffer) {
+>     while (buffer.isFull()) {
+>         buffer.wait();  // 所有等待线程都醒了，包括消费者
+>     }
+>     buffer.add(item);
+>     buffer.notifyAll();  // 唤醒所有（惊群）
+> }
+>
+> synchronized (buffer) {
+>     while (buffer.isEmpty()) {
+>         buffer.wait();  // 所有等待线程都醒了，包括生产者
+>     }
+>     buffer.remove();
+>     buffer.notifyAll();  // 唤醒所有（惊群）
+> }
+> ```
+>
+> **Condition 的解决方案**：
+>
+> ```java
+> ReentrantLock lock = new ReentrantLock();
+> Condition notFull = lock.newCondition();   // 队列不满
+> Condition notEmpty = lock.newCondition();  // 队列不空
+>
+> // 生产者
+> lock.lock();
+> try {
+>     while (buffer.isFull()) {
+>         notFull.await();  // 只在"队列不满"条件上等待
+>     }
+>     buffer.add(item);
+>     notEmpty.signal();   // 只唤醒消费者（精确唤醒）
+> } finally {
+>     lock.unlock();
+> }
+>
+> // 消费者
+> lock.lock();
+> try {
+>     while (buffer.isEmpty()) {
+>         notEmpty.await();  // 只在"队列不空"条件上等待
+>     }
+>     buffer.remove();
+>     notFull.signal();     // 只唤醒生产者（精确唤醒）
+> } finally {
+>     lock.unlock();
+> }
+> ```
+
+#### P6 级别：底层实现
+
+> **Condition 队列的数据结构**：
+>
+> ```java
+> public class ConditionObject implements Condition {
+>     // 条件队列：单向链表（FIFO）
+>     private transient Node firstWaiter;
+>     private transient Node lastWaiter;
+>
+>     // await()：将线程加入条件队列，并释放锁
+>     public final void await() throws InterruptedException {
+>         if (Thread.interrupted()) throw new InterruptedException();
+>
+>         // 1. 创建 Node，加入条件队列
+>         Node node = addConditionWaiter();
+>
+>         // 2. 释放已持有的锁（完全释放，支持可重入）
+>         int savedState = fullyRelease(node);
+>
+>         // 3. park 挂起
+>         while (!isOnSyncQueue(node)) {  // 等待被 signal 移到 CLH 队列
+>             LockSupport.park(this);
+>         }
+>
+>         // 4. 被唤醒后，重新获取锁
+>         if (acquireQueued(node, savedState)) {
+>             selfInterrupt();
+>         }
+>     }
+>
+>     // signal()：将条件队列头部移到 CLH 队列
+>     public final void signal() {
+>         if (!isHeldExclusively())  // 检查是否持有独占锁
+>             throw new IllegalMonitorStateException();
+>
+>         Node first = firstWaiter;
+>         if (first != null) {
+>             doSignal(first);  // 移动第一个等待者
+>         }
+>     }
+> }
+> ```
+>
+> **await() 和 signal() 的协作流程**：
+>
+> ```mermaid
+> graph TD
+>     A[await: 线程加入 Condition 队列] --> B[释放锁, park 挂起]
+>     B --> C[等待 signal]
+>     C --> D[signal: 移动节点到 CLH 队列]
+>     D --> E[unpark, 重新竞争锁]
+>     E --> F[acquireQueued: 获取锁成功]
+> ```
+>
+> **Condition 队列与 CLH 队列的转换**：
+>
+> - Condition 队列：**单向链表**，存储在 await 状态下的线程
+> - CLH 队列：**双向链表**，存储在竞争锁状态下的线程
+>
+> signal() 将节点从 Condition 队列**移动**到 CLH 队列（不是复制）。这个"移动"过程是原子的，通过 CAS 保证。
+
+#### P7 级别：signalAll 与多 Condition 设计
+
+> **signal vs signalAll 的选择**：
+>
+> | 方法 | 适用场景 | 代价 |
+> | --- | --- | --- |
+> | signal() | 只有一个等待线程需要被唤醒（确定只有一个线程的条件满足） | 低 |
+> | signalAll() | 不确定哪个线程的条件满足，或所有等待线程都需要重新检查条件 | 高（惊群效应） |
+>
+> **signalAll 的惊群效应**：
+>
+> ```java
+> // 错误场景：只唤醒一个线程就够了，但用了 signalAll
+> // 场景：bounded buffer，两个消费者都在等待"队列不空"
+> // 只放入了 1 个 item
+> notEmpty.signalAll();  // 两个消费者都被唤醒
+>
+> // 消费者 1: 拿到 item，signal 生产者，释放锁
+> // 消费者 2: 发现自己队列空了（item 已被拿走），再次 await
+> // 浪费了：消费者 2 的竞争 + 上下文切换
+> ```
+>
+> **正确的 signalAll 使用**：
+>
+> 当多个线程等待同一条件，但**条件满足时所有等待线程都需要被唤醒**的场景：
+>
+> ```java
+> // 场景：Barrier，所有线程到达后全部被唤醒
+> lock.lock();
+> try {
+>     count++;
+>     if (count == parties) {
+>         count = 0;
+>         generation++;
+>         notFull.signalAll();  // 所有等待的线程都需要被唤醒
+>     } else {
+>         while (count < parties) {
+>             notFull.await();
+>         }
+>     }
+> } finally { lock.unlock(); }
+> ```
+
+【面试官心理】
+这道题我能问到 P7 级别，是因为 Condition 的实现涉及了 AQS 队列模型、await/signal 的协作流程、多条件设计等多个层次。能说出 Condition 队列和 CLH 队列转换关系的候选人说明他真正理解了 AQS 的设计。能正确使用 signal vs signalAll 的候选人说明他有工程判断力。
+
+### 1.4 追问升级
+
+**追问 1：await() 被中断后会怎样？**
+
+> `await()` 响应中断，会抛出 `InterruptedException`。如果需要在 await 期间忽略中断，使用 `awaitUninterruptibly()`。
+
+**追问 2：为什么 Condition 要用单向链表而不是双向链表？**
+
+> 因为 Condition 队列只需要在队尾添加（FIFO），不需要反向遍历。在 signal 时，将头节点移到 CLH 队列即可。单向链表更简洁、内存开销更小。
+
+## 二、生产者-消费者实现 🟡
+
+### 2.1 BoundedBuffer 的 Condition 实现
+
+```java
+class BoundedBuffer<E> {
+>     final Object[] items;
+>     final ReentrantLock lock = new ReentrantLock();
+>     Condition notFull = lock.newCondition();
+>     Condition notEmpty = lock.newCondition();
+>     int putptr, takeptr, count;
+>
+>     public void put(E x) throws InterruptedException {
+>         lock.lockInterruptibly();
+>         try {
+>             while (count == items.length)
+>                 notFull.await();  // 等待队列不满
+>             items[putptr] = x;
+>             if (++putptr == items.length) putptr = 0;
+>             ++count;
+>             notEmpty.signal();  // 唤醒一个消费者
+>         } finally {
+>             lock.unlock();
+>         }
+>     }
+>
+>     public E take() throws InterruptedException {
+>         lock.lockInterruptibly();
+>         try {
+>             while (count == 0)
+>                 notEmpty.await();  // 等待队列不空
+>             E x = items[takeptr];
+>             if (++takeptr == items.length) takeptr = 0;
+>             --count;
+>             notFull.signal();  // 唤醒一个生产者
+>             return x;
+>         } finally {
+>             lock.unlock();
+>         }
+>     }
+}
+```
+
+## 三、生产避坑
+
+### 3.1 signal 在 await 之前调用
+
+```java
+// 错误：signal 在 await 之前，线程永远等待
+if (condition) {
+    notFull.signal();  // 发送信号
+}
+notFull.await();  // 但线程还没有进入 await！
+```
+
+**问题**：signal() 只唤醒已经在 Condition 队列中等待的线程。如果 signal() 时线程还没有 await，signal 就丢失了。
+
+**解决**：在 await() 前检查条件，或使用 `signalAll()` + 循环检查。
+
+### 3.2 虚假唤醒（Spurious Wakeup）
+
+JDK 的 Condition 实现可能产生**虚假唤醒**——线程在没有收到 signal 的情况下被唤醒。虽然 HotSpot 实现中虚假唤醒极为罕见，但规范要求使用 while 循环而非 if：
+
+```java
+// ✅ 正确
+while (count == 0) {
+    notEmpty.await();
+}
+
+// ❌ 错误
+if (count == 0) {
+    notEmpty.await();  // 可能虚假唤醒后继续执行，导致 count=0 时访问
+}
+```
+
+:::tip 💡
+面试加分点：能说出"JDK 的 Condition 实现使用 `LockSupport.parkNanos(this, nanosTimeout)` 支持超时等待（`awaitNanos`），超时后线程自动从 Condition 队列移到 CLH 队列"，说明他对超时机制有了解。
+:::
+
+:::warning ⚠️
+面试陷阱：被问到"一个 Condition 可以被多个线程同时 signal 吗"，很多人会说"不能"。准确答案是：可以，但实际意义不大——因为 signal() 只唤醒队列头节点，多次 signal 只会唤醒同一个节点（如果第一次 signal 时该节点已在 CLH 队列中，第二次 signal 会直接跳过）。
+:::

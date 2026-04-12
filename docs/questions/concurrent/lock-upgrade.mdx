@@ -1,0 +1,210 @@
+---
+title: synchronized 锁升级过程
+description: 深入剖析 synchronized 的锁升级机制：偏向锁 → 轻量锁 → 重量锁的完整流程、触发条件、Mark Word 状态变化，以及 JDK 15 废弃偏向锁背后的工程权衡。
+---
+
+# synchronized 锁升级过程
+
+候选人小吴在面试蚂蚁 P7 时，面试官看了一眼简历上写的"精通 JVM"，问道：
+
+"你了解 synchronized 的锁升级过程吗？"
+
+小吴说："有偏向锁、轻量锁、重量锁..."面试官追问："具体什么情况下会触发偏向锁撤销？撤销过程中 VM 做了什么？"
+
+小吴开始支支吾吾。面试官继续："轻量锁膨胀为重量锁的临界点是什么？自旋次数是怎么动态调整的？"
+
+小吴答不上来了...
+
+## 一、核心问题：锁升级机制 🔴
+
+### 1.1 问题拆解
+
+```
+第一层：四种锁状态（有哪些？）
+  "synchronized 有哪几种锁状态？它们分别是什么含义？"
+  考察点：偏向锁、轻量锁、重量锁、无锁，以及 Mark Word 的对应表示
+
+第二层：升级条件（何时升级？）
+  "锁从偏向锁升级到轻量锁，再升级到重量锁的触发条件是什么？"
+  考察点：是否理解每种锁的适用场景和 JVM 的自适应策略
+
+第三层：Mark Word 变化（怎么表示？）
+  "每种锁状态下，Mark Word 的内容是什么？"
+  考察点：64位 JVM 的 bit 布局、不同状态下的数据覆盖
+
+第四层：撤销与膨胀（怎么做？）
+  "偏向锁撤销的具体过程是什么？轻量锁膨胀的触发条件？"
+  考察点：安全点、ObjectMonitor、ParkEvent
+```
+
+### 1.2 ❌ 错误示范
+
+**候选人原话 A**："偏向锁是最快的锁，所以应该一直用偏向锁。"
+
+**问题诊断**：偏向锁在无竞争时最快，但在有竞争时撤销成本极高（需要 Stop-The-World）。在现代高并发服务中，竞争是常态，偏向锁的优势反而成为劣势。这也是 JDK 15+ 废弃偏向锁的原因。
+
+**候选人原话 B**："锁升级是不可逆的，锁降级也是可以的。"
+
+**问题诊断**：前半句对，后半句错。锁只能升级不能降级，这是 HotSpot 的设计决策。
+
+### 1.3 标准回答
+
+#### P5 级别：四种锁状态
+
+> **synchronized 的四种锁状态**（由轻到重）：
+>
+> 1. **无锁（Unlocked）**：对象未被锁定，Mark Word 存储对象的 hashCode、分代年龄
+> 2. **偏向锁（Biased Locking）**：Mark Word 存储偏向线程ID，无竞争时无额外开销
+> 3. **轻量锁（Thin Locking）**：Mark Word 存储指向线程栈中 Lock Record 的指针，轻度竞争时 CAS 自旋
+> 4. **重量锁（Fat Locking）**：Mark Word 存储指向 ObjectMonitor 的指针，竞争激烈时使用内核互斥锁
+>
+> **升级时机**：
+> - 程序启动后，默认延迟 4 秒开启偏向锁（`-XX:BiasedLockingStartupDelay=4`）
+> - 无竞争 → 偏向锁
+> - 偏向锁被竞争 → 撤销偏向锁，膨胀为轻量锁
+> - 轻量锁竞争失败（自旋超过阈值）→ 膨胀为重量锁
+
+#### P6 级别：完整升级流程
+
+> **1. 偏向锁获取**：
+>
+> 当一个线程首次进入同步块时，JVM 检查 Mark Word：
+>
+> ```cpp
+> // 偏向锁获取（HotSpot C2 编译器）
+> if (mark->is_biased() && mark->bias_epoch() == klass->prototype_bias_epoch()) {
+>     // 对象处于可偏向状态
+>     if (current->equals(mark->biased_locker())) {
+>         // 重入：无需任何操作，最快路径
+>     } else {
+>         // 尝试 CAS 偏向当前线程
+>         if (mark->cas_bias(current, mark->age(), mark->identity_hash_code())) {
+>             // 偏向成功，进入同步块
+>         }
+>     }
+> } else {
+>     // 不可偏向（epoch 过期/不允许偏向），走轻量锁路径
+> }
+> ```
+>
+> **2. 偏向锁撤销**：
+>
+> 当其他线程尝试获取已被偏向的锁时：
+>
+> - 如果偏向线程不在同步块中（`bias_epoch` 过期）：撤销偏向，设置为无锁状态，偏向线程下次进入时重新偏向
+> - 如果偏向线程在同步块中：膨胀为轻量锁，原偏向线程继续执行
+>
+> 撤销过程需要在**安全点（Safepoint）**进行——JVM 停止所有 Java 线程，遍历它们的栈，找到正在执行的偏向锁对象并修改对象头。这个过程有 **20~100ms** 的 Stop-The-World 开销。
+>
+> **3. 轻量锁获取**：
+>
+> 当线程进入同步块但对象处于无锁或偏向锁状态（不适合偏向）时：
+>
+> ```cpp
+> // 轻量锁获取
+> // 1. 在当前线程栈帧中创建 Lock Record
+> // 2. 将 Mark Word 复制到 Lock Record（displaced header）
+> // 3. CAS 尝试将 Mark Word 替换为指向 Lock Record 的指针
+> if (object_mark_word()->cas_set(
+>         (markOop) lock_record_addr,
+>         (markOop) mark_word) == 0) {
+>     // CAS 成功，当前线程获得轻量锁
+>     // mark_word 仍保存在栈帧的 Lock Record 中
+> }
+> ```
+>
+> **4. 轻量锁膨胀为重量锁**：
+>
+> 当自旋超过阈值（自适应调整，通常 10 次左右）或自旋线程数过多时：
+>
+> - 在 heap 中分配 ObjectMonitor 对象
+> - 将 Mark Word 替换为指向 ObjectMonitor 的指针
+> - 将之前 CAS 失败的线程移到 ObjectMonitor 的 EntryList
+> - 调用 `park()` 挂起这些线程
+
+#### P7 级别：自适应策略与工程权衡
+
+> **自适应自旋（Adaptive Spinning）**：
+>
+> JDK 6 引入的自旋次数不是固定的，而是根据以下因素动态调整：
+>
+> - **上次自旋成功率**：上次在持有锁期间成功自旋获取到锁，说明当前环境适合自旋，增加本次自旋次数
+> - **持有锁的线程状态**：如果持有锁的线程正在运行（未 park），说明临界区执行时间较长，减少自旋次数
+> - **当前 CPU 数量**：CPU 越多，自旋浪费的 CPU 资源越不可接受
+>
+> ```cpp
+> // 伪代码
+> int max_spins = (current_thread_count == 1) ? 8 : 2;
+> if (lock_owner.is_running()) max_spins /= 2;
+> if (recent_success_rate > 0.8) max_spins *= 2;
+> ```
+>
+> **JDK 15+ 废弃偏向锁的原因**：
+>
+> 1. **高竞争场景下撤销成本高**：大量线程竞争同一个锁时，偏向锁撤销触发 Stop-The-World
+> 2. **安全点开销**：偏向锁撤销必须在安全点进行，增加了 GC 的复杂性
+> 3. **现代服务特征**：云原生和容器化环境中，无竞争场景少，高并发是常态
+> 4. **JIT 编译复杂性**：偏向锁和 JIT 优化之间的交互是调试噩梦
+>
+> JDK 15 将偏向锁标记为 `@Deprecated`，JDK 18 完全移除。
+
+【面试官心理】
+这道题我能问到 P7 级别，是因为锁升级机制涉及 JVM 底层设计、Mark Word 数据结构、GC 安全点机制等多个维度。我最想听到的是候选人不仅知道"是什么"，还能说出"为什么这样设计"和"什么情况下会出问题"。能提到 JDK 15 废弃偏向锁的候选人，说明他有技术演进的跟进意识。
+
+### 1.4 追问升级
+
+**追问 1：轻量锁和重量锁的等待队列有什么区别？**
+
+> - **轻量锁**：使用 CAS 自旋，不涉及等待队列。线程在用户态不断重试，不切换到内核态（只要自旋就能成功）
+> - **重量锁**：使用 ObjectMonitor 的 EntryList（双向链表），线程通过 `ParkEvent` 挂起进入内核等待队列，需要用户态/内核态切换
+>
+> 轻量锁的自旋是在**用户态**完成，代价是浪费 CPU 周期；重量锁的等待是**内核态**挂起，不消耗 CPU，但有线程唤醒的延迟。
+
+**追问 2：Lock Record 和 ObjectMonitor 的关系是什么？**
+
+> **Lock Record** 是线程栈帧上的数据结构（轻量锁独有），存储了原始 Mark Word 的拷贝。
+>
+> **ObjectMonitor** 是堆中的对象（重量锁独有），包含 owner、EntryList、WaitSet。
+>
+> 两者在轻量锁膨胀为重量锁时产生联系：Lock Record 中的 displaced header 被复制到 ObjectMonitor 的 `_header` 中。
+
+## 二、Mark Word 详细布局 🟡
+
+### 2.1 64位 JVM 的 bit 分布
+
+> ```mermaid
+> graph TD
+>     A[64 bits Mark Word] --> B{锁状态}
+>
+>     B -->|无锁 01| C1[25bits hashcode<br/>4bits GC age<br/>1bit 偏向<br/>2bits lock=01]
+>     B -->|偏向锁 101| C2[54bits thread ID<br/>2bits epoch<br/>1bit 偏向<br/>2bits lock=101]
+>     B -->|轻量锁 00| C3[62bits ptr to<br/>Lock Record<br/>2bits lock=00]
+>     B -->|重量锁 10| C4[62bits ptr to<br/>ObjectMonitor<br/>2bits lock=10]
+>     B -->|GC 标记 11| C5[30bits 无数据<br/>2bits lock=11]
+> ```
+>
+> **一个关键细节**：hashcode 字段和偏向锁/轻量锁字段是**重叠复用**的。如果对象被用作偏向锁，其 hashcode 字段被覆盖（因为此时对象已被使用，hashcode 应已在第一次调用 `Object.hashCode()` 时确定）。这意味着**一旦对象计算过 hashcode，就不能进入偏向锁状态**。
+
+## 三、生产避坑
+
+### 3.1 启动延迟导致的偏向锁失效
+
+**场景**：Java 服务启动时，前 4 秒内创建的对象在高并发下无法使用偏向锁（因为偏向锁延迟开启），导致大量轻量锁膨胀为重量锁，CPU 使用率飙升。
+
+**根因**：`-XX:BiasedLockingStartupDelay=4` 的默认设置与服务启动后立即高并发的场景冲突。
+
+**解决**：
+- 如果服务启动后立即高并发，使用 `-XX:BiasedLockingStartupDelay=0`
+- 或使用 `-XX:-UseBiasedLocking` 完全禁用偏向锁
+
+### 3.2 偏向锁与 JFR/JitWatch 的监控冲突
+
+某些性能监控工具（JFR、JitWatch）会读取对象的 hashCode 或调用 `System.identityHashCode()`，这会导致这些对象无法进入偏向锁状态，在高并发场景下性能退化。
+
+:::tip 💡
+面试加分点：能说出"轻量锁的 CAS 操作发生在对象头和线程栈之间，不是和主内存"，并解释为什么这样设计（减少跨核通信）——这说明你理解了 CPU 缓存层次结构和锁优化的本质。
+:::
+
+:::warning ⚠️
+面试陷阱：被问到"一个对象有 hashCode 后还能加偏向锁吗"，很多人会说"能"。错！对象的 hashCode 存储在 Mark Word 中，与偏向锁字段重叠。如果调用过 hashCode，Mark Word 中已存储了 hashCode 数据，无法同时存储偏向线程信息，所以该对象无法偏向。
+:::

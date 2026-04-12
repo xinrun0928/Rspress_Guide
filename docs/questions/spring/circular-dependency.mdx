@@ -1,0 +1,633 @@
+---
+title: 循环依赖与三级缓存
+description: 从源码层面深度剖析 Spring 如何通过三级缓存解决循环依赖问题，解释为什么构造器注入无法解决循环依赖，以及各种失效场景。
+---
+
+# 循环依赖与三级缓存
+
+候选人小孙在面试快手 P6 时，面试官问道：
+
+"Spring 是怎么解决循环依赖的？"
+
+小孙说："用三级缓存。"
+
+面试官追问："三级缓存分别存什么？第二级和第三级什么时候会用到？"
+
+小孙说："呃...好像都是存 Bean 的..."
+
+面试官："那为什么需要三级？两级不够吗？"
+
+小孙彻底卡住。
+
+【面试官心理】
+这道题我用来筛选真正研究过 Spring 源码的候选人。三级缓存是 Spring 源码中最难理解的机制之一。知道"三级缓存"这个名词的人很多，但能说清楚每级缓存存什么、怎么配合的，十个里面不超过两个。
+
+---
+
+## 一、核心问题 🔴
+
+### 1.1 问题拆解
+
+**第一层：概念**
+- "什么是循环依赖？举一个例子。"
+- "Spring 中哪些注入方式可以解决循环依赖？哪些不能？"
+
+**第二层：三级缓存机制**
+- "Spring 的三级缓存分别是什么？"
+- "第二级缓存和第三级缓存什么时候会被用到？"
+
+**第三层：源码流程**
+- "从 getBean 到返回 Bean，循环依赖是怎么被解决的？"
+- "为什么需要提前暴露 Bean 引用？"
+
+**第四层：边界情况**
+- "构造器注入的循环依赖能被解决吗？为什么？"
+- "prototype 作用域的 Bean 循环依赖怎么处理？"
+
+### 1.2 ❌ 错误示范
+
+**候选人原话 A**："循环依赖就是 A 依赖 B、B 依赖 A，Spring 用三级缓存来解决。"
+
+**问题诊断**：
+- 知道循环依赖是什么，但完全不理解三级缓存
+- 说明只是看过博客，没有看源码
+- 追问任何细节都会崩
+
+**候选人原话 B**："三级缓存分别是 earlySingletonObjects、singletonFactories、singletonObjects。"
+
+**问题诊断**：
+- 知道三级缓存的名字，但不知道每级存什么、怎么配合
+- 不知道 singletonFactories 存的是 ObjectFactory
+- 说不清 earlySingletonObjects 和 singletonObjects 的区别
+
+**候选人原话 C**："所有循环依赖都能被 Spring 解决。"
+
+**问题诊断**：
+- 这是完全错误的
+- 构造器注入的循环依赖无法解决
+- prototype 作用域的 Bean 循环依赖也无法解决
+
+### 1.3 标准回答
+
+#### P5 回答：什么是循环依赖
+
+**循环依赖**指两个或多个 Bean 相互依赖，形成闭环：
+
+```java
+@Service
+public class A {
+    @Autowired
+    private B b; // A 依赖 B
+}
+
+@Service
+public class B {
+    @Autowired
+    private A a; // B 依赖 A —— 循环依赖！
+}
+```
+
+Spring 中三种注入方式对循环依赖的支持情况：
+
+| 注入方式 | 是否能解决循环依赖 | 原因 |
+| --- | --- | --- |
+| **Setter 注入（@Autowired）** | ✅ 能解决 | 实例化完成后才注入依赖 |
+| **构造器注入** | ❌ 不能解决 | 必须在构造函数中完成注入 |
+| **字段注入（@Autowired 直接打在字段上）** | ✅ 能解决（本质上同 setter） | 但不推荐使用 |
+
+### 1.4 追问升级
+
+**追问 1：三级缓存详解**
+
+这是这道题的核心，必须能说清楚：
+
+Spring 的三级缓存定义在 `DefaultSingletonBeanRegistry` 中：
+
+```java
+// DefaultSingletonBeanRegistry.java
+public class DefaultSingletonBeanRegistry extends SimpleAliasRegistry {
+
+    /** 一级缓存：完整的 Bean（已初始化） */
+    private final Map<String, Object> singletonObjects = new ConcurrentHashMap<>(256);
+
+    /** 二级缓存：提前暴露的 Bean（未完成属性填充） */
+    private final Map<String, Object> earlySingletonObjects = new ConcurrentHashMap<>(16);
+
+    /** 三级缓存：Bean 工厂（用于创建早期引用） */
+    private final Map<String, ObjectFactory<?>> singletonFactories = new ConcurrentHashMap<>(16);
+
+    // ... 其他代码
+}
+```
+
+三级缓存的作用：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     一级缓存：singletonObjects             │
+│   key: beanName → value: 完全初始化好的 Bean                │
+│   什么时候用：getBean() 直接返回这里                        │
+│   状态：已完成实例化、属性填充、初始化                        │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│                     二级缓存：earlySingletonObjects         │
+│   key: beanName → value: 提前暴露的 Bean 引用                │
+│   什么时候用：二级缓存查不到时，从三级拿到工厂后创建并放入这里│
+│   状态：已完成实例化，但未完成属性填充和初始化                │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│                     三级缓存：singletonFactories             │
+│   key: beanName → value: ObjectFactory（Bean 创建工厂）     │
+│   什么时候用：创建单例 Bean 时存入，查询时取出后创建早期引用  │
+│   作用：解决循环依赖 + 支持 AOP 代理                        │
+└─────────────────────────────────────────────────────────────┘
+```
+
+为什么需要三级缓存而不是两级？
+
+```
+假设只有两级缓存（一级 + 二级）：
+
+1. A 开始创建，需要注入 B
+2. A 创建了实例，存入二级缓存
+3. A 去获取 B，B 需要注入 A
+4. B 从二级缓存获取 A → 但 A 此时还没完成初始化！
+
+所以需要三级缓存：
+- 三级缓存存的是 ObjectFactory，可以控制什么时候创建早期引用
+- 通过 ObjectFactory，可以在获取早期引用时决定是否需要创建代理
+- 放入二级缓存后，三级缓存中的 ObjectFactory 就可以删除了
+```
+
+**追问 2：完整源码流程（A → B → A 循环依赖）**
+
+这是理解三级缓存的关键，用代码说话：
+
+```java
+// AbstractBeanFactory.java - getBean 入口
+protected <T> T doGetBean(String name, Class<T> requiredType, Object[] args, boolean typeCheckOnly) {
+    String beanName = transformedBeanName(name);
+    Object bean;
+
+    // 1. 先从一级缓存获取（普通获取流程）
+    Object sharedInstance = getSingleton(beanName);
+    if (sharedInstance != null) {
+        return getObjectForBeanInstance(sharedInstance, name, beanName, null);
+    }
+
+    // 2. 无法从一级缓存获取，说明这个 Bean 正在创建中（可能是循环依赖）
+    // 如果原型 Bean 正在创建，说明有循环依赖
+    if (isPrototypeCurrentlyInCreation(beanName)) {
+        throw new BeanCurrentlyInCreationException(beanName);
+    }
+
+    // 3. 开始创建 Bean
+    if (mbd.isSingleton()) {
+        sharedInstance = getSingleton(beanName, () -> {
+            return createBean(beanName, mbd, args);
+        });
+    }
+
+    return bean;
+}
+
+// DefaultSingletonBeanRegistry.java - 关键方法
+public Object getSingleton(String beanName, ObjectFactory<?> singletonFactory) {
+    synchronized (this.singletonObjects) {
+        // 1. 先查一级缓存
+        Object singletonObject = this.singletonObjects.get(beanName);
+        if (singletonObject != null) {
+            return singletonObject;
+        }
+
+        // 2. 正常创建 Bean
+        // 会在 createBean 时检测到循环依赖并提前暴露
+        singletonObject = singletonFactory.getObject();
+
+        // 3. 创建完成后存入一级缓存，删除二三级缓存
+        addSingleton(beanName, singletonObject);
+        return singletonObject;
+    }
+}
+```
+
+核心在 `createBean` 方法中暴露早期引用：
+
+```java
+// AbstractAutowireCapableBeanFactory.java
+protected Object createBean(String beanName, RootBeanDefinition mbd, Object[] args) {
+    // 1. 实例化 Bean（调用构造函数）
+    Object beanInstance = createBeanInstance(beanName, mbd, args);
+
+    // 2. 【关键】提前暴露早期引用（解决循环依赖）
+    // 将 ObjectFactory 放入三级缓存
+    // 这样当 B 需要 A 时，可以从三级缓存获取 A 的早期引用
+    boolean earlySingletonExposure = mbd.isSingleton()
+            && this.allowCircularReferences
+            && isSingletonCurrentlyInCreation(beanName);
+
+    if (earlySingletonExposure) {
+        // addSingletonFactory 将 ObjectFactory 放入三级缓存
+        // ObjectFactory.getObject() 会调用 getEarlyBeanReference
+        addSingletonFactory(beanName, () -> getEarlyBeanReference(beanName, mbd, beanInstance));
+    }
+
+    // 3. 属性填充（populateBean）
+    // 这里会触发 @Autowired，从而触发 B 的创建
+    populateBean(beanName, mbd, beanInstance);
+
+    // 4. 初始化
+    beanInstance = initializeBean(beanName, beanInstance, mbd);
+
+    return beanInstance;
+}
+
+// DefaultSingletonBeanRegistry.java
+public void addSingletonFactory(String beanName, ObjectFactory<?> singletonFactory) {
+    synchronized (this.singletonObjects) {
+        // 只有一级缓存没有这个 Bean 时，才放入三级缓存
+        if (!this.singletonObjects.containsKey(beanName)) {
+            this.singletonFactories.put(beanName, singletonFactory);
+        }
+    }
+}
+```
+
+现在看 `getEarlyBeanReference` 如何处理循环依赖：
+
+```java
+// AbstractAutowireCapableBeanFactory.java
+protected Object getEarlyBeanReference(String beanName, RootBeanDefinition mbd, Object bean) {
+    Object exposedObject = bean;
+    // 【关键】如果存在针对这个 Bean 的 BeanPostProcessor
+    // 会调用 postProcessEarlyInstantiation
+    // AspectJAwareAdvisorAutoProxyCreator 在这里决定是否创建 AOP 代理
+    if (!mbd.isSynthetic() && hasInstantiationAwareBeanPostProcessors()) {
+        for (BeanPostProcessor bp : getBeanPostProcessors()) {
+            if (bp instanceof SmartInstantiationAwareBeanPostProcessor) {
+                SmartInstantiationAwareBeanPostProcessor ibp =
+                    (SmartInstantiationAwareBeanPostProcessor) bp;
+                exposedObject = ibp.getEarlyBeanReference(exposedObject, beanName);
+            }
+        }
+    }
+    return exposedObject;
+}
+```
+
+A → B → A 循环依赖的完整流程：
+
+```
+时间线：
+T1: getBean("a")
+    ├─ 一级缓存没有，标记 "a" 正在创建
+    ├─ createBean("a")
+    │   ├─ 实例化 A（调用构造函数，B 还未注入）
+    │   ├─ 【存入三级缓存】singletonFactories.put("a", ObjectFactory)
+    │   └─ populateBean("a")
+    │       └─ 注入 @Autowired B
+    │           └─ getBean("b") → 进入 T2
+    │
+T2: getBean("b")
+    ├─ 一级缓存没有，标记 "b" 正在创建
+    ├─ createBean("b")
+    │   ├─ 实例化 B
+    │   ├─ 【存入三级缓存】singletonFactories.put("b", ObjectFactory)
+    │   └─ populateBean("b")
+    │       └─ 注入 @Autowired A
+    │           └─ getBean("a")
+    │               ├─ 【检测到 "a" 正在创建！】
+    │               ├─ 【查一级缓存】没有
+    │               ├─ 【查二级缓存】没有
+    │               ├─ 【查三级缓存】有！从 ObjectFactory 获取早期引用
+    │               │   └─ getEarlyBeanReference() → 返回 A 的引用
+    │               ├─ 【存入二级缓存】earlySingletonObjects.put("a", earlyA)
+    │               ├─ 【删除三级缓存】singletonFactories.remove("a")
+    │               └─ 返回 A 早期引用给 B
+    │       └─ B 完成属性填充
+    │       └─ B 完成初始化
+    │       └─ 【存入一级缓存】singletonObjects.put("b", b)
+    │       └─ 【删除二级缓存】earlySingletonObjects.remove("b")
+    │       └─ 【删除三级缓存】singletonFactories.remove("b")
+    │       └─ 返回 B 给 A
+    │
+T1 继续: A 拿到 B 的引用
+    └─ A 完成属性填充
+    └─ A 完成初始化
+    └─ 【存入一级缓存】singletonObjects.put("a", a)
+    └─ 【删除二级缓存】earlySingletonObjects.remove("a")
+    └─ 【删除三级缓存】singletonFactories.remove("a")
+    └─ 返回 A 给调用者
+```
+
+**【面试官心理】**
+这个流程非常复杂，面试中能把这个时序图画出来的候选人凤毛麟角。但我真正想听到的不是背图，而是：为什么需要提前暴露？为什么需要三级而不是两级？第二级存在的意义是什么？知道这些"为什么"的才是真正理解的。
+
+**追问 3：为什么构造器注入无法解决循环依赖？**
+
+因为构造器注入发生在实例化阶段，此时 Bean 还没有被创建出来，根本无法放入三级缓存。
+
+```java
+@Service
+public class A {
+    private B b;
+
+    // ❌ 构造器注入 - 循环依赖无法解决
+    public A(B b) {
+        this.b = b;
+    }
+}
+
+@Service
+public class B {
+    private A a;
+
+    public B(A a) { // 这里需要 A，但 A 正在创建中，永远得不到
+        this.a = a;
+    }
+}
+```
+
+```
+构造器注入循环依赖的流程：
+T1: getBean("a")
+    └─ createBean("a")
+        └─ 调用 new A(b) —— 但 b 还不存在！
+        └─ 需要创建 B
+            └─ getBean("b")
+                └─ createBean("b")
+                    └─ 调用 new B(a) —— 但 a 还不存在！
+                    └─ 需要创建 A
+                        └─ getBean("a") —— 循环了！
+                        └─ 检测到 "a" 正在创建 → 抛出 BeanCurrentlyInCreationException
+```
+
+:::warning ⚠️
+解决方案：
+1. 使用 `@Lazy` 延迟加载：告诉 Spring 先注入一个代理对象，真正使用时再解析
+2. 使用 Setter 注入代替构造器注入
+3. 重构代码，消除循环依赖（最正确的方式）
+4. 使用 `@Autowired` + `@PostConstruct`：把循环依赖部分的初始化放到构造器之后
+
+```java
+@Service
+public class A {
+    private B b;
+
+    // ✅ 使用 @Lazy - 注入一个代理对象
+    public A(@Lazy B b) {
+        this.b = b; // 这里注入的不是真正的 B，而是一个代理
+    }
+}
+```
+:::
+
+**追问 4：第二级缓存存在的意义？**
+
+这是理解三级缓存设计的关键：
+
+为什么需要第二级而不是直接从三级获取后扔掉？
+
+```
+假设只有一、三级缓存：
+T1: A 获取早期引用，从三级取到 ObjectFactory，创建 A 引用
+T2: C 也需要 A 的早期引用，再次从三级取 ObjectFactory，再次创建
+
+问题：同一个 Bean 的早期引用被创建了多次！
+而且无法保证多次创建的是同一个对象。
+
+加上二级缓存后：
+T1: A 获取早期引用
+    └─ 从三级取 ObjectFactory
+    └─ 创建 A 引用，存入二级缓存
+    └─ 删除三级缓存中的 ObjectFactory
+T2: C 获取早期引用
+    └─ 从二级缓存直接获取（不会再调用 ObjectFactory）
+    └─ 保证同一个 Bean 只有一份早期引用
+```
+
+所以：**二级缓存是为了缓存早期引用，避免重复创建**。
+
+## 二、延伸问题 🟡
+
+### 2.1 prototype 作用域的 Bean 循环依赖
+
+prototype 作用域的 Bean 不支持循环依赖，因为 Spring 不会缓存 prototype Bean 的创建过程：
+
+```java
+@Scope("prototype")
+@Service
+public class PrototypeA {
+    @Autowired
+    private PrototypeB b;
+}
+
+@Scope("prototype")
+@Service
+public class PrototypeB {
+    @Autowired
+    private PrototypeA a;
+}
+```
+
+```java
+// AbstractBeanFactory.java
+if (mbd.isPrototype()) {
+    // prototype 作用域，每次 getBean 都创建新实例
+    // 不走三级缓存，直接报错
+    Object prototypeInstance = createBean(beanName, mbd, args);
+    return prototypeInstance;
+}
+```
+
+原因：prototype Bean 的创建过程不被跟踪，不在 `singletonsCurrentlyInCreation` 集合中，所以无法提前暴露引用。
+
+### 2.2 提前暴露 Bean 和 AOP 代理的关系
+
+Spring 需要三级缓存而不是两级，还有一个重要原因：**支持 AOP**。
+
+考虑这个场景：
+- A 需要注入 B
+- A 有切面（被 AOP 增强）
+- B 需要注入 A
+
+如果 A 有切面，那么 A 的"早期引用"应该是 A 的代理对象，而不是原始对象。
+
+```java
+// 正常情况：A 被 AOP 增强
+A proxyA = createAProxy(); // A 的代理
+// 代理 A 被注入到 B 中
+
+// 循环依赖情况：
+// 1. A 创建了实例
+// 2. A 需要注入 B（需要 B 的早期引用）
+// 3. B 需要注入 A（需要 A 的早期引用）
+// 4. 此时返回给 B 的 A 早期引用，应该是 A 的代理，而不是原始对象
+```
+
+这个逻辑在 `getEarlyBeanReference` 中处理：
+
+```java
+// AbstractAutoWireCapableBeanFactory.java
+protected Object getEarlyBeanReference(String beanName, RootBeanDefinition mbd, Object bean) {
+    Object exposedObject = bean;
+    // 如果有 SmartInstantiationAwareBeanPostProcessor
+    // 会在这里创建 AOP 代理
+    if (!mbd.isSynthetic() && hasInstantiationAwareBeanPostProcessors()) {
+        for (BeanPostProcessor bp : getBeanPostProcessors()) {
+            if (bp instanceof SmartInstantiationAwareBeanPostProcessor) {
+                SmartInstantiationAwareBeanPostProcessor ibp =
+                    (SmartInstantiationAwareBeanPostProcessor) bp;
+                // 【关键】创建代理
+                exposedObject = ibp.getEarlyBeanReference(exposedObject, beanName);
+            }
+        }
+    }
+    return exposedObject;
+}
+```
+
+:::tip 💡
+这就是为什么三级缓存存的是 `ObjectFactory` 而不是直接存 Bean 实例：`ObjectFactory` 允许我们在真正需要早期引用时才决定返回什么——原始对象还是代理对象。如果直接存 Bean 实例，就失去了这个灵活性。
+:::
+
+### 2.3 @Async 导致的循环依赖问题
+
+`@Async` 会创建一个新的代理（AsyncAsyncExecutionAspect），如果处理不当可能导致循环依赖报错：
+
+```java
+@Service
+public class A {
+    @Autowired
+    private B b;
+
+    @Async
+    public void methodA() { }
+}
+
+@Service
+public class B {
+    @Autowired
+    private A a; // 这里注入的 A 是代理对象
+}
+```
+
+Spring 通常能处理这种情况，但如果自定义的 BeanPostProcessor 在 `getEarlyBeanReference` 中处理不当，可能导致重复代理问题。
+
+## 三、生产避坑
+
+### 3.1 循环依赖报错时的排查方法
+
+当发生循环依赖时，错误信息是 `BeanCurrentlyInCreationException`：
+
+```
+BeanCurrentlyInCreationException: Error creating bean with name 'a':
+Requested bean is currently in creation: Is there an unresolvable circular reference?
+```
+
+排查步骤：
+1. **确认是哪个 Bean 之间的循环**：查看错误堆栈，找出循环链
+2. **检查注入方式**：是构造器注入还是 Setter 注入
+3. **使用 @Lazy 临时解决**：先打上 `@Lazy`，再慢慢重构
+4. **审查代码结构**：循环依赖通常是代码设计问题
+
+### 3.2 循环依赖和 @Transactional
+
+如果被循环依赖涉及的 Bean 有 `@Transactional`，要注意：
+
+```java
+@Service
+public class A {
+    @Autowired
+    private B b;
+
+    @Transactional
+    public void methodA() {
+        b.methodB();
+    }
+}
+
+@Service
+public class B {
+    @Autowired
+    private A a;
+
+    public void methodB() {
+        // ...
+    }
+}
+```
+
+在循环依赖场景下，`A` 的早期引用被注入到 `B` 中时，可能还是原始对象而不是代理对象，导致 `A.methodA()` 的事务不生效。
+
+### 3.3 启动时的循环依赖检测
+
+Spring 提供了配置来控制循环依赖检测：
+
+```java
+// 禁止循环依赖（不推荐，只是让错误延迟到运行时）
+DefaultListableBeanFactory factory = new DefaultListableBeanFactory();
+factory.setAllowCircularReferences(false);
+
+// 允许循环依赖
+factory.setAllowCircularReferences(true);
+```
+
+## 四、工程选型
+
+### 4.1 消除循环依赖 vs 用 @Lazy 解决
+
+| 方案 | 推荐度 | 适用场景 |
+| --- | --- | --- |
+| 重构代码，消除循环依赖 | ⭐⭐⭐⭐⭐ | 所有场景，这是最正确的做法 |
+| 使用 @Lazy | ⭐⭐⭐⭐ | 临时解决，为重构争取时间 |
+| 使用 Setter 注入 | ⭐⭐⭐⭐ | 替代构造器注入，避免循环 |
+| 重构为单向依赖 | ⭐⭐⭐⭐⭐ | 引入中间层（如事件机制） |
+
+### 4.2 通过事件机制解耦
+
+如果 A 和 B 确实需要相互调用，可以引入事件机制解耦：
+
+```java
+@Service
+public class A {
+    @Autowired
+    private ApplicationEventPublisher publisher;
+
+    public void doSomething() {
+        publisher.publishEvent(new MyEvent(this));
+    }
+
+    @EventListener
+    public void handleEvent(MyEvent event) {
+        // 响应 B 发来的事件
+    }
+}
+
+@Service
+public class B {
+    @Autowired
+    private ApplicationEventPublisher publisher;
+
+    public void doSomething() {
+        publisher.publishEvent(new MyEvent(this));
+    }
+
+    @EventListener
+    public void handleEvent(MyEvent event) {
+        // 响应 A 发来的事件
+    }
+}
+```
+
+## 五、面试总结
+
+循环依赖是 Spring 源码中最复杂的机制之一，这道题能筛选出真正研究过源码的候选人。
+
+P5 候选人能说出"循环依赖是 A 依赖 B、B 依赖 A"，能说出 setter 注入能解决、构造器注入不能解决。
+P6 候选人能说出三级缓存的名字，能理解为什么要提前暴露 Bean。
+P7 候选人能画出完整的时序图，能说清楚每级缓存的作用，能解释为什么需要三级而不是两级，能说清楚 AOP 代理和循环依赖的关系。
+
+能在这道题上答到最后的，基本都看过 Spring 源码，并且在生产环境处理过循环依赖问题。

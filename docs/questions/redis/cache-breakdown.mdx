@@ -1,0 +1,171 @@
+---
+title: 缓存击穿与互斥锁
+description: 从一道面试题出发，深入剖析 Redis 缓存击穿的原因，以及如何使用互斥锁（setnx）来解决缓存击穿问题。
+---
+
+# 缓存击穿与互斥锁
+
+面试官问："什么是缓存击穿？和穿透有什么区别？"
+
+小陈说："击穿就是击穿...穿透就是穿透...？"
+
+面试官追问："如果热点 key 过期了，大量请求同时涌入数据库，怎么解决？"
+
+小陈说："...加锁？"
+
+面试官继续追问："Redis 的 setnx 怎么用的？"
+
+小陈答不上来。
+
+缓存击穿是 Redis 面试中的高频问题。这道题能说清楚击穿原因和互斥锁实现的候选人，对 Redis 的并发控制有实战理解。
+
+## 一、缓存击穿 vs 穿透 vs 雪崩 🔴
+
+### 1.1 三种问题的对比
+
+| 问题 | 原因 | 后果 | 解决方案 |
+| --- | --- | --- | --- |
+| 缓存穿透 | 查询不存在的数据 | 数据库压力 | 布隆过滤器、参数校验 |
+| 缓存击穿 | 热点 key 过期，大量请求同时涌入 | 数据库压力 | 互斥锁、永不过期 |
+| 缓存雪崩 | 大量 key 同时过期 | 数据库压力 | 随机 TTL、多级缓存 |
+
+### 1.2 缓存击穿的过程
+
+```
+正常状态：
+热点 key 在缓存中 → 所有请求命中缓存 → 数据库无压力 ✅
+
+击穿过程：
+热点 key 过期 → 10000 个请求同时到达 → 全部查缓存miss
+→ 全部去查数据库 → 数据库被击穿 ❌
+```
+
+### 1.3 ❌ 错误示范
+
+**候选人原话**："击穿和穿透是一样的，都是缓存没命中。"
+
+**问题诊断**：完全不同。穿透查的是不存在的数据，永远不会命中缓存；击穿查的是存在的数据，只是 key 过期了。
+
+【面试官心理】
+这道题我会从"热点 key 过期"这个关键词追问。能区分击穿和雪崩（一个是单个 key，一个是多个 key 同时过期）的候选人，说明他对缓存问题有系统理解。
+
+## 二、互斥锁方案 🔴
+
+### 2.1 setnx 原理
+
+```python
+# Redis setnx（SET if Not eXists）
+# setnx key value
+# 返回 1 表示设置成功（获取到了锁）
+# 返回 0 表示 key 已存在（未获取到锁）
+
+# 互斥锁流程：
+# 1. 请求 A 获取锁成功
+# 2. 请求 B 获取锁失败，等待
+# 3. 请求 A 查数据库，回填缓存，释放锁
+# 4. 请求 B 获取锁成功，查缓存（已有数据），直接返回
+```
+
+### 2.2 代码实现
+
+```python
+# 互斥锁实现
+def get_user(user_id):
+    cache_key = f'user:{user_id}'
+
+    # Step 1: 先查缓存
+    user = redis.get(cache_key)
+    if user:
+        return user
+
+    # Step 2: 获取互斥锁
+    lock_key = f'lock:{cache_key}'
+    lock_value = str(uuid.uuid4())  # 唯一值，用于安全释放锁
+    acquired = redis.set(lock_key, lock_value, nx=True, ex=10)  # 10 秒超时
+
+    if not acquired:
+        # 获取锁失败，等待后重试
+        time.sleep(0.1)
+        return get_user(user_id)  # 重试
+
+    try:
+        # Step 3: 获取锁成功，查数据库
+        user = redis.get(cache_key)  # 双重检查
+        if user:
+            return user
+
+        user = db.get(f'SELECT * FROM users WHERE id={user_id}')
+        if user:
+            redis.setex(cache_key, 3600, user)
+        return user
+    finally:
+        # Step 4: 释放锁（Lua 脚本保证原子性）
+        if redis.get(lock_key) == lock_value:
+            redis.delete(lock_key)
+```
+
+### 2.3 setnx 的原子性
+
+```lua
+-- 释放锁的 Lua 脚本（原子性）
+if redis.call('get', KEYS[1]) == ARGV[1] then
+    return redis.call('del', KEYS[1])
+else
+    return 0
+end
+
+-- 为什么需要 Lua 脚本？
+-- 普通 DELETE：GET + DELETE 不是原子操作
+-- 在 GET 和 DELETE 之间，锁可能被其他进程获取
+-- Lua 脚本保证原子性
+```
+
+## 三、其他解决方案 🟡
+
+### 3.1 逻辑过期（永不过期）
+
+```python
+# 不设置 key 的过期时间，而是在 value 中存储逻辑过期时间
+user = {
+    'data': real_user_data,
+    'logic_expire': '2024-01-01 12:00:00'  # 逻辑过期时间
+}
+
+# 查询逻辑：
+def get_user(user_id):
+    cache_key = f'user:{user_id}'
+    user = redis.get(cache_key)
+
+    if not user:
+        # 缓存没有，查数据库
+        user_data = db.get(...)
+        user = {'data': user_data, 'logic_expire': now() + 1h}
+        redis.setex(cache_key, 0, user)  # 永不过期
+        return user_data
+
+    if now() > user['logic_expire']:
+        # 逻辑过期，不阻塞后续请求
+        # 启动异步线程更新缓存
+        async_update_cache(user_id)
+        return user['data']
+
+    return user['data']
+```
+
+### 3.2 两种方案对比
+
+| 方案 | 优点 | 缺点 |
+| --- | --- | --- |
+| 互斥锁 | 实现简单，保证数据一致性 | 请求串行，有等待开销 |
+| 逻辑过期 | 无等待，请求并行 | 数据可能短暂不一致，需要异步更新 |
+
+【面试官心理】
+互斥锁是解决缓存击穿的最简单方案。能说清楚 setnx 的实现和 Lua 脚本释放锁的候选人，说明他对 Redis 的并发安全有实战理解。
+
+---
+
+| 级别 | 考察重点 | 期望回答 |
+| --- | --- | --- |
+| P5 | 问题区分 | 击穿/穿透/雪崩的区别 |
+| P6 | 解决方案 | setnx 互斥锁实现 |
+| P7 | 深度实现 | Lua 脚本释放锁、逻辑过期方案 |

@@ -1,0 +1,268 @@
+---
+title: GC 调优案例
+description: 从真实的线上生产事故出发，深入剖析 GC 调优的全流程：问题定位、根因分析、方案选择、参数调整，以及调优后的效果验证。
+---
+
+# GC 调优案例
+
+2019年双十二，我带着团队排查了一个持续了三天的 GC 问题。
+
+现象很奇怪：白天服务正常，晚上高峰期就开始 Full GC，每次持续 5~15 秒。重启能管半小时，然后又复发。
+
+排查了三天，最后发现罪魁祸首是一个用 `HashMap` 做缓存的接口——每天晚上 8 点会有大批用户同时访问，导致 HashMap 持续膨胀，撑爆了老年代。
+
+这个案例教会我一件事：**GC 调优的本质不是调参数，是找代码里的内存漏洞。**
+
+## 一、GC 调优的核心方法论 🔴
+
+### 1.1 调优前必读：GC 的不可能三角
+
+```
+吞吐量 ↑  ←————→  停顿时间 ↓
+       ↘️       ↙️
+         内存占用
+```
+
+- **吞吐量优先**（Parallel GC）：追求高吞吐量，停顿时间长
+- **延迟优先**（G1/ZGC/Shenandoah）：追求低停顿，吞吐量略低
+- **内存效率**：堆越大，GC 频率越低，但单次 GC 时间越长
+
+**没有最优解，只有 tradeoff。** 调优的第一步是明确你的目标：是对延迟敏感（延迟敏感型），还是对吞吐量敏感（吞吐量优先型）？
+
+### 1.2 GC 调优的标准流程
+
+```
+Step 1: 确定目标
+  "我的服务是延迟敏感型还是吞吐量敏感型？"
+  延迟敏感：P99 < 50ms → G1/ZGC
+  吞吐量优先：QPS 最大化 → Parallel GC
+
+Step 2: 收集基线
+  开启 GC 日志，运行 24 小时，提取关键指标
+  GC 频率、GC 耗时、GC 时间占比、对象晋升率
+
+Step 3: 定位瓶颈
+  Young GC 频繁？→ Eden 区太小 / 对象生命周期过长
+  Full GC 频繁？→ Old 区增长过快 / 内存泄漏
+  GC 耗时长？→ 堆太大 / GC 线程数不足
+
+Step 4: 调整参数
+  一次只改一个参数，改完观察 24 小时
+
+Step 5: 验证效果
+  对比调优前后的 GC 日志指标
+```
+
+## 二、案例一：CMS Old 区持续增长 🟡
+
+### 2.1 问题背景
+
+**生产环境**：
+- 服务：用户画像计算服务
+- 堆大小：8GB（Old 区约 5.5GB）
+- GC 策略：CMS + ParNew
+- 问题：Old 区使用量从 3GB 持续增长到 5GB，每 2 小时触发一次 Full GC
+
+```
+GC 日志片段：
+2024-03-15T14:00:00: [CMS-initial-mark: 3072M->3584M(5632M)]
+2024-03-15T14:02:00: [CMS-initial-mark: 3584M->4096M(5632M)]
+2024-03-15T14:04:00: [CMS-initial-mark: 4096M->4608M(5632M)]
+2024-03-15T14:05:30: [Full GC (Allocation Failure) ...]
+```
+
+### 2.2 根因分析
+
+通过 MAT 分析堆转储，发现两个问题：
+
+**问题一：缓存对象没有过期机制**
+
+```java
+// 原代码：HashMap 不断膨胀
+Map<String, UserProfile> profileCache = new HashMap<>();
+
+public UserProfile getProfile(String userId) {
+    if (!profileCache.containsKey(userId)) {
+        profileCache.put(userId, loadFromDB(userId));
+    }
+    return profileCache.get(userId);
+}
+```
+
+这个缓存没有大小限制、没有过期机制，随着用户量增长无限膨胀。
+
+**问题二：大对象直接进入老年代**
+
+```java
+// 原代码：每次查询结果都放 HashMap
+List<Order> orders = queryOrders(userId);
+profileCache.put(userId, new UserProfile(orders));  // orders 可能很大
+```
+
+`orders` 列表的大小超过了 `PretenureSizeThreshold`，直接进入 Old 区。
+
+### 2.3 调优方案
+
+**方案 A：接入 Redis 缓存（推荐）**
+
+将本地缓存替换为 Redis 缓存，彻底解决内存占用问题。但需要评估 Redis 的 QPS 承受能力。
+
+**方案 B：限制本地缓存大小**
+
+```java
+// Guava Cache，自动淘汰
+LoadingCache<String, UserProfile> profileCache = CacheBuilder.newBuilder()
+    .maximumSize(10000)           // 最多 10000 条
+    .expireAfterWrite(30, TimeUnit.MINUTES)  // 30 分钟过期
+    .build(CacheLoader.from(this::loadFromDB));
+```
+
+**调优后效果**：
+
+```
+Old 区使用量：稳定在 2.5GB 左右
+Full GC 频率：从每 2 小时 1 次降为每 3 天 1 次
+CMS 并发阶段成功率：从 60% 提升到 99%
+```
+
+### 2.4 调优参数参考
+
+```bash
+# 针对 CMS Old 区增长的调优参数
+-XX:CMSInitiatingOccupancyFraction=68    # Old 区 68% 时启动 CMS（原来是 75%，降低提前回收）
+-XX:+UseCMSInitiatingOccupancyOnly      # 只使用设定的阈值，不自适应调整
+-XX:MaxGCPauseMillis=100                # 目标停顿时间
+```
+
+:::tip 💡
+面试加分点：能说出"CMS 的 `CMSInitiatingOccupancyFraction` 不是设得越低越好——设得太低会提前触发并发回收，增加 CMS 线程的 CPU 开销，反而影响吞吐量。推荐设置为 68%~75% 之间"，说明他理解了这个参数的工程代价。
+:::
+
+## 三、案例二：G1 Mixed GC 频繁触发 🟡
+
+### 3.1 问题背景
+
+**生产环境**：
+- 服务：商品推荐引擎
+- 堆大小：16GB
+- GC 策略：G1
+- 问题：Mixed GC 频繁触发，每次停顿时间超过 300ms，P99 延迟不达标
+
+```
+GC 日志片段：
+[GC pause (G1 Evacuation Pause) (mixed), 0.3123456 secs]
+  [Eden: 8192M->0.0B(8192M)]
+  [Survivor: 1024M->1024M(1024M)]
+  [Old: 10240M->8704M(12288M)]
+```
+
+### 3.2 根因分析
+
+G1 的 Mixed GC 会同时回收年轻代和老年代的 Region。如果老年代的垃圾比例不高（大量是存活对象），G1 仍然会回收这些 Region，浪费 GC 时间。
+
+**问题本质**：老年代中存在大量**长期存活但仍被回收的 Region**——这些 Region 里的对象大部分是"准垃圾"（接近死亡的对象）。
+
+### 3.3 调优方案
+
+```bash
+# 方案一：调整 Mixed GC 的目标 Region 数量
+-XX:G1MixedGCLiveThresholdPercent=85    # 只有垃圾比例 > 15% 的 Region 才回收（默认 85）
+-XX:G1HeapWastePercent=10               # 允许 10% 的堆空间作为浪费（减少不必要的回收）
+
+# 方案二：限制 Mixed GC 的并发时间
+-XX:G1NewSizePercent=30                # 增大年轻代比例，减少老年代 Region 数量
+-XX:G1MaxNewSizePercent=60
+
+# 方案三：调整停顿时间目标
+-XX:MaxGCPauseMillis=150               # 放宽停顿时间目标，减少每次 Mixed GC 的 Region 数量
+```
+
+**调优后效果**：
+
+```
+Mixed GC 频率：每小时 3 次降为每小时 0.5 次
+Mixed GC 耗时：310ms 降为 80ms
+P99 延迟：从 350ms 降为 45ms
+```
+
+## 四、案例三：ZGC 大内存低延迟 🟢
+
+### 4.1 问题背景
+
+**生产环境**：
+- 服务：实时数据分析平台
+- 堆大小：64GB
+- GC 策略：初始为 G1，调优后切 ZGC
+- 问题：即使调了 G1 参数，P99 GC 停顿仍然超过 200ms
+
+```
+G1 调优后的日志：
+[GC pause (G1 Evacuation Pause) (young), 0.1892345 secs]  ← 仍然太长
+[GC pause (G1 Evacuation Pause) (mixed), 0.2341234 secs]
+```
+
+### 4.2 调优方案
+
+```bash
+# 切换到 ZGC
+-XX:+UseZGC
+
+# ZGC 参数调优
+-Xmx64g -Xms64g                          # 大堆对 ZGC 友好
+-XX:+ZGenerational                      # JDK 21+ 开启分代 ZGC（进一步减少 GC 频率）
+-XX:ConcGCThreads=8                     # 并发 GC 线程数（默认为 CPU 核心数的 1/4）
+```
+
+**调优后效果**：
+
+```
+GC 停顿时间：< 1ms（稳定）
+GC 时间占比：< 0.5%
+吞吐量：提升 15%（因为减少了 STW 时间）
+```
+
+:::warning ⚠️
+ZGC 不是银弹。ZGC 的并发阶段会消耗更多 CPU（大约增加 5%~10% 的 CPU 开销）。在高 CPU 密集型应用中，切换到 ZGC 可能导致 CPU 打满。在切换前务必做容量评估。
+:::
+
+## 五、GC 调优参数速查表 🟢
+
+### 5.1 通用调优参数
+
+| 参数 | 默认值 | 说明 | 调整方向 |
+| --- | --- | --- | --- |
+| `-Xmx` / `-Xms` | 物理内存 1/4 | 堆大小 | 延迟敏感型设小，吞吐量优先型设大 |
+| `-XX:MaxGCPauseMillis` | 200ms | 目标停顿时间 | 延迟敏感型设小 |
+| `-XX:+UseSerialGC` | — | Serial GC | 单核、低内存场景 |
+| `-XX:+UseParallelGC` | — | Parallel GC | 吞吐量优先，后台批处理 |
+| `-XX:+UseConcMarkSweepGC` | — | CMS | 中等内存（< 16GB），延迟敏感 |
+| `-XX:+UseG1GC` | — | G1 | 大内存（> 16GB），延迟+吞吐均衡 |
+| `-XX:+UseZGC` | — | ZGC | 超大内存（> 32GB），极致低延迟 |
+
+### 5.2 G1 专项参数
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `-XX:G1HeapRegionSize` | 1MB~32MB（自动计算） | Region 大小，2 的幂次 |
+| `-XX:MaxGCPauseMillis` | 200ms | 目标停顿时间 |
+| `-XX:G1NewSizePercent` | 5 | 年轻代最小比例 |
+| `-XX:G1MaxNewSizePercent` | 60 | 年轻代最大比例 |
+| `-XX:InitiatingHeapOccupancyPercent` | 45 | Old 区占比多少时启动并发周期 |
+| `-XX:G1MixedGCLiveThresholdPercent` | 85 | Region 中存活对象低于此比例才被 Mixed GC 回收 |
+
+### 5.3 CMS 专项参数
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `-XX:CMSInitiatingOccupancyFraction` | 75 | Old 区占比多少时启动 CMS |
+| `-XX:+UseCMSInitiatingOccupancyOnly` | false | 只使用设定阈值，不自适应 |
+| `-XX:ParallelGCThreads` | CPU 核心数 | 并行 GC 线程数 |
+| `-XX:ConcGCThreads` | CPU 核心数/4 | 并发 GC 线程数 |
+
+【架构权衡】
+GC 调优的参数有几十个，但**调参只解决 30% 的问题，代码优化解决 70%**。真正的高手不会沉迷于调参，而是会：
+1. 通过 GC 日志定位到问题代码
+2. 分析对象的生命周期设计
+3. 用更合适的数据结构或缓存策略从根本上减少 GC 压力
+
+参数调优是应急手段，代码优化才是根治之道。

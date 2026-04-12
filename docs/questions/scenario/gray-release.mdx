@@ -1,0 +1,478 @@
+---
+title: 灰度发布方案
+description: 从一个灰度发布导致故障扩大的事故出发，深度拆解灰度发布方案：流量灰度、金丝雀发布、A/B测试及回滚策略。
+---
+
+# 灰度发布方案
+
+2020年某电商平台的订单服务发布新版本，灰度10%的流量后发现错误率飙升。
+
+但开发团队犹豫了：到底是继续观察还是回滚？万一只是那10%流量有问题呢？
+
+15分钟后，错误率从5%飙升到50%，但此时已经全量发布了。
+
+**这次故障持续了30分钟，影响了约10万笔订单，直接损失约20万元。**
+
+【面试官手记】
+
+灰度发布是保障线上稳定的关键手段。我面试过的候选人里，能说清楚"灰度策略"的不超过30%，能说出"回滚决策"的不超过20%。灰度发布的关键是**灰度期间发现问题要及时回滚**。
+
+## 一、灰度发布的四大策略 🔴
+
+### 1.1 四大策略
+
+```
+灰度发布四大策略：
+
+1. 流量灰度
+   - 按百分比分配流量
+   - 10%流量到新版本
+   - 优点：简单直接
+   - 缺点：无法精细化
+
+2. 用户灰度
+   - 按用户ID/标签灰度
+   - 白名单用户先体验
+   - 优点：可定向
+   - 缺点：复杂
+
+3. 地域灰度
+   - 按地域分配流量
+   - 先小城市后大城市
+   - 优点：可控
+   - 缺点：样本不均匀
+
+4. 功能灰度
+   - 按功能开关灰度
+   - 只对开启开关的用户灰度
+   - 优点：粒度细
+   - 缺点：需要功能开关支持
+```
+
+### 1.2 灰度比例策略
+
+```
+灰度节奏：
+
+Day 1: 1%
+Day 2: 5%
+Day 3: 10%
+Day 4: 30%
+Day 5: 50%
+Day 6: 100%
+
+关键原则：
+- 每个灰度级别观察2-4小时
+- 异常率上升立即回滚
+- 重大版本延长观察期
+```
+
+## 二、流量灰度实现 🔴
+
+### 2.1 Nginx灰度
+
+```nginx
+# Nginx按IP灰度
+upstream backend_v1 {
+    server 192.168.1.10:8080;
+}
+
+upstream backend_v2 {
+    server 192.168.1.11:8080;
+}
+
+server {
+    listen 80;
+
+    location / {
+        # 取IP的CRC32值，对100取模
+        set $target 0;
+        if ($request_uri ~* "X-User-Id") {
+            set $target 1;  # 有用户ID，按用户ID灰度
+        }
+
+        if ($target = 1) {
+            set $hash $cookie_user_id;
+        } else {
+            set $hash $remote_addr;
+        }
+
+        set $percent 0;
+        set_by_lua $percent '
+            local hash = ngx.var.hash or 0
+            return tonumber(hash) % 100
+        ';
+
+        if ($percent < 10) {  # 10%流量到新版本
+            proxy_pass http://backend_v2;
+        } else {
+            proxy_pass http://backend_v1;
+        }
+    }
+}
+```
+
+### 2.2 Spring Cloud灰度
+
+```yaml
+# application.yml
+spring:
+  cloud:
+    loadbalancer:
+      ribbon:
+        Enabled: true
+    gateway:
+      discovery:
+        locator:
+          lower-case-service-id: true
+
+# 自定义灰度策略
+@Configuration
+public class GrayLoadBalancerConfig {
+
+    @Bean
+    public LoadBalancer grayLoadBalancer() {
+        return new GrayLoadBalancer();
+    }
+}
+
+public class GrayLoadBalancer implements LoadBalancer {
+
+    private static final double GRAY_PERCENT = 0.1;  // 10%
+
+    @Override
+    public ServiceInstance choose(String serviceId, Object hint) {
+        List<ServiceInstance> instances = discoveryClient.getInstances(serviceId);
+        String version = determineVersion(hint);
+
+        return instances.stream()
+            .filter(i -> version.equals(i.getMetadata().get("version")))
+            .findFirst()
+            .orElse(instances.get(0));
+    }
+
+    private String determineVersion(Object hint) {
+        // 方式1：按请求头
+        String headerVersion = request.getHeader("X-Version");
+        if (headerVersion != null) {
+            return headerVersion;
+        }
+
+        // 方式2：按用户ID
+        String userId = request.getHeader("X-User-Id");
+        if (userId != null) {
+            // 用户ID哈希后取模，10%用户走到新版本
+            return Math.abs(userId.hashCode() % 10) < 1 ? "v2" : "v1";
+        }
+
+        return "v1";
+    }
+}
+```
+
+### 2.3 配置中心灰度
+
+```yaml
+# Apollo灰度配置
+# 基础配置（90%流量）
+degrade:
+  new-feature-enabled: false
+
+# 灰度配置（10%流量）
+# 灰度规则：用户ID尾号为0的用户
+degrade:
+  new-feature-enabled: true
+  gray-rule:
+    type: user-id-suffix
+    value: "0"
+```
+
+## 三、金丝雀发布 🟡
+
+### 3.1 原理
+
+```
+金丝雀发布：
+
+概念：把新版本部署到少量服务器，先让部分用户使用，观察后再全量
+
+步骤：
+1. 保留旧版本服务器
+2. 部署新版本到1-2台服务器
+3. 10%流量到新版本
+4. 观察监控指标
+5. 逐步增加新版本服务器
+6. 全部切换
+7. 下线旧版本
+```
+
+### 3.2 Kubernetes实现
+
+```yaml
+# Kubernetes金丝雀发布
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service-v2  # 新版本
+spec:
+  replicas: 2  # 只部署2个副本
+  selector:
+    matchLabels:
+      app: order-service
+      version: v2
+---
+# 金丝雀服务
+apiVersion: v1
+kind: Service
+metadata:
+  name: order-service-canary
+spec:
+  selector:
+    version: v2
+  ports:
+    - port: 80
+      targetPort: 8080
+```
+
+## 四、A/B测试 🟡
+
+### 4.1 A/B测试配置
+
+```java
+// A/B测试服务
+@Service
+public class ABTestService {
+
+    @Autowired
+    private RedisTemplate redisTemplate;
+
+    public boolean isInGroup(String userId, String experimentId) {
+        String key = "abtest:" + experimentId + ":" + userId;
+
+        // 缓存结果
+        Boolean cached = redisTemplate.hasKey(key);
+        if (cached != null && cached) {
+            return Boolean.TRUE.equals(redisTemplate.opsForValue().get(key));
+        }
+
+        // 计算分组
+        int hash = Math.abs((experimentId + userId).hashCode());
+        boolean inTestGroup = hash % 100 < getTestPercent(experimentId);
+
+        // 缓存30分钟
+        redisTemplate.opsForValue().set(key, inTestGroup, 30, TimeUnit.MINUTES);
+
+        return inTestGroup;
+    }
+
+    private int getTestPercent(String experimentId) {
+        // 从配置中心获取灰度比例
+        return configService.getInt("abtest." + experimentId + ".percent", 10);
+    }
+}
+```
+
+### 4.2 A/B测试使用
+
+```java
+// 控制器中使用A/B测试
+@RestController
+public class ProductController {
+
+    @GetMapping("/product/{id}")
+    public ProductVO getProduct(@PathVariable Long id,
+                                @RequestHeader("X-User-Id") String userId) {
+        ProductDetail detail = productService.getDetail(id);
+
+        // A/B测试：新旧UI
+        if (abTestService.isInGroup(userId, "new-product-ui")) {
+            return convertToNewUI(detail);
+        } else {
+            return convertToOldUI(detail);
+        }
+    }
+}
+```
+
+## 五、回滚策略 🟡
+
+### 5.1 自动回滚
+
+```yaml
+# Prometheus告警规则
+groups:
+- name: gray-alerts
+  rules:
+  - alert: GrayVersionErrorRateHigh
+    expr: |
+      (
+        sum(rate(http_requests_total{version="v2",status=~"5.."}[5m])) /
+        sum(rate(http_requests_total{version="v2"}[5m]))
+      ) > 0.05
+    for: 5m
+    labels:
+      severity: critical
+    annotations:
+      summary: "灰度版本错误率超过5%"
+      # 自动回滚
+      runbook: |
+        kubectl rollout undo deployment/order-service
+```
+
+### 5.2 手动回滚
+
+```bash
+# Kubernetes回滚
+kubectl rollout undo deployment/order-service
+
+# 查看回滚历史
+kubectl rollout history deployment/order-service
+
+# 回滚到指定版本
+kubectl rollout undo deployment/order-service --to-revision=2
+```
+
+### 5.3 回滚决策
+
+```
+回滚决策树：
+
+错误率上升？
+  是 → 立即回滚
+  否 → 下一步
+
+响应时间上升 > 50%？
+  是 → 立即回滚
+  否 → 下一步
+
+新功能核心指标下降？
+  是 → 评估是否需要回滚
+  否 → 继续灰度
+
+黄金指标：DAU/GMV/订单量
+```
+
+## 六、生产避坑 🟡
+
+### 6.1 灰度发布的五大坑
+
+**坑1：灰度期间不观察**
+
+```
+问题：灰度发布了就去干别的
+场景：灰度期间问题没发现，全量后才暴露
+解决方案：
+- 灰度期间必须有专人监控
+- 设置告警阈值，超阈值自动通知
+```
+
+**坑2：灰度比例增长过快**
+
+```
+问题：从10%直接到100%
+场景：没留足观察时间
+解决方案：
+- 按比例逐级增长
+- 每级观察2-4小时
+```
+
+**坑3：没有灰度开关**
+
+```
+问题：发现问题无法关闭灰度
+场景：只能全量回滚
+解决方案：
+- 配置中心添加灰度开关
+- 开关可实时调整
+```
+
+**坑4：灰度流量不均匀**
+
+```
+问题：按IP灰度，但大V都在同一IP段
+场景：灰度流量不均匀，样本失真
+解决方案：
+- 按用户ID灰度，保证均匀
+- 或分层灰度：先按IP，再按用户
+```
+
+**坑5：数据库灰度不同步**
+
+```
+问题：新旧版本数据库Schema不一致
+场景：新版本写了新字段，旧版本读不到
+解决方案：
+- 数据库变更先于应用变更
+- 新字段有默认值
+```
+
+### 6.2 灰度检查清单
+
+```
+灰度前检查：
+- [ ] 代码Review通过
+- [ ] 测试环境验证通过
+- [ ] 监控告警配置完成
+- [ ] 回滚方案就绪
+- [ ] 值班人员到位
+
+灰度中检查：
+- [ ] 错误率监控
+- [ ] 响应时间监控
+- [ ] 核心业务指标
+- [ ] 日志异常
+
+灰度后检查：
+- [ ] 全量监控观察
+- [ ] 旧版本服务器下线
+```
+
+## 七、真实面试回放 🟡
+
+> **面试官**：灰度发布怎么实现？
+>
+> **候选人**（小张）：三种方式：
+>
+> 一是流量灰度。按请求百分比分配流量，比如10%到新版本。
+>
+> 二是用户灰度。按用户ID哈希，决定走哪个版本。
+>
+> 三是金丝雀发布。保留旧版本服务器，部署新版本到少量服务器，逐步切换。
+>
+> **面试官**：灰度期间出现问题怎么决策？
+>
+> 小张：三个原则：
+>
+> 一是错误率上升。超过正常值的2倍，立即回滚。
+>
+> 二是响应时间上升。P99超过500ms，立即回滚。
+>
+> 三是核心指标下降。DAU/订单量下降超过10%，立即回滚。
+>
+> **面试官**：怎么保证灰度流量均匀？
+>
+> 小张：用用户ID哈希。
+>
+> 比如10%流量到新版本，就对用户ID的哈希值取模，余数小于1的用户走新版本。
+>
+> 这样每个用户看到的版本是固定的，不会忽新忽旧。
+>
+> 【面试官手记】
+>
+> 小张这场面试的亮点：
+>
+> 1. 知道三种灰度方式
+>
+> 2. 知道回滚决策的三个原则
+>
+> 3. 知道用用户ID哈希保证均匀
+>
+> 灰度发布是P6工程师必备技能，能完整回答的候选人，说明有发布运维经验。
+
+灰度发布的核心理念是**小步快跑，快速试错**。记住三个要点：
+
+1. **灰度策略**：按流量/用户/地域分批
+2. **监控观察**：每个级别观察2-4小时
+3. **及时回滚**：有问题立即回滚，不要犹豫
+
+灰度发布是保障线上稳定的护身符。

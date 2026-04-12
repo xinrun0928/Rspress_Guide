@@ -1,0 +1,498 @@
+---
+title: 线程池故障实战
+description: 从一次线程池拒绝策略导致请求堆积的事故出发，深度拆解线程池配置问题：核心参数、队列选择、拒绝策略及常见故障处理。
+---
+
+# 线程池故障实战
+
+2020年双十一当天，某电商平台的订单服务出现了严重的请求堆积问题。
+
+监控告警显示：线程池队列堆积超过10万个任务，响应时间从50ms飙升到30s，大量用户反馈下单超时。
+
+技术团队排查后发现：开发同学配置了Executors.newFixedThreadPool(100)，队列是LinkedBlockingQueue，默认容量是Integer.MAX_VALUE，看起来不会拒绝任务。
+
+但问题是：100个线程处理10万QPS，每个任务耗时100ms，线程池吞吐量只有1000QPS，根本处理不过来。
+
+**这次故障导致订单丢失约5000笔，直接损失约100万元。**
+
+【面试官手记】
+
+线程池是Java开发中最容易被错误配置的组件。我面试过的候选人里，能说清楚"线程池参数"的有60%，能说清楚"队列选择"的有30%，能说清楚"拒绝策略"的有20%。线程池配置的关键词是**合理容量 + 队列有界**。
+
+## 一、线程池的七大参数 🔴
+
+### 1.1 七大参数详解
+
+```java
+public ThreadPoolExecutor(
+    int corePoolSize,              // 核心线程数
+    int maximumPoolSize,           // 最大线程数
+    long keepAliveTime,            // 空闲线程存活时间
+    TimeUnit unit,                 // 时间单位
+    BlockingQueue<Runnable> workQueue,  // 任务队列
+    ThreadFactory threadFactory,   // 线程工厂
+    RejectedExecutionHandler handler    // 拒绝策略
+)
+```
+
+```
+七大参数详解：
+
+1. corePoolSize：核心线程数
+   - 常驻线程数，即使空闲也不销毁
+   - 建议：CPU密集型 = CPU核数 + 1，IO密集型 = CPU核数 × 2
+
+2. maximumPoolSize：最大线程数
+   - 线程池最多持有的线程数
+   - 包含核心线程和非核心线程
+   - 建议：CPU密集型 = CPU核数 + 1，IO密集型 = CPU核数 × 2 + 1
+
+3. keepAliveTime：空闲线程存活时间
+   - 非核心线程空闲后存活时间
+   - 可以通过 allowCoreThread TimeOut 设置核心线程超时
+
+4. workQueue：任务队列
+   - ArrayBlockingQueue：有界队列，需要指定容量
+   - LinkedBlockingQueue：无界队列，默认Integer.MAX_VALUE
+   - SynchronousQueue：同步队列，不存储任务
+   - PriorityBlockingQueue：优先级队列
+
+5. threadFactory：线程工厂
+   - 用于创建线程
+   - 可以设置线程名称、优先级、是否为守护线程
+
+6. handler：拒绝策略
+   - AbortPolicy：抛异常（默认）
+   - CallerRunsPolicy：由调用方执行
+   - DiscardPolicy：丢弃任务
+   - DiscardOldestPolicy：丢弃最老的任务
+```
+
+### 1.2 常见错误配置
+
+```java
+// 错误配置1：无界队列
+ExecutorService pool1 = Executors.newFixedThreadPool(100);
+// 等价于：
+new ThreadPoolExecutor(100, 100, 0L, TimeUnit.MILLISECONDS,
+    new LinkedBlockingQueue<Runnable>());  // Integer.MAX_VALUE!
+
+// 问题：队列无限膨胀，内存溢出
+
+// 错误配置2：单线程池
+ExecutorService pool2 = Executors.newSingleThreadExecutor();
+// 问题：所有任务串行执行
+
+// 错误配置3：缓存线程池
+ExecutorService pool3 = Executors.newCachedThreadPool();
+// 问题：线程数无限增长，高并发时创建大量线程
+
+// 错误配置4：队列容量过大
+new ThreadPoolExecutor(10, 20, 0L, TimeUnit.SECONDS,
+    new LinkedBlockingQueue<>(1000000));  // 100万容量!
+
+// 问题：队列太大，任务堆积严重，响应延迟
+```
+
+### 1.3 正确配置方法
+
+```java
+// 正确配置：IO密集型任务
+public class ThreadPoolConfig {
+
+    @Bean
+    public ThreadPoolExecutor orderExecutor() {
+        // IO密集型：线程数 = CPU核数 × 2
+        int cpuCores = Runtime.getRuntime().availableProcessors();
+        int poolSize = cpuCores * 2;
+
+        return new ThreadPoolExecutor(
+            poolSize,                     // 核心线程数
+            poolSize * 2,                 // 最大线程数
+            60L,                          // 空闲存活时间
+            TimeUnit.SECONDS,
+            // 必须是有限队列，控制任务堆积
+            new LinkedBlockingQueue<>(1000),
+            // 自定义线程工厂
+            new ThreadFactoryBuilder()
+                .setNameFormat("order-pool-%d")
+                .setDaemon(false)
+                .build(),
+            // 拒绝策略
+            new ThreadPoolExecutor.AbortPolicy()
+        );
+    }
+}
+
+// 正确配置：CPU密集型任务
+@Bean
+public ThreadPoolExecutor computeExecutor() {
+    int cpuCores = Runtime.getRuntime().availableProcessors();
+
+    return new ThreadPoolExecutor(
+        cpuCores + 1,
+        cpuCores + 1,
+        0L, TimeUnit.MILLISECONDS,
+        new LinkedBlockingQueue<>(100),
+        new ThreadFactoryBuilder()
+            .setNameFormat("compute-pool-%d")
+            .build(),
+        new ThreadPoolExecutor.AbortPolicy()
+    );
+}
+```
+
+## 二、线程池队列选择 🟡
+
+### 2.1 队列类型对比
+
+```
+队列类型对比：
+
+1. LinkedBlockingQueue
+   - 无界队列，容量Integer.MAX_VALUE
+   - 优点：不拒绝任务
+   - 缺点：堆积导致内存溢出
+   - 适用：任务不紧急，允许延迟
+
+2. ArrayBlockingQueue
+   - 有界队列，需要指定容量
+   - 优点：可控，不会无限堆积
+   - 缺点：满时拒绝任务
+   - 适用：必须控制堆积量
+
+3. SynchronousQueue
+   - 同步队列，不存储任务
+   - 优点：不会堆积，必须立即执行
+   - 缺点：高并发时创建大量线程
+   - 适用：需要立即执行的任务
+
+4. PriorityBlockingQueue
+   - 优先级队列
+   - 优点：按优先级处理任务
+   - 缺点：无界，需要注意容量
+   - 适用：优先级任务调度
+```
+
+### 2.2 队列选择策略
+
+```java
+// 队列选择策略
+public class QueueSelectionStrategy {
+
+    /**
+     * 根据任务特性选择队列
+     */
+    public BlockingQueue<Runnable> selectQueue(TaskType type, int capacity) {
+        switch (type) {
+            case URGENT:
+                // 紧急任务：SynchronousQueue，必须立即处理
+                return new SynchronousQueue<>();
+
+            case IMPORTANT:
+                // 重要任务：ArrayBlockingQueue，有界可控
+                return new ArrayBlockingQueue<>(capacity);
+
+            case NORMAL:
+                // 普通任务：LinkedBlockingQueue，允许一定堆积
+                return new LinkedBlockingQueue<>(capacity);
+
+            case BACKGROUND:
+                // 后台任务：PriorityBlockingQueue，按优先级
+                return new PriorityBlockingQueue<>(capacity,
+                    Comparator.comparingInt(Task::getPriority));
+
+            default:
+                return new LinkedBlockingQueue<>(capacity);
+        }
+    }
+}
+```
+
+## 三、拒绝策略设计 🟡
+
+### 3.1 拒绝策略对比
+
+```
+拒绝策略对比：
+
+1. AbortPolicy（默认）
+   - 抛RejectedExecutionException
+   - 优点：调用方能感知任务被拒绝
+   - 缺点：需要上层处理异常
+   - 适用：需要严格保证任务执行的场景
+
+2. CallerRunsPolicy
+   - 由调用方线程执行任务
+   - 优点：不会丢失任务
+   - 缺点：调用方线程被阻塞，可能影响主流程
+   - 适用：不允许任务丢失，但可以接受延迟
+
+3. DiscardPolicy
+   - 直接丢弃任务
+   - 优点：不会阻塞
+   - 缺点：任务丢失
+   - 适用：不重要的任务
+
+4. DiscardOldestPolicy
+   - 丢弃队列中最老的任务
+   - 优点：腾出空间给新任务
+   - 缺点：老任务丢失
+   - 适用：优先处理新任务的场景
+```
+
+### 3.2 自定义拒绝策略
+
+```java
+// 自定义拒绝策略：记录+告警+降级
+public class LoggingRejectHandler implements RejectedExecutionHandler {
+
+    @Autowired
+    private AlertService alertService;
+
+    @Autowired
+    private MetricsService metricsService;
+
+    @Override
+    public void rejectedExecution(Runnable r, ThreadPoolExecutor executor) {
+        // 1. 记录日志
+        log.error("任务被拒绝，线程池状态：活跃={}, 队列大小={}, 核心={}, 最大={}",
+            executor.getActiveCount(),
+            executor.getQueue().size(),
+            executor.getCorePoolSize(),
+            executor.getMaximumPoolSize());
+
+        // 2. 发送告警
+        alertService.sendAlert("线程池拒绝任务，当前队列堆积：" +
+            executor.getQueue().size());
+
+        // 3. 记录指标
+        metricsService.increment("threadpool.rejected");
+
+        // 4. 降级处理
+        if (r instanceof Callable) {
+            try {
+                // 降级：同步执行，设置超时
+                Object result = ((Callable<?>) r).call();
+                log.warn("降级执行成功");
+            } catch (Exception e) {
+                log.error("降级执行失败", e);
+            }
+        }
+    }
+}
+
+// 降级策略：写入消息队列
+public class MQRejectHandler implements RejectedExecutionHandler {
+
+    @Autowired
+    private MessageProducer producer;
+
+    @Override
+    public void rejectedExecution(Runnable r, ThreadPoolExecutor executor) {
+        if (r instanceof TaskRunnable) {
+            TaskRunnable task = (TaskRunnable) r;
+            // 写入消息队列，稍后处理
+            producer.send("task.retry", task.getTaskData());
+            log.warn("任务写入MQ重试队列");
+        }
+    }
+}
+```
+
+## 四、线程池监控 🟡
+
+### 4.1 线程池指标采集
+
+```java
+// 线程池监控
+@Component
+@Slf4j
+public class ThreadPoolMonitor {
+
+    @Autowired
+    private Map<String, ThreadPoolExecutor> threadPools;
+
+    @Scheduled(fixedRate = 10000)
+    public void monitor() {
+        for (Map.Entry<String, ThreadPoolExecutor> entry : threadPools.entrySet()) {
+            String name = entry.getKey();
+            ThreadPoolExecutor pool = entry.getValue();
+
+            int activeCount = pool.getActiveCount();
+            int poolSize = pool.getPoolSize();
+            int queueSize = pool.getQueue().size();
+            long completedTaskCount = pool.getCompletedTaskCount();
+            long totalTaskCount = pool.getTaskCount();
+
+            // 计算使用率
+            double activeRate = (double) activeCount / poolSize;
+            double queueUsage = (double) queueSize / 1000;  // 假设队列容量1000
+
+            log.info("线程池[{}]：活跃={}/{}, 队列={}, 完成={}/{}",
+                name, activeCount, poolSize, queueSize,
+                completedTaskCount, totalTaskCount);
+
+            // 告警条件
+            if (activeRate > 0.8) {
+                alert("线程池[{}]活跃率超过80%", name);
+            }
+            if (queueSize > 800) {
+                alert("线程池[{}]队列堆积超过80%", name);
+            }
+        }
+    }
+}
+```
+
+### 4.2 动态调整线程池
+
+```java
+// 动态调整线程池
+@Service
+public class DynamicThreadPool {
+
+    @Autowired
+    private ConfigService configService;
+
+    public void adjustThreadPool(String poolName, ThreadPoolExecutor pool) {
+        // 从配置中心获取新的配置
+        int coreSize = configService.getInt(poolName + ".coreSize", 10);
+        int maxSize = configService.getInt(poolName + ".maxSize", 20);
+
+        // 调整核心线程数
+        pool.setCorePoolSize(coreSize);
+
+        // 调整最大线程数
+        pool.setMaximumPoolSize(maxSize);
+
+        // 设置核心线程超时
+        pool.allowCoreThreadTimeOut(
+            configService.getBoolean(poolName + ".allowTimeout", true));
+
+        log.info("线程池[{}]已调整：核心={}, 最大={}",
+            poolName, coreSize, maxSize);
+    }
+}
+```
+
+## 五、生产避坑 🟡
+
+### 5.1 线程池的五大坑
+
+**坑1：使用Executors创建线程池**
+
+```
+问题：Executors创建的是无界队列或无限线程
+场景：newFixedThreadPool队列容量Integer.MAX_VALUE
+解决方案：
+- 使用ThreadPoolExecutor自定义配置
+- 指定队列容量
+- 配置拒绝策略
+```
+
+**坑2：队列容量设置过大**
+
+```
+问题：队列太大，任务堆积严重
+场景：队列容量100万
+解决方案：
+- 根据业务设置合理容量
+- 监控队列堆积量
+- 超过阈值告警
+```
+
+**坑3：线程数设置不合理**
+
+```
+问题：CPU密集型配置了大量线程
+场景：8核CPU配置50线程
+解决方案：
+- CPU密集型：线程数 = CPU核数 + 1
+- IO密集型：线程数 = CPU核数 × 2
+```
+
+**坑4：没有拒绝策略**
+
+```
+问题：任务被拒绝但没有处理
+场景：AbortPolicy默认抛异常
+解决方案：
+- 自定义拒绝策略
+- 记录日志+发送告警
+- 降级处理
+```
+
+**坑5：没有监控**
+
+```
+问题：线程池状态不透明，出问题才发现
+场景：队列堆积到10万才发现
+解决方案：
+- 监控线程池指标
+- 监控队列堆积量
+- 设置告警阈值
+```
+
+### 5.2 线程池检查清单
+
+```
+配置规范：
+- [ ] 不使用Executors创建线程池
+- [ ] 队列容量必须设置
+- [ ] 拒绝策略必须配置
+- [ ] 线程数根据任务类型配置
+
+监控规范：
+- [ ] 监控活跃线程数
+- [ ] 监控队列堆积量
+- [ ] 监控任务执行时间
+- [ ] 告警阈值设置合理
+
+代码规范：
+- [ ] 任务必须实现接口
+- [ ] 任务必须可序列化
+- [ ] 异常必须捕获处理
+```
+
+## 六、真实面试回放 🟡
+
+> **面试官**：线程池参数有哪些？怎么配置？
+>
+> **候选人**（小张）：七大参数：
+>
+> corePoolSize核心线程数、maximumPoolSize最大线程数、keepAliveTime空闲存活时间、workQueue任务队列、threadFactory线程工厂、handler拒绝策略。
+>
+> 配置的话，CPU密集型配置核心线程数为CPU核数加1，IO密集型配置为CPU核数乘以2。
+>
+> **面试官**：LinkedBlockingQueue和ArrayBlockingQueue区别？
+>
+> 小张：LinkedBlockingQueue是无界的，默认容量是Integer.MAX_VALUE，容易堆积。ArrayBlockingQueue是有界的，必须指定容量，不会无限堆积。
+>
+> **面试官**：拒绝策略有哪些？
+>
+> 小张：四种：
+>
+> AbortPolicy抛异常，CallerRunsPolicy由调用方执行，DiscardPolicy丢弃任务，DiscardOldestPolicy丢弃最老的任务。
+>
+> 我一般用AbortPolicy，配合告警。
+>
+> 【面试官手记】
+>
+> 小张这场面试的亮点：
+>
+> 1. 知道七大参数
+>
+> 2. 知道队列类型区别
+>
+> 3. 知道拒绝策略种类
+>
+> 线程池是P6工程师必备知识点，能完整回答的候选人，说明有生产调优经验。
+
+线程池配置的核心是**合理容量 + 队列有界**。记住三个要点：
+
+1. **队列必须有界**：防止内存溢出
+2. **线程数合理**：CPU密集型=核数+1，IO密集型=核数×2
+3. **拒绝策略必须配置**：记录日志+发送告警+降级处理
+
+线程池是生产环境的性能关键，配错了轻则响应慢，重则OOM。

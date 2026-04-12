@@ -1,0 +1,206 @@
+---
+title: HashMap 线程不安全表现
+description: 详解 HashMap 在并发场景下的数据丢失、循环链表、size 不准确等线程安全问题，以及 ConcurrentHashMap 的解决方案。
+---
+
+# HashMap 线程不安全表现
+
+面试官问："HashMap 是线程安全的吗？"
+
+候选人小卫答："不是。"
+
+面试官追问："那在多线程环境下使用 HashMap 会发生什么问题？"
+
+小卫说："会有并发问题。"
+
+面试官追问："具体会发生什么问题？"
+
+小卫答不上来。
+
+【面试官心理】
+这道题考的是候选人对 HashMap 并发问题的理解深度。能说出"数据丢失"、"循环链表"、"size 不准确"三种问题的候选人，说明对并发编程有一定积累。
+
+## 一、HashMap 的三大并发问题 🔴
+
+### 1.1 数据丢失
+
+```java
+// 两个线程同时 put，hash 冲突时
+// 假设 key1 和 key2 的 hash 值相同，桶中已有 key1
+
+// 线程1: e = table[i] (key1)
+// 线程2: e = table[i] (key1)
+// 线程1: table[i] = newNode(key2, value2)  // key2 覆盖了 key1 的位置
+// 线程2: e.next = newNode(key3, value3)   // e.next 被修改，但 key2 丢了！
+```
+
+```java
+// 模拟数据丢失场景
+public class HashMapDataLoss {
+    public static void main(String[] args) throws InterruptedException {
+        HashMap<Integer, Integer> map = new HashMap<>(16);
+
+        // 100 个线程，每个 put 1000 次
+        // 使用相同的 key range，大量 hash 冲突
+        Thread[] threads = new Thread[100];
+        for (int t = 0; t < 100; t++) {
+            threads[t] = new Thread(() -> {
+                for (int i = 0; i < 1000; i++) {
+                    // hash 值固定，产生大量冲突
+                    map.put(i, i);
+                }
+            });
+            threads[t].start();
+        }
+
+        for (Thread t : threads) t.join();
+
+        System.out.println("Expected: " + (100 * 1000)); // 100000
+        System.out.println("Actual: " + map.size()); // 通常小于 100000
+        // 实际结果通常在 90000-99000 之间，有数据丢失！
+    }
+}
+```
+
+### 1.2 循环链表（JDK 7 扩容）
+
+```java
+// JDK 7：扩容时 transfer 使用头插法
+// 多线程同时扩容时，链表节点顺序会反转
+// 如果两个线程同时处理同一个桶中的链表，可能形成环形链表
+
+void transfer(Entry[] newTable) {
+    for (Entry<K, V> e = table[i]; e != null; ) {
+        Entry<K, V> next = e.next;
+        e.next = newTable[i]; // 头插：链表反转
+        newTable[i] = e;
+        e = next;
+    }
+}
+
+// 两个线程同时执行：
+// 原链表：A -> B -> C -> null
+// 线程1: e=A, next=B, e.next=null, newTable[0]=A, e=B
+// 线程2: e=A, next=B, e.next=A(被线程1修改！), newTable[0]=A, e=B
+// 线程2: e=B, next=C, e.next=A, newTable[0]=B, e=C
+// 线程2: e=C, next=null, e.next=B(被线程1修改！), newTable[0]=C, e=null
+// 结果链表：C -> B -> A -> A（环形！）
+```
+
+:::warning ⚠️
+JDK 7 HashMap 扩容形成环形链表后，调用 `get()` 会导致 **CPU 100%** 的死循环。这是 Java 历史上最著名的并发 bug 之一。
+:::
+
+### 1.3 size 不准确
+
+```java
+// HashMap 的 size 字段不是 volatile
+// 多线程 put 时，size++ 不是原子操作
+transient int size;
+
+// size++ 的字节码：
+// getfield size      // 读取 size
+// iconst_1          // 常量 1
+// iadd              // 加法
+// putfield size     // 写回
+// 这三步之间可能被其他线程打断
+
+// 两个线程同时 size++：
+// 线程1: getfield size -> 0
+// 线程2: getfield size -> 0
+// 线程1: iadd -> 1
+// 线程2: iadd -> 1
+// 线程1: putfield size -> 1
+// 线程2: putfield size -> 1
+// 期望 size=2，实际 size=1
+```
+
+## 二、为什么 ConcurrentHashMap 是解决方案 🔴
+
+```java
+// ConcurrentHashMap 的改进：
+
+// 1. size 用 CAS 更新，而不是直接++
+private final LongAdder counter = new LongAdder();
+public int size() {
+    long sum = 0;
+    for (LongAdder cell : counter.cells) {
+        sum += cell.sum();
+    }
+    return (sum >= Integer.MAX_VALUE) ? Integer.MAX_VALUE : (int) sum;
+}
+
+// 2. JDK 8 使用 synchronized + CAS 代替分段锁
+// 3. JDK 8 扩容支持多线程并发 transfer
+```
+
+## 三、生产中的教训 🔴
+
+### 3.1 Spring 的 @Cacheable 注解
+
+```java
+// ❌ 错误配置
+@Bean
+public CacheManager cacheManager() {
+    // 静态 HashMap 作为缓存
+    return new ConcurrentMapCacheManager("data",
+        Collections.singletonMap("data",
+            new ConcurrentMapCache<>("data", new HashMap<>())));
+}
+
+// ✅ 正确配置
+@Bean
+public CacheManager cacheManager() {
+    // 使用 ConcurrentHashMap 作为缓存存储
+    return new ConcurrentMapCacheManager(
+        new ConcurrentHashMap<>());
+}
+```
+
+### 3.2 统计聚合数据
+
+```java
+// ❌ 错误：多线程使用 HashMap 统计
+Map<String, Integer> counter = new HashMap<>();
+for (DataItem item : data) {
+    String key = item.getCategory();
+    // ❌ 不是原子操作
+    counter.put(key, counter.getOrDefault(key, 0) + 1);
+}
+
+// ✅ 正确：使用 ConcurrentHashMap
+Map<String, LongAdder> counter = new ConcurrentHashMap<>();
+for (DataItem item : data) {
+    String key = item.getCategory();
+    counter.computeIfAbsent(key, k -> new LongAdder()).increment();
+}
+```
+
+## 四、线程安全的替代方案 🔴
+
+| 方案 | 特点 | 适用场景 |
+| --- | --- | --- |
+| `Hashtable` | 全局 synchronized，效率低 | 不推荐 |
+| `Collections.synchronizedMap()` | 包装为同步map，同步开销大 | 不推荐 |
+| `ConcurrentHashMap` | 分段锁（JDK 7）/ CAS+synchronized（JDK 8） | 高并发首选 |
+| `ConcurrentSkipListMap` | 无锁，支持有序遍历 | 需要有序时 |
+| `guava CacheBuilder` | 本地缓存，支持过期 | 缓存场景 |
+
+## 五、追问升级
+
+**面试官**："ConcurrentHashMap 在 JDK 7 和 JDK 8 有什么区别？"
+
+```java
+// JDK 7：Segment 分段锁
+// 将数据分成 16 个段，每段独立加锁
+// 优点：并发度高（最多 16 线程并发写）
+// 缺点：实现复杂，初始化时一次性分配所有内存
+
+// JDK 8：CAS + synchronized
+// 直接在 Node 级别加锁
+// 优点：实现简单，内存利用率高
+// 缺点：写并发度受限于单个桶（但红黑树查找快）
+```
+
+【面试官心理】
+能说出 ConcurrentHashMap JDK 7/8 差异的候选人，说明对 Java 并发集合有深入了解。这是 P6+ 的要求。

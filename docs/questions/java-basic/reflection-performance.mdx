@@ -1,0 +1,259 @@
+---
+title: 反射的性能问题与优化
+description: 深入分析反射的性能开销来源、MethodHandle 对比、以及 Spring、MyBatis、Hibernate 等框架中的反射优化实践。
+---
+
+# 反射的性能问题与优化
+
+面试官问："反射有什么性能问题？如何优化？"
+
+候选人小冯答："反射调用比普通方法调用慢很多，可以缓存 Method 对象来优化。"
+
+面试官追问："反射慢的原因是什么？能具体量化吗？"
+
+小冯说："大概慢个几倍？"
+
+面试官又问："除了缓存 Method 对象，还有其他优化方式吗？"
+
+小冯说不出来了。
+
+【面试官心理】
+这道题考的是候选人对 JVM 底层机制的理解程度。能说出"MethodHandle"、"Inflation 机制"、"JIT 内联失效"的候选人，是真正研究过这个问题的。
+
+## 一、反射的性能开销量化 🔴
+
+### 1.1 性能对比（真实数据）
+
+| 调用方式 | 相对耗时 |
+| --- | --- |
+| 正常方法调用 | 1x |
+| 反射调用（首次） | ~50x |
+| 反射调用（缓存后） | ~5-10x |
+| MethodHandle 调用 | ~2-3x |
+| Lambda 表达式 | ~1.2x |
+
+### 1.2 性能开销的来源
+
+```java
+// 反射调用的每一次 invoke() 都要经过：
+// 1. 参数类型检查
+// 2. 访问权限检查（setAccessible）
+// 3. 参数装箱（基本类型 → Object[]）
+// 4. 参数拆箱（Object[] → 基本类型）
+// 5. 结果装箱（Object → 基本类型）
+// 6. 异常包装
+// 7. JIT 无法内联
+
+// 普通调用：
+// 直接 CPU 指令执行
+```
+
+## 二、JDK 反射的 Inflation 机制 🔴
+
+### 2.1 JDK 8 及之前的 Inflation
+
+```java
+// 反射第一次调用时：
+// JVM 不是直接用 native 方法，而是用 Java 层包装
+// 创建一个 NativeMethodAccessorImpl
+// 如果调用次数超过阈值（默认 15 次），切换到字节码生成的 Accessor
+
+// 源码逻辑（MethodAccessorGenerator）：
+// 调用次数 < 15：使用 NativeMethodAccessorImpl
+// 调用次数 >= 15：生成字节码 Accessor（更快）
+```
+
+`inflationThreshold = 15`（可通过 `-Djdk.invoke.reflection.Threshold=N` 修改）
+
+```java
+// 实际效果：
+// 前 15 次调用：慢（native 层）
+// 第 15 次之后：快（字节码生成的 Accessor）
+// 但仍然比直接调用慢 5-10x
+```
+
+### 2.2 JDK 17+ 的改进
+
+JDK 17 移除了 Inflation 机制，简化了反射调用路径，性能提升约 30%：
+
+```java
+// JDK 17+: 不再有 Inflation 切换
+// 直接使用字节码生成的 Accessor
+// 但 setAccessible 仍然有额外开销
+```
+
+## 三、优化策略 🔴
+
+### 3.1 缓存 Method/Field 对象
+
+```java
+// ❌ 每次调用都反射查找
+public void process(Object target) {
+    Method method = target.getClass().getMethod("doWork"); // 每次查找！
+    method.invoke(target);
+}
+
+// ✅ 缓存 Method 对象
+private static final Map<Class<?>, Method> METHOD_CACHE = new ConcurrentHashMap<>();
+
+public void process(Object target) {
+    Class<?> cls = target.getClass();
+    Method method = METHOD_CACHE.computeIfAbsent(cls,
+        c -> {
+            try {
+                return c.getMethod("doWork");
+            } catch (NoSuchMethodException e) {
+                throw new ReflectionException(e);
+            }
+        });
+    method.invoke(target);
+}
+```
+
+:::tip 💡
+Spring、MyBatis、Hibernate 内部都大量使用了 Method/Field 缓存。Spring 的 `CachedIntrospectionResults` 就是专门做这个的。
+:::
+
+### 3.2 使用 MethodHandle 替代反射
+
+```java
+// MethodHandle（JDK 7+）比反射快 10x
+// MethodHandle 是"类型安全的引用"，类似于虚方法表的直接引用
+
+public class MethodHandleInvoker {
+    private final MethodHandle handle;
+
+    public MethodHandleInvoker(Class<?> cls, String methodName, Class<?>... paramTypes)
+            throws NoSuchMethodException, IllegalAccessException {
+        this.handle = MethodHandles.lookup()
+            .findVirtual(cls, methodName,
+                MethodType.methodType(void.class, paramTypes));
+    }
+
+    public Object invoke(Object receiver, Object... args) throws Throwable {
+        return handle.bindTo(receiver).invokeWithArguments(args);
+    }
+}
+```
+
+### 3.3 设置 setAccessible 的方式
+
+```java
+// ❌ 每次都 setAccessible
+Method m = cls.getDeclaredMethod("doWork");
+m.setAccessible(true); // 每次都遍历调用栈检查安全管理器
+
+// ✅ 只 setAccessible 一次，配合缓存
+private static final Map<Member, Boolean> ACCESS_CACHE = new ConcurrentHashMap<>();
+
+public static void makeAccessible(Member member) {
+    if (!ACCESS_CACHE.computeIfAbsent(member, m -> {
+        if (!m.isAccessible()) {
+            m.setAccessible(true);
+            return true;
+        }
+        return false;
+    })) {
+        // 已经设置过了
+    }
+}
+```
+
+### 3.4 使用 LambdaMetafactory 内联优化
+
+```java
+// JDK 8+: 使用 LambdaMetafactory 将反射调用"内联"为方法引用
+// MyBatis 3.8+ 的实现
+
+public interface MethodInvoker {
+    Object invoke(Object target, Object... args) throws Throwable;
+}
+
+// 创建一个"看起来像普通接口调用"的包装
+public static MethodInvoker createMethodInvoker(Method method) {
+    if (method.getParameterCount() == 0) {
+        return (target, args) -> method.invoke(target);
+    }
+    return method::invoke; // Lambda 表达式，JIT 可以优化
+}
+```
+
+## 四、Spring 框架的反射优化 🔴
+
+### 4.1 CachedIntrospectionResults
+
+```java
+// Spring 的 BeanWrapper 使用 CachedIntrospectionResults
+// 内部结构：
+class CachedIntrospectionResults {
+    // 缓存 PropertyDescriptor（包含 getter/setter/field）
+    private final Map<String, PropertyDescriptor> propertyDescriptorCache;
+
+    // Spring 缓存的是 PropertyDescriptor，而非原始 Method
+    // PropertyDescriptor 已经包含了优化后的方法引用
+}
+
+// 使用时直接调用缓存好的 accessor，不需要每次反射
+BeanWrapper bw = new BeanWrapperImpl(bean);
+bw.setPropertyValue("name", "Alice"); // 内部使用缓存的 set 方法
+```
+
+### 4.2 Spring Boot 的 Optimized
+
+Spring Boot 2.x 之后，大量使用 `reflection-pbo`（Reflection Based Property Wrapper）进行反射优化，减少反射调用次数。
+
+## 五、生产中的反思使用场景 🔴
+
+### 5.1 序列化/反序列化
+
+```java
+// Jackson 的 ObjectMapper
+// 为了性能，使用了大量的反射优化技巧：
+// 1. 生成字节码（ASM）动态创建反序列化器
+// 2. 缓存所有 accessor
+// 3. 使用 @JsonIgnore 过滤不必要的字段
+
+// 即使这样，JSON 反序列化仍然是 CPU 密集型操作
+// 高 QPS 服务中，JSON 反序列化占 CPU 时间的 20-30%
+```
+
+### 5.2 通用 CRUD 框架
+
+```java
+// MyBatis 的 SQL 执行流程中的反射优化：
+// 1. ResultSetHandler 使用 TypeHandlerRegistry
+// 2. 每个 JDBC Type 映射到一个 TypeHandler
+// 3. TypeHandler 内部使用反射设置字段
+// 4. 所有 TypeHandler 在启动时一次性初始化并缓存
+
+// MyBatis Plus（MyBatis 的增强库）进一步优化：
+// 使用 JSqlParser 生成特定类型的 Setter
+// 避免运行时反射
+```
+
+:::warning ⚠️
+在高频调用场景（每秒数万次反射调用），即使做了所有优化，反射仍然可能是性能瓶颈。MySQL JDBC driver 在 8.0 版本后将 PreparedStatement 的反射调用改为直接类型化调用，性能提升显著。
+:::
+
+## 六、追问升级
+
+**面试官**："Unsafe.getObject() 能绕过反射性能开销吗？"
+
+```java
+// sun.misc.Unsafe 的直接内存访问
+import sun.misc.Unsafe;
+Field f = Unsafe.class.getDeclaredField("theUnsafe");
+f.setAccessible(true);
+Unsafe unsafe = (Unsafe) f.get(null);
+
+// 直接设置字段（无需 getter/setter，无需反射）
+unsafe.putObject(obj, offset, value); // 比反射快 3-5x
+```
+
+Unsafe 确实更快，但：
+- **安全性**：Unsafe 可以访问任意内存地址，是安全漏洞来源
+- **兼容性**：JDK 9+ 模块系统限制了对 Unsafe 的访问
+- **正确性**：错误的 offset 会导致 JVM 崩溃
+
+【面试官心理】
+能说出 Unsafe 并讨论其限制的候选人，说明对 Java 底层有一定研究。但要注意，说 Unsafe 是为了"优化"而不是为了"破解"才是正确的角度。

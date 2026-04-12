@@ -1,0 +1,247 @@
+---
+title: binlog 三种格式对比
+description: 从一道面试题出发，深入剖析 MySQL binlog 的三种格式——STATEMENT、ROW、MIXED，理解每种格式的记录方式、优缺点以及适用场景。
+---
+
+# binlog 三种格式对比
+
+面试官问："MySQL binlog 有哪几种格式？有什么区别？"
+
+小李说："有 STATEMENT 格式和 ROW 格式。"
+
+面试官追问："那 MIXED 格式是什么？"
+
+小李说："...混合模式？"
+
+面试官继续追问："为什么大厂推荐用 ROW 格式？STATEMENT 格式有什么问题？"
+
+小李开始答不上来。
+
+binlog 格式是 MySQL 主从复制的核心。这道题能说清楚三种格式的区别、优缺点和适用场景的候选人，对 MySQL 复制的理解已经相当深入。
+
+## 一、三种 binlog 格式 🔴
+
+### 1.1 格式概览
+
+| 格式 | 记录内容 | binlog 大小 | 一致性 | 性能 |
+| --- | --- | --- | --- | --- |
+| STATEMENT | SQL 语句 | 小 | 可能不一致 | 高 |
+| ROW | 行级变更 | 大 | 完全一致 | 中 |
+| MIXED | 自动选择 | 中 | 自动选择 | 中 |
+
+### 1.2 STATEMENT 格式
+
+```sql
+-- Master 执行：
+UPDATE orders SET amount = amount + 100 WHERE user_id = 1;
+
+-- binlog 记录：
+UPDATE orders SET amount = amount + 100 WHERE user_id = 1;
+-- (记录的是原始 SQL 语句)
+```
+
+**Slave 重放**：执行相同的 SQL 语句。
+
+**问题**：
+
+```sql
+-- Master：
+INSERT INTO orders (order_no, created_at) VALUES ('A001', NOW());
+-- binlog: INSERT INTO orders (order_no, created_at) VALUES ('A001', NOW());
+
+-- Slave：
+-- NOW() 在 Slave 执行时可能返回不同时间
+-- 导致 created_at 不一致
+```
+
+### 1.3 ROW 格式
+
+```sql
+-- Master 执行：
+UPDATE orders SET amount = amount + 100 WHERE user_id = 1;
+
+-- binlog 记录（每行变更）：
+UPDATE orders
+WHERE id=1 AND user_id=1 AND amount=1000
+SET amount=1100;
+-- (记录每行的具体变更前后值)
+```
+
+**Slave 重放**：执行相同的行变更操作。
+
+**优点**：精确到每一行，不受函数影响。
+
+**缺点**：批量更新时，binlog 体积可能是 STATEMENT 的 10 倍甚至 100 倍。
+
+### 1.4 MIXED 格式
+
+```sql
+-- MySQL 自动判断：
+-- 普通 SQL：用 STATEMENT 格式（节省 binlog）
+-- 非确定性 SQL（NOW(), RAND() 等）：用 ROW 格式（保证一致性）
+```
+
+### 1.5 ❌ 错误示范
+
+**候选人原话**："ROW 格式总是最好的，所以所有场景都用 ROW。"
+
+**问题诊断**：ROW 格式虽然精确，但 binlog 体积大，在高并发写入时可能撑爆磁盘。应根据业务场景选择。
+
+**候选人原话 2**："STATEMENT 格式记录的是执行结果。"
+
+**问题诊断**：混淆了 STATEMENT 和 ROW。STATEMENT 记录的是 SQL 语句，不是执行结果。
+
+【面试官心理】
+这道题我能从 STATEMENT 格式的问题切入。比如我会问："为什么 NOW() 函数在 STATEMENT 格式下会导致主从不一致？"能说清楚非确定性函数问题的候选人，说明他对 binlog 格式有深入理解。
+
+## 二、STATEMENT 格式的坑 🔴
+
+### 2.1 非确定性函数
+
+```sql
+-- 以下函数在 STATEMENT 格式下会导致主从不一致：
+NOW(), CURDATE(), RAND(), UUID(), USER(), FOUND_ROWS()
+LOAD_FILE(), VERSION(), etc.
+
+-- 案例：
+-- Master: INSERT INTO log (msg, created) VALUES ('login', NOW());
+-- binlog: INSERT INTO log (msg, created) VALUES ('login', NOW());
+
+-- Slave: INSERT INTO log (msg, created) VALUES ('login', NOW());
+-- NOW() 在 Slave 执行时可能差几毫秒
+```
+
+### 2.2 自增列和序列
+
+```sql
+-- STATEMENT 格式下，自增列在 Master 和 Slave 的行为可能不同
+INSERT INTO orders VALUES (NULL, 'A001');
+-- 如果 Master 分配了 ID=100，但 Slave 因为某种原因分配了 ID=101
+```
+
+### 2.3 触发器和存储过程
+
+```sql
+-- 触发器中的 SQL 在 STATEMENT 格式下可能产生不同结果
+CREATE TRIGGER tr_after_insert AFTER INSERT ON orders
+FOR EACH ROW
+BEGIN
+    UPDATE inventory SET count = count - 1 WHERE item_id = NEW.item_id;
+END;
+
+-- 触发器内部的 SQL 在 binlog 中如何记录？
+-- 如果触发器执行了多次，Master 和 Slave 的行为可能不一致
+```
+
+## 三、ROW 格式的优缺点 🟡
+
+### 3.1 ROW 格式的优势
+
+1. **精确性**：每一行变更有完整的变更前后值
+2. **一致性**：不受函数、触发器、存储过程影响
+3. **可回滚**：可以精确回滚任意一行数据
+4. **审计友好**：可以看到每行的具体变更
+
+### 3.2 ROW 格式的劣势
+
+```sql
+-- 批量更新 100 万行：
+-- STATEMENT 格式 binlog：
+UPDATE orders SET status = 2 WHERE created_at < '2024-01-01';
+-- 大小：几十字节
+
+-- ROW 格式 binlog：
+UPDATE orders SET status=2 WHERE id=1 AND status=1;
+UPDATE orders SET status=2 WHERE id=2 AND status=1;
+... (100 万条)
+-- 大小：可能几十 MB 甚至几百 MB
+```
+
+**问题**：
+- binlog 体积膨胀，磁盘 IO 压力大
+- 主从复制时网络传输量大
+- 归档日志占更多空间
+
+### 3.3 binlog_row_image 参数
+
+```sql
+-- 控制 ROW 格式下记录多少数据
+SHOW VARIABLES LIKE 'binlog_row_image';
+
+-- FULL（默认）：记录变更行的所有列
+-- MINIMAL：只记录主键列和变更的列
+-- NOBLOB：只记录变更的列，不记录未变更的 BLOB/TEXT 列
+SET GLOBAL binlog_row_image = 'MINIMAL';
+```
+
+## 四、MIXED 格式的选择逻辑 🟡
+
+### 4.1 MIXED 的判断规则
+
+```sql
+-- 以下情况使用 ROW 格式：
+-- 1. 存储过程、触发器、函数中执行的 SQL
+-- 2. 使用了非确定性函数：NOW(), RAND(), UUID(), etc.
+-- 3. 连接了用户变量：@var
+-- 4. LOAD DATA INFILE
+-- 5. 调用了不支持 STATEMENT 格式的存储引擎
+
+-- 其他情况使用 STATEMENT 格式
+```
+
+### 4.2 如何选择格式
+
+```sql
+-- 互联网业务（高并发写入、数据量大）：
+-- 推荐 MIXED 或 ROW
+-- binlog_row_image = MINIMAL 进一步节省空间
+
+-- 审计/金融类业务（精确性要求高）：
+-- 推荐 ROW
+-- 牺牲一些性能，换取数据精确性
+
+-- 报表类业务（只读副本）：
+-- 可以用 STATEMENT
+-- 从库只做查询，不需要高精确性
+```
+
+## 五、生产配置 🟢
+
+### 5.1 设置 binlog 格式
+
+```sql
+-- 动态设置（会话级别）
+SET SESSION binlog_format = 'ROW';
+SET SESSION binlog_format = 'MIXED';
+
+-- 静态设置（全局，需重启）
+-- my.cnf:
+-- binlog_format = ROW
+-- binlog_row_image = MINIMAL
+```
+
+### 5.2 监控 binlog 大小
+
+```sql
+-- 查看 binlog 文件大小
+SHOW BINARY LOGS;
+
+-- 查看当前 binlog
+SHOW MASTER STATUS;
+
+-- 自动清理 binlog
+SHOW VARIABLES LIKE 'expire_logs_days';
+SET GLOBAL expire_logs_days = 7;  -- 保留 7 天
+PURGE BINARY LOGS BEFORE '2024-01-01 00:00:00';
+```
+
+【面试官心理】
+问 binlog 格式的候选人很多，但能说出 `binlog_row_image` 参数和 expire_logs_days 配置的是少数。生产环境中的 binlog 管理是一个重要的运维知识点。
+
+---
+
+| 级别 | 考察重点 | 期望回答 |
+| --- | --- | --- |
+| P5 | 基本概念 | 三种格式的名称和基本区别 |
+| P6 | 深度理解 | STATEMENT 的坑、ROW 的优缺点、MIXED 的选择逻辑 |
+| P7 | 生产运维 | binlog_row_image 参数、expire_logs_days 管理 |

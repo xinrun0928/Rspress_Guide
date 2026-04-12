@@ -1,0 +1,192 @@
+---
+title: ZooKeeper 分布式锁
+description: 深度解析 ZooKeeper 分布式锁的实现原理，解释临时顺序节点、Watch 机制、以及与 Redis 分布式锁的对比。
+---
+
+# ZooKeeper 分布式锁
+
+某团队在使用 ZooKeeper 实现分布式锁时，发现锁的获取速度比 Redis 慢 10 倍。
+
+排查后发现：每次获取锁都要在 ZooKeeper 中创建临时顺序节点，而 ZooKeeper 的写操作需要 Leader 节点处理，高并发下成为瓶颈。
+
+但 ZooKeeper 分布式锁有一个 Redis 分布式锁无法替代的优势：**锁的可靠性更高**，不会出现 Redis 主从切换导致的锁丢失问题。
+
+【架构权衡】
+ZooKeeper 分布式锁和 Redis 分布式锁是两种不同的实现思路。Redis 锁性能高但存在主从切换风险，ZooKeeper 锁可靠性高但性能较低。选择哪种，取决于业务对"一致性"和"性能"的权衡。
+
+---
+
+## 一、核心问题 🔴
+
+### 1.1 ZooKeeper 数据模型
+
+```
+ZooKeeper 的数据结构：
+
+ZooKeeper 将数据存储为树形结构（类似于文件系统）：
+
+/
+├── /locks
+│   ├── /locks/lock-000000001  ← 临时顺序节点
+│   ├── /locks/lock-000000002  ← 临时顺序节点
+│   └── /locks/lock-000000003  ← 临时顺序节点
+└── /services
+    └── /services/order        ← 持久节点
+```
+
+### 1.2 ZooKeeper 分布式锁原理
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    ZooKeeper 分布式锁原理                          │
+│                                                                  │
+│  获取锁：                                                          │
+│  1. 在 /locks 下创建临时顺序节点                                  │
+│     └─ /locks/lock-000000001                                    │
+│                                                                  │
+│  2. 获取 /locks 下所有子节点                                      │
+│     └─ [lock-000000001, lock-000000002, lock-000000003]         │
+│                                                                  │
+│  3. 判断自己是否是序号最小的节点                                 │
+│     └─ 如果是，获取锁成功                                        │
+│     └─ 如果不是，Watcher 监听上一个节点                         │
+│                                                                  │
+│  释放锁：                                                          │
+│  └─ 删除自己的临时节点                                            │
+│     └─ 删除时触发下一个节点的 Watch                               │
+│     └─ 下一个节点收到通知，再次判断是否最小                      │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 二、方案实现
+
+### 2.1 Curator 的 InterProcessMutex
+
+```java
+// 使用 Curator 实现分布式锁
+@Service
+public class ZkDistributedLock {
+
+    @Autowired
+    private CuratorFramework curatorFramework;
+
+    public void executeWithLock(String lockPath, Runnable task) {
+        // 创建分布式锁
+        InterProcessMutex lock = new InterProcessMutex(curatorFramework, lockPath);
+
+        try {
+            // 尝试获取锁，等待 30 秒
+            boolean acquired = lock.acquire(30, TimeUnit.SECONDS);
+
+            if (acquired) {
+                task.run();
+            } else {
+                throw new RuntimeException("获取 ZooKeeper 分布式锁失败");
+            }
+        } catch (Exception e) {
+            throw new RuntimeException("获取 ZooKeeper 分布式锁异常", e);
+        } finally {
+            try {
+                // 释放锁
+                if (lock.isOwnedByCurrentThread()) {
+                    lock.release();
+                }
+            } catch (Exception e) {
+                log.error("释放 ZooKeeper 分布式锁失败", e);
+            }
+        }
+    }
+}
+```
+
+### 2.2 手写分布式锁（理解原理）
+
+```java
+// 手写 ZooKeeper 分布式锁
+@Service
+public class SimpleZkLock {
+
+    @Autowired
+    private CuratorFramework curatorFramework;
+
+    private static final String LOCK_PATH = "/distributed-locks";
+
+    public String acquireLock(String lockKey, long timeoutMs) throws Exception {
+        // 创建父节点（如果不存在）
+        if (curatorFramework.checkExists().forPath(LOCK_PATH) == null) {
+            curatorFramework.create().withMode(CreateMode.PERSISTENT).forPath(LOCK_PATH);
+        }
+
+        // 创建临时顺序节点
+        String nodePath = curatorFramework.create()
+            .withMode(CreateMode.EPHEMERAL_SEQUENTIAL)
+            .forPath(LOCK_PATH + "/" + lockKey + "-", new byte[0]);
+
+        // 获取锁
+        long startTime = System.currentTimeMillis();
+        while (System.currentTimeMillis() - startTime < timeoutMs) {
+            // 获取所有子节点
+            List<String> children = curatorFramework.getChildren()
+                .forPath(LOCK_PATH);
+
+            // 按序号排序
+            Collections.sort(children);
+            String smallest = children.get(0);
+
+            // 如果自己是最小节点，获取锁成功
+            if (nodePath.endsWith(smallest)) {
+                return nodePath;
+            }
+
+            // 监听上一个节点
+            String previousNode = findPreviousNode(children, nodePath);
+            CountDownLatch latch = new CountDownLatch(1);
+
+            curatorFramework.getData()
+                .usingWatcher(new Watcher() {
+                    @Override
+                    public void process(WatchedEvent event) {
+                        if (event.getType() == Event.EventType.NodeDeleted) {
+                            latch.countDown();
+                        }
+                    }
+                })
+                .forPath(LOCK_PATH + "/" + previousNode);
+
+            // 等待上一个节点删除
+            latch.await(timeoutMs, TimeUnit.MILLISECONDS);
+        }
+
+        // 超时，删除自己创建的节点
+        curatorFramework.delete().forPath(nodePath);
+        return null;
+    }
+
+    public void releaseLock(String nodePath) throws Exception {
+        curatorFramework.delete().forPath(nodePath);
+    }
+}
+```
+
+【架构权衡】
+ZooKeeper 分布式锁的核心优势是**可靠性**：临时节点和 Watch 机制保证了锁的正确性，即使 ZooKeeper 节点崩溃也会自动释放锁。但它的性能不如 Redis，因为每次锁操作都需要 ZooKeeper 服务端的参与。
+
+## 三、Redis vs ZooKeeper
+
+| 对比维度 | Redis 分布式锁 | ZooKeeper 分布式锁 |
+| --- | --- | --- |
+| **实现复杂度** | 中 | 高 |
+| **性能** | 高（内存操作） | 低（网络 + 服务端处理） |
+| **可靠性** | 中（主从切换可能丢锁） | 高（ZAB 协议保证一致性） |
+| **可重入** | 需要额外实现 | Curator 原生支持 |
+| **公平性** | 非公平 | 公平（按序号） |
+| **主从切换** | 有风险 | 无风险 |
+| **适用场景** | 高并发 | 高可靠性 |
+
+## 四、落地 Checklist
+
+- [ ] **客户端**：使用 Curator 客户端库
+- [ ] **连接管理**：连接池配置、Session 超时
+- [ ] **超时设置**：合理设置获取锁和等待时间
+- [ ] **释放保证**：finally 中释放锁
+- [ ] **监控告警**：监控锁获取失败率

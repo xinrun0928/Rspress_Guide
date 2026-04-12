@@ -1,0 +1,487 @@
+---
+title: 附近的人（LBS）系统
+description: 从微信"附近的人"功能失效的线上故障切入，深度拆解LBS系统的核心技术：Geohash、GeoHash与 Redis GEO、附近搜索的实现与优化。
+---
+
+# 附近的人（LBS）系统
+
+2017年，某社交App的"附近的人"功能在高峰期出现了一个诡异的bug：用户刷新后，附近的人列表显示的用户位置几乎没有变化，但用户明明在移动。
+
+技术团队排查后发现：GeoHash精度设置过高，导致相邻格子内的用户在格子边界处频繁"消失"和"出现"。
+
+更严重的是：这个bug持续了3天，累计影响了约500万次位置查询，用户投诉率飙升。
+
+这是一个典型的LBS精度设计问题。
+
+【架构权衡】
+
+LBS系统的核心矛盾是**精度和性能的权衡**。精度越高，搜索范围越小，但需要的格子越多，计算越复杂；精度越低，搜索范围越大，但结果越不精确。不同的业务场景需要不同的精度设计——附近的人需要中等精度，外卖配送需要高精度，区域统计需要低精度。
+
+## 一、LBS系统的核心问题 🔴
+
+### 1.1 四大核心问题
+
+```
+LBS系统的四座大山：
+
+1. 坐标存储
+   - 经纬度如何存储？
+   - 如何建立空间索引？
+   - 如何支持高效查询？
+
+2. 距离计算
+   - 如何计算两点间的实际距离？
+   - 地球曲率要不要考虑？
+   - 浮点数精度怎么处理？
+
+3. 附近搜索
+   - 如何找出附近N公里的所有用户？
+   - 如何按距离排序？
+   - 如何分页？
+
+4. 性能优化
+   - 亿级用户如何做附近搜索？
+   - 如何处理高并发？
+   - 如何缓存热点数据？
+```
+
+### 1.2 量化指标
+
+```
+LBS系统的关键数字：
+
+坐标精度：
+- GPS精度：约3-5米（民用）
+- GeoHash精度：9位约2米，7位约153米
+
+搜索范围：
+- 附近1公里：约2000个活跃用户
+- 附近5公里：约50000个活跃用户
+- 附近10公里：约200000个活跃用户
+
+性能要求：
+- 附近搜索延迟：P99 < 50ms
+- 位置更新频率：每秒1000次
+- 支持在线用户：亿级
+```
+
+### 1.3 面试核心问题
+
+> 面试官：设计一个"附近的人"功能，亿级用户，怎么实现？
+>
+> 候选人：核心是**GeoHash + Redis GEO + 分层搜索**。
+>
+> 1. 用户位置用GeoHash编码（如 wx4g0e8f8），存Redis
+>
+> 2. 查询时先找到用户所在格子及其周边8个格子
+>
+> 3. 用Redis的 GEORADIUS 命令搜索
+>
+> 4. 返回结果按距离排序
+>
+> 面试官：为什么只搜9个格子就够了？
+>
+> 候选人：GeoHash是Z字形填充的，一个格子代表一块矩形区域。查询附近的人，就是找相邻格子。地球表面是连续的，相邻格子的用户一定在附近。
+>
+> 【面试官心理】
+>
+> LBS系统是系统设计中的高频考点。能回答GeoHash的候选人，说明理解空间索引的原理；能回答"只搜9个格子"的候选人，说明理解GeoHash的空间特性。
+
+## 二、GeoHash算法原理 🔴
+
+### 2.1 经纬度编码
+
+```
+GeoHash原理：将经纬度（二维）编码成一维字符串
+
+编码过程：
+1. 维度范围：-90到90，二分法，得到二进制
+2. 经度范围：-180到180，二分法，得到二进制
+3. 交叉合并：维度奇数位，经度偶数位
+4. 转Base32：每5位二进制转一个字符
+
+示例：
+经度 116.408107 → 二进制交叉 → Base32 → wx4g0e
+维度 39.911067                        8f8
+合并后：wx4g0e8f8（9位，约±2米精度）
+```
+
+### 2.2 GeoHash与距离
+
+```
+GeoHash长度与覆盖范围：
+
+| 长度 | 格子大小 | 适用场景 |
+| 1 | 5000km | 大洲级别 |
+| 2 | 1250km | 国家级别 |
+| 3 | 156km | 省级别 |
+| 4 | 39km | 城市级别 |
+| 5 | 5km | 区级别 |
+| 6 | 1.2km | 街道级别 |
+| 7 | 153m | 附近精度 |
+| 8 | 38m | 高精度 |
+| 9 | 2m | 厘米级 |
+```
+
+### 2.3 精度选择
+
+```
+不同业务场景的精度选择：
+
+附近的人（社交）：
+- 搜索范围：3-5公里
+- 精度：7位（153米）
+- 理由：精度太高会导致边界抖动，太低会包含太多无关用户
+
+外卖配送：
+- 搜索范围：500米-3公里
+- 精度：8-9位（38米-2米）
+- 理由：骑手和商家距离要精确匹配
+
+打卡签到：
+- 搜索范围：100-500米
+- 精度：9位（2米）
+- 理由：防止作弊
+
+区域统计：
+- 搜索范围：整个城市
+- 精度：4-5位（5-39公里）
+- 理由：只需要大致区域
+```
+
+## 三、Redis GEO实现 🟡
+
+### 3.1 Redis GEO命令
+
+```bash
+# 添加用户位置
+GEOADD user:location 116.408107 39.911067 "user_10001"
+
+# 添加多个用户位置
+GEOADD user:location 116.408107 39.911067 "user_10001" \
+                            116.409107 39.912067 "user_10002" \
+                            116.410107 39.913067 "user_10003"
+
+# 查询附近的人（10公里范围，返回20个，按距离排序）
+GEORADIUS user:location 116.408107 39.911067 10 km COUNT 20 ASC
+
+# 查询附近的人（返回距离和坐标）
+GEORADIUS user:location 116.408107 39.911067 5 km WITHDIST WITHCOORD ASC
+
+# 查询某个用户的距离
+GEODIST user:location user_10001 user_10002 km
+
+# 获取用户坐标
+GEOPOS user:location user_10001
+```
+
+### 3.2 Java实现
+
+```java
+@Service
+public class LBSService {
+
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+
+    /**
+     * 上报用户位置
+     */
+    public void updateLocation(Long userId, double longitude, double latitude) {
+        String key = "geo:user:location";
+        redisTemplate.opsForGeo().add(key, new Point(longitude, latitude), "user_" + userId);
+    }
+
+    /**
+     * 搜索附近的人
+     */
+    public List<NearByUser> searchNearBy(Long userId, double longitude,
+                                          double latitude, double radiusKm, int limit) {
+        String key = "geo:user:location";
+
+        // 查询附近的人（返回距离）
+        Distance distance = new Distance(radiusKm, Metrics.KILOMETERS);
+        Circle circle = new Circle(new Point(longitude, latitude), distance);
+
+        GeoResults<RedisGeoCommands.GeoLocation<String>> results =
+            redisTemplate.opsForGeo().radius(key,
+                GeoRedisCommands.GeoRadiusCommandArgs.newGeoRadiusArgs()
+                    .includeDistance()  // 返回距离
+                    .sortAscending()    // 按距离升序
+                    .limit(limit)       // 限制数量
+            );
+
+        // 转换为业务对象
+        return results.getContent().stream()
+            .map(r -> {
+                String redisMember = r.getContent().getName();
+                Long nearByUserId = Long.parseLong(redisMember.replace("user_", ""));
+                return new NearByUser(nearByUserId, r.getDistance().getValue());
+            })
+            .filter(u -> !u.getUserId().equals(userId))  // 排除自己
+            .collect(Collectors.toList());
+    }
+}
+```
+
+## 四、GeoHash边界问题 🟡
+
+### 4.1 边界抖动问题
+
+```
+问题：用户在格子边界移动时，可能在"附近的人"中频繁消失和出现
+
+场景：
+用户A在格子边界（wx4g0e8f8和wx4g0e8g0的分界线）
+用户B在格子wx4g0e8g0
+当A移动过边界时，A从wx4g0e8f8消失，进入wx4g0e8g0
+B看到的附近的人列表会突然变化
+
+GeoHash边界示意：
++------------+------------+
+|  wx4g0e8f8 |  wx4g0e8g0 |
+|   A用户    |   B用户    |
+|            |            |
++------------+------------+
+         边界线
+```
+
+### 4.2 解决方案
+
+```
+方案1：扩大搜索范围（推荐）
+- 搜索半径从5km扩大到5.5km
+- 搜索9个格子变成25个格子（扩大一圈）
+- 在应用层过滤掉超出5km的结果
+
+方案2：多精度搜索
+- 同时搜索7位和8位精度
+- 合并结果后去重
+- 保证边界两侧的用户都能被找到
+
+方案3：位置平滑
+- 用户位置不实时上报，而是定时上报
+- 或者上报后做移动平均
+- 避免频繁跨越边界
+
+方案4：只搜中心点
+- 格子中心点距离 = 格子半径
+- 用户只要不在格子中心，就有一定偏差
+- 接受这个偏差
+```
+
+### 4.3 实现多精度搜索
+
+```java
+public List<NearByUser> searchNearByMultiPrecision(
+        double longitude, double latitude, double radiusKm, int limit) {
+
+    // 获取当前精度的Geohash及其周边格子
+    String currentHash = Geohash.encode(latitude, longitude, 7);
+    List<String> neighborHashes = getNeighborHashes(currentHash);  // 9个格子
+
+    Set<Long> userIds = new LinkedHashSet<>();
+    List<NearByUser> results = new ArrayList<>();
+
+    for (String hash : neighborHashes) {
+        // 搜索每个格子
+        List<NearByUser> users = searchByGeohash(hash, longitude, latitude, radiusKm);
+        for (NearByUser user : users) {
+            if (!userIds.contains(user.getUserId())) {
+                userIds.add(user.getUserId());
+                results.add(user);
+                if (results.size() >= limit) {
+                    return results;
+                }
+            }
+        }
+    }
+
+    return results;
+}
+```
+
+## 五、性能优化 🟡
+
+### 5.1 亿级用户优化
+
+```
+优化策略：
+
+1. 按城市分片
+   - key = geo:user:location:beijing
+   - 查询时先确定用户所在城市
+   - 只搜索该城市的Redis key
+
+2. 热数据分层
+   - 在线用户：Redis GEO（实时更新）
+   - 离线用户：MySQL分表存储（定时同步）
+   - 只搜在线用户，或按需合并
+
+3. 预计算格子
+   - 预先计算每个城市的GeoHash网格
+   - 用户注册时根据坐标确定初始格子
+   - 更新位置时只更新格子内数据
+```
+
+### 5.2 分片策略
+
+```java
+// 按城市分片
+public String getGeoKey(Long userId) {
+    Long cityId = userDAO.selectCityId(userId);
+    return "geo:user:location:city_" + cityId;
+}
+
+// 按Geohash前缀分片
+public String getGeoKeyByHash(double longitude, double latitude) {
+    String hash = Geohash.encode(latitude, longitude, 5);  // 5位精度
+    String shardKey = hash.substring(0, 2);  // 取前2位作为分片key
+    return "geo:user:location:shard_" + shardKey;
+}
+```
+
+### 5.3 缓存热点
+
+```
+附近的人的热点缓存：
+
+1. 位置不变时缓存结果
+   - 用户位置更新频率低（移动用户除外）
+   - 附近的人列表可以缓存
+   - 缓存key = 用户ID + Geohash
+
+2. 缓存过期策略
+   - 活跃用户：TTL = 30秒
+   - 非活跃用户：TTL = 5分钟
+
+3. 缓存失效
+   - 用户位置更新时，清除自己和附近N个格子的缓存
+   - 或者设置较短TTL，让缓存自然过期
+```
+
+## 六、生产避坑 🟡
+
+### 6.1 LBS系统的五大坑
+
+**坑1：坐标系统混乱**
+
+```
+问题：GPS坐标和地图坐标混用
+场景：GPS返回WGS84，地图用的是GCJ-02（火星坐标）
+影响：显示位置偏移几百米
+解决方案：
+- 统一坐标系统：全部转为GCJ-02（国内）或WGS84（海外）
+- 入库前转换
+- 服务端存储一份原始坐标和一份转换后坐标
+```
+
+**坑2：冷启动问题**
+
+```
+问题：新用户没有位置数据，无法参与附近搜索
+场景：用户首次使用，位置为空
+影响：新用户体验差
+解决方案：
+- 首次使用时请求位置权限
+- 拒绝授权的用户从搜索结果中排除
+- 提供手动设置位置的功能
+```
+
+**坑3：恶意刷附近**
+
+```
+问题：用户伪造位置，出现在任意地点
+场景：用户修改GPS数据，出现在纽约
+影响：破坏社交生态
+解决方案：
+- 设备指纹识别：同一设备短时间内切换多个城市
+- 基站/WiFi校验：位置和IP所在地对比
+- 风控模型：检测异常定位行为
+```
+
+**坑4：Redis GEO性能下降**
+
+```
+问题：Redis GEO在亿级数据下性能下降
+场景：单个key存储1亿用户位置
+影响：GEORADIUS延迟飙升
+解决方案：
+- 按城市或Geohash前缀分key
+- 控制单个key的数据量在1000万以内
+- 或迁移到专用空间数据库（如PostGIS）
+```
+
+**坑5：距离计算不准确**
+
+```
+问题：Haversine公式和Redis GEODIST结果不一致
+场景：边界值处理
+影响：用户体验不一致
+解决方案：
+- 统一使用Redis GEODIST作为唯一计算标准
+- 应用层不再二次计算
+- 或使用相同的Haversine公式
+```
+
+【架构权衡】
+
+LBS系统设计的核心矛盾是**精度 vs 性能 vs 成本**。GeoHash + Redis GEO的组合能覆盖90%的场景，但亿级用户时需要分片。专用的空间数据库（如PostGIS、SpatialDB）能提供更强大的查询能力，但运维成本高。选择什么方案，取决于你的用户规模和精度要求。
+
+## 七、真实面试回放 🟡
+
+> **面试官**：设计一个外卖配送系统，需要找出附近5公里的骑手，怎么实现？
+>
+> **候选人**（小林）：和附近的人类似，但有几个区别：
+>
+> 一是精度要求更高。附近的人可以偏差几百米，外卖骑手匹配偏差几十米就够了，所以用8位GeoHash（38米精度）。
+>
+> 二是搜索半径更大。要覆盖5公里，9个格子可能不够，需要25个格子（扩大一圈）。
+>
+> 三是实时性要求更高。骑手位置每秒都在变，不能用长TTL缓存。
+>
+> 架构是：
+>
+> 1. 骑手位置上报：每5秒上报一次到Redis GEO
+>
+> 2. 商家位置：预存到Redis GEO
+>
+> 3. 查询时：根据商家坐标搜索附近5公里的骑手
+>
+> 4. 排序：先按距离排序，再按骑手当前订单数排序（负载均衡）
+>
+> **面试官**：骑手位置更新很频繁，Redis压力大怎么办？
+>
+> 小林：三个优化：
+>
+> 一是位置聚合。如果骑手在移动中，5秒内的位移很小，可以做本地聚合，合并后批量更新。
+>
+> 二是懒更新。只有位置变化超过50米时才更新Redis。
+>
+> 三是降级。如果Redis压力大，可以切换到分片模式，每个分片只存部分骑手。
+>
+> **面试官**：如果骑手和商家不在同一个格子，搜索结果会漏吗？
+>
+> 小林：不会。Redis GEORADIUS是基于距离的，不是基于格子。它会返回所有在5公里内的点，不管Geohash是什么。我说的格子搜索只是一种优化思路，实际用GEORADIUS不需要考虑格子问题。
+>
+> 【面试官手记】
+>
+> 小林这场面试的亮点：
+>
+> 1. 区分了外卖和社交的不同需求：精度更高、搜索范围更大
+>
+> 2. 知道Redis GEORADIUS是距离搜索，不是格子搜索
+>
+> 3. 性能优化有实际思路：聚合、懒更新、分片
+>
+> 这场面试属于P6+级别，GeoHash和Redis GEO是LBS的基础，能区分边界问题和距离搜索的候选人，说明真正理解了原理。
+>
+> 追问方向：会问"如果要用多边形区域搜索怎么办"和"PostGIS和Redis GEO怎么选"，这两个问题考验候选人对空间数据库的理解。
+
+LBS系统设计的核心是**GeoHash + Redis GEO**，记住三个要点：
+
+1. **GeoHash编码**：经纬度转字符串，支持前缀匹配
+2. **Redis GEO**：GEORADIUS基于真实距离搜索，不依赖格子
+3. **边界问题**：扩大搜索范围或多精度搜索解决
+
+当你能在面试中讲清楚GeoHash的精度选择和Redis GEO的使用，LBS这关就算过了。

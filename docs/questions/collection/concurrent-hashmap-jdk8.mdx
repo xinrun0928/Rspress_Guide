@@ -1,0 +1,290 @@
+---
+title: ConcurrentHashMap JDK 8 原理
+description: 深入剖析 JDK 8 ConcurrentHashMap 的 CAS+synchronized 实现、核心数据结构、并发机制与扩容原理。
+---
+
+# ConcurrentHashMap JDK 8 原理
+
+面试官问："ConcurrentHashMap 在 JDK 8 是怎么实现线程安全的？"
+
+候选人小余答："JDK 8 用了 CAS 和 synchronized。"
+
+面试官追问："CAS 用在哪里？synchronized 用在哪里？"
+
+小余说："put 的时候用...具体在哪我说不清楚。"
+
+面试官又问："JDK 7 和 JDK 8 最大的区别是什么？"
+
+小余答不上来。
+
+【面试官心理】
+这道题考查的是候选人对 ConcurrentHashMap 演进的理解。能说出"JDK 7 分段锁"和"JDK 8 无锁化"差异的候选人，说明对并发编程有深入研究。
+
+## 一、JDK 7 vs JDK 8 对比 🔴
+
+| 维度 | JDK 7 | JDK 8 |
+| --- | --- | --- |
+| 并发机制 | Segment 分段锁（ReentrantLock） | CAS + synchronized |
+| 锁粒度 | 段级别（16 个 Segment） | 桶级别（Node） |
+| 读操作 | 无锁 | 无锁（volatile + CAS） |
+| 写操作 | 锁段 | 锁桶（首次 CAS 失败后） |
+| 扩容 | 单线程扩容 | 支持多线程并发扩容 |
+| 实现复杂度 | 高（双重数据结构） | 低（统一 Node 结构） |
+
+## 二、核心数据结构 🔴
+
+### 2.1 Node 节点
+
+```java
+static class Node<K, V> implements Map.Entry<K, V> {
+    final int hash;
+    final K key;
+    volatile V val;   // volatile：保证可见性
+    volatile Node<K, V> next; // volatile：保证可见性
+
+    Node(int hash, K key, V val, Node<K, V> next) {
+        this.hash = hash;
+        this.key = key;
+        this.val = val;
+        this.next = next;
+    }
+
+    // 只读方法
+    public final Map.Entry<K, V> next() { return next; }
+}
+```
+
+**关键**：`val` 和 `next` 都是 `volatile`，保证读取线程能看到最新值。
+
+### 2.2 TreeBin 红黑树节点
+
+```java
+static final class TreeBin<K, V> extends Node<K, V> {
+    TreeNode<K, V> root;
+    TreeNode<K, V> first;
+    WTLock waiter; // 等待获取写锁的线程
+    int lockState; // 锁状态
+    // ...
+}
+```
+
+## 三、put 流程源码解析 🔴
+
+```java
+final V putVal(K key, V value, boolean onlyIfAbsent) {
+    if (key == null || value == null) throw new NullPointerException();
+
+    int hash = spread(key.hashCode()); // 与 HashMap 不同：再次扰动
+    int binCount = 0;
+
+    for (Node<K, V>[] tab = table; ; ) {
+        Node<K, V> f;
+        int n, i, fh;
+
+        // 第一次 put：初始化 table
+        if (tab == null || (n = tab.length) == 0)
+            tab = initTable();
+
+        // CAS + 无锁：检查桶是否为空
+        else if ((f = tabAt(tab, i = (n - 1) & hash)) == null) {
+            // CAS 尝试创建新节点（成功则结束）
+            if (casTabAt(tab, i, null, new Node<K, V>(hash, key, value, null)))
+                break;
+        }
+
+        // 扩容帮助（当前线程检测到正在扩容，协助扩容）
+        else if ((fh = f.hash) == MOVED)
+            tab = helpTransfer(tab, f);
+
+        // 桶中有数据：synchronized 加锁
+        else {
+            V oldVal = null;
+
+            // 🔒 锁住当前桶（而非整个表）
+            synchronized (f) {
+                // 双重检查：确保桶的头节点没变
+                if (tabAt(tab, i) == f) {
+                    if (fh >= 0) {
+                        // 链表处理
+                        binCount = 1;
+                        for (Node<K, V> e = f; ; ++binCount) {
+                            if (e.hash == hash &&
+                                ((k = e.key) == key || key.equals(k))) {
+                                oldVal = e.val;
+                                if (!onlyIfAbsent)
+                                    e.val = value;
+                                break;
+                            }
+                            Node<K, V> pred = e;
+                            if ((e = e.next) == null) {
+                                pred.next = new Node<K, V>(hash, key, value, null);
+                                break;
+                            }
+                        }
+                    } else if (f instanceof TreeBin) {
+                        // 红黑树处理
+                        Node<K, V> p = ((TreeBin<K, V>) f).putTreeVal(hash, key, value);
+                        oldVal = p.val;
+                    }
+                }
+            }
+
+            if (binCount != 0) {
+                if (binCount >= TREEIFY_THRESHOLD)
+                    treeifyBin(tab, i);
+                if (oldVal != null)
+                    return oldVal;
+                break;
+            }
+        }
+    }
+
+    addCount(1L, binCount);
+    return null;
+}
+```
+
+## 四、CAS 的使用场景 🔴
+
+### 4.1 tabAt：读取桶中的节点
+
+```java
+// 读取 table[i] 的值
+// volatile 读取（保证可见性）
+static final <K, V> Node<K, V> tabAt(Node<K, V>[] tab, int i) {
+    return U.getObjectVolatile(tab, ((long) i << ASHIFT) + ABASE);
+}
+```
+
+### 4.2 casTabAt：CAS 设置桶中的节点
+
+```java
+// CAS 尝试设置 table[i]
+static final <K, V> boolean casTabAt(Node<K, V>[] tab, int i,
+                                      Node<K, V> c, Node<K, V> v) {
+    return U.compareAndSwapObject(tab, ((long) i << ASHIFT) + ABASE, c, v);
+}
+```
+
+### 4.3 CAS 的典型场景
+
+```java
+// 场景一：桶为空时，无锁插入
+if (casTabAt(tab, i, null, newNode)) {
+    break; // 成功，插入完成
+}
+
+// 场景二：初始化 table
+private final Node<K, V>[] initTable() {
+    Node<K, V>[] tab;
+    int sc;
+    while ((tab = table) == null || tab.length == 0) {
+        if ((sc = sizeCtl) < 0)
+            Thread.yield(); // 让出 CPU
+        else if (U.compareAndSwapInt(this, SIZECTL, sc, -1)) {
+            // CAS 设置 sizeCtl = -1，表示正在初始化
+            // 只有一个线程能进入这里
+            // ...
+        }
+    }
+}
+```
+
+## 五、synchronized 的使用场景 🔴
+
+### 5.1 为什么不用 ReentrantLock
+
+```java
+// JDK 7 的 Segment：
+class Segment<K, V> extends ReentrantLock {
+    // 每个 Segment 是一把锁
+}
+
+// JDK 8 改用 synchronized：
+synchronized (f) { // 锁住当前桶的头节点
+    // ...
+}
+```
+
+**JDK 8 选择 synchronized 的原因**：
+1. JDK 6+ 对 synchronized 做了大量优化（偏向锁、轻量级锁、自旋锁）
+2. synchronized 不需要手动释放锁
+3. 锁粒度更细（桶级别，而非段级别）
+
+### 5.2 锁的代价
+
+```java
+// 读多写少场景：大部分读操作无锁
+Node<K, V> e = tabAt(tab, i); // volatile 读取，无锁
+if (e != null) {
+    return e.val; // 无锁读取
+}
+
+// 写操作：只锁当前桶
+synchronized (f) { // 只锁一个桶
+    // ...
+}
+```
+
+## 六、并发扩容机制 🔴
+
+### 6.1 JDK 7 的单线程扩容
+
+JDK 7 的 Segment 扩容是单线程的，其他线程只能等待。
+
+### 6.2 JDK 8 的多线程并发扩容
+
+```java
+// JDK 8 支持多线程同时 transfer
+// 每个线程处理一批桶（默认 16 个）
+// 用 sizeCtl 控制并发度
+
+static final int MOVED = -1; // hash == MOVED 表示正在扩容
+
+// 帮助扩容：
+final Node<K, V>[] helpTransfer(Node<K, V>[] tab, Node<K, V> f) {
+    Node<K, V>[] nextTab;
+    int sc;
+    if (tab != null && f instanceof ForwardingNode &&
+        (nextTab = ((ForwardingNode<K, V>) f).nextTable) != null) {
+        // 协助 transfer
+        // ...
+    }
+}
+```
+
+## 七、追问升级
+
+**面试官**："ConcurrentHashMap 的 get 操作是无锁的吗？"
+
+```java
+// 是的，get 操作完全无锁
+public V get(Object key) {
+    Node<K, V>[] tab;
+    Node<K, V> e, p;
+    int n, eh;
+    K ek;
+
+    if ((tab = table) != null && (n = tab.length) > 0 &&
+        (e = tabAt(tab, (n - 1) & (h = spread(key.hashCode())))) != null) {
+        if ((eh = e.hash) == h) {
+            if ((ek = e.key) == key || (ek != null && key.equals(ek)))
+                return e.val;
+        } else if (eh < 0) // 红黑树或 ForwardingNode
+            return (p = e.find(h, key)) != null ? p.val : null;
+        while ((e = e.next) != null) {
+            if (e.hash == h &&
+                ((ek = e.key) == key || (ek != null && key.equals(ek))))
+                return e.val;
+        }
+    }
+    return null;
+}
+
+// 无锁原因：
+// 1. val 和 next 是 volatile，保证可见性
+// 2. Node 节点的添加是"发布安全"的（putVal 完全完成后才对其他线程可见）
+```
+
+【面试官心理】
+能说出 get 操作无锁原理的候选人，说明对 Java 内存模型和 volatile 有深入理解。这是 P6+ 的标准要求。

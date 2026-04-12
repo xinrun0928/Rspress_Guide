@@ -1,0 +1,429 @@
+---
+title: 索引失效故障复盘
+description: 从一次索引失效导致数据库雪崩的事故出发，深度拆解索引失效问题：失效原因排查、最左前缀原则、隐式转换及常见错误。
+---
+
+# 索引失效故障复盘
+
+2021年某电商平台的商品搜索接口突然变慢，平均响应时间从50ms飙升到20s。
+
+技术团队排查后发现：开发同学在一次需求迭代中，把搜索条件的日期格式从字符串改成了函数调用，结果导致原本建好的索引全部失效。
+
+更可怕的是：这个问题在测试环境没有复现，因为测试数据量小，全表扫描也很快，只有在生产环境的千万级数据量下才暴露。
+
+**这次故障导致商品搜索不可用2小时，直接损失约300万元。**
+
+【面试官手记】
+
+索引失效是生产环境最隐蔽的问题之一。我面试过的候选人里，能说清楚"索引失效原因"的有40%，能说清楚"最左前缀原则"的有30%，能说清楚"优化方法"的有20%。索引失效的关键词是**理解原理 + 避免踩坑**。
+
+## 一、索引失效的十大原因 🔴
+
+### 1.1 十大原因详解
+
+```
+索引失效十大原因：
+
+1. 函数/运算
+   - WHERE YEAR(create_time) = 2024
+   - WHERE LEFT(name, 3) = '张'
+   - 解决：改写为范围查询
+
+2. 隐式类型转换
+   - 字段VARCHAR，传入数字
+   - WHERE phone = 13800138000
+   - 解决：保证类型一致
+
+3. 最左前缀不匹配
+   - 索引(a, b, c)，查询只用b
+   - 解决：确保查询从最左列开始
+
+4. LIKE前缀匹配
+   - WHERE name LIKE '%张%'
+   - 解决：使用ElasticSearch
+
+5. OR连接不同字段
+   - WHERE a = 1 OR b = 2
+   - 解决：使用UNION或添加联合索引
+
+6. 范围查询后
+   - 索引(a, b)，WHERE a = 1 AND b > 10
+   - b列的索引失效
+   - 解决：把范围查询放最后
+
+7. IS NULL / IS NOT NULL
+   - WHERE phone IS NULL
+   - 解决：业务允许时使用空字符串
+
+8. NOT EQUAL / NOT IN
+   - WHERE status `<>` 1
+   - 解决：改写为正向条件
+
+9. 字符串不加引号
+   - WHERE phone = 13800138000
+   - 解决：字符串加引号
+
+10. 全表扫描快于索引
+    - 数据量小时，全表扫描更快
+    - 解决：强制使用索引
+```
+
+### 1.2 函数/运算导致失效
+
+```sql
+-- 索引失效场景1：函数运算
+-- 索引：create_time
+SELECT * FROM orders WHERE YEAR(create_time) = 2024;
+-- 失效原因：对索引列使用函数
+
+-- 正确写法：
+SELECT * FROM orders WHERE create_time >= '2024-01-01' AND create_time < '2025-01-01';
+
+-- 索引失效场景2：数学运算
+-- 索引：price
+SELECT * FROM products WHERE price * 0.8 = 80;
+-- 失效原因：对索引列做运算
+
+-- 正确写法：
+SELECT * FROM products WHERE price = 80 / 0.8;
+
+-- 索引失效场景3：字符串函数
+-- 索引：name
+SELECT * FROM users WHERE LEFT(name, 1) = '张';
+-- 失效原因：函数包裹索引列
+
+-- 正确写法：
+SELECT * FROM users WHERE name LIKE '张%';
+```
+
+### 1.3 隐式类型转换
+
+```sql
+-- 索引失效场景：隐式类型转换
+-- 表结构：user_id VARCHAR(20)
+-- 错误SQL：
+SELECT * FROM users WHERE user_id = 123456;
+-- 123456是数字，VARCHAR和数字比较会触发转换
+-- user_id会转为数字，相当于 CAST(user_id AS DOUBLE) = 123456
+-- 全表扫描！
+
+-- 正确写法：
+SELECT * FROM users WHERE user_id = '123456';
+-- 加上引号，使用索引
+
+-- 验证：
+EXPLAIN SELECT * FROM users WHERE user_id = 123456;
+-- type = ALL（全表扫描）
+
+EXPLAIN SELECT * FROM users WHERE user_id = '123456';
+-- type = ref（使用索引）
+```
+
+### 1.4 最左前缀不匹配
+
+```sql
+-- 索引失效场景：最左前缀不匹配
+CREATE INDEX idx_a_b_c ON orders(a, b, c);
+
+-- 全匹配：生效
+SELECT * FROM orders WHERE a = 1 AND b = 1 AND c = 1;
+
+-- 部分匹配a,b：生效
+SELECT * FROM orders WHERE a = 1 AND b = 1;
+
+-- 部分匹配a：生效
+SELECT * FROM orders WHERE a = 1;
+
+-- 跳过a匹配b：失效！
+SELECT * FROM orders WHERE b = 1;
+
+-- 跳过a,b匹配c：失效！
+SELECT * FROM orders WHERE c = 1;
+
+-- 范围查询后：部分失效
+SELECT * FROM orders WHERE a = 1 AND b > 10 AND c = 1;
+-- a生效，b生效（但b后的索引失效），c失效
+
+-- 总结：索引(a, b, c)
+-- WHERE a = ? → 使用索引
+-- WHERE a = ? AND b = ? → 使用索引
+-- WHERE a = ? AND b = ? AND c = ? → 使用索引
+-- WHERE b = ? → 不使用索引
+-- WHERE a > 10 → 使用索引（范围）
+-- WHERE a = 1 AND b > 10 → a生效，b生效，c失效
+```
+
+## 二、OR导致索引失效 🟡
+
+### 2.1 OR索引失效
+
+```sql
+-- OR导致索引失效
+-- 索引：user_id, status
+SELECT * FROM orders WHERE user_id = 1 OR status = 1;
+-- 失效！OR要求两边的字段都有索引
+
+-- 原因分析：
+-- MySQL需要检查OR两边的条件
+-- 如果一边有索引，一边没有，会回表验证
+-- 两个条件都使用OR，优化器可能放弃索引
+
+-- 解决方案1：使用UNION
+SELECT * FROM orders WHERE user_id = 1
+UNION
+SELECT * FROM orders WHERE status = 1;
+
+-- 解决方案2：改写SQL
+SELECT * FROM orders WHERE user_id = 1
+UNION ALL
+SELECT * FROM orders WHERE status = 1 AND user_id <> 1;
+
+-- 解决方案3：添加联合索引
+ALTER TABLE orders ADD INDEX idx_user_status (user_id, status);
+SELECT * FROM orders WHERE user_id = 1 OR status = 1;
+-- 如果有联合索引(user_id, status)，OR可能使用索引
+```
+
+### 2.2 IN/NOT IN索引失效
+
+```sql
+-- IN/NOT IN索引问题
+SELECT * FROM orders WHERE status IN (1, 2, 3);
+-- 生效：IN等于多个OR，MySQL会优化
+
+SELECT * FROM orders WHERE status NOT IN (1, 2, 3);
+-- 可能失效：NOT IN很难使用索引
+
+-- 优化方案：改写为正向条件
+-- NOT IN (1, 2, 3) 改写为：
+SELECT * FROM orders WHERE status > 3 OR status < 1;
+-- 或者使用范围
+SELECT * FROM orders WHERE status NOT IN (1, 2, 3) AND status IS NOT NULL;
+
+-- 大量IN值的问题
+SELECT * FROM orders WHERE user_id IN (1, 2, 3, ..., 10000);
+-- IN值过多，MySQL会转换为全表扫描
+
+-- 优化方案：分批查询
+SELECT * FROM orders WHERE user_id IN (1, 2, 3, ..., 1000);
+UNION ALL
+SELECT * FROM orders WHERE user_id IN (1001, 1002, ..., 2000);
+```
+
+## 三、索引优化实战 🟡
+
+### 3.1 索引设计原则
+
+```
+索引设计原则：
+
+1. 独立列
+   - 索引列不能参与运算
+   - 不能有函数包裹
+
+2. 简短列
+   - 索引长度尽量短
+   - 字符串用前缀索引
+
+3. 选择性高
+   - 唯一索引 > 高基数字段
+   - 低选择性字段（性别）不适合单独建索引
+
+4. 覆盖索引
+   - 查询的所有字段都在索引中
+   - 不需要回表
+
+联合索引设计示例：
+场景：用户订单查询
+WHERE user_id = ? AND status = ? ORDER BY create_time DESC LIMIT 100
+
+设计：INDEX idx_user_status_time (user_id, status, create_time DESC)
+
+- user_id = ? → 精确匹配，使用索引
+- status = ? → 精确匹配，使用索引
+- ORDER BY create_time DESC → 使用索引排序，不需要filesort
+- LIMIT 100 → 索引限制扫描范围
+```
+
+### 3.2 SQL改写优化
+
+```java
+// 优化前：索引失效
+@Select("SELECT * FROM orders WHERE " +
+    "user_id = #{userId} AND " +
+    "DATE(create_time) = #{date} AND " +
+    "status IN (1, 2)")
+List<Order> selectOrders(@Param("userId") Long userId, @Param("date") String date);
+
+// EXPLAIN分析：
+// type = ALL, rows = 500000, Using filesort
+// 全表扫描 + 排序！
+
+// 优化后：索引生效
+@Select("SELECT id, user_id, amount, status, create_time FROM orders WHERE " +
+    "user_id = #{userId} AND " +
+    "create_time >= #{startTime} AND " +
+    "create_time < #{endTime} AND " +
+    "status IN (1, 2) " +
+    "ORDER BY create_time DESC " +
+    "LIMIT 100")
+List<Order> selectOrders(@Param("userId") Long userId,
+                          @Param("startTime") LocalDateTime startTime,
+                          @Param("endTime") LocalDateTime endTime);
+
+// 提前计算时间范围
+public LocalDateTime getStartOfDay(String date) {
+    return LocalDate.parse(date).atStartOfDay();
+}
+
+public LocalDateTime getEndOfDay(String date) {
+    return LocalDate.parse(date).plusDays(1).atStartOfDay();
+}
+```
+
+### 3.3 强制使用索引
+
+```sql
+-- 强制使用索引
+SELECT * FROM orders FORCE INDEX (idx_user_status) WHERE user_id = 1 AND status = 1;
+-- 注意：FORCE INDEX会影响优化器决策，一般不推荐使用
+
+-- 使用IGNORE忽略索引
+UPDATE orders IGNORE INDEX (idx_old) SET status = 1 WHERE user_id = 1;
+
+-- 优化器提示
+SELECT * FROM orders USE INDEX (idx_user_status) WHERE user_id = 1;
+```
+
+## 四、生产避坑 🟡
+
+### 4.1 索引失效的五大坑
+
+**坑1：日期查询用函数**
+
+```
+问题：WHERE YEAR(create_time) = 2024
+场景：开发图方便
+解决方案：
+- 改写为范围查询
+- 使用BETWEEN
+```
+
+**坑2：字符串字段传数字**
+
+```
+问题：VARCHAR字段传Long类型
+场景：参数类型不匹配
+解决方案：
+- 保证类型一致
+- 参数加引号
+```
+
+**坑3：OR连接没有索引的字段**
+
+```
+问题：WHERE a = 1 OR b = 1
+场景：一边有索引，一边没有
+解决方案：
+- 使用UNION
+- 两边都加索引
+```
+
+**坑4：最左前缀跳跃**
+
+```
+问题：索引(a,b,c)，查询只用b,c
+场景：以为a没用就不查
+解决方案：
+- 必须从最左列开始
+- OR改写
+```
+
+**坑5：测试环境数据量小**
+
+```
+问题：测试快生产慢
+场景：索引在小表上不生效
+解决方案：
+- 生产数据量测试
+- 使用EXPLAIN验证
+```
+
+### 4.2 索引检查清单
+
+```
+开发规范：
+- [ ] 索引列不参与运算
+- [ ] 索引列不加函数
+- [ ] 字符串加引号
+- [ ] 类型必须一致
+- [ ] OR两边都有索引
+
+设计规范：
+- [ ] 联合索引遵循最左前缀
+- [ ] 范围查询放最后
+- [ ] 选择性高的列建索引
+
+测试规范：
+- [ ] 用EXPLAIN验证索引
+- [ ] 生产数据量测试
+- [ ] 压力测试验证
+```
+
+## 五、真实面试回放 🟡
+
+> **面试官**：什么情况下索引会失效？
+>
+> **候选人**（小张)：十大原因：
+>
+> 一是函数运算。对索引列使用函数。
+>
+> 二是隐式类型转换。VARCHAR字段传数字。
+>
+> 三是最左前缀不匹配。查询跳过第一列。
+>
+> 四是LIKE前缀。
+>
+> 五是OR。
+>
+> 六是范围查询后。
+>
+> 七是IS NULL。
+>
+> 八是NOT。
+>
+> 九是字符串不加引号。
+>
+> 十是数据量小，全表扫描更快。
+>
+> **面试官**：最左前缀原则说一下。
+>
+> 小张：联合索引(a, b, c)，查询必须从a开始。
+>
+> WHERE a = 1 → 用索引。
+>
+> WHERE a = 1 AND b = 1 → 用索引。
+>
+> WHERE b = 1 → 不用索引。
+>
+> WHERE a = 1 AND c = 1 → a用索引，c不用。
+>
+> 【面试官手记】
+>
+> 小张这场面试的亮点：
+>
+> 1. 知道十大索引失效原因
+>
+> 2. 知道最左前缀原则
+>
+> 3. 能说出具体的SQL改写方法
+>
+> 索引失效是P6工程师必备知识点，能完整回答的候选人，说明有数据库调优经验。
+
+索引失效的核心是**理解原理 + 避免踩坑**。记住三个要点：
+
+1. **独立列原则**：索引列不能参与运算，不能加函数
+2. **最左前缀原则**：联合索引必须从最左列开始
+3. **类型一致**：字符串加引号，类型必须匹配
+
+索引失效是生产环境最隐蔽的坑，Code Review必须重点检查。

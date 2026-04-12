@@ -1,0 +1,489 @@
+---
+title: 定时任务调度系统
+description: 从一次定时任务重复执行导致数据重复的线上事故切入，深度拆解定时任务调度系统的核心架构：单机调度、分布式调度、任务分片，以及任务失败的处理策略。
+---
+
+# 定时任务调度系统
+
+2021年"双十一"，某电商平台的对账系统出现了问题：对账结果显示有2000个用户的订单被重复结算了两次。
+
+技术团队排查后发现：定时任务部署在两台服务器上，每台服务器都执行了对账任务。
+
+原因是：开发人员在cron表达式里写错了分母——应该是 `0 0 2 * * ?`（每天凌晨2点执行一次），但写成了 `0/5 * * * *`（每5分钟执行一次）。两台服务器同时执行，导致每5分钟对账一次。
+
+2000个用户在这个5分钟内完成了订单确认，被扣了两次钱。
+
+这是一个典型的**定时任务重复执行**问题。
+
+【架构权衡】
+
+定时任务调度的核心问题不是"怎么定时执行"，而是**怎么保证任务只执行一次**。单机环境下可以用锁，但分布式环境下需要分布式锁。选择什么方案，取决于你的**任务特性**（执行时间长不长）、**数据规模**（数据量大小）、**可靠性要求**（丢了怎么办）。
+
+## 一、定时任务的核心问题 🔴
+
+### 1.1 四大核心问题
+
+```
+定时任务调度的四座大山：
+
+1. 重复执行问题
+   - 多台服务器同时触发
+   - 网络抖动导致重试
+   - 任务执行超时导致重复拉取
+
+2. 任务分片
+   - 大数据量任务如何分片执行？
+   - 如何保证分片完整性？
+   - 如何处理分片失败？
+
+3. 任务依赖
+   - 任务A完成后才能执行任务B
+   - DAG调度怎么实现？
+   - 循环依赖怎么处理？
+
+4. 失败处理
+   - 任务执行失败怎么办？
+   - 超时怎么处理？
+   - 如何保证幂等？
+```
+
+### 1.2 量化指标
+
+```
+定时任务调度的关键数字：
+
+执行模式：
+- 单机定时器：简单，但不可靠
+- 分布式调度：可靠，但复杂
+- 混合模式：按任务特性选择
+
+性能要求：
+- 单节点任务吞吐量：1000任务/秒
+- 调度延迟：< 100ms
+- 任务分片数：最大1024
+
+可靠性要求：
+- 任务不重复执行
+- 任务不丢失
+- 失败可重试
+```
+
+### 1.3 面试核心问题
+
+> 面试官：分布式环境下怎么保证定时任务只执行一次？
+>
+> 候选人：三个方案：
+>
+> 一是分布式锁：任务执行前抢锁，抢到锁才执行，执行完释放锁。
+>
+> 二是任务队列：定时任务只生成任务到队列，消费者竞争消费。
+>
+> 三是主备模式：只有主节点执行任务，备节点监控主节点健康。
+>
+> 面试官：分布式锁用什么实现？
+>
+> 候选人：Redis SETNX 或 Zookeeper临时节点。
+
+【面试官心理】
+
+定时任务调度的追问方向通常围绕"重复执行"和"分片"。能回答出分布式锁的候选人，说明理解了分布式调度的核心问题；能说出任务分片策略的候选人，说明有实际优化经验。
+
+## 二、单机调度 vs 分布式调度 🔴
+
+### 2.1 单机调度
+
+```
+单机调度：所有任务在同一台机器上执行
+
+工具：
+1. JDK Timer：简单，但任务失败会中断其他任务
+2. ScheduledThreadPoolExecutor：支持多线程，支持异常捕获
+3. Spring @Scheduled：注解方式，侵入性小
+
+问题：
+1. 单点故障：机器挂了，所有任务都不执行
+2. 无法分片：数据量大时无法并行处理
+3. 扩展性差：无法动态增加执行节点
+```
+
+### 2.2 分布式调度
+
+```
+分布式调度：任务分配到多台机器执行
+
+架构：
+Scheduler（调度器） → TaskQueue → Worker（执行器集群）
+
+调度器：
+- 负责管理任务配置
+- 负责触发定时执行
+- 负责分配任务到Worker
+
+任务队列：
+- 存储待执行任务
+- 支持任务持久化
+- 支持任务分片
+
+Worker：
+- 竞争获取任务
+- 执行任务
+- 上报执行结果
+```
+
+## 三、分布式锁实现 🟡
+
+### 3.1 Redis分布式锁
+
+```java
+public class DistributedLock {
+
+    private static final String LOCK_PREFIX = "task:lock:";
+    private static final long LOCK_EXPIRE = 300;  // 5分钟
+
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+
+    public boolean tryLock(String taskId, String instanceId) {
+        String key = LOCK_PREFIX + taskId;
+        String value = instanceId;
+
+        // SETNX + EXPIRE 原子操作
+        Boolean result = redisTemplate.opsForValue()
+            .setIfAbsent(key, value, LOCK_EXPIRE, TimeUnit.SECONDS);
+
+        return Boolean.TRUE.equals(result);
+    }
+
+    public void unlock(String taskId, String instanceId) {
+        String key = LOCK_PREFIX + taskId;
+        String currentValue = redisTemplate.opsForValue().get(key);
+
+        // 只释放自己持有的锁
+        if (instanceId.equals(currentValue)) {
+            redisTemplate.delete(key);
+        }
+    }
+}
+```
+
+### 3.2 Zookeeper分布式锁
+
+```java
+public class ZookeeperLock implements Watcher {
+
+    private static final String LOCK_PATH = "/task/locks/";
+    private final ZooKeeper zk;
+    private String lockId;
+    private String currentNode;
+
+    public boolean tryLock(String taskId) {
+        try {
+            // 创建临时顺序节点
+            lockId = LOCK_PATH + taskId;
+            currentNode = zk.create(lockId + "/lock_", null,
+                ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.EPHEMERAL_SEQUENTIAL);
+
+            // 获取所有子节点
+            List<String> nodes = zk.getChildren(lockId, false);
+            Collections.sort(nodes);
+
+            // 如果当前节点是最小的，获得锁
+            if (currentNode.endsWith(nodes.get(0))) {
+                return true;
+            }
+
+            // 否则监听前一个节点
+            String previousNode = nodes.get(
+                Collections.binarySearch(nodes, currentNode.substring(lockId.length() + 1)) - 1
+            );
+
+            CountDownLatch latch = new CountDownLatch(1);
+            zk.getData(lockId + "/" + previousNode, this, null);
+            latch.await();
+
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    @Override
+    public void process(WatchedEvent event) {
+        if (event.getType() == Event.EventType.NodeDeleted) {
+            latch.countDown();
+        }
+    }
+}
+```
+
+### 3.3 锁的选型对比
+
+| 维度 | Redis分布式锁 | Zookeeper锁 |
+| --- | --- | --- |
+| 性能 | 高（10万QPS） | 中（数千QPS） |
+| 可靠性 | 中（需防主从切换） | 高（ZAB协议） |
+| 实现复杂度 | 低 | 中 |
+| 锁类型 | 非公平 | 公平（顺序节点） |
+| 适用场景 | 高并发 | 高可靠 |
+
+## 四、任务分片 🟡
+
+### 4.1 分片策略
+
+```
+分片场景：处理1000万条数据
+
+单机处理：
+- 1000万条，单线程处理
+- 假设每秒处理1000条，需要10万秒（约28小时）
+
+分片处理（10台机器）：
+- 每台处理100万条
+- 每台耗时2.8小时
+
+分片方式：
+1. 按ID取模：hash(id) % shardCount
+2. 按范围：ID 1-100万 → shard 1
+3. 按时间：按日期分片
+```
+
+### 4.2 分片实现
+
+```java
+public class ShardTaskExecutor {
+
+    private static final int SHARD_COUNT = 10;
+
+    public void executeShardedTask(String taskId, ShardTaskConfig config) {
+        // 获取当前节点的分片
+        String instanceId = getInstanceId();
+        int shardIndex = Math.abs(instanceId.hashCode() % SHARD_COUNT);
+
+        // 查询当前分片的数据
+        long startId = shardIndex * (config.getTotalData() / SHARD_COUNT);
+        long endId = (shardIndex + 1) * (config.getTotalData() / SHARD_COUNT);
+
+        // 分批处理
+        long offset = startId;
+        int batchSize = 1000;
+
+        while (offset < endId) {
+            List<Data> batch = dataDAO.selectByRange(offset, offset + batchSize);
+            processBatch(batch);
+            offset += batchSize;
+        }
+    }
+
+    // 所有分片都完成后执行回调
+    public void onAllShardsComplete(String taskId, Callback callback) {
+        String counterKey = "task:shard:counter:" + taskId;
+        Long count = redisTemplate.opsForValue().increment(counterKey);
+
+        if (count == SHARD_COUNT) {
+            // 所有分片完成，执行回调
+            callback.execute();
+            redisTemplate.delete(counterKey);
+        }
+    }
+}
+```
+
+### 4.3 分布式任务平台
+
+```
+XXL-Job / ElasticJob 架构：
+
+调度中心：
+- 管理任务配置
+- 触发定时执行
+- 分配任务到执行器
+
+执行器：
+- 注册到调度中心
+- 接收任务分配
+- 执行任务并上报结果
+
+特点：
+1. 支持任务分片
+2. 支持失败重试
+3. 支持任务依赖
+4. 支持任务监控
+```
+
+## 五、任务失败处理 🟡
+
+### 5.1 失败策略
+
+```
+失败策略：
+1. 失败重试：失败后自动重试N次
+2. 失败告警：失败后发送告警
+3. 失败转移：失败后转移到其他节点
+4. 失败挂起：失败后暂停任务，等待人工处理
+
+重试策略：
+- 重试次数：3次
+- 重试间隔：1分钟、5分钟、30分钟
+- 重试条件：可重试异常才重试（如超时、网络错误）
+- 不重试：业务异常（如余额不足）
+```
+
+### 5.2 超时处理
+
+```java
+public class TaskExecutor {
+
+    private static final long TASK_TIMEOUT = 300;  // 5分钟
+
+    public TaskResult execute(Task task) {
+        Future<TaskResult> future = executor.submit(() -> {
+            return doExecute(task);
+        });
+
+        try {
+            return future.get(TASK_TIMEOUT, TimeUnit.SECONDS);
+        } catch (TimeoutException e) {
+            future.cancel(true);
+            return TaskResult.timeout();
+        } catch (Exception e) {
+            return TaskResult.failed(e);
+        }
+    }
+}
+```
+
+### 5.3 幂等处理
+
+```
+任务幂等设计：
+
+1. 唯一键防重
+   - 任务ID = task_type + biz_id + date
+   - 重复任务直接跳过
+
+2. 状态机防重
+   - 任务执行前检查状态
+   - 如果已完成，直接返回
+
+3. 分布式锁防重
+   - 任务执行前抢锁
+   - 抢到锁才执行
+```
+
+## 六、生产避坑 🟡
+
+### 6.1 定时任务的五大坑
+
+**坑1：集群环境下重复执行**
+
+```
+问题：多台服务器同时执行同一任务
+场景：没有分布式锁，机器都触发了
+影响：数据重复处理
+解决方案：
+- 分布式锁：任务执行前抢锁
+- 任务队列：只有消费者能执行
+- 调度分离：调度中心和执行器分离
+```
+
+**坑2：任务超时未处理**
+
+```
+问题：任务执行超时，但没有熔断
+场景：任务卡死，但没有超时机制
+影响：任务一直挂着，占用资源
+解决方案：
+- 设置任务超时时间
+- 超时后中断任务
+- 超时后告警
+```
+
+**坑3：分片不均匀**
+
+```
+问题：数据倾斜，导致某些分片特别慢
+场景：按用户ID分片，但某些用户数据量特别大
+影响：木桶效应，整体任务卡在某个分片
+解决方案：
+- 按范围分片，而非取模分片
+- 动态分片：根据数据量动态调整
+```
+
+**坑4：任务依赖死循环**
+
+```
+问题：任务A依赖B，B依赖A
+场景：复杂的DAG图，没有环检测
+影响：调度陷入死循环
+解决方案：
+- DAG建图时检测环
+- 或限制任务依赖深度
+```
+
+**坑5：低峰期任务堆积**
+
+```
+问题：高峰期任务太多，队列堆积
+场景：零点时刻，大量定时任务同时触发
+影响：任务延迟执行
+解决方案：
+- 错峰调度：不同任务错开执行时间
+- 降级处理：高峰期延迟非关键任务
+- 扩容：高峰期临时扩容执行器
+```
+
+【架构权衡】
+
+定时任务调度的设计哲学是**可靠性第一**。任务可以不及时，但不能重复执行。宁可延迟，不可重复。分布式锁、分片策略、失败处理，都是为了这个目标。
+
+## 七、真实面试回放 🟡
+
+> **面试官**：XXL-Job是怎么保证任务不重复执行的？
+>
+> 候选人（调度架构师）：XXL-Job用任务队列 + 竞争消费的模式。
+>
+> 调度中心把任务添加到队列，执行器竞争获取任务。
+>
+> 只有一个执行器能获取到同一个任务，执行完成后从队列移除。
+>
+> 如果执行器挂了，任务会超时重新进入队列，被其他执行器获取。
+>
+> **面试官**：如果执行器执行任务时JVM挂了怎么办？
+>
+> 候选人：这种情况任务会丢失。
+>
+> XXL-Job有两种模式：单机模式和分片模式。
+>
+> 单机模式用阻塞队列，JVM挂了任务就丢了。
+>
+> 分片模式用数据库做任务队列，任务持久化到数据库，JVM挂了不会丢。
+>
+> **面试官**：那怎么保证分片完整性？比如任务要处理1000万数据，分成10个分片，怎么知道所有分片都完成了？
+>
+> 候选人：可以用计数器。
+>
+> 每个分片完成后，在Redis里做一个 `increment`，计数+1。
+>
+> 当计数达到10时，说明所有分片完成，可以触发后续任务。
+>
+> 如果某个分片一直没完成，超时后就告警，人工介入。
+>
+> 【面试官手记】
+>
+> 调度架构师这场面试的亮点：
+>
+> 1. 知道XXL-Job的任务队列模式：竞争消费
+>
+> 2. 知道单机模式和分片模式的区别：队列持久化
+>
+> 3. 知道分片完整性检测：Redis计数器
+>
+> 这场面试属于P6+级别，定时任务是工程实践中的常见问题。
+
+定时任务调度系统的核心是**可靠性**，记住三个要点：
+
+1. **分布式锁**：保证任务不重复执行
+2. **任务分片**：大数据量时并行处理
+3. **失败处理**：重试 + 超时 + 幂等
+
+任务可以不及时，但不能重复执行。

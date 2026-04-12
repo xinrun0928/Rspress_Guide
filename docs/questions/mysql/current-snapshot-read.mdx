@@ -1,0 +1,203 @@
+---
+title: 当前读与快照读
+description: 从一道面试题出发，深入剖析 MySQL InnoDB 中快照读与当前读的区别，LRU 列表与 flush 列表的作用，以及两种读在不同场景下的应用。
+---
+
+# 当前读与快照读
+
+面试官问："MySQL 的快照读和当前读有什么区别？"
+
+小马说："快照读是读历史版本，当前读是读最新版本。"
+
+面试官追问："那哪些 SQL 是快照读，哪些是当前读？"
+
+小马说："普通的 SELECT 是快照读，SELECT FOR UPDATE 是当前读。"
+
+面试官继续追问："那 SELECT COUNT(*) FROM orders 是快照读还是当前读？"
+
+小张说："...应该是快照读？"
+
+面试官追问："MVCC 对哪种读生效？"
+
+小马说："快照读？"
+
+面试官点点头。
+
+这道题，表面上是区分两种读的类型，实际上考的是候选人对 MVCC 和锁机制边界的理解。能说清楚"什么读加锁、什么读不加锁、什么读用 MVCC"的候选人，对 InnoDB 并发控制的理解已经非常扎实。
+
+## 一、快照读 vs 当前读 🔴
+
+### 1.1 定义
+
+**快照读（Snapshot Read）**：读取数据的历史版本，不加锁，不阻塞其他事务。MVCC 对快照读生效。
+
+**当前读（Current Read）**：读取数据的最新版本，加锁，阻塞其他事务的写操作。
+
+### 1.2 分类对比
+
+| 类型 | SQL 语句 | 加锁 | MVCC | 读取内容 |
+| --- | --- | --- | --- | --- |
+| 快照读 | `SELECT ... FROM ...` | ❌ 不加锁 | ✅ 生效 | 历史版本 |
+| 当前读 | `SELECT ... LOCK IN SHARE MODE` | 🔒 共享锁 | ❌ 不生效 | 最新版本 |
+| 当前读 | `SELECT ... FOR UPDATE` | 🔒 排他锁 | ❌ 不生效 | 最新版本 |
+| 当前读 | `INSERT INTO ...` | 🔒 排他锁 | ❌ 不生效 | 最新版本 |
+| 当前读 | `UPDATE ...` | 🔒 排他锁 | ❌ 不生效 | 最新版本 |
+| 当前读 | `DELETE ...` | 🔒 排他锁 | ❌ 不生效 | 最新版本 |
+
+### 1.3 代码验证
+
+```sql
+-- Session 1:
+BEGIN;
+SELECT * FROM orders WHERE id = 1;  -- 快照读，不加锁
+
+-- Session 2:
+UPDATE orders SET amount = 500 WHERE id = 1;  -- 不被阻塞，因为 Session 1 没加锁
+
+-- Session 1:
+SELECT * FROM orders WHERE id = 1;  -- RR 模式下看不到 Session 2 的修改（快照读）
+COMMIT;
+
+-- Session 1:
+BEGIN;
+SELECT * FROM orders WHERE id = 1 FOR UPDATE;  -- 当前读，加排他锁
+
+-- Session 2:
+UPDATE orders SET amount = 800 WHERE id = 1;  -- 被阻塞！等待 Session 1 释放锁
+```
+
+### 1.4 ❌ 错误示范
+
+**候选人原话**："MVCC 对所有读都生效，所以 MySQL 不需要锁了。"
+
+**问题诊断**：完全错误。MVCC 只对快照读生效。当前读必须加锁来保证并发安全。
+
+**候选人原话 2**："快照读就是读旧数据，当前读就是读新数据。"
+
+**问题诊断**：不够精确。快照读的"旧"是相对于 ReadView 的，不是绝对时间。如果其他事务在 ReadView 生成后提交了，快照读就看不到。
+
+【面试官心理】
+这道题我能从多个角度追问。比如："MVCC 的 ReadView 什么时候生成？快照读在 RR 下生成一次，RC 下每次都生成，那当前读需要生成 ReadView 吗？"能答出"当前读不需要生成 ReadView，因为它加锁了，不需要 MVCC"的是真正理解并发控制边界的候选人。
+
+## 二、MVCC 对两类读的处理 🔴
+
+### 2.1 快照读的完整流程
+
+```sql
+-- T1: BEGIN;
+-- T1: SELECT * FROM orders WHERE id = 1;
+-- 执行过程：
+-- Step 1: 生成 ReadView（或复用）
+-- Step 2: 读取当前行，得到 trx_id
+-- Step 3: 执行可见性判断四条件
+-- Step 4: 如果不可见，沿 roll_pointer 找历史版本
+-- Step 5: 重复 Step 2~4，直到找到可见版本
+-- Step 6: 返回结果
+```
+
+### 2.2 当前读的完整流程
+
+```sql
+-- T1: BEGIN;
+-- T1: SELECT * FROM orders WHERE id = 1 FOR UPDATE;
+-- 执行过程：
+-- Step 1: 不生成 ReadView（MVCC 不参与）
+-- Step 2: 在索引上寻找 id = 1 的记录
+-- Step 3: 在记录上加排他锁
+-- Step 4: 读取最新版本的数据
+-- Step 5: 返回结果
+```
+
+### 2.3 两者的核心区别
+
+| 维度 | 快照读 | 当前读 |
+| --- | --- | --- |
+| 是否生成 ReadView | ✅ 是 | ❌ 否 |
+| 是否加锁 | ❌ 否 | ✅ 是 |
+| MVCC 参与 | ✅ 是 | ❌ 否 |
+| 读取版本 | 历史版本（ReadView 决定） | 最新提交版本 |
+| 并发能力 | 高（读读不冲突） | 低（读写、写读冲突） |
+
+## 三、一致性读（Consistent Read）🟡
+
+### 3.1 一致性读的定义
+
+快照读在 InnoDB 中也叫**一致性非锁定读（Consistent Non-locking Read）**。
+
+"一致性"：事务内多次读取结果一致（RR 级别）。
+
+"非锁定"：不加锁，不阻塞写操作。
+
+### 3.2 为什么需要快照读？
+
+```sql
+-- 场景：报表查询 + 业务更新并发
+-- 用户 A：报表查询，扫描全表
+-- 用户 B：实时更新订单
+
+-- 没有快照读：
+-- 用户 A 扫描到第 5000 行，用户 B 修改了第 5000 行
+-- 用户 A 看到的要么是修改前，要么是修改后，取决于谁先完成
+-- 报表数据前后不一致
+
+-- 有快照读：
+-- 用户 A 的事务开始时生成 ReadView
+-- 整个查询过程中，用户 A 始终看到 ReadView 时的数据快照
+-- 用户 B 的修改不影响用户 A 的查询
+```
+
+### 3.3 快照读的陷阱
+
+```sql
+-- T1: BEGIN;
+-- T1: SELECT SUM(amount) FROM orders WHERE user_id = 1;  -- 快照读，得到 10000
+-- T2: UPDATE orders SET amount = amount + 500 WHERE user_id = 1; COMMIT;
+-- T1: SELECT SUM(amount) FROM orders WHERE user_id = 1;  -- 仍是 10000（RR）
+-- T1: UPDATE orders SET amount = amount + 1000 WHERE user_id = 1;  -- 当前读
+-- T1: SELECT SUM(amount) FROM orders WHERE user_id = 1;  -- 11000
+-- T1: COMMIT;
+```
+
+**陷阱**：事务内用快照读做统计，然后基于统计结果做 UPDATE。UPDATE 是当前读，会读到最新数据。如果其他事务在快照读和 UPDATE 之间提交了数据，就会出现数据不一致。
+
+## 四、生产避坑 🟡
+
+### 4.1 先读后写的并发问题
+
+```sql
+-- ❌ 不安全的写法
+SELECT balance FROM account WHERE id = 1;  -- 快照读，得到 1000
+-- 其他事务修改了 balance 为 500 并提交
+UPDATE account SET balance = 1000 + 100 WHERE id = 1;  -- 当前读
+-- 结果：1000 + 100 = 1100，但实际应该是 500 + 100 = 600
+
+-- ✅ 安全的写法：使用当前读读取最新数据
+SELECT balance FROM account WHERE id = 1 FOR UPDATE;  -- 当前读，得到 500
+UPDATE account SET balance = 500 + 100 WHERE id = 1;
+-- 结果：500 + 100 = 600
+```
+
+### 4.2 SELECT COUNT(*) 的特殊性
+
+```sql
+-- SELECT COUNT(*) 是快照读还是当前读？
+SELECT COUNT(*) FROM orders;
+-- InnoDB 中，COUNT(*) 在没有 WHERE 条件时，遍历主键索引
+-- MVCC 生效，读到的是快照版本
+-- 但返回的是满足条件的历史行数，不一定是最新提交的行数
+```
+
+:::warning ⚠️
+在 RR 隔离级别下，`SELECT COUNT(*)` 返回的是事务开始时的行数快照。如果其他事务在此期间插入了新行，`COUNT(*)` 不会包括这些新行。这在某些业务场景下可能导致数据不一致。
+:::
+
+【面试官心理】
+这道题我能从"先读后写"的场景切入，看候选人是否理解快照读在业务逻辑中的陷阱。很多生产事故就是因为不了解快照读和当前读的区别，在事务内先快照读统计、后当前写更新，导致的数据不一致。
+
+---
+
+| 级别 | 考察重点 | 期望回答 |
+| --- | --- | --- |
+| P5 | 类型区分 | 哪些 SQL 是快照读，哪些是当前读 |
+| P6 | 机制理解 | 快照读生成 ReadView，当前读加锁 |
+| P7 | 实战陷阱 | 先读后写的不一致性、MVCC 边界 |

@@ -1,0 +1,466 @@
+---
+title: 数据迁移方案
+description: 从一个数据迁移导致数据丢失的事故出发，深度拆解数据迁移的方案：双写方案、CDC方案、增量同步及常见问题处理。
+---
+
+# 数据迁移方案
+
+2021年某电商平台从Oracle迁移到MySQL，迁移过程中出现了严重的数据丢失问题：
+
+迁移脚本写的是"DELETE FROM old_table"，执行后发现新表的数据还没同步完，删掉了旧表的数据。
+
+更糟糕的是，因为Oracle和MySQL的SQL语法有差异，部分查询在MySQL上执行报错，业务停了整整2小时。
+
+**这次迁移事故导致约5万条数据丢失，平台损失约10万元。**
+
+【面试官手记】
+
+数据迁移是生产环境最危险的操作之一。我面试过的候选人里，能说清楚"迁移方案"的不超过30%，能说出"回滚方案"的不超过20%。数据迁移的关键是**可回滚 + 可验证**。
+
+## 一、数据迁移的四种方案 🔴
+
+### 1.1 四种方案
+
+```
+数据迁移四种方案：
+
+1. 停机迁移
+   - 停止写入，迁移数据，验证后切换
+   - 优点：简单可靠
+   - 缺点：需要停服
+   - 适用：低频迁移、数据量小
+
+2. 双写方案
+   - 新旧系统同时写入，切换后停止旧系统
+   - 优点：不停服
+   - 缺点：需要改代码、可能有数据不一致
+   - 适用：高可用系统
+
+3. CDC方案
+   - 监听数据库变更日志，实时同步到新系统
+   - 优点：实时同步、侵入性小
+   - 缺点：延迟、复杂度高
+   - 适用：异构数据库迁移
+
+4. 批量同步方案
+   - 批量导出导入，增量同步，最后切换
+   - 优点：对业务影响小
+   - 缺点：周期长
+   - 适用：历史数据迁移
+```
+
+### 1.2 方案对比
+
+| 方案 | 停服时间 | 数据一致性 | 复杂度 | 适用场景 |
+| --- | --- | --- | --- | --- |
+| 停机迁移 | 数小时 | 高 | 低 | 低频迁移 |
+| 双写 | 分钟级 | 中 | 中 | 高可用系统 |
+| CDC | 秒级 | 高 | 高 | 异构迁移 |
+| 批量同步 | 分钟级 | 中 | 中 | 历史数据迁移 |
+
+## 二、停机迁移方案 🔴
+
+### 2.1 流程
+
+```
+停机迁移流程：
+
+1. 准备工作
+   - 备份数据
+   - 验证脚本
+   - 准备回滚方案
+
+2. 通知用户（提前公告）
+   - 发送停服通知
+   - 设置维护页面
+
+3. 停止写入
+   - 关闭写入入口
+   - 等待现有请求处理完成
+
+4. 迁移数据
+   - 导出数据
+   - 清洗转换
+   - 导入新库
+
+5. 验证数据
+   - 数据量对比
+   - 抽样校验
+   - 关键业务验证
+
+6. 切换
+   - 修改配置指向新库
+   - 启动服务
+   - 监控验证
+
+7. 回滚（如果有问题）
+   - 修改配置指回旧库
+   - 恢复旧库
+```
+
+### 2.2 脚本示例
+
+```bash
+#!/bin/bash
+# 停机迁移脚本
+
+set -e
+
+# 1. 备份旧库
+echo "备份旧库..."
+mysqldump -h old_host -u root -p old_db | gzip > /backup/old_db_$(date +%Y%m%d).sql.gz
+
+# 2. 导出数据
+echo "导出数据..."
+sqluldr -h old_host -u root -p -q "SELECT * FROM orders" -f orders.csv
+
+# 3. 数据清洗
+echo "清洗数据..."
+python clean_data.py orders.csv orders_clean.csv
+
+# 4. 导入新库
+echo "导入新库..."
+mysql -h new_host -u root -p new_db < orders_clean.sql
+
+# 5. 验证
+echo "验证数据..."
+python verify_data.py
+
+echo "迁移完成!"
+```
+
+## 三、双写方案 🟡
+
+### 3.1 原理
+
+```
+双写方案：
+
+架构：
+应用 → 新库（新）
+应用 → 旧库（旧）
+
+流程：
+1. 新旧库双写阶段
+   - 应用同时写入新旧库
+   - 验证新库数据正确性
+
+2. 观察阶段
+   - 持续观察新库数据
+   - 记录差异
+
+3. 切换阶段
+   - 停止写入旧库
+   - 全部写入新库
+
+4. 清理阶段
+   - 下线旧库写入逻辑
+   - 删除旧库数据
+```
+
+### 3.2 代码实现
+
+```java
+// 双写拦截器
+@Component
+public class DualWriteInterceptor {
+
+    @Autowired
+    private OrderDAO oldOrderDAO;  // 旧库
+
+    @Autowired
+    private OrderDAO newOrderDAO;  // 新库
+
+    @Autowired
+    private ConfigService configService;
+
+    @Transactional
+    public void createOrder(Order order) {
+        // 写入旧库（始终）
+        oldOrderDAO.insert(order);
+
+        // 判断是否双写
+        if (configService.isDualWriteEnabled()) {
+            // 双写新库
+            try {
+                newOrderDAO.insert(order);
+            } catch (Exception e) {
+                // 双写失败，记录日志但不回滚
+                log.error("双写新库失败，orderId={}", order.getId(), e);
+            }
+        }
+    }
+}
+```
+
+### 3.3 数据校验
+
+```java
+// 数据校验
+@Service
+public class DataValidator {
+
+    @Autowired
+    private OrderDAO oldOrderDAO;
+
+    @Autowired
+    private OrderDAO newOrderDAO;
+
+    public ValidationResult validate() {
+        // 1. 数据量对比
+        long oldCount = oldOrderDAO.count();
+        long newCount = newOrderDAO.count();
+        if (oldCount != newCount) {
+            return ValidationResult.fail("数据量不一致", oldCount, newCount);
+        }
+
+        // 2. 抽样对比
+        List<Order> samples = oldOrderDAO.selectRandom(100);
+        for (Order oldOrder : samples) {
+            Order newOrder = newOrderDAO.selectById(oldOrder.getId());
+            if (!equals(oldOrder, newOrder)) {
+                return ValidationResult.fail("抽样数据不一致，id=" + oldOrder.getId());
+            }
+        }
+
+        return ValidationResult.success();
+    }
+}
+```
+
+## 四、CDC方案 🟡
+
+### 4.1 原理
+
+```
+CDC（Change Data Capture）：
+
+原理：监听数据库变更日志，实时同步到新库
+
+工具：
+- Canal：阿里开源，监听MySQL binlog
+- Debezium：RedHat开源，支持多种数据库
+- Oracle GoldenGate：Oracle官方，Oracle迁移
+
+流程：
+1. 配置CDC源
+   - 配置MySQL binlog
+   - 启动Canal Server
+
+2. 数据同步
+   - Canal Client消费binlog
+   - 解析并写入新库
+
+3. 切换
+   - 校验数据一致性
+   - 切换读取到新库
+```
+
+### 4.2 Canal实现
+
+```java
+// Canal消费者
+@Service
+public class CanalSyncService {
+
+    @Autowired
+    private OrderDAO newOrderDAO;
+
+    @RabbitListener(queues = "canal.orders")
+    public void handleMessage(CanalMessage message) {
+        String type = message.getType();
+        Order order = message.getData();
+
+        switch (type) {
+            case "INSERT":
+                newOrderDAO.insert(order);
+                break;
+            case "UPDATE":
+                newOrderDAO.update(order);
+                break;
+            case "DELETE":
+                newOrderDAO.deleteById(order.getId());
+                break;
+        }
+    }
+}
+```
+
+## 五、回滚方案 🟡
+
+### 5.1 回滚策略
+
+```
+回滚方案：
+
+1. 立即回滚
+   - 切换配置指回旧库
+   - 停止新库写入
+   - 恢复旧库数据
+
+2. 灰度回滚
+   - 逐步将流量切回旧库
+   - 观察验证
+   - 最终完全回滚
+
+3. 数据修复
+   - 发现差异后，修复新库数据
+   - 不回滚整体架构
+```
+
+### 5.2 回滚脚本
+
+```bash
+#!/bin/bash
+# 回滚脚本
+
+set -e
+
+echo "开始回滚..."
+
+# 1. 停止双写
+echo "停止双写..."
+curl -X POST http://config-server/api/dual-write/disable
+
+# 2. 恢复旧库数据（如有必要）
+if [ "$1" == "--restore-old-db" ]; then
+    echo "恢复旧库数据..."
+    gunzip < /backup/old_db_latest.sql.gz | mysql -h old_host -u root -p old_db
+fi
+
+# 3. 切换配置
+echo "切换配置..."
+curl -X POST http://config-server/api/db/rollback
+
+# 4. 验证
+echo "验证服务..."
+curl http://api-server/health
+
+echo "回滚完成!"
+```
+
+## 六、生产避坑 🟡
+
+### 6.1 数据迁移的五大坑
+
+**坑1：迁移脚本有bug**
+
+```
+问题：迁移脚本没验证，上线后才发现问题
+场景：SQL语法差异导致迁移失败
+解决方案：
+- 迁移前在测试环境验证
+- 分批次执行，设置checkpoint
+```
+
+**坑2：迁移过程新数据丢失**
+
+```
+问题：迁移过程中新增的数据没有同步
+场景：双写方案中，新库没写入成功
+解决方案：
+- 迁移完成后再次校验
+- 使用CDC实时同步
+```
+
+**坑3：迁移后查询性能下降**
+
+```
+问题：新库查询走了全表扫描
+场景：旧库索引和MySQL不同
+解决方案：
+- 迁移前检查索引
+- 迁移后重建索引
+```
+
+**坑4：事务范围过大**
+
+```
+问题：迁移脚本在一个大事务里
+场景：迁移失败回滚时间过长
+解决方案：
+- 分批次迁移
+- 每批次单独事务
+```
+
+**坑5：没有回滚方案**
+
+```
+问题：迁移出问题，无法回滚
+场景：没有备份、没有回滚脚本
+解决方案：
+- 必须有完整回滚方案
+- 必须有数据备份
+```
+
+### 6.2 迁移检查清单
+
+```
+迁移前检查：
+- [ ] 测试环境验证通过
+- [ ] 数据备份完成
+- [ ] 回滚方案就绪
+- [ ] 监控告警配置
+- [ ] 通知用户
+
+迁移中检查：
+- [ ] 进度监控
+- [ ] 错误日志
+- [ ] 数据量对比
+
+迁移后检查：
+- [ ] 数据一致性验证
+- [ ] 性能验证
+- [ ] 功能验证
+- [ ] 监控观察
+```
+
+## 七、真实面试回放 🟡
+
+> **面试官**：数据迁移怎么保证一致性？
+>
+> **候选人**（小张）：三种方案：
+>
+> 一是停机迁移。最简单，迁移期间停止写入，数据一致性高。但需要停服。
+>
+> 二是双写。应用同时写入新旧库，切换前校验数据，然后切换。双写期间可能不一致。
+>
+> 三是CDC。监听binlog实时同步，对业务影响最小，但实现复杂。
+>
+> **面试官**：双写过程中数据不一致了怎么办？
+>
+> 小张：两个步骤：
+>
+> 一是发现差异。定期校验新旧库数据，找出不一致的记录。
+>
+> 二是修复差异。用旧库数据覆盖新库数据，或者修复后同步。
+>
+> **面试官**：迁移失败了怎么回滚？
+>
+> 小张：三个原则：
+>
+> 一是迁移前必须备份。
+>
+> 二是迁移脚本要支持checkpoint，分批次执行。
+>
+> 三是要有回滚脚本，能一键切回旧库。
+>
+> 【面试官手记】
+>
+> 小张这场面试的亮点：
+>
+> 1. 知道三种迁移方案及适用场景
+>
+> 2. 知道双写期间的数据校验方法
+>
+> 3. 知道回滚的三个原则
+>
+> 数据迁移是P6工程师必备技能，能完整回答的候选人，说明有生产运维经验。
+
+数据迁移的核心是**可回滚 + 可验证**。记住三个要点：
+
+1. **方案选择**：根据停服时间要求选择方案
+2. **数据校验**：迁移后必须校验一致性
+3. **回滚方案**：必须准备好回滚方案
+
+数据迁移是生产环境最危险的操作，宁可慢一点，不可出错。

@@ -1,0 +1,441 @@
+---
+title: 堆转储分析
+description: 从真实的 OOM 事故出发，深入剖析堆转储（Heap Dump）的生成方法、MAT与JProfiler的使用技巧、对象引用链分析，以及如何从堆转储中定位内存泄漏的根因。
+---
+
+# 堆转储分析
+
+2019年的那次 OOM 事故，我们花了三个小时还没定位到根因。
+
+后来生成了堆转储文件，用 MAT（Memory Analyzer Tool）打开，两分钟就找到了问题：有一个 `HashMap` 持有了 3.2GB 的数据，引用链清晰得就像一张地图。
+
+堆转储是排查 Java 内存问题的终极工具。但很多人不知道的是：**堆转储本身就能解决问题 50% 的 OOM**——剩下 50% 需要你懂得怎么看。
+
+## 一、堆转储的生成方法 🔴
+
+### 1.1 触发方式一览
+
+```bash
+# 方式一：OOM 时自动生成（生产必备）
+java -Xmx4g -Xms4g \
+    -XX:+HeapDumpOnOutOfMemoryError \
+    -XX:HeapDumpPath=/var/log/java/heapdump.hprof \
+    MyApp
+
+# 方式二：手动生成（不影响服务运行）
+jmap -dump:format=b,file=heapdump.hprof <pid>
+
+# 方式三：JCMD 生成
+jcmd <pid> GC.heap_dump heapdump.hprof
+
+# 方式四：JVisualVM 图形界面
+# jvisualvm → 选择进程 → 堆 Dump
+
+# 方式五： Arthas 生成
+arthas> heapdump heapdump.hprof
+```
+
+:::warning ⚠️
+生产环境注意事项：
+1. **堆转储会触发 Full GC**，在高峰期可能导致服务短暂停顿。尽量在低峰期操作。
+2. **堆转储文件可能很大**（等于堆大小，几十 GB）。确保磁盘空间充足。
+3. **堆转储生成需要时间**（大堆可能需要几分钟）。不要在生成一半时停止进程。
+4. **使用 `-XX:+HeapDumpOnOutOfMemoryError` 代替手动触发**，这样只在 OOM 时才生成，不影响正常服务。
+:::
+
+### 1.2 离线转储与在线诊断
+
+| 方式 | 适用场景 | 优点 | 缺点 |
+| --- | --- | --- | --- |
+| OOM 自动生成 | OOM 故障复盘 | 完整记录故障现场 | 不能实时分析 |
+| jmap/jcmd 在线 | 非 OOM 场景排查 | 可随时生成 | Full GC 停顿 |
+| Arthas 在线 | 不想导文件的场景 | 不需要 dump 文件 | 分析功能有限 |
+| JMX programmatic | 自动化监控 | 可集成到监控系统 | 实现复杂度高 |
+
+### 1.3 堆转储的格式
+
+`.hprof` 文件包含：
+
+```
+Heap Dump
+  ├── 类实例（Instance）
+  │     ├── 对象头（Object Header）
+  │     ├── 实例字段（Instance Fields）
+  │     └── 引用（References）
+  ├── 类信息（Class）
+  │     ├── 类加载器
+  │     ├── 静态字段
+  │     └── 常量池
+  ├── GC Roots
+  └── 对象引用图（邻接表）
+```
+
+## 二、MAT 使用指南 🔴
+
+### 2.1 核心概念
+
+**Shallow Heap vs Retained Heap**：
+
+| 概念 | 定义 | 计算方式 |
+| --- | --- | --- |
+| **Shallow Heap** | 对象自身占用的内存 | 对象头（12 字节）+ 字段大小 |
+| **Retained Heap** | 对象被 GC 后能释放的内存总量 | 对象自身 + 所有直接/间接引用对象的 Shallow Heap 之和 |
+
+```
+示例：
+HashMap 实例
+  → Shallow Heap: 48 字节（HashMap 自身大小）
+  → Retained Heap: 3.2GB（HashMap + 它持有的所有 Entry + 所有 value 对象）
+
+Retained Heap 才是判断内存占用的关键指标。
+```
+
+**GC Roots**：
+
+GC Roots 是堆外指向堆内对象的引用，是对象是否"存活"的判断依据：
+
+```
+GC Roots 包括：
+1. JVM 方法区中的类静态属性引用的对象
+2. JVM 方法区中的常量引用的对象
+3. 活跃的本地方法栈中 JNI 引用的对象
+4. 活跃线程持有的对象
+5. JNI 全局引用
+6. 用于同步的 Monitor 对象
+```
+
+### 2.2 MAT 的核心功能
+
+**功能一：Leak Suspects Report（泄漏嫌疑人报告）**
+
+```
+使用步骤：
+1. File → Open Heap Dump
+2. 选择 "Leak Suspects Report"
+3. MAT 自动分析并生成报告
+
+报告内容：
+- 可能的内存泄漏点
+- 每个泄漏点占用的大小
+- 简化的引用链
+```
+
+**功能二：Histogram（直方图）**
+
+查看所有类的实例数量和内存占用：
+
+```
+Path To GC Roots → exclude weak/soft/phantom refs
+  → 显示对象的完整引用链
+  → 找到是什么持有这个对象（GC Root）
+
+Dominator Tree
+  → 以对象支配关系展示内存结构
+  → 快速找到最大的内存占用者
+```
+
+**功能三：OQL（对象查询语言）**
+
+类似 SQL 的查询语言：
+
+```sql
+-- 查询 HashMap 中大于 1MB 的 value
+SELECT p.value.toString().length() AS size
+FROM java.util.HashMap$Node p
+WHERE p.value.toString().length() > 1048576
+
+-- 查询特定类的所有实例
+SELECT * FROM com.example.UserProfile
+
+-- 查询字段数量超过 1000 的 ArrayList
+SELECT * FROM java.util.ArrayList WHERE capacity > 1000
+
+-- 查询持有大对象的 HashMap
+SELECT * FROM java.util.HashMap
+WHERE objectHeader.@length > 10000
+```
+
+### 2.3 MAT 分析实战
+
+**场景：定位 HashMap 内存泄漏**
+
+```
+Step 1: 打开 Leak Suspects Report
+        发现 "Problem Suspect 1" 占用了 3.2GB
+
+Step 2: 点击进入详情
+        发现是 com.xxx.UserProfileService.profileCache
+
+Step 3: 查看引用链
+        Right-click → Path To GC Roots → exclude weak/soft refs
+        显示：
+        profileCache (HashMap)
+          → userProfileService (Spring Bean)
+            → Spring Container
+              → ClassLoader
+                → Bootstrap ClassLoader (GC Root)
+
+Step 4: 结论
+        profileCache 被 Spring 单例 Bean 持有，生命周期 = JVM 生命周期
+        缓存没有大小限制 → 持续膨胀 → OOM
+```
+
+## 三、JProfiler 使用指南 🟡
+
+### 3.1 JProfiler vs MAT
+
+| 维度 | MAT | JProfiler |
+| --- | --- | --- |
+| **费用** | 免费（Eclipse 工具） | 商业收费 |
+| **启动方式** | 离线分析 dump 文件 | 在线 + 离线 |
+| **实时性** | 需要生成 dump | 实时监控 |
+| **堆大小支持** | 支持超大堆（需分配足够内存） | 有限制 |
+| **分析深度** | 深（引用链分析强大） | 中 |
+| **适合场景** | OOM 根因分析 | 日常性能调优 |
+
+### 3.2 JProfiler 的内存分析视图
+
+**Biggest Objects（最大对象视图）**
+
+```
+显示堆中占用最大的对象：
+1. com.xxx.UserProfileService.profileCache (3.2GB)
+   └── HashMap$Node[] (3.2GB)
+       ├── Entry: userId_001 → UserProfile (500KB)
+       ├── Entry: userId_002 → UserProfile (480KB)
+       └── ...
+2. com.xxx.OrderService.orderCache (800MB)
+```
+
+**Reference View（引用视图）**
+
+显示对象的入引用（谁引用了这个对象）和出引用（这个对象引用了谁）。
+
+**Unreachable Objects（不可达对象）**
+
+分析对象在 GC 之前的状态，了解对象为什么没有被及时回收。
+
+### 3.3 JProfiler 分析实战
+
+```
+场景：排查服务内存持续增长
+
+Step 1: Attach 到运行中的进程
+        Session → Attach to JVM
+
+Step 2: 开启内存记录
+        Memory Views → Start Recording
+
+Step 3: 执行可疑操作（查询、缓存操作等）
+
+Step 4: 停止记录，分析分配
+        "Recorded Objects" 视图
+        → 按类分组，查看哪些类实例数量增长最快
+        → "Allocation Call Tree" 查看分配来源
+
+Step 5: 生成堆转储对比
+        间隔 5 分钟生成两个 dump
+        对比两个 dump 中对象数量变化
+        → 快速定位增长最快的对象类型
+```
+
+## 四、引用链分析方法 🟡
+
+### 4.1 引用链分析的三种模式
+
+**模式一：入引用分析（谁持有我？）**
+
+```
+适用场景：知道哪个对象占用了大量内存，想知道是什么持有它
+
+MAT 操作：
+  Histogram → 选择目标类 → Right-click → Path To GC Roots
+
+JProfiler 操作：
+  Objects → 选择实例 → Show Nearest GC Root
+```
+
+**模式二：出引用分析（我持有了什么？）**
+
+```
+适用场景：分析一个容器的内存结构
+
+MAT 操作：
+  Histogram → 选择 HashMap → Right-click → List Objects → with outgoing refs
+
+JProfiler 操作：
+  Instances → 选择 HashMap → Show Paths to GC Roots
+```
+
+**模式三：支配树分析（谁支配了我？）**
+
+```
+支配关系：如果从 GC Root 到 A 的每条路径都经过 B，则 B 支配 A
+
+支配树的用途：
+  - 快速找到内存占用最大的根因
+  - 不需要分析整个引用链，只需看支配者
+```
+
+### 4.2 常见 GC Root 类型
+
+| GC Root 类型 | 说明 | 在 MAT 中的标签 |
+| --- | --- | --- |
+| `Local Variable` | 活跃线程的栈帧中的局部变量 | `Local Variable` |
+| `JNI Global` | JNI 全局引用 | `JNI Global` |
+| `JNI Local` | JNI 局部引用 | `JNI Local` |
+| `Thread Object` | 活跃线程对象 | `Java Local` |
+| `Class` | 类静态属性 | `Java Static` |
+| `Finalizer` | 等待终结器执行的对象 | `Finalizer` |
+| `Busy Monitor` | 持有 synchronized 锁的对象 | `Busy Monitor` |
+
+### 4.3 排除弱/软引用
+
+```
+面试常见问题：为什么用 "exclude weak/soft references"？
+
+原因：
+- WeakReference 和 SoftReference 本身就是设计为可回收的
+- 它们持有的对象不应该被视为内存泄漏的原因
+- 排除它们可以让引用链更清晰，找到真正的根因
+
+使用场景：
+  HashMap<String, WeakReference<User>> cache
+  → HashMap 本身可能不大
+  → 但 cache 引用的对象可能在等待 GC
+  → 排除 weak refs 后可以看到真正的内存占用
+```
+
+## 五、生产排查案例 🟡
+
+### 5.1 案例：String.intern() 导致 Metaspace 膨胀
+
+```java
+// 问题代码
+List<String> hugeList = new ArrayList<>();
+for (Order order : orders) {
+    // intern() 会将 String 放入字符串常量池（JDK 7+ 在堆中）
+    // 但这里过度使用，导致常量池膨胀
+    hugeList.add(order.getName().intern());
+}
+```
+
+**排查过程**：
+
+```bash
+# 生成 dump 后用 MAT 分析
+# 1. Histogram 视图
+# 2. 选择 java.lang.String
+# 3. 按 Retained Heap 排序
+# 4. 发现有 100 万个 unique String，总共 500MB
+
+# 5. Path To GC Roots → exclude all refs
+# 6. 发现这些 String 都在字符串常量池中
+# 7. 回到代码，找到 intern() 的使用位置
+```
+
+### 5.2 案例：ThreadLocal 泄漏
+
+```java
+// 问题代码
+public class UserContextFilter {
+    private static final ThreadLocal<User> userHolder = new ThreadLocal<>();
+
+    public static void setUser(User user) {
+        userHolder.set(user);
+    }
+
+    public static User getUser() {
+        return userHolder.get();
+    }
+
+    // ❌ 没有 remove()！线程池复用时会导致内存泄漏
+}
+```
+
+**排查过程**：
+
+```bash
+# MAT 分析
+# 1. 搜索 java.lang.ThreadLocal
+# 2. 查看 Retained Heap
+# 3. Path To GC Roots
+# 4. 发现大量 ThreadLocalMap.Entry 的 key 为 null
+#    但 value 指向 User 对象
+
+# 根因：
+# ThreadLocalMap.Entry 的 key（ThreadLocal）被回收了
+# 但 value（User）仍然被 Entry 持有
+# → 内存泄漏
+```
+
+### 5.3 案例：连接池泄漏
+
+```java
+// 问题代码
+public Connection getConnection() {
+    Connection conn = dataSource.getConnection();
+    // ❌ 异常时没有关闭连接
+    if (Math.random() > 0.9) {
+        throw new RuntimeException("random error");
+    }
+    return conn;
+}
+```
+
+**排查过程**：
+
+```bash
+# 1. Histogram 视图
+# 2. 查看 java.sql.Connection 子类（如 DruidConnectionImpl）
+# 3. 实例数量异常高
+
+# 4. Path To GC Roots
+# 5. 发现连接被某个方法局部变量持有
+# 6. 确认是异常路径下没有释放连接
+```
+
+## 六、工具配置参考 🟢
+
+### 6.1 MAT 配置
+
+```bash
+# MAT 需要足够的内存来分析大堆转储
+# 修改 MemoryAnalyzer.ini（位于 MAT 安装目录）
+-vmargs
+-Xmx8g          # 至少 8GB，用于分析大堆
+-Xms4g
+-XX:+UseG1GC
+```
+
+### 6.2 Arthas heapdump 命令
+
+```bash
+# 使用 Arthas 生成 heapdump（不需要手动下载 MAT）
+arthas> heapdump /tmp/heapdump.hprof
+arthas> heapdump /tmp/heapdump.hprof -g
+
+# 参数说明：
+# /tmp/heapdump.hprof        # 指定输出路径
+# -g                         # 包含对象类型信息（默认包含）
+# --live                     # 只 dump 存活对象（GC 前执行）
+#   注意：--live 会先触发 Full GC
+```
+
+### 6.3 dump 文件大小参考
+
+| 堆大小 | dump 文件大小 | MAT 建议内存 |
+| --- | --- | --- |
+| 4GB | ~3GB | 8GB |
+| 8GB | ~6GB | 16GB |
+| 16GB | ~12GB | 32GB |
+| 32GB+ | 很大 | 考虑用 jhat 或在线分析 |
+
+:::tip 💡
+面试加分点：能说出"在 16GB 以上的大堆场景下，dump 文件会非常大（可能超过 50GB），MAT 可能无法直接加载。解决方案是使用 IBM Heap Analyzer 或者通过 `jhat` 进行在线分析"，说明他有过大堆转储的实际排查经验。
+:::
+
+【架构权衡】
+堆转储是排查内存问题的终极手段，但不是唯一手段。**日常监控比堆转储更重要**——通过 GC 日志、Prometheus + JMX Exporter、Grafana 等工具监控内存使用趋势，可以在 OOM 发生之前发现问题。
+
+堆转储的价值在于**定位根因**，而不是**解决问题**。找到泄漏点后，必须回到代码层面修复——用合适的缓存框架替换裸 HashMap，用 try-finally 确保资源释放，用弱引用/软引用替代强引用。工具只是手段，代码优化才是目的。

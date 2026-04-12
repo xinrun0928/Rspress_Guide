@@ -1,0 +1,300 @@
+---
+title: Semaphore 原理
+description: 从限流场景出发，深入剖析 Semaphore 的实现：AQS 共享模式、permits 计数、公平与非公平、acquire 与 release 的配对使用，以及在连接池和限流器中的应用。
+---
+
+# Semaphore 原理
+
+候选人小丁在面试滴滴 P6 时，面试官问道：
+
+"Semaphore 是什么？它是怎么实现限流的？"
+
+小丁说："Semaphore 控制同时访问资源的线程数量..."面试官追问："acquire() 和 release() 的底层实现是什么？permits 耗尽了怎么办？"
+
+小丁答不上来。面试官继续："Semaphore 可以用于实现连接池吗？"
+
+小丁说："应该可以..."面试官继续追问："那和直接用连接池有什么区别？"
+
+小丁彻底卡住了...
+
+## 一、核心问题：Semaphore 原理 🔴
+
+### 1.1 问题拆解
+
+```
+第一层：概念与场景（是什么？）
+  "Semaphore 的典型使用场景是什么？"
+  考察点：限流、连接池、资源池
+
+第二层：AQS 共享实现（怎么做到？）
+  "Semaphore 的 acquire() 和 release() 底层是怎么实现的？"
+  考察点：AQS 共享模式、permits 计数
+
+第三层：公平 vs 非公平（选哪个？）
+  "Semaphore 的公平和非公平有什么区别？"
+  考察点：hasQueuedPredecessors、CLH 队列、FIFO
+
+第四层：工程应用（怎么用？）
+  "如何用 Semaphore 实现连接池？"
+  考察点：资源管理、异常处理
+```
+
+### 1.2 ❌ 错误示范
+
+**候选人原话 A**："Semaphore 的 permits 是指同时有 N 个线程能进入临界区。"
+
+**问题诊断**：不完全准确。Semaphore 控制的是**许可数量**，获取一个 permit 后才能进入临界区，执行完后释放 permit。permits 表示"同时持有资源的最大数量"，而非"同时进入临界区的线程数量"。
+
+**候选人原话 B**："Semaphore 比 synchronized 性能更好，应该总用 Semaphore。"
+
+**问题诊断**：Semaphore 适用于"资源池数量有限"的场景。如果资源是单个不可分割的（如一个数据库连接），Semaphore 可以管理连接池；但如果需要互斥，应该用 ReentrantLock。
+
+### 1.3 标准回答
+
+#### P5 级别：使用场景
+
+> **典型场景：资源池限流**
+>
+> ```java
+> Semaphore semaphore = new Semaphore(10);  // 最多 10 个并发
+>
+> // 获取许可
+> semaphore.acquire();
+> try {
+>     // 使用资源（数据库连接、网络连接等）
+>     useResource();
+> } finally {
+>     semaphore.release();  // 释放许可
+> }
+> ```
+>
+> **常见使用场景**：
+> - **连接池限流**：控制数据库连接的使用数量
+> - **令牌桶限流**：控制 API 请求的并发数量
+> - **文件访问限流**：限制同时打开的文件数量
+> - **信号量模式**：控制对某个共享资源的并发访问数量
+
+#### P6 级别：AQS 共享实现
+
+> **核心实现**：
+>
+> Semaphore 使用 AQS 的**共享模式**，`state` 字段存储可用的 permits 数量：
+>
+> ```java
+> // NonfairSync
+> static final class NonfairSync extends Sync {
+>     protected int tryAcquireShared(int acquires) {
+>         return nonfairTryAcquireShared(acquires);
+>     }
+> }
+>
+> // FairSync
+> static final class FairSync extends Sync {
+>     protected int tryAcquireShared(int acquires) {
+>         for (;;) {
+>             if (hasQueuedPredecessors()) {  // 公平：检查队列
+>                 return -1;
+>             }
+>             int available = getState();
+>             int next = available - acquires;
+>             if (next < 0) return -1;  // permits 不足
+>             if (compareAndSetState(available, next))
+>                 return next;
+>         }
+>     }
+> }
+>
+> // 释放许可
+> protected final boolean tryReleaseShared(int releases) {
+>     for (;;) {
+>         int current = getState();
+>         int next = current + releases;
+>         if (compareAndSetState(current, next))
+>             return true;
+>     }
+> }
+> ```
+>
+> **acquire() 的流程**：
+>
+> ```java
+> public void acquire() throws InterruptedException {
+>     sync.acquireSharedInterruptibly(1);
+> }
+>
+> public final void acquireSharedInterruptibly(int arg) {
+>     if (Thread.interrupted()) throw new InterruptedException();
+>     if (tryAcquireShared(arg) < 0) {  // permits 不足
+>         doAcquireSharedInterruptibly(arg);  // 阻塞，加入共享队列
+>     }
+> }
+> ```
+>
+> **permits 耗尽时**：
+>
+> 线程调用 `acquire()` 时，如果 permits 为 0（已被全部获取），线程被加入 CLH 队列的共享节点并 park。当其他线程调用 `release()` 释放 permits 时，`doReleaseShared()` 唤醒队列中的一个等待线程，该线程重新尝试获取 permits。
+
+#### P7 级别：工程应用与陷阱
+
+> **用 Semaphore 实现连接池**：
+>
+> ```java
+> class SimpleConnectionPool<E> {
+>     private final Queue<E> pool = new LinkedList<>();
+>     private final Semaphore permits;
+>
+>     SimpleConnectionPool(int poolSize, Supplier<E> factory) {
+>         permits = new Semaphore(poolSize);
+>         for (int i = 0; i < poolSize; i++) {
+>             pool.add(factory.get());
+>         }
+>     }
+>
+>     E getConnection(long timeout, TimeUnit unit) throws InterruptedException, TimeoutException {
+>         if (!permits.tryAcquire(timeout, unit)) {
+>             throw new TimeoutException("Connection pool exhausted");
+>         }
+>         return pool.poll();  // 获取连接
+>     }
+>
+>     void releaseConnection(E connection) {
+>         pool.offer(connection);
+>         permits.release();  // 释放许可
+>     }
+> }
+> ```
+>
+> **Semaphore vs 专用连接池的区别**：
+>
+> | 维度 | Semaphore 方案 | 专用连接池（Druid/HikariCP） |
+> | --- | --- | --- |
+> | 功能 | 只控制并发数 | 连接管理、健康检查、超时、自动重连 |
+> | 性能 | 无优化 | 预热、缓存、批量获取 |
+> | 可靠性 | 无 | 故障检测、连接有效性检查 |
+> | 推荐场景 | 简单限流 | 生产环境数据库连接 |
+>
+> **Semaphore 的常见陷阱**：
+>
+> ```java
+> // 陷阱 1：acquire 和 release 不配对
+> Semaphore semaphore = new Semaphore(10);
+> semaphore.acquire();
+> if (someCondition) {
+>     return;  // ❌ 忘记 release，permits 泄漏
+> }
+> semaphore.release();
+>
+> // 解决：try-finally
+> semaphore.acquire();
+> try {
+>     // 业务
+> } finally {
+>     semaphore.release();
+> }
+>
+> // 陷阱 2：多个线程获取多个 permits，但释放时不匹配
+> semaphore.acquire(5);  // 获取 5 个 permits
+> // 业务
+> semaphore.release(3);  // ❌ 只释放 3 个，剩余 2 个泄漏
+> semaphore.release(2);  // 需要显式释放剩余的
+> ```
+
+【面试官心理】
+这道题我能问到 P7 级别，是因为 Semaphore 涉及了 AQS 共享模式和资源管理的工程实践。能正确使用 Semaphore 实现连接池并说明其局限性的候选人说明他有工程判断力。能说出 permits 泄漏和异常处理问题的候选人说明他有过实际踩坑经验。
+
+### 1.4 追问升级
+
+**追问 1：Semaphore 的 permits 可以动态调整吗？**
+
+> 可以使用 `release()` 增加 permits（`acquire()` 减少 permits）：
+>
+> ```java
+> Semaphore semaphore = new Semaphore(10);
+> semaphore.release(5);  // 增加 5 permits，变为 15
+> ```
+>
+> 但这种动态调整不常用，因为改变已发放的许可数量可能导致不可预期的行为。
+
+**追问 2：Semaphore 的公平模式和非公平模式的性能差异？**
+
+> 公平模式下，`tryAcquireShared()` 每次都需要检查 `hasQueuedPredecessors()`（O(1) 的链表头检查），在低竞争场景下额外开销较小；在高竞争场景下，非公平模式的吞吐量仍然更高。
+
+## 二、生产避坑 🟡
+
+### 2.1 permits 泄漏
+
+```java
+// 错误：异常时 permits 泄漏
+semaphore.acquire();
+doSomething();  // 抛出异常
+semaphore.release();
+
+// 正确：使用 try-finally
+semaphore.acquire();
+try {
+    doSomething();
+} finally {
+    semaphore.release();
+}
+
+// 更安全：使用 tryAcquire
+if (semaphore.tryAcquire()) {
+    try {
+        doSomething();
+    } finally {
+        semaphore.release();
+    }
+} else {
+    // 拒绝处理
+}
+```
+
+### 2.2 使用 Semaphore 实现令牌桶
+
+```java
+class TokenBucket {
+    private final Semaphore semaphore;
+>    private final int maxTokens;
+>
+>    TokenBucket(int maxTokens) {
+>        this.maxTokens = maxTokens;
+>        this.semaphore = new Semaphore(maxTokens);
+>    }
+>
+>    boolean tryAcquire() {
+>        return semaphore.tryAcquire();
+>    }
+>
+>    void refill() {
+>        int permits = maxTokens - semaphore.availablePermits();
+>        semaphore.release(permits);
+>    }
+}
+```
+
+## 三、Semaphore 的特性对比 🟢
+
+### 3.1 与 CountDownLatch/CyclicBarrier 的区别
+
+> | 维度 | Semaphore | CountDownLatch | CyclicBarrier |
+> | --- | --- | --- | --- |
+> | 目标 | 控制并发资源数量 | 等待事件完成 | 多线程互相等待 |
+> | 状态变化 | `acquire()` 减少, `release()` 增加 | `countDown()` 递减 | parties 递减到 0 后重置 |
+> | 线程关系 | 独立获取/释放 | 一方等另一方 | 多方互相等待 |
+> | 可复用 | 是（动态 release） | 否 | 是（自动重置） |
+
+### 3.2 Semaphore 的特殊方法
+
+```java
+semaphore.availablePermits();  // 查询剩余 permits
+semaphore.drainPermits();      // 获取所有剩余 permits
+semaphore.reducePermits(n);    // 减少 permits（不可逆）
+```
+
+:::tip 💡
+面试加分点：能说出"Semaphore 的 permits 可以超过初始值（通过 release()），这在动态扩展资源池时有用"，说明他对 Semaphore 的行为有深入理解。
+:::
+
+:::warning ⚠️
+面试陷阱：被问到"Semaphore 的 permits 耗尽时，调用 acquire() 的线程会怎样"，很多人会说"等待"。更准确的回答是：线程被加入 AQS 的 CLH 队列共享节点并 park，当其他线程 release() 时才被唤醒。如果不调用 release()（例如业务异常），线程会永久等待。
+:::

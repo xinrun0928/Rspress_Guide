@@ -1,0 +1,246 @@
+---
+title: InheritableThreadLocal 原理
+description: 从父子线程数据传递出发，深入剖析 InheritableThreadLocal 的实现：Thread 类的 inheritableThreadLocals、父子值复制时机、线程池中的数据错乱问题，以及 TransmittableThreadLocal 的解决方案。
+---
+
+# InheritableThreadLocal 原理
+
+候选人小汪在面试字节 P6 时，面试官问道：
+
+"InheritableThreadLocal 和 ThreadLocal 有什么区别？它是怎么实现的？"
+
+小汪说："子线程可以继承父线程的 ThreadLocal..."面试官追问："那在线程池中使用 InheritableThreadLocal 会有什么问题？"
+
+小汪答不上来...
+
+## 一、核心问题：InheritableThreadLocal 原理 🔴
+
+### 1.1 问题拆解
+
+```
+第一层：与 ThreadLocal 的区别（有什么不同？）
+  "InheritableThreadLocal 和 ThreadLocal 的使用方式有什么区别？"
+  考察点：set/get 相同，但继承语义不同
+
+第二层：实现机制（怎么继承？）
+  "子线程是怎么继承父线程的值的？在哪里复制的？"
+  考察点：Thread.init()、inheritableThreadLocals
+
+第三层：线程池中的数据问题（有什么坑？）
+  "在线程池中使用 InheritableThreadLocal 会有什么数据问题？"
+  考察点：线程复用、数据错乱
+```
+
+### 1.2 ❌ 错误示范
+
+**候选人原话 A**："InheritableThreadLocal 比 ThreadLocal 更好，应该总用它。"
+
+**问题诊断**：InheritableThreadLocal 只在**线程创建时**复制父线程的值。在线程池中，线程被复用，子线程并不是"新创建"的，而是从线程池中取出已存在的线程，所以无法继承父线程的值。
+
+**候选人原话 B**："InheritableThreadLocal 在所有情况下都能继承父线程的值。"
+
+**问题诊断**：只有在新线程创建时（`new Thread()`）才复制。线程池复用线程时，不会重新复制。
+
+### 1.3 标准回答
+
+#### P5 级别：与 ThreadLocal 的区别
+
+> **使用方式完全相同**：
+>
+> ```java
+> InheritableThreadLocal<String> itl = new InheritableThreadLocal<>();
+>
+> itl.set("Hello from parent");
+>
+> new Thread(() -> {
+>     String value = itl.get();  // 获取到 "Hello from parent"
+>     System.out.println(value);
+> }).start();
+> ```
+>
+> **ThreadLocal vs InheritableThreadLocal**：
+>
+> | 维度 | ThreadLocal | InheritableThreadLocal |
+> | --- | --- | --- |
+> | set/get | 相同 | 相同 |
+> | 继承 | 不继承父线程的值 | 继承父线程的值 |
+> | 存储位置 | `Thread.threadLocals` | `Thread.inheritableThreadLocals` |
+> | 继承时机 | 无 | 线程创建时（Thread.init） |
+
+#### P6 级别：实现机制
+
+> **Thread 对象持有两个 Map**：
+>
+> ```java
+> public class Thread implements Runnable {
+>     ThreadLocal.ThreadLocalMap threadLocals = null;           // 普通 ThreadLocal
+>     ThreadLocal.ThreadLocalMap inheritableThreadLocals = null; // 可继承版本
+> }
+> ```
+>
+> **复制发生的时机——Thread.init()**：
+>
+> ```java
+> private void init(ThreadGroup g, Runnable target, String name,
+>                   long stackSize, AccessControlContext acc,
+>                   boolean inheritThreadLocals) {
+>     // ...
+>     if (inheritThreadLocals && parent.inheritableThreadLocals != null) {
+>         // 复制父线程的 inheritableThreadLocals
+>         this.inheritableThreadLocals =
+>             ThreadLocal.createInheritedMap(parent.inheritableThreadLocals);
+>     }
+> }
+> ```
+>
+> **createInheritedMap 的复制逻辑**：
+>
+> ```java
+> static ThreadLocalMap createInheritedMap(ThreadLocalMap parentMap) {
+>     return new ThreadLocalMap(parentMap);
+> }
+>
+> // 构造函数中复制
+> private ThreadLocalMap(ThreadLocalMap parentMap) {
+>     Entry[] parentTable = parentMap.table;
+>     int len = parentTable.length;
+>     table = new Entry[len];
+>
+>     for (Entry e : parentTable) {
+>         if (e != null) {
+>             ThreadLocal<?> key = e.get();
+>             if (key != null) {  // key 为 null 的 Entry 不复制
+>                 Object value = e.value;
+>                 // 创建新的 Entry（注意：值是强引用复制）
+>                 Entry child = new Entry(key, value);
+>                 int h = key.threadLocalHashCode & (len - 1);
+>                 while (table[h] != null) {
+>                     h = nextIndex(h, len);
+>                 }
+>                 table[h] = child;
+>                 size++;
+>             }
+> }
+> ```
+>
+> **关键点**：复制的是**值本身**（深拷贝引用），不是引用。所以父线程修改值后，子线程看不到（因为 Entry 已复制）。
+
+#### P7 级别：线程池中的数据问题
+
+> **线程池中的问题**：
+>
+> ```java
+> ExecutorService pool = Executors.newFixedThreadPool(4);
+>
+> // 请求 1
+> InheritableThreadLocal<String> ctx = new InheritableThreadLocal<>();
+> ctx.set("User1");
+> pool.submit(() -> {
+>     System.out.println(ctx.get());  // 输出 "User1"
+> });
+>
+> // 请求 2（在请求 1 完成后）
+> ctx.set("User2");
+> pool.submit(() -> {
+>     // 如果线程被复用：ctx.get() 可能输出 "User1"（旧数据！）
+>     // 因为线程并非"新创建"，没有复制父线程的值
+>     System.out.println(ctx.get());  // 数据错乱！
+> });
+> ```
+>
+> **为什么会错乱？**
+>
+> 线程池中的 worker 线程不是新创建的线程，不会执行 `Thread.init()` 中的复制逻辑。当请求 2 设置 ctx="User2" 时，设置的是 worker 线程的 inheritableThreadLocals。当请求 2 的任务执行时，它读取到的值取决于：
+> - 如果 worker 线程上次使用的值没被清理 → 读到旧值
+> - 如果 worker 线程的值被正确清理 → 读到 null 或其他请求的值
+>
+> **解决方案：TransmittableThreadLocal（阿里巴巴开源）**
+>
+> ```java
+> // 使用 TransmittableThreadLocal
+> TransmittableThreadLocal<String> ctx = new TransmittableThreadLocal<>();
+>
+> // 在 Runnable/Callable 提交前，自动复制父线程的值
+> TtlRunnable runnable = TtlRunnable.get(() -> {
+>     // 在这里获取的是提交时复制的值
+>     System.out.println(ctx.get());
+> });
+> pool.submit(runnable);
+> ```
+>
+> TransmittableThreadLocal 的实现原理：
+> 1. **快照**：在 Runnable/Callable 提交前，复制当前的 ThreadLocal 值
+> 2. **注入**：在任务执行时，将快照值注入到执行线程
+> 3. **恢复**：任务完成后，恢复原线程的值
+
+【面试官心理】
+这道题我能问到 P7 级别，是因为 InheritableThreadLocal 在线程池场景下的问题是一个经典的生产陷阱。能说出 TransmittableThreadLocal 的候选人说明他对阿里的工程实践有了解。
+
+### 1.4 追问升级
+
+**追问 1：InheritableThreadLocal 的值复制是深拷贝还是浅拷贝？**
+
+> 复制的是 Entry 对象（重新创建 Entry），但值（value）是引用复制（浅拷贝）。所以父线程修改值后，子线程看不到——因为 Entry 已经是独立的副本了。
+
+**追问 2：为什么需要两个 Map 而不是用一个？**
+
+> 为了兼容性。如果 InheritableThreadLocal 也存在 threadLocals 中，每次线程创建时都要扫描所有 ThreadLocal 判断是否可继承，开销大。分离后，只在需要继承时复制 inheritableThreadLocals。
+
+## 二、生产避坑 🟡
+
+### 2.1 线程池 + InheritableThreadLocal 的数据问题
+
+```java
+// 错误：线程池中使用 InheritableThreadLocal
+InheritableThreadLocal<String> userId = new InheritableThreadLocal<>();
+
+pool.submit(() -> {
+    userId.set(getCurrentUserId());
+    doWork();
+    // 没有清理！
+});
+
+// 问题：
+// 1. userId 的值不会被自动清理
+// 2. 线程复用后，旧值仍然存在
+```
+
+**正确做法**：使用 TransmittableThreadLocal 或在 finally 中清理。
+
+### 2.2 TransmittableThreadLocal 的使用
+
+```java
+TransmittableThreadLocal<String> ctx = new TransmittableThreadLocal<>();
+
+// 方式 1：TtlRunnable.get()
+pool.submit(TtlRunnable.get(() -> {
+    ctx.set("value");
+    doWork();
+}));
+
+// 方式 2：TtlCallable.get()
+pool.submit(TtlCallable.get(() -> {
+    return ctx.get();
+}));
+
+// 方式 3：Java Agent（无需修改代码）
+// 启动时加 -javaagent:transmittable-thread-local-2.x.jar
+```
+
+## 三、ThreadLocal 家族对比 🟢
+
+### 3.1 三种 ThreadLocal
+
+| 类型 | 继承父线程值 | 线程池安全 | 清理 |
+| --- | --- | --- | --- |
+| ThreadLocal | ❌ | 需要手动清理 | 手动 |
+| InheritableThreadLocal | ✅ | 需要 TransmittableThreadLocal | 手动 |
+| TransmittableThreadLocal | ✅ | ✅（自动） | 自动 |
+
+:::tip 💡
+面试加分点：能说出"TransmittableThreadLocal 在 JDK 17+ 可以使用 Java Agent（`javaagent`）方式接入，无需修改业务代码，且支持 Finagle、Apache HttpClient、gRPC 等常见框架"，说明他对阿里的开源生态有了解。
+:::
+
+:::warning ⚠️
+面试陷阱：被问到"InheritableThreadLocal 继承的是值还是引用"，很多人会说"值"。准确答案是：引用。子线程得到的是独立 Entry，但 Entry.value 指向的对象引用和父线程相同。如果该对象是可变的，子线程和父线程可以同时修改它（线程不安全）。
+:::

@@ -1,0 +1,379 @@
+---
+title: 数据库连接池满排查
+description: 从一个连接池耗尽导致服务不可用的线上事故出发，深度拆解连接池满的排查方法：连接池配置、连接泄漏、连接等待问题定位及解决策略。
+---
+
+# 数据库连接池满排查
+
+2019年某电商平台的订单服务在高峰期突然无法响应新请求，所有接口都报"获取数据库连接超时"。
+
+技术团队紧急拉起会议，运维尝试重启服务后恢复正常。但1小时后，同样的问题再次出现。
+
+最后用jstack抓了线程栈，发现大量线程处于 `waiting for monitor entry` 状态，等待同一个数据库连接。
+
+排查发现：某个开发人员在代码里加了一段"性能优化"，在查询前加了个Thread.sleep(1000)，用于"模拟慢查询"。这个sleep在连接池里执行，导致连接被长时间占用，其他请求无法获取连接。
+
+**这次故障持续了45分钟，影响了约3万笔订单，直接损失约10万元。**
+
+【面试官手记】
+
+数据库连接池问题是生产环境最常见的问题之一。我面试过的候选人里，能说清楚"连接池配置"的不超过40%，能说清楚"连接泄漏"原因的不超过20%。连接池问题的关键是**理解连接池的工作原理**。
+
+## 一、连接池耗尽的常见原因 🔴
+
+### 1.1 四大原因
+
+```
+连接池耗尽的四大原因：
+
+1. 连接泄漏
+   - 获取连接后没有释放
+   - 典型场景：异常没有执行finally、return前忘记close
+   - 症状：连接数逐渐增长到上限
+
+2. 连接等待超时
+   - 连接池满了，新请求等待
+   - 典型场景：慢查询、锁等待
+   - 症状：等待线程越来越多
+
+3. 连接池配置过小
+   - 业务增长，但连接池没调整
+   - 典型场景：大促前没扩容
+   - 症状：高峰期连接不够用
+
+4. 数据库压力过大
+   - 数据库本身处理不过来
+   - 典型场景：慢查询堆积、锁等待
+   - 症状：获取连接时间变长
+```
+
+### 1.2 量化指标
+
+```
+连接池配置参考（8核16G机器）：
+
+HikariCP（推荐）：
+- maximumPoolSize: 20-30
+- minimumIdle: 5-10
+- connectionTimeout: 30000ms
+- idleTimeout: 600000ms
+- maxLifetime: 1800000ms
+
+Druid：
+- maxActive: 20-30
+- initialSize: 5
+- minIdle: 5
+- maxWait: 30000ms
+```
+
+### 1.3 面试追问
+
+> 面试官：连接池满了怎么排查？
+>
+> 候选人：用jstack看看线程状态，如果是waiting for connection，说明连接不够用。
+>
+> 面试官：怎么判断是连接泄漏还是连接池太小？
+>
+> 候选人：看连接数曲线。如果连接数逐渐增长到上限，然后保持，就是泄漏；如果连接数达到上限后不再增长但有新请求在等待，就是池太小。
+>
+> 【面试官心理】
+>
+> 连接池问题的追问通常很深入。能回答出"看连接数曲线"的候选人，说明有监控意识；能说出"连接泄漏的典型场景"的候选人，说明有实战经验。
+
+## 二、排查流程 🔴
+
+### 2.1 第一步：确认连接池状态
+
+```bash
+# Druid连接池监控
+# 访问 /druid/index.html 查看监控
+
+# HikariCP日志
+# 配置 logPerformance=true 查看连接获取情况
+```
+
+```java
+// Druid连接池状态
+DruidDataSource dataSource = (DruidDataSource) ctx.getBean("dataSource");
+DruidPooledConnection conn = dataSource.getConnection();
+
+// 关键指标
+dataSource.getActiveCount();      // 当前活跃连接数
+dataSource.getPoolingCount();     // 当前空闲连接数
+dataSource.getWaitThreadCount();  // 等待获取连接的线程数
+dataSource.getErrorCount();       // 错误数
+```
+
+### 2.2 第二步：分析线程栈
+
+```bash
+# 查找等待连接的线程
+jstack <pid> | grep -A 5 "waiting for monitor entry"
+
+# 查找持有连接的线程
+jstack <pid> | grep -A 10 "Locked connection"
+```
+
+```java
+// jstack中的连接等待
+"pool-1-thread-100" #12345 prio=5 os_prio=0 tid=0x00007f8a4c02a800 nid=0x303a waiting for monitor entry
+   java.lang.Thread.State: BLOCKED
+    at com.zaxxer.hikari.pool.HikariPool.createTimeoutException(HikariPool.java:541)
+    - waiting to lock <0x00000007d8a01234> (a com.zaxxer.hikari.pool.HikariPool)
+    at com.zaxxer.hikari.pool.HikariPool.getConnection(HikariPool.java:186)
+```
+
+### 2.3 第三步：查看数据库连接
+
+```sql
+-- 查看当前数据库连接
+SHOW FULL PROCESSLIST;
+
+-- 查看连接数上限
+SHOW VARIABLES LIKE 'max_connections';
+
+-- 查看各状态的连接数
+SELECT * FROM information_schema.PROCESSLIST GROUP BY Command;
+
+-- 查看长事务
+SELECT * FROM information_schema.INNODB_TRX WHERE trx_state = 'RUNNING';
+```
+
+## 三、常见问题与解决 🟡
+
+### 3.1 连接泄漏
+
+```java
+// 典型连接泄漏代码
+public void query() {
+    Connection conn = dataSource.getConnection();
+    try {
+        // 业务代码
+    } catch (Exception e) {
+        // 异常处理
+        throw e;  // 问题：没有close，连接泄漏
+    }
+    // 问题：忘记close
+}
+
+// 正确写法：try-with-resources
+public void query() {
+    try (Connection conn = dataSource.getConnection()) {
+        // 业务代码
+    }  // 自动关闭
+}
+
+// 正确写法：finally中关闭
+public void query() {
+    Connection conn = null;
+    try {
+        conn = dataSource.getConnection();
+        // 业务代码
+    } catch (Exception e) {
+        throw e;
+    } finally {
+        if (conn != null) {
+            try {
+                conn.close();  // 必须关闭
+            } catch (SQLException e) {
+                log.error("关闭连接失败", e);
+            }
+        }
+    }
+}
+```
+
+### 3.2 慢查询导致连接占用
+
+```java
+// 问题：慢查询占用连接
+public void slowQuery() {
+    try (Connection conn = dataSource.getConnection()) {
+        Thread.sleep(5000);  // 问题：模拟慢查询，占用连接5秒
+        // 实际是复杂的SQL查询
+    }
+}
+
+// 解决：优化查询 + 设置查询超时
+public void optimizedQuery() {
+    try (Connection conn = dataSource.getConnection()) {
+        // 设置查询超时（MySQL）
+        Statement stmt = conn.createStatement();
+        stmt.setQueryTimeout(3);  // 3秒超时
+
+        // 优化SQL
+        // 使用索引、减少查询范围
+    }
+}
+```
+
+### 3.3 连接池配置优化
+
+```yaml
+# application.yml
+spring:
+  datasource:
+    hikari:
+      maximum-pool-size: 30        # 最大连接数
+      minimum-idle: 10            # 最小空闲
+      connection-timeout: 30000   # 获取连接超时（毫秒）
+      idle-timeout: 600000        # 空闲超时
+      max-lifetime: 1800000       # 连接最大生命周期
+      connection-test-query: SELECT 1  # 连接测试SQL
+```
+
+## 四、连接池配置参考 🟡
+
+### 4.1 连接数计算公式
+
+```
+连接数计算公式：
+
+需要的连接数 = ((核心线程数 / 单请求耗时) × 平均并发) + 额外缓冲
+
+示例：
+- QPS = 1000
+- 平均响应时间 = 100ms
+- 并发请求数 = 1000 × 0.1 = 100
+- 需要的连接数 = 100 + 20 = 120
+
+连接池配置：
+- 核心连接数 = 120 × 0.7 = 84
+- 最大连接数 = 120 + 50 = 170
+
+注意：实际中要考虑SQL执行时间分布、数据库CPU等因素。
+```
+
+### 4.2 不同场景的配置
+
+```
+场景1：小并发（QPS < 100）
+连接池配置：
+- maximumPoolSize: 10-20
+- 理由：小并发不需要太多连接
+
+场景2：中等并发（QPS 100-1000）
+连接池配置：
+- maximumPoolSize: 20-50
+- 理由：需要更多连接支持并发
+
+场景3：大并发（QPS > 1000）
+连接池配置：
+- maximumPoolSize: 50-100
+- 理由：超高并发需要大量连接
+- 注意：同时考虑数据库连接数上限
+```
+
+## 五、生产避坑 🟡
+
+### 5.1 连接池排查的五大坑
+
+**坑1：连接没有关闭**
+
+```
+问题：异常分支没有close
+场景：try-catch中return
+解决方案：
+- 用try-with-resources
+- 或finally中close
+```
+
+**坑2：只调连接池不调数据库**
+
+```
+问题：连接池调大了，但数据库连接数上限没调
+场景：MySQL max_connections = 100
+解决方案：
+- 同时调整应用连接池和数据库连接数上限
+- show variables like 'max_connections'
+```
+
+**坑3：忽略了连接生命周期**
+
+```
+问题：连接用太久，过了maxLifetime
+场景：长事务、批量处理
+解决方案：
+- 拆分长事务
+- 控制批量大小
+- 调整maxLifetime
+```
+
+**坑4：连接测试SQL太复杂**
+
+```
+问题：连接测试SQL是SELECT * FROM large_table
+场景：测试连接时反而拖慢性能
+解决方案：
+- 使用简单测试SQL：SELECT 1
+- 或关闭测试：automaticTestTable=""（HikariCP）
+```
+
+**坑5：没有监控**
+
+```
+问题：出了问题才发现
+场景：连接逐渐泄漏
+解决方案：
+- 接入连接池监控（Druid监控台）
+- 设置告警：等待线程数 > 0 告警
+```
+
+### 5.2 连接池监控指标
+
+| 指标 | 正常值 | 告警阈值 |
+| --- | --- | --- |
+| activeCount | < maximumPoolSize | = maximumPoolSize |
+| waitThreadCount | = 0 | > 0 |
+| errorCount | < 10/分钟 | > 100/分钟 |
+| connectionTimeout | < 30s | > 30s |
+
+## 六、真实面试回放 🟡
+
+> **面试官**：数据库连接池满了怎么排查？
+>
+> **候选人**（小张）：分三步：
+>
+> 一是用监控看连接池状态。Druid有监控台，可以看到活跃连接数、等待线程数。
+>
+> 二是用jstack看线程栈。看是不是有大量线程在等待连接，以及有没有慢查询占着连接。
+>
+> 三是看数据库的PROCESSLIST。看是不是有长时间运行的SQL。
+>
+> **面试官**：连接泄漏和连接池太小怎么区分？
+>
+> 小张：看连接数曲线。
+>
+> 如果连接数逐渐增长到上限，然后保持稳定，就是泄漏。
+>
+> 如果连接数达到上限后，等待线程数也在增长，就是池太小。
+>
+> **面试官**：连接池配置怎么计算？
+>
+> 小张：有个公式：
+>
+> 连接数 = ((QPS × 平均响应时间) / 1000) × 并发因子
+>
+> 但还要考虑数据库的max_connections。
+>
+> 一般来说，应用层连接池要比数据库max_connections小，留一些给运维和其他应用。
+>
+> 【面试官手记】
+>
+> 小张这场面试的亮点：
+>
+> 1. 排查步骤清晰：监控 → 线程栈 → PROCESSLIST
+>
+> 2. 知道区分连接泄漏和池太小：看连接数曲线
+>
+> 3. 知道连接数计算公式
+>
+> 连接池问题是P6工程师必备技能，能完整回答的候选人，说明有实际排查经验。
+
+连接池排查的核心是**监控 + 线程栈 + 数据库状态**。记住三个要点：
+
+1. **连接泄漏**：连接逐渐增长到上限，用try-with-resources解决
+2. **连接池太小**：连接够用但有等待线程，增加maximumPoolSize
+3. **慢查询**：长时间占用连接，优化SQL + 设置查询超时
+
+连接数公式：QPS × 响应时间 / 1000。

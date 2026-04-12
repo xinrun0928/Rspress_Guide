@@ -1,0 +1,382 @@
+---
+title: 跨库分页查询
+description: 从一个分页查询导致数据库雪崩的线上事故出发，深度拆解跨库分页的解决方案：全局分页、ES搜索、游标分页及常见问题处理。
+---
+
+# 跨库分页查询
+
+2020年某电商平台的订单列表接口，用户翻到第100页时，数据库CPU突然飙升到95%，整个服务瘫痪了5分钟。
+
+技术团队排查后发现：订单表分到了8个库，每个库3000万条记录。查询第100页（每页20条）时：
+
+```sql
+SELECT * FROM orders WHERE user_id = 123456 ORDER BY create_time DESC LIMIT 2000, 20
+```
+
+这个SQL在每个分片上都要扫描2000条记录才能返回第20条，8个分片累计扫描16000条。
+
+**随着页数增加，每个分片需要扫描的记录数线性增长，最终导致数据库被打挂。**
+
+这是一个典型的"深度分页"问题。
+
+【面试官手记】
+
+跨库分页是分库分表后最常见的问题之一。我面试过的候选人里，能说清楚"分页为什么会慢"的不超过40%，能说出"解决方案"的不超过20%。跨库分页的关键是**避免深度扫描**。
+
+## 一、分页查询的原理 🔴
+
+### 1.1 单库分页原理
+
+```
+分页查询原理：
+
+SELECT * FROM orders ORDER BY create_time DESC LIMIT 1000000, 20
+
+执行过程：
+1. 按排序字段建索引
+2. 按索引扫描前1000020条记录
+3. 取最后20条返回
+
+问题：
+- 页数越深，扫描的记录越多
+- 第1000页需要扫描1000020条记录
+```
+
+### 1.2 跨库分页原理
+
+```
+跨库分页问题：
+
+8个分片，每个分片3000万条记录
+查询第N页：
+- 每个分片需要扫描 (N-1) × 20 / 8 条记录
+- 假设N=100，需要扫描 99 × 20 / 8 = 248 条
+
+问题：
+- 分片数越多，每个分片扫描记录越多
+- 当分片数 × 扫描记录数 > 数据库上限时，雪崩
+```
+
+### 1.3 面试追问
+
+> 面试官：为什么分页越深越慢？
+>
+> 候选人：因为数据库需要扫描前面的记录才能定位到目标记录。
+>
+> 面试官：怎么解决深度分页问题？
+>
+> 候选人：三个方案：
+>
+> 一是游标分页：用主键或时间戳作为游标，不扫描中间记录
+>
+> 二是ES搜索：ElasticSearch天然支持分页
+>
+> 三是限制最大页数：超过阈值返回空
+>
+> 【面试官心理】
+>
+> 跨库分页的追问通常很深入。能回答出"游标分页"的候选人，说明知道基本原理；能说出"ES搜索"的候选人，说明知道进阶方案。
+
+## 二、游标分页方案 🔴
+
+### 2.1 原理
+
+```
+游标分页（Keyset分页）：
+
+核心思想：不使用OFFSET，使用上一页最后一条记录作为起点
+
+示例：
+- 第一页：SELECT * FROM orders ORDER BY id DESC LIMIT 20
+- 第二页：SELECT * FROM orders WHERE id < 上一页最后一条.id ORDER BY id DESC LIMIT 20
+- 第三页：SELECT * FROM orders WHERE id < 第二页最后一条.id ORDER BY id DESC LIMIT 20
+
+优点：
+- 查询效率恒定，不随页数增加而变慢
+- 适合跨库分页
+
+缺点：
+- 不支持跳页
+- 必须知道上一页的最后一条记录
+```
+
+### 2.2 代码实现
+
+```java
+// 游标分页实现
+public class CursorPagination {
+
+    public PageResult<Order> queryByCursor(Long userId, Long lastId, int pageSize) {
+        if (lastId == null) {
+            // 第一页：从最新开始
+            return orderDAO.selectByUserId(userId, null, pageSize);
+        }
+
+        // 游标分页：id < lastId
+        return orderDAO.selectByUserIdWithCursor(userId, lastId, pageSize);
+    }
+}
+
+// DAO实现
+public interface OrderDAO {
+    // 游标分页查询
+    List<Order> selectByUserIdWithCursor(
+        @Param("userId") Long userId,
+        @Param("lastId") Long lastId,
+        @Param("limit") int limit
+    );
+}
+
+@Select("""
+    SELECT * FROM orders
+    WHERE user_id = #{userId}
+    AND id < #{lastId}
+    ORDER BY id DESC
+    LIMIT #{limit}
+""")
+List<Order> selectByUserIdWithCursor(
+    @Param("userId") Long userId,
+    @Param("lastId") Long lastId,
+    @Param("limit") int limit
+);
+```
+
+### 2.3 跨库游标分页
+
+```java
+// 跨库游标分页
+public class DistributedCursorPagination {
+
+    public PageResult<Order> queryCrossDB(Long userId, Long lastId, int pageSize) {
+        // 1. 查询当前分片的最后一条记录
+        if (lastId == null) {
+            // 第一页：查询所有分片，取前pageSize条
+            return queryFirstPage(userId, pageSize);
+        }
+
+        // 2. 根据游标查询下一批
+        List<Order> results = new ArrayList<>();
+        for (int i = 0; i < SHARD_COUNT; i++) {
+            String sql = String.format(
+                "SELECT * FROM orders_%d WHERE user_id = %d AND id < %d ORDER BY id DESC LIMIT %d",
+                i, userId, lastId, pageSize / SHARD_COUNT + 1
+            );
+            List<Order> shardResult = jdbcTemplate.query(sql, orderRowMapper);
+            results.addAll(shardResult);
+        }
+
+        // 3. 合并排序
+        results.sort((a, b) -> b.getId().compareTo(a.getId()));
+        return new PageResult<>(results.subList(0, Math.min(pageSize, results.size())));
+    }
+}
+```
+
+## 三、ES搜索方案 🟡
+
+### 3.1 原理
+
+```
+ElasticSearch分页：
+
+ES支持三种分页方式：
+
+1. from + size（浅分页）
+   - from=0, size=20
+   - 限制：from + size 不能超过10000
+
+2. scroll（深分页）
+   - 用于导出大量数据
+   - 效率高，但不支持跳页
+
+3. search_after（游标分页）
+   - 实时高并发深分页
+   - 不支持跳页
+```
+
+### 3.2 ES代码实现
+
+```java
+// ES search_after实现
+public class ESSearchAfter {
+
+    @Autowired
+    private ElasticsearchRestTemplate esTemplate;
+
+    public SearchResult searchAfter(Long userId, Long[] sortValues, int size) {
+        SearchSourceBuilder sourceBuilder = new SearchSourceBuilder();
+        sourceBuilder.query(QueryBuilders.termQuery("user_id", userId));
+        sourceBuilder.sort("id", SortOrder.DESC);
+        sourceBuilder.size(size);
+
+        if (sortValues != null && sortValues.length > 0) {
+            // 使用上一页的最后一条记录作为游标
+            sourceBuilder.searchAfter(sortValues);
+        }
+
+        SearchResponse response = esTemplate.search(
+            new SearchRequest("orders").source(sourceBuilder),
+            Order.class
+        );
+
+        // 提取下一页游标
+        Object[] nextSortValues = response.getHits().getHits().length > 0
+            ? response.getHits().getHits()[response.getHits().getHits().length - 1].getSortValues()
+            : null;
+
+        return new SearchResult(response.getHits(), nextSortValues);
+    }
+}
+```
+
+## 四、限制最大页数 🟡
+
+### 4.1 方案
+
+```java
+// 限制最大页数
+public class LimitedPagination {
+
+    private static final int MAX_PAGE_SIZE = 100;  // 最大100页
+    private static final int PAGE_SIZE = 20;
+
+    public PageResult<Order> query(Long userId, int pageNum) {
+        if (pageNum > MAX_PAGE_SIZE) {
+            return PageResult.empty();  // 返回空结果
+        }
+
+        int offset = (pageNum - 1) * PAGE_SIZE;
+        return orderDAO.selectByUserId(userId, offset, PAGE_SIZE);
+    }
+}
+```
+
+### 4.2 前端引导
+
+```javascript
+// 前端引导用户刷新
+if (pageNum > MAX_PAGE_SIZE) {
+    // 显示提示
+    showToast('请使用搜索功能查找更早的订单');
+
+    // 引导用户使用时间筛选
+    showDateRangePicker();
+}
+```
+
+## 五、生产避坑 🟡
+
+### 5.1 跨库分页的五大坑
+
+**坑1：深度分页导致雪崩**
+
+```
+问题：跨库深度分页，每个分片扫描大量记录
+场景：用户翻到第100页
+解决方案：
+- 游标分页替代OFFSET
+- 限制最大页数
+```
+
+**坑2：游标分页不支持跳页**
+
+```
+问题：用户想从第5页跳到第10页
+场景：游标分页不支持
+解决方案：
+- 显示总页数限制
+- 或引导用户搜索筛选
+```
+
+**坑3：跨库排序不一致**
+
+```
+问题：多个分片的数据合并后排序可能不一致
+场景：分片1和分片2的边界记录排序不确定
+解决方案：
+- 按ID排序时，确保ID全局唯一
+- 按时间排序时，使用时间戳+ID组合排序
+```
+
+**坑4：数据倾斜**
+
+```
+问题：某些分片数据量特别大
+场景：用户订单分布不均匀
+解决方案：
+- 按用户ID分片，保证用户数据在一个分片
+- 或按时间分片，冷热分离
+```
+
+**坑5：分页数据量不确定**
+
+```
+问题：跨库分页返回的数据量不固定
+场景：8个分片，每个分片返回pageSize/8条，但合并后可能少于pageSize
+解决方案：
+- 循环查询直到凑够pageSize
+- 或提前告知用户可能数据不足
+```
+
+### 5.2 方案对比
+
+| 方案 | 优点 | 缺点 | 适用场景 |
+| --- | --- | --- | --- |
+| OFFSET分页 | 支持跳页 | 深度分页慢 | 页数 < 100 |
+| 游标分页 | 性能恒定 | 不支持跳页 | 深分页 |
+| ES分页 | 功能丰富 | 需要额外存储 | 全文搜索 |
+| 限制页数 | 简单 | 不支持深分页 | 用户列表 |
+
+## 六、真实面试回放 🟡
+
+> **面试官**：分库分表后怎么查询？分页怎么做？
+>
+> **候选人**（小张）：查询分两种：
+>
+> 一是分片键查询。查询条件包含分片键，直接路由到对应分片。
+>
+> 二是非分片键查询。需要查询所有分片，合并结果。
+>
+> 分页的话：
+>
+> 一是浅分页。用OFFSET和LIMIT，页数不深时可以用。
+>
+> 二是游标分页。用上一页最后一条记录的ID作为起点，性能恒定。
+>
+> **面试官**：游标分页怎么实现跨库？
+>
+> 小张：三个步骤：
+>
+> 一是每个分片执行游标查询：WHERE shard_key = ? AND id < lastId ORDER BY id DESC LIMIT N。
+>
+> 二是合并所有分片的结果。
+>
+> 三是合并后再排序，取前pageSize条。
+>
+> **面试官**：游标分页的缺点是什么？
+>
+> 小张：两个缺点：
+>
+> 一是不支持跳页。用户从第5页不能直接跳到第10页。
+>
+> 二是需要上一页的游标。无法直接获取第N页。
+>
+> 【面试官手记】
+>
+> 小张这场面试的亮点：
+>
+> 1. 知道查询分两种：分片键和非分片键
+>
+> 2. 知道分页方案：OFFSET和游标分页
+>
+> 3. 知道跨库游标分页的实现步骤
+>
+> 跨库分页是P6工程师必备技能，能完整回答的候选人，说明有分库分表经验。
+
+跨库分页的核心是**避免深度扫描**。记住三个要点：
+
+1. **OFFSET分页**：页数不深时使用
+2. **游标分页**：深度分页用，性能恒定
+3. **ES分页**：全文搜索场景使用
+
+没有完美的分页方案，只有最适合业务场景的方案。

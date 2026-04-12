@@ -1,0 +1,514 @@
+---
+title: 支付系统对账设计
+description: 深度拆解支付系统对账清算的核心设计：文件获取、格式解析、差异核对、差错处理，以及T+1日结的完整链路。
+---
+
+# 支付系统对账设计
+
+2020年"双十一"后第一个工作日，某电商平台财务对账时发现：平台显示的支付宝交易总额是8.76亿元，支付宝导出的交易总额是8.74亿元。
+
+差了200万元。
+
+技术团队排查了3天，发现是凌晨3点到5点之间，有一批支付回调因为Redis抖动丢失了。那段时间内的1200笔订单，平台显示"待支付"，但支付宝已经扣款成功。
+
+这200万的差异，如果没有对账系统，可能永远发现不了。
+
+【架构权衡】
+
+对账是支付系统的"最后一道防线"。不管前面的幂等、事务做得多么完美，对账都是那个兜底的检查点。对账发现差异不可怕，可怕的是差异没有被及时发现——那意味着真金白银的损失。
+
+## 一、对账的核心问题 🔴
+
+### 1.1 为什么需要对账
+
+```
+对账的本质：多方数据交叉验证
+
+参与方：
+1. 支付平台：记录所有支付流水
+2. 渠道（支付宝/微信）：记录所有交易流水
+3. 银行：记录所有资金变动
+
+为什么会有差异？
+1. 网络问题：回调丢失、消息延迟
+2. 时序问题：支付成功但回调晚到
+3. 数据问题：格式解析错误、字段截断
+4. 人为问题：内部操作失误、渠道bug
+```
+
+### 1.2 对账的类型
+
+```
+对账分类：
+
+1. 渠道对账（平台 vs 渠道）
+   - 交易对账：订单维度对比
+   - 退款对账：退款维度对比
+   - 资金对账：金额维度对比
+
+2. 内部对账（平台内部各系统间）
+   - 订单 vs 支付
+   - 支付 vs 账务
+   - 账务 vs 结算
+
+3. 资金对账（账务 vs 银行）
+   - 账户余额 vs 银行余额
+   - 流水明细 vs 银行流水
+```
+
+### 1.3 面试核心问题
+
+> 面试官：支付系统为什么需要对账？
+>
+> 候选人：因为上游系统可能有数据丢失或错误。支付系统依赖支付宝/微信的回调通知，但回调可能丢失（比如网络抖动），也可能延迟（比如凌晨处理积压）。对账就是用"笨办法"——直接拿渠道的数据和自己的数据对比——来发现这些差异。
+>
+> 面试官：对账发现差异怎么处理？
+>
+> 候选人：差异分三类：
+>
+> 一是"我无你有"：平台没有但渠道有。可能是回调丢失，需要补录数据。
+>
+> 二是"我有你无"：平台有但渠道没有。可能是重复记录或虚假记录，需要核实。
+>
+> 三是"金额不符"：两边都有但金额不一致。需要排查是否是手续费、退款等正常差异。
+>
+> 面试官：差异处理后怎么处理？
+>
+> 候选人：补账或调账。补账是把缺失的交易补录进来，调账是调整错误的金额。操作后要留审计日志，定期复盘差异原因，从源头优化。
+
+【面试官心理】
+
+对账是支付系统中最容易被忽视但最重要的环节。能回答出"渠道vs平台数据对比"的候选人，说明理解了基本的对账原理；能说出差异分类和处理流程的候选人，说明有完整的工程意识。
+
+## 二、对账文件获取 🟡
+
+### 2.1 渠道对账文件
+
+```
+对账文件获取方式：
+
+支付宝：
+- 文件类型： merchants收款明细、用户退款明细、周期结算明细
+- 获取方式：SFTP / HTTPS直连下载
+- 下载时间：每天上午8:00（提供前一日数据）
+
+微信支付：
+- 文件类型：交易账单、退款账单、资金账单
+- 获取方式：API下载 / SFTP
+- 下载时间：每天上午9:00（提供前一日数据）
+
+银联：
+- 文件类型：交易文件、退款文件
+- 获取方式：SFTP
+- 下载时间：每天上午10:00
+```
+
+### 2.2 文件下载实现
+
+```java
+public class ReconcileFileDownloader {
+
+    public void downloadYesterdayFiles() {
+        String yesterday = DateUtil.formatDate(DateUtil.addDays(new Date(), -1));
+
+        // 下载支付宝对账文件
+        try {
+            AlipayReconcileFile file = alipayApi.downloadBill(yesterday);
+            saveToOSS(file.getFileName(), file.getContent());
+        } catch (Exception e) {
+            log.error("支付宝对账文件下载失败", e);
+            alert("支付宝对账文件下载失败");
+        }
+
+        // 下载微信对账文件
+        try {
+            WechatReconcileFile file = wechatApi.downloadBill(yesterday);
+            saveToOSS(file.getFileName(), file.getContent());
+        } catch (Exception e) {
+            log.error("微信对账文件下载失败", e);
+            alert("微信对账文件下载失败");
+        }
+    }
+
+    private void saveToOSS(String fileName, byte[] content) {
+        String ossKey = "reconcile/" + DateUtil.today() + "/" + fileName;
+        ossClient.putObject(bucketName, ossKey, new ByteArrayInputStream(content));
+        log.info("对账文件已上传OSS: {}", ossKey);
+    }
+}
+```
+
+## 三、文件解析与核对 🟡
+
+### 3.1 文件格式
+
+```
+支付宝对账文件格式（CSV）：
+trade_no,merchant_order_no,merchant_no,trade_status,total_amount,receipt_amount,...
+
+微信对账文件格式（CSV）：
+交易时间,交易类型,交易状态,总金额,...
+
+字段解析：
+- trade_no：渠道交易流水号（唯一）
+- merchant_order_no：商户订单号（关联我们的order_id）
+- trade_status：交易状态（SUCCESS/REFUND/CLOSED）
+- total_amount：交易总金额
+- receipt_amount：商户实收金额（扣除手续费后）
+```
+
+### 3.2 解析与核对实现
+
+```java
+public class ReconcileProcessor {
+
+    @Transactional
+    public ReconcileReport reconcile(String date, String channel) {
+        // Step 1: 获取文件
+        List<String> channelRecords = parseChannelFile(date, channel);
+
+        // Step 2: 查询本地流水
+        List<PaymentDO> localRecords = paymentDAO.selectByDateAndChannel(date, channel);
+
+        // Step 3: 构建核对Map
+        Map<String, ChannelRecord> channelMap = buildChannelMap(channelRecords);
+        Map<String, PaymentDO> localMap = buildLocalMap(localRecords);
+
+        // Step 4: 逐条核对
+        List<Difference> differences = new ArrayList<>();
+
+        // 4.1: 我有你无（渠道有，平台没有）
+        for (String key : channelMap.keySet()) {
+            if (!localMap.containsKey(key)) {
+                differences.add(new Difference(key, channelMap.get(key), null, "我无你有"));
+            }
+        }
+
+        // 4.2: 我有你无（平台有，渠道没有）
+        for (String key : localMap.keySet()) {
+            if (!channelMap.containsKey(key)) {
+                differences.add(new Difference(key, null, localMap.get(key), "我有你无"));
+            }
+        }
+
+        // 4.3: 金额不符
+        for (String key : channelMap.keySet()) {
+            PaymentDO local = localMap.get(key);
+            ChannelRecord channel = channelMap.get(key);
+            if (local != null && local.getAmount().compareTo(channel.getAmount()) != 0) {
+                differences.add(new Difference(key, channel, local, "金额不符"));
+            }
+        }
+
+        // Step 5: 保存报告
+        ReconcileReport report = new ReconcileReport();
+        report.setDate(date);
+        report.setChannel(channel);
+        report.setChannelCount(channelMap.size());
+        report.setLocalCount(localMap.size());
+        report.setDiffCount(differences.size());
+        report.setDifferences(differences);
+        report.setCreateTime(new Date());
+        reportDAO.insert(report);
+
+        // Step 6: 告警
+        if (differences.size() > 0) {
+            alert("对账发现 " + differences.size() + " 条差异，请及时处理");
+        }
+
+        return report;
+    }
+}
+```
+
+### 3.3 核对维度
+
+```
+核对维度：
+
+1. 交易笔数核对
+   - 平台交易笔数 vs 渠道交易笔数
+   - 差异 = 平台 - 渠道
+   - 容差：0（任何差异都要查）
+
+2. 交易金额核对
+   - 平台交易金额 vs 渠道交易金额
+   - 差异 = 平台 - 渠道
+   - 容差：<=1分钱（浮点数精度问题）
+
+3. 退款笔数核对
+   - 平台退款笔数 vs 渠道退款笔数
+
+4. 退款金额核对
+   - 平台退款金额 vs 渠道退款金额
+
+5. 净额核对
+   - 交易金额 - 退款金额 = 净额
+   - 净额必须完全一致
+```
+
+## 四、差错处理 🟡
+
+### 4.1 差异分类
+
+```
+差异分类：
+
+1. 正常差异（可解释）
+   - 手续费差异：平台记总额，渠道记净额
+   - 退款手续费：退款时渠道不退手续费
+   - 币种差异：外币结算汇率差异
+
+2. 异常差异（需处理）
+   - 回调丢失：平台没有，渠道有
+   - 重复记录：平台有两条，渠道有一条
+   - 金额错误：两边金额不一致
+
+3. 可疑差异（需调查）
+   - 大额差异：单笔差异超过1万元
+   - 批量差异：短时间内大量差异
+```
+
+### 4.2 补账流程
+
+```java
+public class DifferenceHandler {
+
+    /**
+     * 处理"我无你有"：补录缺失记录
+     */
+    public void handleMissingRecord(Difference diff) {
+        ChannelRecord channel = diff.getChannelRecord();
+
+        // 1. 核实渠道记录真实性
+        boolean verified = verifyWithChannel(channel.getTradeNo());
+        if (!verified) {
+            diff.setStatus(DifferenceStatus.FAKE);
+            return;
+        }
+
+        // 2. 创建补录流水
+        PaymentDO supplement = new PaymentDO();
+        supplement.setOrderId(channel.getMerchantOrderNo());
+        supplement.setChannel(channel.getChannel());
+        supplement.setChannelTradeNo(channel.getTradeNo());
+        supplement.setAmount(channel.getAmount());
+        supplement.setStatus(PaymentStatus.SUCCESS);
+        supplement.setPayTime(channel.getTradeTime());
+        supplement.setIsSupplement(true);  // 标记为补录
+        paymentDAO.insert(supplement);
+
+        // 3. 通知下游系统
+        mqService.sendPaymentSuccessNotification(supplement);
+
+        // 4. 更新差异状态
+        diff.setStatus(DifferenceStatus.RESOLVED);
+        diff.setResolvedBy("auto_supplement");
+        diff.setResolvedTime(new Date());
+    }
+
+    /**
+     * 处理"我有你无"：核实是否重复
+     */
+    public void handleExtraRecord(Difference diff) {
+        PaymentDO local = diff.getLocalRecord();
+
+        // 1. 核实渠道是否真的没有
+        boolean confirmed = confirmMissingWithChannel(local.getChannelTradeNo());
+        if (!confirmed) {
+            // 渠道有记录，可能是文件还没同步，继续等待
+            return;
+        }
+
+        // 2. 如果确认没有，可能是重复记录，标记待核实
+        diff.setStatus(DifferenceStatus.PENDING_MANUAL_REVIEW);
+    }
+}
+```
+
+### 4.3 人工处理流程
+
+```
+人工处理场景：
+
+1. 大额差异（>1万元）
+   - 需要财务主管审批
+   - 操作前需电话核实用户
+   - 操作后需填写差错处理单
+
+2. 批量差异（>10条）
+   - 需要排查是否是系统bug
+   - 修复bug后再处理差异
+   - 避免逐条处理的低效
+
+3. 可疑差异
+   - 需要安全风控介入
+   - 排查是否是欺诈行为
+   - 可能涉及法律程序
+```
+
+## 五、日终清算 🟡
+
+### 5.1 清算流程
+
+```
+T+1日结清算流程：
+
+T日（当天）：
+- 00:00-23:59：实时交易处理
+- 23:59：停止T日交易，开始日切
+
+T+1日（次日）：
+- 08:00：下载渠道对账文件
+- 09:00：解析并核对
+- 10:00：生成差异报告
+- 11:00：自动处理可确认差异
+- 14:00：人工处理剩余差异
+- 16:00：生成清算报表
+- 17:00：发起资金结算
+```
+
+### 5.2 清算报表
+
+```
+清算报表内容：
+
+1. 汇总数据
+   - 总交易笔数、金额
+   - 总退款笔数、金额
+   - 净清算金额
+
+2. 渠道明细
+   - 按支付渠道分组
+   - 交易/退款/净额
+
+3. 差异汇总
+   - 差异笔数、金额
+   - 已处理差异
+   - 待处理差异
+
+4. 账户余额
+   - 各账户T日余额
+   - T-1日余额
+   - T日变动
+```
+
+## 六、生产避坑 🟡
+
+### 6.1 对账系统的五大坑
+
+**坑1：对账文件下载失败**
+
+```
+问题：渠道文件没按时到达
+场景：渠道SFTP服务故障，文件没生成
+影响：对账无法执行
+解决方案：
+- 多源下载：主备SFTP服务器
+- 重试机制：下载失败自动重试3次
+- 兜底方案：凌晨3点前必须完成，否则告警
+```
+
+**坑2：文件格式变更**
+
+```
+问题：渠道偷偷改了文件格式
+场景：支付宝升级了API，文件字段顺序变了
+影响：解析失败，导致所有对账都是差异
+解决方案：
+- 解析时跳过未知字段
+- 版本校验：解析前检查文件版本
+- 灰度监控：发现大量解析异常立即告警
+```
+
+**坑3：时区问题**
+
+```
+问题：跨时区交易日期不对
+场景：美东时间23:00的交易，UTC时间是次日凌晨
+影响：交易被记到错误的日期
+解决方案：
+- 统一用UTC时间存储
+- 对账时以渠道交易时间为准
+- 避免用本地服务器时间
+```
+
+**坑4：对账延迟**
+
+```
+问题：对账发现差异太晚，来不及处理
+场景：T+1日才看到T日的差异，但用户已经投诉
+影响：客诉爆发
+解决方案：
+- 实时监控：交易状态和渠道状态实时对比
+- 准实时对账：每小时对一次关键交易
+- 告警升级：T+0发现差异立即告警
+```
+
+**坑5：补账后重复通知**
+
+```
+问题：补录交易后，MQ通知被重复消费
+场景：补录的交易同时触发了实时通知
+影响：下游系统处理两次
+解决方案：
+- 下游系统幂等：基于order_id去重
+- 补录标记：is_supplement=true，下游特殊处理
+- 通知延迟：补录后等待5分钟再通知，让实时消息先到达
+```
+
+【架构权衡】
+
+对账系统有一个核心原则：**宁可错杀，不可放过**。任何一笔差异，在没查清楚之前都要当"真问题"处理。对账不是追责的工具，而是发现问题的手段。每年因为"反正差异不大"的侥幸心理而造成的资金损失，可能比系统改造成本还要高。
+
+## 七、真实面试回放 🟡
+
+> **面试官**：对账发现200万的差异，你怎么处理？
+>
+> **候选人**（财务小李）：分几步处理：
+>
+> 第一步：拆分差异。按渠道、按交易类型（交易/退款）、按金额区间拆分，看差异集中在哪。
+>
+> 第二步：如果是渠道有、平台没有，大概率是回调丢失。先用渠道交易号去渠道API查实，确认后再补录。
+>
+> 第三步：如果是金额差异，先看是不是手续费差异（正常），再排查是否需要调账。
+>
+> 第四步：如果金额很大（单笔>1万），走人工处理流程，需要主管审批。
+>
+> 第五步：处理完后复盘，看差异是从哪个环节引入的，从源头修复。
+>
+> **面试官**：如果补录了一条交易，但之前那条其实只是延迟了，会怎样？
+>
+> 小李：会产生重复记录：一条是真实交易，一条是补录的。处理方案是：
+>
+> 核实的时候先去渠道确认交易状态，确认只发生了一次再补录。或者补录后标记is_supplement=true，统计时排除。
+>
+> **面试官**：对账文件格式解析要注意什么？
+>
+> 小李：三个注意点：
+>
+> 一是字段截断。渠道文件可能有字段长度限制，比如金额字段最多15位，如果超长会被截断。
+>
+> 二是字符编码。支付宝用GBK，微信用UTF-8，要分别处理。
+>
+> 三是字段顺序变化。渠道升级后可能改变字段顺序，要有容错能力。
+>
+> 【面试官手记】
+>
+> 小李的回答展示了几个关键能力：
+>
+> 1. 分层处理：拆分 → 核实 → 补录/调账 → 复盘
+>
+> 2. 知道重复补录的风险：补录前要核实，不能盲目补
+>
+> 3. 解析细节到位：编码、截断、顺序变化，说明有踩坑经验
+>
+> 对账系统的问题通常来自生产实践，能回答出解析细节的候选人，说明真的做过对账系统。
+
+对账设计的核心是**发现差异、核实差异、处理差异**，记住三个要点：
+
+1. **文件获取**：多源下载 + 失败重试 + 超时告警
+2. **交叉核对**：渠道 vs 平台，按交易号和金额双重核对
+3. **差异处理**：先核实再处理，避免重复补录
+
+对账是支付系统的最后一道防线，做好了对账，支付系统的资金安全才有保障。

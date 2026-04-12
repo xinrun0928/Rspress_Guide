@@ -1,0 +1,212 @@
+---
+title: 脏读、不可重复读、幻读
+description: 从一道面试题出发，深入剖析 MySQL InnoDB 中脏读、不可重复读、幻读三种并发问题的产生原因，以及隔离级别和锁机制如何解决这些问题。
+---
+
+# 脏读、不可重复读、幻读
+
+面试官问："脏读、不可重复读、幻读分别是什么？能举个例子吗？"
+
+小陈说："脏读就是读到脏数据，不可重复读就是两次读的不一样，幻读就是出现幻觉多了一行。"
+
+面试官追问："那脏读和不可重复读的区别是什么？"
+
+小陈想了想："脏读是读到了未提交的数据，不可重复读是读到了已提交的数据？"
+
+面试官继续追问："在 MySQL 的可重复读隔离级别下，会发生幻读吗？"
+
+小陈说："...应该不会？"
+
+面试官："如果用当前读呢？"
+
+小陈又开始犹豫了。
+
+这道题，表面上是考概念，实际上考的是候选人对并发控制机制的理解深度。知道"是什么"的人很多，知道"为什么会发生"以及"如何避免"的人，不多。
+
+## 一、三种并发问题 🔴
+
+### 1.1 脏读（Dirty Read）
+
+**定义**：事务 A 读取了事务 B 未提交的数据。
+
+```sql
+-- T1: BEGIN;
+-- T1: UPDATE account SET balance = 500 WHERE id = 1;
+-- T2: SELECT balance FROM account WHERE id = 1;  --> balance = 500（脏数据）
+-- T1: ROLLBACK;  -- T1 回滚了
+-- T2: -- T2 拿到的 500 是错误的
+```
+
+**产生条件**：读未提交隔离级别。
+
+**严重性**：极高。读到未提交的数据，可能导致业务逻辑错误。
+
+### 1.2 不可重复读（Non-repeatable Read）
+
+**定义**：事务 A 在事务期间两次读取同一行数据，结果不一样（因为事务 B 在中间修改并提交了这行）。
+
+```sql
+-- T1: BEGIN;
+-- T1: SELECT balance FROM account WHERE id = 1;  --> 1000
+-- T2: BEGIN;
+-- T2: UPDATE account SET balance = 500 WHERE id = 1;
+-- T2: COMMIT;
+-- T1: SELECT balance FROM account WHERE id = 1;  --> 500（不可重复读）
+```
+
+**产生条件**：读已提交及更低隔离级别。
+
+**严重性**：中等。同一条数据两次读到的值不一样，需要业务逻辑能处理这种情况。
+
+### 1.3 幻读（Phantom Read）
+
+**定义**：事务 A 在事务期间两次查询，结果集不一样（因为事务 B 在中间插入或删除了一些行）。
+
+```sql
+-- T1: BEGIN;
+-- T1: SELECT COUNT(*) FROM orders WHERE status = 0;  --> 10
+-- T2: BEGIN;
+-- T2: INSERT INTO orders VALUES (...status=0...);
+-- T2: COMMIT;
+-- T1: SELECT COUNT(*) FROM orders WHERE status = 0;  --> 11（幻读）
+```
+
+**产生条件**：可重复读及更低隔离级别（当前读）。
+
+**严重性**：中等偏高。幻读会影响统计类查询和范围查询的正确性。
+
+### 1.4 三者的区别
+
+| 问题 | 区别 | 影响的数据 |
+| --- | --- | --- |
+| 脏读 | 读到其他事务**未提交**的数据 | 单行数据 |
+| 不可重复读 | 同一行数据**被修改**并提交后，两次读结果不同 | 单行数据 |
+| 幻读 | 结果集**新增或删除行**，两次查询行数不同 | 多行数据（结果集） |
+
+**核心区别**：脏读和不可重复读是**行级别**的数据不一致，幻读是**结果集级别**的数据不一致。
+
+### 1.5 ❌ 错误示范
+
+**候选人原话**："脏读和不可重复读是一样的，都是读到了不对的数据。"
+
+**问题诊断**：混淆了两种问题的本质区别。脏读是未提交数据，不可重复读是已提交数据的值变化。
+
+**候选人原话 2**："MySQL 的可重复读完全解决了幻读问题。"
+
+**问题诊断**：不完全正确。InnoDB 在 RR 级别下，快照读通过 MVCC 解决了幻读，但当前读通过 Next-Key Lock 解决。如果混用快照读和当前读，仍可能在某些边角场景出现幻读。
+
+【面试官心理】
+这道题我会从脏读切入，一路追问到幻读。如果候选人能把三者串起来讲清楚，说明他对并发控制有系统理解。我特别会追问的是："快照读和当前读在幻读问题上的表现有什么区别？"能答出 MVCC + Next-Key Lock 协同工作的是 P7 水平。
+
+## 二、隔离级别与三种问题的关系 🔴
+
+### 2.1 各隔离级别能解决哪些问题
+
+| 隔离级别 | 脏读 | 不可重复读 | 幻读 |
+| --- | --- | --- | --- |
+| 读未提交 | ❌ | ❌ | ❌ |
+| 读已提交 | ✅ | ❌ | ❌ |
+| 可重复读 | ✅ | ✅ | ⚠️ 快照读✅ 当前读⚠️ |
+| 串行化 | ✅ | ✅ | ✅ |
+
+### 2.2 读已提交 vs 可重复读
+
+**读已提交（RC）**：
+- 快照读每次都生成新 ReadView，可以看到其他事务已提交的修改
+- **解决脏读，但不解决不可重复读和幻读**
+- 适合报表类查询，每次查最新数据
+
+**可重复读（RR）**：
+- 快照读在事务开始时生成 ReadView，事务内始终读同一版本
+- **解决脏读和不可重复读**
+- **快照读层面解决幻读**，但当前读仍需 Next-Key Lock
+
+## 三、MySQL InnoDB 的解决方案 🟡
+
+### 3.1 MVCC 解决脏读和不可重复读
+
+MVCC（Multi-Version Concurrency Control）通过 undo log 链和 ReadView 实现每个事务看到数据的历史版本。
+
+```sql
+-- 事务 A（RR 模式）执行过程：
+-- 事务开始，生成 ReadView，ReadView 中记录了当前所有活跃事务的 ID
+-- 事务 A 第一次读取数据行，看这行的 trx_id 是否在 ReadView 的活跃事务中
+-- 如果不在，说明这行是在 ReadView 生成前提交的，可以读取
+-- 如果在，说明这行是活跃事务修改的，需要沿 roll_pointer 找更早的版本
+```
+
+### 3.2 Next-Key Lock 解决幻读
+
+```sql
+-- T1: BEGIN;
+-- T1: SELECT * FROM orders WHERE id BETWEEN 1 AND 100 FOR UPDATE;
+-- T1: Next-Key Lock 锁住区间 [1, 100] 及之间的所有间隙
+
+-- T2: INSERT INTO orders VALUES (50, ...);  --> 被阻塞
+-- T2: INSERT INTO orders VALUES (101, ...);  --> 可以（不在锁范围内）
+```
+
+### 3.3 MVCC + 锁的协同
+
+InnoDB 在 RR 级别下，两套机制协同工作：
+
+1. **快照读**（普通 SELECT）：纯 MVCC，不加锁，解决脏读、不可重复读、快照读幻读
+2. **当前读**（SELECT FOR UPDATE/LOCK IN SHARE MODE）：Next-Key Lock，加锁，解决当前读幻读
+
+```sql
+-- T1: BEGIN;
+-- T1: SELECT * FROM orders WHERE id BETWEEN 1 AND 100;
+-- 结果: 10 行（快照读，MVCC）
+-- T2: INSERT INTO orders VALUES (50, ...); COMMIT;
+-- T1: SELECT * FROM orders WHERE id BETWEEN 1 AND 100;
+-- 结果: 仍是 10 行（快照读，不受新插入影响）
+
+-- 但如果 T1 用当前读：
+-- T1: SELECT * FROM orders WHERE id BETWEEN 1 AND 100 FOR UPDATE;
+-- T2: INSERT INTO orders VALUES (50, ...);  --> 被 Next-Key Lock 阻塞
+```
+
+## 四、生产避坑 🟡
+
+### 4.1 不要在事务内混合快照读和当前读
+
+```sql
+-- ❌ 容易混淆
+BEGIN;
+SELECT balance FROM account WHERE id = 1;  -- 快照读
+UPDATE account SET balance = 500 WHERE id = 1;  -- 当前读
+SELECT balance FROM account WHERE id = 1;  -- 快照读
+COMMIT;
+
+-- 如果其他事务在快照读和当前读之间修改了数据，UPDATE 会基于旧版本的快照
+-- 可能导致"先读后写"的语义问题
+```
+
+### 4.2 长事务的危害
+
+长事务会积累大量 undo log，影响 MVCC 的性能：
+
+```sql
+-- ❌ 长事务导致 undo log 膨胀
+BEGIN;
+-- 1 小时前的快照读
+SELECT * FROM orders WHERE ...;  -- 生成 ReadView
+-- ... 1 小时内大量其他事务修改了数据 ...
+-- 这些修改都产生 undo log，但长事务持有 ReadView 导致无法清理
+COMMIT;
+```
+
+:::warning ⚠️
+长事务是 MySQL 性能杀手之一。事务持有 ReadView 期间，所有被修改行的历史版本（undo log）都必须保留，无法被 purge 线程清理。
+:::
+
+【面试官心理】
+这道题我能从三个层面问。第一层问三种问题的定义，第二层问隔离级别如何解决，第三层问 MySQL 内部实现（MVCC + Next-Key Lock）。能答到第三层的候选人，说明他对 InnoDB 的并发控制机制有源码级别的理解。
+
+---
+
+| 级别 | 考察重点 | 期望回答 |
+| --- | --- | --- |
+| P5 | 概念定义 | 三种问题的定义和区别 |
+| P6 | 隔离级别关系 | 各隔离级别能/不能解决哪些问题 |
+| P7 | 底层实现 | MVCC + Next-Key Lock 协同解决 |

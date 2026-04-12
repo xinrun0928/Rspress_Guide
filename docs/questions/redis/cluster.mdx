@@ -1,0 +1,191 @@
+---
+title: Redis Cluster 集群
+description: 从一道面试题出发，深入剖析 Redis Cluster 的数据分片——16384 个 Hash Slot、自动故障转移、客户端重定向，理解 Redis Cluster vs Sentinel 的区别。
+---
+
+# Redis Cluster 集群
+
+面试官问："Redis Cluster 是什么？和 Sentinel 有什么区别？"
+
+小陈说："Cluster 是集群，Sentinel 是哨兵？"
+
+面试官追问："那什么时候用 Cluster，什么时候用 Sentinel？"
+
+小陈说："... Sentinel 是做高可用的，Cluster 是做...分片的？"
+
+面试官继续追问："Cluster 的 16384 个 slot 是怎么分配的？"
+
+小陈答不上来。
+
+Redis Cluster 是 Redis 的分布式集群方案。这道题能说清楚 Cluster vs Sentinel 的区别、Hash Slot 分配的候选人，对 Redis 分布式架构有实战理解。
+
+## 一、Cluster vs Sentinel 🔴
+
+### 1.1 两种方案对比
+
+| 维度 | Sentinel | Cluster |
+| --- | --- | --- |
+| 定位 | 高可用 | 数据分片 + 高可用 |
+| 数据 | 主从复制（数据相同） | 分片（数据不同） |
+| 节点角色 | 1 主 + N 从 | N 主 + N 从 |
+| 槽位 | 无 | 16384 个 Hash Slot |
+| 客户端 | 连接任意节点 | 需要支持 MOVED 重定向 |
+| 故障转移 | Sentinel 控制 | 自动选主（节点间投票） |
+| 适用场景 | 单机主库的高可用 | 海量数据 + 高并发 |
+
+### 1.2 何时用哪个？
+
+```sql
+-- Sentinel 适用：
+-- - 数据量不大（单实例 < 50GB）
+-- - 需要主从复制的高可用
+-- - 不想引入 Cluster 的复杂度
+
+-- Cluster 适用：
+-- - 数据量超过单实例容量
+-- - 需要水平扩展
+-- - 需要更高的写入吞吐量
+```
+
+## 二、16384 个 Hash Slot 🔴
+
+### 2.1 Slot 分配
+
+```sql
+-- 16384 个 slot 分配给多个主节点
+-- 假设 3 个主节点：
+-- 节点1: slot 0 ~ 5460
+-- 节点2: slot 5461 ~ 10922
+-- 节点3: slot 10923 ~ 16383
+
+-- Slot 数量固定，不随节点数增加而增加
+-- 优点：槽信息小（16384 字节 ≈ 16KB），便于 Gossip 传播
+```
+
+### 2.2 Key 到 Slot 的映射
+
+```sql
+-- CRC16 算法计算 slot
+slot = CRC16(key) % 16384
+
+-- 示例：
+CRC16("user:100") = 12345
+slot = 12345 % 16384 = 12345
+
+-- 为什么选 CRC16？
+-- 计算快、分布均匀、16 位结果
+```
+
+### 2.3 ❌ 错误示范
+
+**候选人原话**："Cluster 有 16384 个节点。"
+
+**问题诊断**：16384 是 slot（槽位）的数量，不是节点数量。节点数量可以是任意数量（推荐至少 3 主）。
+
+**候选人原话 2**："Cluster 不需要 Sentinel。"
+
+**问题诊断**：Cluster 本身有故障检测和自动选主，不需要 Sentinel。但 Cluster 的选主机制比 Sentinel 简单。
+
+【面试官心理】
+这道题我会从"16384 个 slot 怎么分配"追问。能说清楚 slot 分配和 CRC16 映射的候选人，说明他理解了 Cluster 的数据分片原理。
+
+## 三、客户端重定向 🟡
+
+### 3.1 MOVED 重定向
+
+```sql
+-- 客户端连接到节点 A，想访问 key "user:100"
+-- 但 "user:100" 的 slot 在节点 B 上
+-- 节点 A 返回 MOVED 错误
+
+GET user:100
+# MOVED 12345 节点B:6379
+# 12345 是 slot，节点B:6379 是实际节点地址
+
+-- 智能客户端会：
+-- 1. 收到 MOVED 后，更新本地槽缓存
+-- 2. 直接连接节点 B
+-- 3. 后续请求直接发送到正确的节点
+```
+
+### 3.2 ASK 重定向
+
+```sql
+-- ASK 重定向：迁移过程中的临时状态
+
+-- slot 从节点 A 迁移到节点 B 的过程中：
+-- 1. slot 仍在节点 A 上（权威数据）
+-- 2. 部分 key 已迁移到节点 B（新数据）
+
+-- 客户端请求 "user:100"
+-- 节点 A：如果 key 在本地，返回数据
+-- 节点 A：如果 key 已迁移到 B，返回 ASK 12345 节点B:6379
+
+-- ASK vs MOVED：
+-- ASK：临时状态，客户端可以继续发送后续请求到原节点
+-- MOVED：最终状态，客户端更新槽缓存
+```
+
+## 四、故障检测与选主 🟡
+
+### 4.1 Cluster 的故障检测
+
+```sql
+-- Cluster 也使用 Gossip 协议
+-- 节点间互相发送 PING/PONG
+-- 如果节点长时间无响应，标记为 FAIL
+
+-- 故障确认：
+-- 需要 slot 主节点的所有从节点投票
+-- 或超过一半的节点认为主节点 FAIL
+```
+
+### 4.2 Cluster 的选主机制
+
+```sql
+-- Cluster 选主比 Sentinel 简单：
+-- 1. 从从节点中选一个
+-- 2. 条件：和主节点断开时间 < cluster-node-timeout / 2
+-- 3. 优先：复制 offset 最大（数据最新）
+-- 4. 优先：run id 最小的
+
+-- 注意：
+-- Cluster 的选主不需要 Sentinel
+-- 节点之间互相投票
+```
+
+## 五、集群扩缩容 🟢
+
+### 5.1 增加节点
+
+```bash
+# 新增主节点
+redis-cli --cluster add-node 新节点:端口 任意已有节点:端口 --cluster-master-id 新节点ID
+
+# 迁移 slot
+redis-cli --cluster reshard 任意已有节点:端口
+# 交互式迁移：选择要迁移的 slot 数量、目标节点
+
+# 新增从节点
+redis-cli --cluster add-node 新从节点:端口 任意已有节点:端口 --cluster-slave --cluster-master-id 主节点ID
+```
+
+### 5.2 减少节点
+
+```bash
+# 下线节点
+redis-cli --cluster del-node 任意已有节点:端口 节点ID
+
+# 会自动将节点上的 slot 迁移走
+```
+
+【面试官心理】
+Cluster 是 Redis 分布式架构的核心。能说清楚 Cluster vs Sentinel、slot 分配、ASK/MOVED 重定向的候选人，说明他对 Redis 分布式集群有系统理解。
+
+---
+
+| 级别 | 考察重点 | 期望回答 |
+| --- | --- | --- |
+| P5 | 基本区别 | Cluster vs Sentinel、slot 基本概念 |
+| P6 | 核心机制 | CRC16 映射、ASK vs MOVED |
+| P7 | 运维能力 | 扩缩容、故障选主 |

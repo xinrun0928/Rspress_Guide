@@ -1,0 +1,354 @@
+---
+title: 2PC 两阶段提交
+description: 从架构层面深度解析 2PC 两阶段提交协议的执行流程、源码实现、优缺点，以及在分布式事务中的应用与缺陷。
+---
+
+# 2PC 两阶段提交
+
+某银行系统需要实现跨行转账：用户 A 从工商银行转账到建设银行。
+
+架构师设计了一个分布式事务：要么转账成功（两个银行账户都扣款），要么转账失败（两个银行账户都不变）。
+
+选用了 2PC（两阶段提交）协议。
+
+结果：在一次转账中，工商银行已经提交了扣款，建设银行的提交请求因为网络抖动没有收到确认。系统处于"部分提交"状态——用户 A 的钱扣了，但用户 B 没收到。
+
+这是一个经典的 2PC 缺陷：**协调者故障导致的阻塞问题**。
+
+【架构权衡】
+2PC 是分布式事务的经典协议，但它的阻塞问题（coordinator failure）是生产环境的致命缺陷。任何基于 2PC 的分布式事务系统，都必须正视这个问题。理解 2PC 的原理和缺陷，才能正确评估何时该用、何时不该用。
+
+---
+
+## 一、问题背景
+
+### 1.1 分布式事务的场景
+
+```
+跨行转账的事务性要求：
+
+场景：用户 A 转账 100 元给用户 B
+
+原子性要求：
+├─ A 账户 -100，B 账户 +100 —— 同时成功
+└─ 或者同时失败 —— 不能 A 扣了 B 没收到
+
+分布式挑战：
+├─ A 账户在工商银行系统
+├─ B 账户在建设银行系统
+└─ 两个系统是两个独立的数据库
+```
+
+### 1.2 2PC 的核心思想
+
+```
+两阶段提交（Two-Phase Commit）：
+
+阶段一：准备阶段（Prepare）
+  协调者 → 所有参与者：准备好了吗？
+  参与者 → 协调者：准备好 / 失败
+
+阶段二：提交阶段（Commit）
+  协调者 → 所有参与者：提交！
+  参与者 → 协调者：已提交
+
+或回滚：
+  协调者 → 所有参与者：回滚！
+  参与者 → 协调者：已回滚
+```
+
+## 二、方案演进
+
+### 2.1 2PC 的详细流程
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         阶段一：准备阶段                            │
+│                                                                  │
+│    协调者                                                           │
+│      │                                                              │
+│      ├─ 发送 PREPARE 到所有参与者                                   │
+│      │                                                              │
+│      ▼                                                              │
+│  ┌─────────┐    PREPARE    ┌─────────┐    PREPURE    ┌─────────┐ │
+│  │ 参与者1  │ ◄──────────► │ 协调者  │ ◄──────────► │ 参与者2  │ │
+│  │ TM 本地 │              │         │              │ TM 本地 │ │
+│  │ 事务挂起│              │         │              │ 事务挂起│ │
+│  └─────────┘              └─────────┘              └─────────┘ │
+│      │                                                              │
+│      └─ 锁定本地资源，等待协调者指令                                │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│                         阶段二：提交阶段                            │
+│                                                                  │
+│  场景1：所有参与者都回应"准备好"                                   │
+│    协调者 ──COMMIT──► 参与者1 ──COMMIT──► 参与者2                  │
+│    所有参与者提交本地事务，释放锁                                  │
+│                                                                  │
+│  场景2：任意参与者回应"失败"                                       │
+│    协调者 ──ROLLBACK──► 参与者1 ◄──ROLLBACK──► 参与者2             │
+│    所有参与者回滚本地事务，释放锁                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 2.2 2PC 的源码实现
+
+```java
+// 协调者实现（简化版）
+public class Coordinator {
+    private List<Participant> participants = new ArrayList<>();
+
+    public boolean commit(String transactionId) {
+        // 阶段一：发送 PREPARE
+        List<ParticipantResponse> responses = new ArrayList<>();
+        for (Participant participant : participants) {
+            try {
+                boolean ready = participant.prepare(transactionId);
+                responses.add(new ParticipantResponse(participant, ready));
+            } catch (Exception e) {
+                responses.add(new ParticipantResponse(participant, false));
+            }
+        }
+
+        // 检查所有参与者是否准备好
+        boolean allReady = responses.stream()
+            .allMatch(ParticipantResponse::isReady);
+
+        if (allReady) {
+            // 阶段二：发送 COMMIT
+            for (Participant participant : participants) {
+                try {
+                    participant.commit(transactionId);
+                } catch (Exception e) {
+                    // COMMIT 失败，进入等待恢复状态
+                    log.error("参与者提交失败，等待恢复", e);
+                    waitForRecovery(participant, transactionId);
+                }
+            }
+            return true;
+        } else {
+            // 任意一个失败，发送 ROLLBACK
+            for (Participant participant : participants) {
+                participant.rollback(transactionId);
+            }
+            return false;
+        }
+    }
+}
+
+// 参与者实现（简化版）
+public class Participant {
+    private String name;
+
+    public boolean prepare(String transactionId) {
+        try {
+            // 1. 开启本地事务
+            connection.setAutoCommit(false);
+
+            // 2. 执行 SQL
+            executeSQL();
+
+            // 3. 预提交：锁定资源，但未真正提交
+            // 此时数据库锁住，其他操作无法修改相关数据
+            PreparedStatement ps = connection.prepareStatement(
+                "PREPARE TO COMMIT '" + transactionId + "'"
+            );
+            ps.execute();
+
+            // 4. 返回"准备好"
+            return true;
+        } catch (Exception e) {
+            // 回滚本地事务
+            connection.rollback();
+            return false;
+        }
+    }
+
+    public void commit(String transactionId) {
+        // 正式提交
+        connection.commit();
+    }
+
+    public void rollback(String transactionId) {
+        // 回滚
+        connection.rollback();
+    }
+}
+```
+
+【架构权衡】
+2PC 的关键问题是：**阶段一（PREPARE）后，资源被锁定，直到阶段二（COMMIT/ROLLBACK）完成**。如果协调者在阶段二崩溃，参与者将永远处于锁定状态，无法释放资源。这就是"阻塞问题"。
+
+## 三、核心设计
+
+### 3.1 2PC 的状态机
+
+```
+参与者状态机：
+
+                    ┌─────────────────────────┐
+                    │      INITIAL            │
+                    │      初始状态            │
+                    └─────────────────────────┘
+                               │
+                         prepare()
+                               │
+                               ▼
+                    ┌─────────────────────────┐
+                    │      PREPARING           │
+                    │      准备中              │
+                    ├─────────────────────────┤
+                    │ prepare() 成功 ───► READY│
+                    │ prepare() 失败 ───► ABORT│
+                    └─────────────────────────┘
+                               │
+                    receive DECISION from coordinator
+                               │
+                    ┌──────────┴──────────┐
+                    │                     │
+               COMMIT              ROLLBACK
+                    │                     │
+                    ▼                     ▼
+           ┌───────────────┐     ┌───────────────┐
+           │   COMMITTED   │     │    ABORTED    │
+           │   已提交      │     │    已回滚     │
+           └───────────────┘     └───────────────┘
+```
+
+### 3.2 协调者的恢复机制
+
+```java
+// 协调者崩溃恢复
+public class CoordinatorRecovery {
+    // 协调者在发送 PREPARE 前，会将事务状态写入 WAL
+    private WriteAheadLog wal;
+
+    public void recover() {
+        // 1. 读取 WAL 中未完成的事务
+        List<TransactionRecord> inFlightTransactions = wal.getInFlightTransactions();
+
+        for (TransactionRecord record : inFlightTransactions) {
+            // 2. 查询每个参与者的状态
+            TransactionState state = queryParticipantState(record.transactionId);
+
+            if (state == TransactionState.COMMITTED) {
+                // 如果参与者已提交，提交完成
+                continue;
+            } else if (state == TransactionState.ABORTED) {
+                // 如果参与者已回滚，回滚完成
+                continue;
+            } else {
+                // 参与者处于 READY 状态，需要重新发送决策
+                // 问题：协调者不知道参与者是否真的收到了 COMMIT
+                // 只能假设参与者没收到，重新发送
+                resendDecision(record.transactionId);
+            }
+        }
+    }
+}
+```
+
+### 3.3 2PC 的局限性
+
+| 局限性 | 描述 | 影响 |
+| --- | --- | --- |
+| **同步阻塞** | Prepare 阶段锁定资源，直到事务结束 | 吞吐受限 |
+| **单点故障** | 协调者崩溃后参与者阻塞 | 服务不可用 |
+| **数据不一致** | 部分提交后协调者崩溃 | 数据不一致 |
+| **无法处理并发 | 一个事务期间资源被锁定 | 并发能力受限 |
+
+【架构权衡】
+2PC 的核心缺陷是"协调者单点故障"和"同步阻塞"。在实际生产环境中，这两个缺陷往往是致命的。因此，2PC 通常用于**同一数据中心内的分布式数据库**，而不是跨数据中心的分布式事务。
+
+## 四、生产避坑
+
+### 4.1 协调者超时问题
+
+```java
+// ❌ 错误：没有处理协调者和参与者的超时
+public class BadCoordinator {
+    public void commit(String transactionId) {
+        // 发送 PREPARE 后无限等待
+        participant.prepare(transactionId);
+        // 如果 participant 挂了，这里永远等待
+    }
+}
+
+// ✅ 正确：处理超时
+public class GoodCoordinator {
+    public boolean commit(String transactionId, long timeoutMs) {
+        Future<Boolean> future = executor.submit(() ->
+            participant.prepare(transactionId));
+
+        try {
+            Boolean ready = future.get(timeoutMs, TimeUnit.MILLISECONDS);
+            if (ready) {
+                participant.commit(transactionId);
+                return true;
+            } else {
+                participant.rollback(transactionId);
+                return false;
+            }
+        } catch (TimeoutException e) {
+            // 超时，视为失败
+            participant.rollback(transactionId);
+            return false;
+        }
+    }
+}
+```
+
+### 4.2 参与者超时处理
+
+```java
+// 参与者在 READY 状态等待协调者的决策
+// 如果协调者崩溃，参与者永远等待
+// 解决方案：参与者也需要有超时机制
+
+public class Participant {
+    private ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
+
+    public boolean prepare(String transactionId) {
+        // 开启本地事务
+        connection.setAutoCommit(false);
+        executeSQL();
+
+        // 注册协调者地址
+        registerWithCoordinator(transactionId, coordinatorAddress);
+
+        // 启动超时检测
+        Future<?> timeoutTask = scheduler.schedule(() -> {
+            // 如果超时时间内没有收到协调者指令
+            // 向协调者查询事务状态
+            TransactionDecision decision = queryCoordinator(transactionId);
+            if (decision == null) {
+                // 协调者无响应，回滚
+                this.rollback(transactionId);
+            }
+        }, 30, TimeUnit.SECONDS);
+
+        return true;
+    }
+}
+```
+
+## 五、工程代价评估
+
+| 维度 | 评估 |
+| --- | --- |
+| **实现复杂度** | 中（协调者和参与者的状态管理） |
+| **同步开销** | 高（所有参与者同步等待） |
+| **可用性** | 低（协调者单点） |
+| **一致性保证** | 强（2PC 是强一致的协议） |
+| **并发能力** | 低（资源锁定） |
+| **适用场景** | 同数据中心、强一致性要求 |
+
+## 六、落地 Checklist
+
+- [ ] **环境检查**：确认是否在同一数据中心
+- [ ] **超时设计**：设置合理的 PREPARE 和 COMMIT 超时时间
+- [ ] **日志持久化**：协调者和参与者都要持久化事务状态
+- [ ] **恢复机制**：实现协调者和参与者的崩溃恢复逻辑
+- [ ] **监控部署**：监控超时事务、阻塞资源
+- [ ] **替代方案**：评估 TCC、Saga 等替代方案

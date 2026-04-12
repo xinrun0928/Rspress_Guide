@@ -1,0 +1,462 @@
+---
+title: Feed 流系统设计
+description: 从微博热搜导致Feed流服务雪崩的线上事故切入，深度拆解Feed流系统的核心架构：写入模型、存储设计、拉取优化，以及大V热点的处理策略。
+---
+
+# Feed 流系统设计
+
+2021年1月，某社交平台发生了服务雪崩：从晚上8点到10点，Feed流接口响应时间从200ms飙升到30秒，CPU打满，数据库被打挂。
+
+事后复盘，原因很简单：**一个头部大V发了一条普通生活动态，引发了5000万粉丝的Feed流更新**。
+
+5000万条Feed消息，同时写入粉丝的收件箱。同时触发了缓存失效、数据库写入洪峰、消息队列积压。一个"简单"的内容发布，变成了一场灾难。
+
+这是Feed流系统中最经典的**热点问题**：大V的发布行为会产生远超普通用户的系统压力。
+
+【架构权衡】
+
+Feed流系统的核心矛盾是**写入成本 vs 读取成本**。推模式写入成本高、拉模式读取成本高。不同平台根据业务特征选择不同模式：微博用混合模式、Twitter早期用拉模式、今日头条用推模式。理解这个trade-off，是设计Feed流系统的基础。
+
+## 一、Feed流的核心问题 🔴
+
+### 1.1 推拉模式对比
+
+```
+Feed流系统的两种基本模式：
+
+【推模式（Push）】
+- 发布时：主动推送给所有粉丝
+- 优点：读取快，用户请求时直接返回
+- 缺点：写入成本高，大V压力大
+- 适用：粉丝数差异不大的场景
+
+【拉模式（Pull）】
+- 读取时：聚合所有关注对象的新内容
+- 优点：写入成本低，发布无压力
+- 缺点：读取成本高，大用户读取慢
+- 适用：粉丝数差异大的场景
+
+【混合模式】
+- 大V用拉，普通用户用推
+- 优点：平衡读写成本
+- 缺点：实现复杂
+- 适用：微博、抖音等头部效应明显的场景
+```
+
+### 1.2 量化指标
+
+```
+Feed流系统的关键数字：
+
+数据规模：
+- 日均发布量：1亿条
+- 日均读取量：100亿次
+- 用户关注数：平均200人，最多5000人
+- 大V粉丝数：500万~1亿
+
+性能要求：
+- Feed流接口：P99 < 500ms
+- 发布接口：P99 < 1s
+- 在线用户：1亿
+
+存储估算：
+- 单条Feed：约1KB（文本+媒体URL+元数据）
+- 1亿条/天 = 100GB/天
+- 保留30天 = 3TB
+```
+
+### 1.3 面试核心问题
+
+> 面试官：微博的Feed流是推模式还是拉模式？
+>
+> 候选人：混合模式。
+>
+> 普通用户发微博，推送给粉丝的收件箱——这是推模式。
+>
+> 大V发微博，不主动推送，粉丝读取Feed时实时聚合——这是拉模式。
+>
+> 面试官：为什么大V要用拉模式？
+>
+> 候选人：因为推送成本太高。一个大V有5000万粉丝，如果每次发微博都推送，1亿条/天的写入会变成5000万倍的压力。
+>
+> 但拉模式也有问题：粉丝读取Feed时要实时聚合5000万人的最新微博，性能很差。所以Twitter早期（2010年）用的是纯拉模式，用户抱怨很严重。后来才演变成混合模式。
+
+【面试官心理】
+
+Feed流系统的追问方向通常围绕"推拉模式的trade-off"展开。能回答出混合模式的候选人，说明理解了大V问题的本质；能说出具体阈值（如"粉丝超过100万用拉模式"）的候选人，说明有量化分析能力。
+
+## 二、写入模型设计 🔴
+
+### 2.1 收件箱设计
+
+```
+推模式：每个用户的收件箱
+
+存储结构：
+用户A的收件箱 = [所有A关注的用户发布的Feed]
+
+Redis List实现：
+key: inbox:{user_id}
+value: List[feed_id, feed_id, feed_id...]
+
+问题：
+- 100亿条Feed需要巨大存储
+- 按时间排序困难
+
+优化：只存Feed ID，Feed内容单独存储
+key: inbox:{user_id}
+value: List[feed_id, feed_id, feed_id...]
+key: feed:{feed_id}
+value: Feed{content, author, time...}
+```
+
+### 2.2 发布流程
+
+```java
+public class FeedService {
+
+    public void publish(Long userId, String content) {
+        // Step 1: 创建Feed内容
+        Feed feed = new Feed();
+        feed.setId(snowflakeId);
+        feed.setUserId(userId);
+        feed.setContent(content);
+        feed.setCreateTime(new Date());
+        feedDAO.insert(feed);
+
+        // Step 2: 判断用户类型
+        User user = userDAO.selectById(userId);
+        int fanCount = user.getFanCount();
+
+        if (fanCount < 10000) {
+            // 普通用户：推送到粉丝收件箱
+            pushToFans(userId, feed.getId());
+        } else {
+            // 大V：只写自己的Timeline
+            writeToOwnTimeline(userId, feed.getId());
+            // 异步更新热点池
+            asyncUpdateHotPool(userId, feed.getId());
+        }
+    }
+
+    private void pushToFans(Long userId, Long feedId) {
+        // 获取粉丝列表
+        List<Long> fans = fanDAO.selectFans(userId);
+        // 批量写入收件箱
+        for (List<Long> batch : Lists.partition(fans, 1000)) {
+            redisTemplate.opsForList().rightPushAll(
+                batch.stream().map(fanId -> "inbox:" + fanId).toArray(String[]::new),
+                feedId
+            );
+        }
+    }
+}
+```
+
+### 2.3 大V处理策略
+
+```
+大V阈值设计：
+
+阈值：粉丝数 > 100万
+
+触发策略：
+1. 粉丝数超过阈值后，切换为拉模式
+2. 切换过程：灰度切换，先对10%粉丝用拉模式，观察效果
+3. 热度衰减：发布超过24小时，切换为推模式
+
+大V拉模式优化：
+1. 热门大V的Feed预加载到CDN
+2. 粉丝读取时优先查CDN
+3. CDN miss时查Redis缓存
+4. 缓存miss时查数据库
+
+CDN预热：
+- 大V发布后，立即将Feed ID写入CDN
+- 缓存TTL设置为24小时
+- 过期前主动刷新
+```
+
+## 三、存储设计 🟡
+
+### 3.1 多级存储
+
+```
+Feed流存储架构：
+
+第一层：Redis List（热数据，7天内）
+- 在线用户的收件箱
+- 命中率 > 90%
+- TTL = 7天
+
+第二层：MySQL分库分表（全部数据）
+- 所有历史Feed
+- 按 feed_id 取模分表
+- 分8库64表
+
+第三层：HBase/ES（归档数据）
+- 超过30天的Feed
+- 按时间范围查询
+- 支持复杂检索
+
+第四层：OSS（媒体文件）
+- 图片、视频等媒体内容
+- CDN加速
+```
+
+### 3.2 拉取优化
+
+```
+拉模式读取流程：
+
+用户读取Feed流：
+1. 获取用户关注列表（如200人）
+2. 获取每个关注者最近N条Feed
+3. 合并并按时间排序
+4. 分页返回
+
+优化：
+1. 并行拉取：200个关注者的Feed并行查询
+2. 缓存热点：热门用户（如大V）的Feed缓存到Redis
+3. 限制范围：每个用户最多取最近100条
+4. 结果缓存：用户Feed流结果缓存5分钟
+```
+
+### 3.3 分页设计
+
+```java
+public class FeedPullService {
+
+    public FeedList pull(Long userId, Long lastFeedId, int pageSize) {
+        // Step 1: 获取关注列表
+        List<Long> following = followDAO.selectFollowing(userId);
+
+        // Step 2: 并行拉取关注者的Feed
+        List<Feed> allFeeds = new ArrayList<>();
+        ExecutorService executor = Executors.newFixedThreadPool(20);
+
+        CountDownLatch latch = new CountDownLatch(following.size());
+        for (Long authorId : following) {
+            executor.submit(() -> {
+                try {
+                    List<Feed> feeds = pullAuthorFeed(authorId, lastFeedId, 20);
+                    synchronized (allFeeds) {
+                        allFeeds.addAll(feeds);
+                    }
+                } finally {
+                    latch.countDown();
+                }
+            });
+        }
+        latch.await();
+        executor.shutdown();
+
+        // Step 3: 合并排序
+        allFeeds.sort((a, b) -> b.getCreateTime().compareTo(a.getCreateTime()));
+
+        // Step 4: 分页返回
+        return new FeedList(allFeeds.stream()
+            .limit(pageSize)
+            .collect(Collectors.toList()));
+    }
+}
+```
+
+## 四、热数据处理 🟡
+
+### 4.1 热点检测
+
+```
+热点Feed判定：
+
+维度1：发布后5分钟内的互动量
+- 点赞数 > 10000
+- 评论数 > 1000
+- 转发数 > 500
+
+维度2：用户画像
+- 认证用户
+- 粉丝数 > 100万
+- 高活跃度账号
+
+维度3：内容特征
+- 包含热门话题
+- 包含@大V
+- 包含热门关键词
+
+触发热点处理：
+1. 热点Feed写入热点池（Redis Set）
+2. 热点Feed预加载到CDN
+3. 热点Feed写入搜索索引
+4. 通知推荐系统
+```
+
+### 4.2 缓存策略
+
+```
+Feed缓存架构：
+
+1. 用户收件箱缓存
+   - key: inbox:{user_id}
+   - value: List[feed_id...]
+   - TTL: 7天
+   - 更新：发布时写，读取时续期
+
+2. Feed内容缓存
+   - key: feed:{feed_id}
+   - value: Feed{content, author, media...}
+   - TTL: 7天
+   - 更新：发布时写入，编辑时失效
+
+3. 热点Feed缓存
+   - key: hot:feed:list
+   - value: List[feed_id...]
+   - TTL: 24小时
+   - 更新：热点检测触发
+
+4. Feed流结果缓存
+   - key: feed:stream:{user_id}
+   - value: List[Feed...]
+   - TTL: 5分钟
+   - 更新：每次拉取刷新
+```
+
+## 五、生产避坑 🟡
+
+### 5.1 Feed流系统的五大坑
+
+**坑1：收件箱膨胀**
+
+```
+问题：用户关注人数过多，收件箱数据量爆炸
+场景：用户关注了5000人，每人每天发10条Feed，收件箱每天增加5万条
+影响：Redis内存爆炸，读取性能下降
+解决方案：
+- 收件箱容量限制：最多保留1000条
+- 老旧Feed归档：超过7天的Feed迁移到MySQL
+- 拉模式兜底：关注人数超过阈值后，切换到拉模式
+```
+
+**坑2：热点大V雪崩**
+
+```
+问题：大V发微博时，推送压力导致系统雪崩
+场景：粉丝5000万的大V发微博
+影响：推送队列积压，数据库被打挂
+解决方案：
+- 大V用拉模式：超过100万粉丝自动切换
+- 异步推送：用MQ削峰，不同步推送
+- 灰度切换：先推10%粉丝，观察效果
+```
+
+**坑3：Feed重复消费**
+
+```
+问题：同一个Feed被多次推送到收件箱
+场景：推送过程中用户取消关注又重新关注
+影响：用户看到重复Feed
+解决方案：
+- Feed ID去重：推送前检查是否已存在
+- 幂等写入：收件箱用Set而非List
+- 定时清理：每天凌晨清理重复Feed
+```
+
+**坑4：缓存击穿**
+
+```
+问题：热门Feed缓存过期，瞬间大量请求穿透到数据库
+场景：热点Feed的缓存TTL=7天，过期时正好是发布后7天
+影响：数据库被打挂
+解决方案：
+- 热点Feed永不过期：主动续期
+- 随机TTL：TTL = 7天 + random(0, 1天)
+- 互斥锁：只有一个线程去加载缓存
+```
+
+**坑5：排序不稳定**
+
+```
+问题：用户刷新Feed流，看到的内容顺序不一致
+场景：分布式环境下，多个分片返回的数据合并顺序不同
+影响：用户体验割裂
+解决方案：
+- 按时间戳排序：统一使用create_time
+- 分页维度统一：last_feed_id + 游标分页
+- 结果缓存：用户Feed流结果缓存5分钟
+```
+
+【架构权衡】
+
+Feed流系统的设计哲学是**读多写少、热点集中**。90%的访问集中在10%的热数据上，所以缓存是关键。但缓存不是万能的——大V的热点问题、收件箱膨胀问题，都需要从架构层面解决，而不是单纯加缓存。
+
+## 六、真实面试回放 🟡
+
+> **面试官**：设计一个今日头条的Feed流系统，日均发布1亿条，日均读取100亿次，怎么设计？
+>
+> **候选人**（架构师老张）：先分析特征：
+>
+> 今日头条是推荐Feed，和微博社交Feed不同：
+>
+> 1. 推荐Feed：系统决定你看什么，不需要关注关系
+> 2. 内容来源：推荐算法+编辑精选+用户互动
+> 3. 读取模式：拉模式为主，用户每次刷新都重新计算
+>
+> 架构设计：
+>
+> 1. 内容存储：用MySQL分库分表存Feed内容，ElasticSearch存索引
+>
+> 2. 用户Profile：用HBase存用户特征向量
+>
+> 3. 推荐引擎：读取用户特征，计算最相关的内容
+>
+> 4. 缓存层：Redis缓存热门内容、用户特征
+>
+> 5. 写入：Feed发布后写MySQL，推送消息到推荐队列
+>
+> **面试官**：100亿次读取/天，峰值QPS多少？怎么扛？
+>
+> 老张：峰值因子取5，峰值QPS = 100亿 × 5 / 86400 ≈ 58万
+>
+> 扛法：
+>
+> 1. CDN缓存：热门内容缓存到CDN，命中率80%，回源QPS = 11.6万
+>
+> 2. Redis缓存：CDN miss的内容查Redis，命中率90%，回源QPS = 1.16万
+>
+> 3. 分库分表：MySQL分128表，单表扛100 QPS，需要116台...不对，重算
+>
+> MySQL单表1000 QPS，1.16万需要12台就够了，加上主从和高可用，24台
+>
+> **面试官**：推荐算法怎么决定用户看什么？
+>
+> 老张：协同过滤 + 内容特征 + 实时特征
+>
+> 协同过滤：你喜欢的内容，和你相似的人也喜欢
+>
+> 内容特征：你之前看过类似的内容
+>
+> 实时特征：当前热点、所在地区、当天时间
+>
+> 三种特征加权融合，实时更新用户画像
+>
+> 【面试官手记】
+>
+> 老张这场面试的亮点：
+>
+> 1. 区分了推荐Feed和社交Feed：不是所有Feed流都是微博模式
+>
+> 2. 量化分析到位：峰值QPS计算、存储估算
+>
+> 3. 推荐系统基础：协同过滤、内容特征、实时特征
+>
+> 这场面试属于P7级别，能区分不同类型Feed流的候选人，说明有全局视野。
+>
+> 追问方向：会问"怎么冷启动新用户"和"推荐结果怎么评估"，这两个问题考验候选人对推荐系统的理解。
+
+Feed流系统设计的核心是**推拉模式的trade-off**，记住三个要点：
+
+1. **推模式**：写多读少，适合粉丝数均匀的场景
+2. **拉模式**：写少读多，适合热点集中的场景
+3. **混合模式**：大V用拉、普通用户用推
+
+理解这个trade-off，你就能设计出适合任何场景的Feed流系统。

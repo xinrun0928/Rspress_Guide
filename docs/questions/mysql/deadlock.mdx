@@ -1,0 +1,275 @@
+---
+title: 死锁排查与解决
+description: 从一次线上死锁事故出发，深入剖析 MySQL InnoDB 死锁的产生原因、排查方法，以及通过合理的事务设计避免死锁的策略。
+---
+
+# 死锁排查与解决
+
+2024 年双十一零点，订单服务的数据库连接池突然耗尽，大量请求超时。DBA 紧急介入，发现是死锁导致的。
+
+事故过程：
+1. 商家 A 和商家 B 同时处理两笔订单（订单 1 和订单 2）
+2. 商家 A 锁了订单 1，等订单 2；商家 B 锁了订单 2，等订单 1
+3. 死锁形成，两个商家互相等待
+
+这不是技术故障，是**事务设计缺陷**导致的业务层面死锁。今天这篇，把 InnoDB 死锁从根上讲透。
+
+## 一、死锁的定义 🔴
+
+### 1.1 死锁的形成条件
+
+死锁的四个必要条件（Coffman 条件）：
+
+1. **互斥条件**：资源一次只能被一个事务持有
+2. **持有并等待**：事务持有资源的同时，等待其他事务释放资源
+3. **不可抢占**：资源不能被强制从持有事务中抢走
+4. **循环等待**：事务之间形成循环等待链
+
+**MySQL InnoDB 的死锁**：两个或多个事务互相持有对方需要的锁，形成循环等待。
+
+### 1.2 InnoDB 的死锁处理机制
+
+MySQL InnoDB 有**死锁检测机制**：
+
+```sql
+-- InnoDB 默认检测到死锁后，会回滚占用 UNDO log 较少的事务
+-- 让持有锁较少的事务回滚，释放锁，让其他事务继续
+
+-- 查看死锁信息
+SHOW ENGINE INNODB STATUS;
+-- LATEST DETECTED DEADLOCK 部分包含死锁详情
+```
+
+### 1.3 ❌ 错误示范
+
+**候选人原话**："死锁就是锁等待超时了。"
+
+**问题诊断**：混淆了死锁和锁等待超时。死锁是两个事务互相等待；锁等待超时是一个事务等另一个事务释放锁。死锁由 MySQL 自动检测并处理；锁等待超时需要设置 `innodb_lock_wait_timeout`。
+
+**候选人原话 2**："InnoDB 能完全避免死锁。"
+
+**问题诊断**：错误。InnoDB 只能检测并处理死锁，不能完全避免死锁。业务层必须合理设计事务来减少死锁发生的概率。
+
+【面试官心理】
+这道题我会从生产事故切入，然后问具体的死锁案例。如果候选人能在 SHOW ENGINE INNODB STATUS 的输出中快速定位问题，说明他有实战经验。
+
+## 二、死锁的典型场景 🔴
+
+### 2.1 场景一：行锁争用
+
+```sql
+-- 表 orders：id, user_id, amount, status
+-- 索引：PRIMARY(id), idx_user_id(user_id)
+
+-- T1: BEGIN;
+-- T1: UPDATE orders SET status = 2 WHERE user_id = 100 AND id = 1;  -- 锁 id=1
+
+-- T2: BEGIN;
+-- T2: UPDATE orders SET status = 2 WHERE user_id = 100 AND id = 2;  -- 锁 id=2
+-- 此时不冲突
+
+-- T1: UPDATE orders SET status = 2 WHERE user_id = 100 AND id = 2;  -- 等 T2 释放 id=2
+-- T2: UPDATE orders SET status = 2 WHERE user_id = 100 AND id = 1;  -- 等 T1 释放 id=1
+-- 死锁！循环等待形成
+```
+
+### 2.2 场景二：间隙锁 + 插入
+
+```sql
+-- 表 orders：id 索引 {1, 5, 10}
+
+-- T1: BEGIN;
+-- T1: SELECT * FROM orders WHERE id > 3 AND id < 7 FOR UPDATE;
+-- 临键锁锁住 [5, 10)，包含间隙 (5, 10)
+
+-- T2: BEGIN;
+-- T2: INSERT INTO orders VALUES (6, ...);  -- 被 T1 的间隙锁阻塞
+
+-- T1: INSERT INTO orders VALUES (6, ...);  -- 也要等 T2？
+-- 实际上：如果 T2 先拿到插入意向锁，T1 等待 T2，形成死锁
+```
+
+### 2.3 场景三：不同事务访问顺序不一致
+
+```sql
+-- 最经典的死锁场景：
+-- T1: 先锁 A，再锁 B
+-- T2: 先锁 B，再锁 A
+-- T1 持有 A，等 B；T2 持有 B，等 A
+-- 死锁形成
+
+-- 解决方案：统一访问顺序
+-- T1 和 T2 都按 A→B 的顺序访问
+```
+
+## 三、死锁排查方法 🟡
+
+### 3.1 查看死锁日志
+
+```sql
+SHOW ENGINE INNODB STATUS\G
+```
+
+输出示例（LATEST DETECTED DEADLOCK 部分）：
+
+```
+*** (1) TRANSACTION:
+TRANSACTION 12345, ACTIVE 5 sec inserting
+mysql tables in use 1, locked 1
+LOCK WAIT 2 lock struct(s), heap size 1136, 1 row lock(s)
+MySQL thread id 234, OS thread handle 0x7f8a, query id 567 update
+UPDATE orders SET status = 2 WHERE id = 1
+
+*** (2) TRANSACTION:
+TRANSACTION 12346, ACTIVE 5 sec inserting
+mysql tables in use 1, locked 1
+2 lock struct(s), heap size 1136, 1 row lock(s)
+MySQL thread id 235, OS thread handle 0x7f8b, query id 568 update
+UPDATE orders SET status = 2 WHERE id = 2
+
+*** (1) WAITING FOR THIS LOCK TO BE GRANTED:
+record lock lock_mode X waiting
+RECORD LOCKS space id 123 page no 4 n bits 72 index PRIMARY
+Gap lock on page 4
+
+*** (2) HOLDS THE LOCK(S):
+record lock lock_mode X locks rec but not gap
+Record lock on page 4
+
+*** (2) WAITING FOR THIS LOCK TO BE GRANTED:
+record lock lock_mode X
+RECORD LOCKS space id 456 page no 5 n bits 72 index PRIMARY
+Gap lock on page 5
+```
+
+### 3.2 关键信息解读
+
+| 信息 | 含义 |
+| --- | --- |
+| `TRANSACTION` | 事务 ID 和活跃时间 |
+| `LOCK WAIT` | 等待锁的事务 |
+| `HOLDS THE LOCK(S)` | 持有锁的事务 |
+| `WAITING FOR THIS LOCK TO BE GRANTED` | 在等什么锁 |
+| `Gap lock` | 间隙锁 |
+| `record lock` | 记录锁 |
+| `lock_mode X` | 排他锁 |
+
+### 3.3 信息收集
+
+```sql
+-- 查看当前锁信息
+SHOW OPEN TABLES WHERE In_use > 0;
+SHOW FULL PROCESSLIST;
+
+-- 查看锁等待
+SELECT * FROM information_schema.INNODB_LOCK_WAITS;
+
+-- 查看锁详情
+SELECT * FROM information_schema.INNODB_LOCKS;
+
+-- 查看事务详情
+SELECT * FROM information_schema.INNODB_TRX;
+```
+
+## 四、死锁预防策略 🟡
+
+### 4.1 统一资源访问顺序
+
+```sql
+-- ❌ 可能死锁
+-- T1: UPDATE orders SET status=2 WHERE id=1; UPDATE orders SET status=2 WHERE id=2;
+-- T2: UPDATE orders SET status=2 WHERE id=2; UPDATE orders SET status=2 WHERE id=1;
+
+-- ✅ 不会死锁
+-- T1 和 T2 都按 id 从小到大顺序访问
+-- UPDATE orders WHERE id IN (1, 2) ORDER BY id;  -- 一次性锁住
+```
+
+### 4.2 减少事务持有时间
+
+```sql
+-- ❌ 持有锁时间过长
+BEGIN;
+SELECT * FROM orders WHERE id = 1;  -- 当前读，加锁
+-- ... 业务处理耗时 5 秒 ...
+UPDATE orders SET status = 2 WHERE id = 1;
+COMMIT;
+
+-- ✅ 减少锁持有时间
+BEGIN;
+-- ... 业务处理在锁外完成 ...
+SELECT * FROM orders WHERE id = 1 FOR UPDATE;  -- 最后才加锁
+UPDATE orders SET status = 2 WHERE id = 1;
+COMMIT;
+```
+
+### 4.3 降低隔离级别
+
+```sql
+-- 如果业务允许，可以降低隔离级别减少锁争用
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+```
+
+### 4.4 避免在事务中交互用户
+
+```sql
+-- ❌ 在事务中等待用户确认（锁长时间持有）
+BEGIN;
+UPDATE account SET balance = balance - 1000 WHERE id = 1;  -- 锁 1000
+-- 等待商家确认订单（用户思考 30 秒）
+UPDATE account SET balance = balance + 1000 WHERE id = 2;
+COMMIT;
+
+-- ✅ 拆分为多个小事务
+BEGIN;
+UPDATE account SET balance = balance - 1000 WHERE id = 1;
+COMMIT;
+
+BEGIN;
+UPDATE account SET balance = balance + 1000 WHERE id = 2;
+COMMIT;
+```
+
+## 五、生产调优 🟢
+
+### 5.1 配置死锁检测
+
+```sql
+-- 死锁检测开关（默认开启）
+SHOW VARIABLES LIKE 'innodb_deadlock_detect';
+-- 可以关闭死锁检测（不推荐）
+-- SET GLOBAL innodb_deadlock_detect = OFF;
+
+-- 设置锁等待超时
+SHOW VARIABLES LIKE 'innodb_lock_wait_timeout';
+SET GLOBAL innodb_lock_wait_timeout = 5;  -- 等待 5 秒后超时
+```
+
+### 5.2 监控告警
+
+```sql
+-- 开启死锁日志到错误日志
+SET GLOBAL innodb_print_all_deadlocks = ON;
+
+-- 在错误日志中查看死锁信息
+-- shell: tail -f /var/log/mysql/error.log | grep deadlock
+```
+
+### 5.3 常见死锁处理流程
+
+1. **发现**：监控告警或用户投诉响应慢
+2. **确认**：SHOW ENGINE INNODB STATUS 确认死锁
+3. **分析**：读懂死锁日志，确定事务之间的等待关系
+4. **处理**：终止持有锁较少的事务，或优化 SQL 改写
+5. **预防**：修改业务逻辑，统一访问顺序
+
+【面试官心理】
+死锁是 MySQL 面试中最考验实战经验的题目之一。能说出完整排查流程和预防策略的候选人，说明他真正踩过坑、救过火。
+
+---
+
+| 级别 | 考察重点 | 期望回答 |
+| --- | --- | --- |
+| P5 | 基础概念 | 死锁定义、四个必要条件 |
+| P6 | 排查处理 | SHOW ENGINE INNODB STATUS、死锁日志解读 |
+| P7 | 预防策略 | 统一访问顺序、减少锁持有时间、业务设计避免死锁 |

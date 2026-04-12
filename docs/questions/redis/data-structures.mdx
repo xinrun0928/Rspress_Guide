@@ -1,0 +1,256 @@
+---
+title: Redis 数据结构全解
+description: 从一道面试题出发，全面解析 Redis 的五大数据类型（String/Hash/List/Set/ZSet）的底层实现、适用场景与性能特征，理解为什么 Redis 能同时保证高性能与丰富的数据抽象。
+---
+
+# Redis 数据结构全解
+
+面试官问："Redis 有哪些数据类型？"
+
+小陈说："String、Hash、List、Set、ZSet。"
+
+面试官追问："那你知道它们的底层实现分别是什么吗？"
+
+小陈说："String 是 SDS，Hash 是...压缩列表？"
+
+面试官继续追问："Redis 什么时候用压缩列表，什么时候用哈希表？"
+
+小陈开始支支吾吾。
+
+这道题，90% 的候选人能说出五种数据类型的名字，但能说清楚底层实现的不到 30%，能解释"为什么要用压缩列表而不是哈希表"的，不到 10%。
+
+## 一、五大数据类型概览 🔴
+
+### 1.1 数据类型 vs 底层实现
+
+| 数据类型 | 底层实现 1 | 底层实现 2 | 底层实现 3 |
+| --- | --- | --- | --- |
+| String | SDS（简单动态字符串） | | |
+| Hash | 压缩列表（ziplist） | 哈希表（hashtable） | |
+| List | 压缩列表（ziplist） | 双向链表（linkedlist） | 快速列表（quicklist） |
+| Set | 整数集合（intset） | 哈希表（hashtable） | |
+| ZSet | 压缩列表（ziplist） | 跳表 + 哈希表（skiplist+dict） | |
+
+**核心规律**：小数据量用压缩结构（省内存），大数据量用复杂结构（高性能）。
+
+### 1.2 快速理解
+
+```sql
+String  -- 字符串、计数器、缓存 JSON
+Hash    -- 对象、字典（类似 MySQL rows）
+List    -- 队列、栈、时间线
+Set     -- 标签、去重、集合运算
+ZSet    -- 排行榜、延时队列、有序集合
+```
+
+### 1.3 ❌ 错误示范
+
+**候选人原话**："String 就是 C 语言的 char 数组。"
+
+**问题诊断**：Redis 从不用 C 的 char 数组存储字符串，而是用 SDS（Simple Dynamic String）。这是 Redis 的基础数据结构创新。
+
+**候选人原话 2**："List 就是数组，支持随机访问。"
+
+**问题诊断**：Redis List 是链表，不是数组。链表不支持随机访问（O(n)），但插入/删除很快（O(1)）。
+
+【面试官心理】
+这道题我能从多个角度追问。比如我会问："为什么要用压缩列表？它的优缺点是什么？"能答出"压缩列表是小数据量的紧凑表示，节省内存但插入/删除 O(n)"的候选人，说明他对 Redis 的内存优化有理解。
+
+## 二、String（SDS）🔴
+
+### 2.1 SDS 是什么
+
+SDS（Simple Dynamic String）是 Redis 自定义的字符串结构，不是 C 的 char 数组。
+
+```
+C 字符串：
+[字符][字符][字符][\0]
+固定长度，strlen 需要 O(n)
+
+SDS：
+[header][字符数据][\0]
+header: len（长度）、alloc（已分配）、flags（类型）
+strlen 只需要读 len → O(1)
+```
+
+### 2.2 SDS 的优势
+
+| 特性 | C 字符串 | SDS |
+| --- | --- | --- |
+| 长度获取 | O(n) | O(1) |
+| 缓冲区溢出 | 可能 | 不会（自动扩展） |
+| 内存重分配 | 频繁 | 空间预分配/惰性释放 |
+| 二进制安全 | 否 | 是 |
+
+### 2.3 SDS 的空间预分配
+
+```c
+// SDS 扩展策略：
+// 1. 如果新长度 < 1MB，预分配 2 倍空间
+//    新 len=100KB，alloc=200KB
+// 2. 如果新长度 >= 1MB，预分配 +1MB
+//    新 len=2MB，alloc=3MB
+
+// 优势：减少内存重分配次数
+```
+
+## 三、Hash（ziplist vs hashtable）🟡
+
+### 3.1 压缩列表（ziplist）
+
+```c
+// ziplist 结构：紧凑的字节数组
+[zlbytes][zltail][zllen][entry1][entry2]...[entryN][zlend]
+// 每个 entry：previous_length + encoding + content
+// previous_length 变长字段（1 或 5 字节），前一个 entry 越长它越长
+```
+
+**优点**：紧凑存储，节省内存
+**缺点**：插入/删除需要 O(n) 重建
+
+### 3.2 转换条件
+
+```c
+// Hash 满足以下任一条件时，从 ziplist → hashtable：
+// 1. 字段数量 > hash-max-ziplist-entries（默认 512）
+// 2. 任意字段 value 长度 > hash-max-ziplist-value（默认 64 字节）
+
+// 示例：
+HSET user:1 name "Tom"           // 字段少，用 ziplist
+HSET user:1 bio "很长的个人简介..."  // value 超 64 字节 → 转 hashtable
+```
+
+### 3.3 生产建议
+
+```sql
+-- 小对象用 Hash 存（字段少、value 短）
+HSET user:100 name "Tom" age "25" city "Beijing"
+HGET user:100 name
+
+-- 大对象不要用 Hash（避免频繁转换）
+-- bio/description 等长文本用 String 存
+HSET user:100 bio "很长的个人简介..."
+```
+
+## 四、List（quicklist）🟡
+
+### 4.1 三代 List 的演进
+
+```sql
+Redis 2.8之前：双向链表（linkedlist）  -- 节点多时内存开销大
+Redis 2.8~Redis 4.0：压缩列表（ziplist）  -- 大数据量时性能差
+Redis 4.0+：快速列表（quicklist）      -- ziplist + linkedlist 的组合
+```
+
+### 4.2 quicklist 结构
+
+```
+quicklist = 双向链表 + 每个节点是 ziplist
+
+[head] → [ziplist: 100个元素] → [ziplist: 80个元素] → [tail]
+          O(1) push/pop         O(1) push/pop
+          每个 ziplist ≤ list-max-ziplist-size（默认 8KB）
+```
+
+**配置参数**：
+
+```sql
+-- 每个 ziplist 的最大大小
+CONFIG SET list-max-ziplist-size 2000  -- 每个 ziplist 最多 2000 个元素
+
+-- 两端压缩（两端元素小时不压缩中间）
+CONFIG SET list-compress-depth 1  -- 两端各 1 个 ziplist 不压缩
+```
+
+## 五、Set（intset vs hashtable）🟡
+
+### 5.1 整数集合（intset）
+
+```c
+// intset 结构：小整数集合的紧凑表示
+[encoding][length][int[]]
+// encoding: INTSET_ENC_INT16 / INT32 / INT64
+// 自动升级：元素超出当前编码范围时升级
+
+// 优点：比 hashtable 节省内存
+// 缺点：插入/删除需要 O(n) 扩容/降级
+```
+
+### 5.2 转换条件
+
+```sql
+-- Set 满足以下条件时，从 intset → hashtable：
+-- 1. 元素数量 > set-max-intset-entries（默认 512）
+-- 2. 任意元素不是整数
+```
+
+## 六、ZSet（ziplist vs skiplist）🟢
+
+### 6.1 ZSet 的双重结构
+
+Redis ZSet 底层是**跳表（skiplist）+ 哈希表（dict）** 的组合：
+
+```
+ZSet:
+├── 跳表（skiplist）：按 score 排序，支持范围查询、排名
+│   zskip_1 → zskip_5 → zskip_10 → ...
+└── 哈希表（dict）：member → score，快速查找
+
+查找 member: O(1)（通过 dict）
+查找排名: O(log n)（通过 skiplist）
+按 score 排序: O(log n)（通过 skiplist）
+```
+
+### 6.2 为什么需要两个结构？
+
+```sql
+-- 通过 dict 快速找到 member 的 score
+ZSCORE zset member  --> dict 查找 O(1)
+
+-- 按 score 排名
+ZRANK zset member  --> skiplist 查找 O(log n)
+
+-- 按 score 范围查询
+ZRANGEBYSCORE zset 0 100  --> skiplist 范围扫描 O(log n + m)
+```
+
+## 七、生产避坑 🟢
+
+### 7.1 大量小 Hash 的问题
+
+```sql
+-- ❌ 反模式：每个用户一个小 Hash，但字段很多
+HSET user:1 name "Tom" age "25" city "Beijing" ...
+HSET user:2 name "Jerry" age "30" ...
+-- user:1 的字段超过 512 → 转 hashtable，失去 ziplist 的内存优势
+
+-- ✅ 正确做法：按业务拆分
+-- 小字段用 Hash（name, age, city）
+-- 大字段用 String（bio, avatar）
+```
+
+### 7.2 Big Key 问题
+
+```sql
+-- List 存储百万元素
+RPUSH biglist "item1" "item2" ...  -- 100万个元素
+
+-- 问题：LTRIM 删除大量元素会阻塞
+LTRIM biglist 0 9999  -- 删除 99 万个元素，阻塞 Redis
+
+-- 解决：分批删除
+while LLEN biglist > 10000 do
+    LTRIM biglist 0 9999
+end
+```
+
+【面试官心理】
+问 Redis 数据结构的候选人很多，但能说清楚"为什么用压缩列表"和"什么时候转换"的很少。能说出 quicklist 演进和 ZSet 双重结构的是真正理解 Redis 实现的候选人。
+
+---
+
+| 级别 | 考察重点 | 期望回答 |
+| --- | --- | --- |
+| P5 | 基本类型 | 五种数据类型名称和基本用法 |
+| P6 | 底层实现 | SDS、ziplist、intset、skiplist 结构 |
+| P7 | 深度权衡 | 转换条件、内存优化、Big Key 问题 |

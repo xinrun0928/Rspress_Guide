@@ -1,0 +1,543 @@
+---
+title: Spring 事务管理
+description: 从原理层面深度剖析 Spring 事务的实现机制，解释 TransactionInterceptor、事务传播行为、以及声明式事务和编程式事务的区别。
+---
+
+# Spring 事务管理
+
+候选人小吴在面试美团 P7 时，面试官问道：
+
+"Spring 事务是怎么实现的？"
+
+小吴说："通过 AOP 代理实现的..."
+
+面试官追问："那 TransactionInterceptor 的工作原理是什么？"
+
+小吴说："它会在方法执行前后开启和提交事务..."
+
+面试官："那如果方法内部捕获了异常但没有重新抛出，事务会怎样？"
+
+小吴支支吾吾答不上来。
+
+【面试官心理】
+这道题我用来测试候选人对 Spring 事务的深度理解。知道"通过 AOP 实现"的人很多，但能说清楚异常处理机制、事务传播行为的底层逻辑的人很少。能回答"吞掉异常会导致事务不回滚"这个陷阱的，基本都踩过这个坑。
+
+---
+
+## 一、核心问题 🔴
+
+### 1.1 问题拆解
+
+**第一层：原理**
+- "Spring 事务是怎么实现的？"
+- "TransactionInterceptor 是什么？"
+
+**第二层：异常处理**
+- "@Transactional 标注的方法捕获了异常会怎样？"
+- "什么异常会导致事务回滚？"
+- "rollbackFor 参数怎么用？"
+
+**第三层：传播行为**
+- "Spring 有哪些事务传播行为？"
+- "REQUIRED 和 REQUIRES_NEW 的区别是什么？"
+- "NESTED 和 REQUIRED 的区别是什么？"
+
+**第四层：实现细节**
+- "事务同步管理器 TransactionSynchronizationManager 是什么？"
+- "Connection 和事务的关系是什么？"
+
+### 1.2 ❌ 错误示范
+
+**候选人原话 A**："Spring 事务通过 AOP 实现，在方法前后加上了事务开启和提交的逻辑。"
+
+**问题诊断**：
+- 知道大概原理，但不理解细节
+- 不知道 TransactionInterceptor 的具体实现
+- 说不清什么情况会导致事务失效
+
+**候选人原话 B**："只要方法标注了 @Transactional，就一定会有事务。"
+
+**问题诊断**：
+- 这是完全错误的理解
+- 异常被捕获后不重新抛出，事务不会回滚
+- private 方法不会走代理
+
+**候选人原话 C**："REQUIRED 是如果没有事务就创建新事务，REQUIRES_NEW 是每次都创建新事务。"
+
+**问题诊断**：
+- 知道两者的区别，但不理解底层原理
+- 不知道"新事务"在什么上下文中创建
+- 不知道嵌套事务和新建事务的区别
+
+### 1.3 标准回答
+
+#### P5 回答：基本原理
+
+Spring 事务通过 AOP 代理实现，核心组件是 `TransactionInterceptor`：
+
+```
+方法调用链：
+
+代理对象.method()
+  └─ TransactionInterceptor.invoke()
+      └─ 获取事务（获取或创建）
+      └─ try {
+      │     执行目标方法
+      │   } catch (Exception e) {
+      │     判断是否回滚
+      │   } finally {
+      │     提交或回滚
+      │   }
+      └─ 返回结果
+```
+
+```java
+// TransactionInterceptor 核心代码
+public class TransactionInterceptor extends TransactionAspectSupport {
+    @Override
+    public Object invoke(MethodInvocation invocation) throws Throwable {
+        // 包装目标方法调用
+        return invokeWithinTransaction(invocation.getMethod(), invocation.getTargetClass(),
+            () -> invocation.proceed());
+    }
+}
+
+// TransactionAspectSupport 是核心逻辑类
+protected Object invokeWithinTransaction(Method method, Class<?> targetClass,
+        final InvocationCallback invocation) throws Throwable {
+
+    // 1. 获取事务
+    TransactionInfo txInfo = createTransactionIfNecessary();
+
+    Object result = null;
+    try {
+        // 2. 执行目标方法
+        result = invocation.proceed();
+        // 3. 正常返回 → 提交事务
+        commitTransactionAfterReturning(txInfo);
+    } catch (Throwable ex) {
+        // 4. 异常抛出 → 判断是否回滚
+        completeTransactionAfterThrowing(txInfo, ex);
+        throw ex;
+    } finally {
+        // 5. 清理
+        doCleanupAfterCompletion(txInfo);
+    }
+
+    return result;
+}
+```
+
+### 1.4 追问升级
+
+**追问 1：异常处理机制**
+
+这是 Spring 事务最容易踩坑的地方：
+
+```java
+@Transactional
+public void transfer(Long fromId, Long toId, BigDecimal amount) {
+    try {
+        accountService.deduct(fromId, amount);
+        accountService.add(toId, amount);
+    } catch (Exception e) {
+        // ❌ 大坑！异常被捕获后没有重新抛出
+        // 事务不会回滚！
+        log.error("转账失败", e);
+    }
+}
+```
+
+Spring 默认只对 `RuntimeException` 和 `Error` 回滚，对 `Checked Exception` 默认不回滚：
+
+```java
+// TransactionAspectSupport 中判断是否回滚的逻辑
+protected void completeTransactionAfterThrowing(TransactionInfo txInfo, Throwable ex) {
+    // 如果事务已经被标记为只读，跳过
+    if (txInfo.isReadOnly()) {
+        return;
+    }
+
+    // 【关键】判断回滚条件
+    // 默认情况下：RollbackRuleAttribute 决定
+    // 只对 RuntimeException、Error 回滚
+    // 对 Checked Exception 不回滚
+    if (txInfo.getTransactionAttribute().rollbackOn(ex)) {
+        // 回滚
+        doRollback(txInfo);
+    } else {
+        // 不回滚，继续提交
+        doCommit(txInfo);
+    }
+}
+```
+
+可以通过 `rollbackFor` 修改这个行为：
+
+```java
+// 让所有异常都回滚
+@Transactional(rollbackFor = Exception.class)
+
+// 让特定异常回滚
+@Transactional(rollbackFor = {BusinessException.class, SystemException.class})
+
+// 让特定异常不回滚
+@Transactional(noRollbackFor = ValidationException.class)
+```
+
+**追问 2：事务传播行为详解**
+
+Spring 定义了 7 种事务传播行为，最常用的有 3 种：
+
+```java
+// Spring 定义的事务传播行为
+public enum Propagation {
+    REQUIRED      // 如果有事务就加入，没有就创建新的（默认）
+    REQUIRES_NEW  // 每次都创建新事务，挂起当前事务
+    SUPPORTS      // 如果有事务就加入，没有就不使用事务
+    NOT_SUPPORTED // 不使用事务，挂起当前事务
+    MANDATORY     // 必须在事务中执行，否则抛异常
+    NEVER         // 不能在事务中执行，否则抛异常
+    NESTED        // 如果有事务就在嵌套事务中执行，没有就创建新的
+}
+```
+
+| 传播行为 | 说明 | 常用场景 |
+| --- | --- | --- |
+| `REQUIRED` | 有则加入，无则创建 | 大多数场景，默认值 |
+| `REQUIRES_NEW` | 每次创建新事务 | 日志记录（不影响主事务） |
+| `NESTED` | 嵌套事务（Savepoint） | 子事务需要独立回滚 |
+| `SUPPORTS` | 有则加入，无则无事务 | 查询方法 |
+| `NOT_SUPPORTED` | 挂起当前事务 | 大数据量导入 |
+
+```
+REQUIRED vs REQUIRES_NEW 的执行对比：
+
+场景：A.method() 调用 B.method()，A 有 @Transactional
+
+【REQUIRED】
+A.method() 开启事务 T1
+  └─ B.method() 加入事务 T1
+      └─ B 执行异常
+      └─ 整个事务 T1 回滚
+      └─ A 和 B 的修改全部回滚
+
+【REQUIRES_NEW】
+A.method() 开启事务 T1
+  └─ B.method() 挂起 T1，开启新事务 T2
+      └─ B 执行异常，T2 回滚
+      └─ T2 独立提交/回滚
+  └─ A.method() 继续在 T1 中执行
+      └─ A 后续操作...提交 T1
+      └─ B 回滚，B 的修改回滚
+      └─ A 的修改仍然提交
+```
+
+```
+REQUIRED vs NESTED 的对比：
+
+【NESTED】
+A.method() 开启事务 T1（假设 T1 有 Savepoint）
+  └─ B.method() 在嵌套事务中执行
+      └─ B 执行异常
+      └─ 回滚到 Savepoint（只有 B 的修改回滚）
+      └─ A 继续执行
+      └─ A 提交事务 T1（A 的修改提交）
+  └─ 结果：B 回滚，A 提交
+
+【REQUIRED】
+  └─ B 执行异常
+  └─ 整个事务回滚
+  └─ 结果：A 和 B 全部回滚
+```
+
+:::warning ⚠️
+NESTED 传播行为依赖于数据库的 Savepoint 机制。如果数据库不支持 Savepoint（如 MySQL + InnoDB 引擎），NESTED 的行为会退化到 REQUIRED（因为无法创建 Savepoint）。
+:::
+
+**追问 3：TransactionSynchronizationManager**
+
+这是理解事务同步的关键：
+
+```java
+// 事务同步管理器 - 管理当前线程的事务上下文
+public abstract class TransactionSynchronizationManager {
+    // 事务资源（Connection、Session 等）
+    private static final ThreadLocal<Map<Object, Object>> resources =
+        new NamedThreadLocal<>("Transactional resources");
+
+    // 事务同步回调
+    private static final ThreadLocal<Set<TransactionSynchronization>> synchronizations =
+        new NamedThreadLocal<>("Transaction synchronizations");
+
+    // 当前事务名称
+    private static final ThreadLocal<String> currentTransactionName =
+        new NamedThreadLocal<>("Current transaction name");
+
+    // 是否只读
+    private static final ThreadLocal<Boolean> currentTransactionReadOnly =
+        new NamedThreadLocal<>("Current transaction read-only status");
+
+    // 获取当前事务的数据库连接
+    public static Connection getResource(Object key) {
+        // 从 ThreadLocal 中获取
+    }
+}
+```
+
+```java
+// 使用示例：在事务提交前执行某些操作
+@Transactional
+public void doSomething() {
+    // 注册事务同步回调
+    TransactionSynchronizationManager.registerSynchronization(
+        new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                // 事务提交后执行（如发送消息）
+                // 只有在事务真正提交后才发送，避免事务回滚导致消息发出
+            }
+
+            @Override
+            public void afterCompletion(int status) {
+                // 事务完成后执行（无论提交还是回滚）
+            }
+        }
+    );
+
+    // 业务逻辑
+}
+```
+
+:::tip 💡
+`afterCommit()` 非常有用！如果你在事务方法中发送消息，消息可能会在事务回滚后被消费（因为消息发送不一定会失败）。使用 `afterCommit()` 可以确保只在事务真正提交后才发送消息。
+:::
+
+## 二、延伸问题 🟡
+
+### 2.1 事务失效场景
+
+Spring 事务在以下场景会失效：
+
+```java
+// 场景1：方法内部调用（不经过代理）
+@Service
+public class OrderService {
+    @Transactional
+    public void methodA() {
+        this.methodB(); // ❌ 不走代理，事务失效
+    }
+
+    @Transactional
+    public void methodB() {
+        // 不会在事务中执行
+    }
+}
+
+// 场景2：private 方法
+@Service
+public class OrderService {
+    @Transactional
+    private void saveOrder() { // ❌ private 方法不会被代理
+    }
+}
+
+// 场景3：异常被捕获但未重新抛出
+@Service
+public class OrderService {
+    @Transactional
+    public void save() {
+        try {
+            doSomething();
+        } catch (Exception e) {
+            // ❌ 吞掉异常，事务不回滚
+        }
+    }
+}
+
+// 场景4：数据库不支持事务
+// MySQL MyISAM 引擎不支持事务，@Transactional 无效
+
+// 场景5：传播行为为 NEVER
+@Transactional(propagation = Propagation.NEVER)
+public void method() {
+    // 如果当前有事务，会抛异常
+}
+```
+
+### 2.2 @Transactional 的参数
+
+```java
+@Transactional(
+    value = "transactionManager",          // 指定事务管理器 Bean 名称
+    propagation = Propagation.REQUIRED,     // 传播行为
+    isolation = Isolation.READ_COMMITTED,  // 隔离级别
+    timeout = 30,                          // 超时时间（秒）
+    readOnly = true,                       // 是否只读
+    rollbackFor = Exception.class,         // 导致回滚的异常类型
+    noRollbackFor = ValidationException.class // 不导致回滚的异常类型
+)
+```
+
+```java
+// timeout 示例
+@Transactional(timeout = 30) // 30秒超时
+public void longRunningOperation() {
+    // 如果超过 30 秒，自动回滚
+}
+
+// readOnly 示例
+@Transactional(readOnly = true) // 优化查询性能
+public List<User> listUsers() {
+    return userRepository.findAll();
+}
+```
+
+### 2.3 编程式事务
+
+除了声明式事务，Spring 还支持编程式事务：
+
+```java
+// 方式1：TransactionTemplate
+@Service
+public class OrderService {
+    @Autowired
+    private TransactionTemplate transactionTemplate;
+
+    public void createOrder() {
+        transactionTemplate.executeWithoutResult(status -> {
+            // 业务逻辑
+            try {
+                orderRepository.save(order);
+            } catch (Exception e) {
+                status.setRollbackOnly(); // 手动标记回滚
+            }
+        });
+    }
+
+    public BigDecimal calculate() {
+        return transactionTemplate.execute(status -> {
+            return orderRepository.sum();
+        });
+    }
+}
+
+// 方式2：PlatformTransactionManager 直接使用
+@Service
+public class OrderService {
+    @Autowired
+    private PlatformTransactionManager transactionManager;
+
+    public void createOrder() {
+        DefaultTransactionDefinition def = new DefaultTransactionDefinition();
+        def.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRED);
+        TransactionStatus status = transactionManager.getTransaction(def);
+
+        try {
+            orderRepository.save(order);
+            transactionManager.commit(status);
+        } catch (Exception e) {
+            transactionManager.rollback(status);
+            throw e;
+        }
+    }
+}
+```
+
+## 三、生产避坑
+
+### 3.1 超时设置导致的连锁回滚
+
+```java
+@Transactional(timeout = 5)
+public void method() {
+    // 如果这个方法调用了另一个超时为 3 秒的方法
+    // 可能会导致问题
+    remoteService.call(); // 假设这个方法需要 4 秒
+    // 会抛出 TransactionTimeoutException
+}
+```
+
+### 3.2 嵌套事务的回滚
+
+```java
+@Transactional
+public void methodA() {
+    doA();
+    try {
+        methodB(); // REQUIRED，默认加入 A 的事务
+    } catch (Exception e) {
+        // 这里捕获了 B 的异常
+        // 默认情况：异常会继续传播，导致 A 也回滚
+    }
+}
+
+@Transactional(propagation = Propagation.REQUIRES_NEW)
+public void methodB() {
+    // 这个方法有自己的事务
+    // B 回滚不会影响 A
+}
+```
+
+### 3.3 分布式事务的假象
+
+Spring 的 `@Transactional` 只解决**单个数据源**的事务问题：
+
+```java
+@Service
+public class OrderService {
+    @Transactional  // ❌ 只能保证这个事务
+    public void createOrder() {
+        orderRepository.save(order);        // 数据源 A
+        inventoryService.deduct(itemId);    // 远程调用，数据源 B —— 独立事务
+        paymentService.pay(orderId);        // 远程调用，数据源 C —— 独立事务
+    }
+}
+```
+
+这个场景需要分布式事务解决方案（如 Seata）。
+
+## 四、工程选型
+
+### 4.1 声明式事务 vs 编程式事务
+
+| 对比 | 声明式事务 | 编程式事务 |
+| --- | --- | --- |
+| **代码侵入** | 无，注解方式 | 有，需要显式调用 |
+| **灵活性** | 一般 | 高 |
+| **适用场景** | 大多数业务方法 | 复杂事务逻辑 |
+| **性能** | 代理开销 | 无额外开销 |
+| **推荐** | ✅ 首选 | 仅复杂场景使用 |
+
+### 4.2 事务管理器的选择
+
+```java
+// 单数据源
+@Autowired
+private DataSourceTransactionManager transactionManager;
+
+// JPA
+@Autowired
+private JpaTransactionManager transactionManager;
+
+// Hibernate
+@Autowired
+private HibernateTransactionManager transactionManager;
+
+// 分布式事务
+@Autowired
+private DataSourceTransactionManager transactionManager; // Seata AT 模式
+// 或者
+@Autowired
+private GlobalTransactionManager transactionManager; // Seata XA 模式
+```
+
+## 五、面试总结
+
+Spring 事务是 Java 面试中的高频核心题。
+
+P5 候选人能说出"通过 AOP 代理实现，在方法前后开启和提交事务"。
+P6 候选人能说出异常处理机制（默认只对 RuntimeException 回滚）、能说出 REQUIRES_NEW 和 REQUIRED 的区别、能说清 @Transactional 的常见失效场景。
+P7 候选人能说出 TransactionSynchronizationManager 的 ThreadLocal 机制、能说出 afterCommit() 的使用场景、能解释嵌套事务和 Savepoint 的关系。
+
+记住，Spring 事务不是背概念，而是理解"什么情况下会失效、什么情况下会回滚"。

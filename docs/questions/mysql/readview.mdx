@@ -1,0 +1,231 @@
+---
+title: ReadView 可见性判断
+description: 从一道面试题出发，深入剖析 MySQL InnoDB 中 ReadView 的数据结构、可见性判断四条件，以及 RC 和 RR 隔离级别下 ReadView 的差异。
+---
+
+# ReadView 可见性判断
+
+面试官问："ReadView 的可见性是怎么判断的？具体有哪几个条件？"
+
+小赵想了半天："就是判断事务 ID 是不是在活跃事务列表里？"
+
+面试官追问："那 ReadView 里除了活跃事务列表，还有什么？"
+
+小赵："...好像有最大事务 ID？"
+
+面试官继续追问："那最小事务 ID 在判断中起什么作用？"
+
+小赵开始支支吾吾。
+
+ReadView 的可见性判断是 MVCC 机制的核心，也是面试中容易被问懵的深水区。这道题能答出完整的四个条件的候选人，说明他对 MVCC 的理解已经到了源码级别。
+
+## 一、ReadView 的数据结构 🔴
+
+### 1.1 ReadView 四要素
+
+```sql
+struct ReadView {
+    // 1. 活跃事务 ID 列表
+    m_ids;          -- 当前所有未提交事务的 ID 列表
+
+    // 2. 活跃事务最小 ID
+    min_trx_id;     -- m_ids 中的最小值
+
+    // 3. 活跃事务最大 ID
+    max_trx_id;     -- 创建 ReadView 时分配的最大事务 ID + 1
+
+    // 4. 创建 ReadView 的事务自身 ID
+    creator_trx_id; -- 当前事务自己的 ID
+}
+```
+
+### 1.2 事务 ID 的分配
+
+MySQL InnoDB 的事务 ID 是递增分配的全局计数器：
+
+```sql
+-- 每次开启新事务或执行 DML 时分配新事务 ID
+-- 事务 ID 是一个严格递增的整数
+-- ID 越小，事务越早开始
+```
+
+### 1.3 ReadView 的生成时机
+
+| 隔离级别 | 生成时机 | 说明 |
+| --- | --- | --- |
+| 读未提交 | 不生成 ReadView | 每次都读最新数据 |
+| 读已提交 | **每次快照读时生成** | 每次 SELECT 都生成新 ReadView |
+| 可重复读 | **事务开始时生成一次** | 整个事务复用同一个 ReadView |
+| 串行化 | 快照读退化为当前读 | 不需要 ReadView |
+
+## 二、可见性判断四条件 🔴
+
+### 2.1 完整判断流程
+
+```sql
+/**
+ * 判断某行数据的 trx_id 对当前事务是否可见
+ * @param row_trx_id: 数据行中的 trx_id（最近修改这行的事务 ID）
+ * @param read_view: 当前事务的 ReadView
+ */
+function isVisible(row_trx_id, read_view) {
+
+    // ========== 条件 1: 自己的事务自己可见 ==========
+    if (row_trx_id == read_view.creator_trx_id) {
+        return VISIBLE;  // 这行是自己修改的
+    }
+
+    // ========== 条件 2: 旧版本数据可见 ==========
+    if (row_trx_id < read_view.min_trx_id) {
+        return VISIBLE;  // 这行在 ReadView 生成前就提交了
+    }
+
+    // ========== 条件 3: 未来事务不可见 ==========
+    if (row_trx_id >= read_view.max_trx_id) {
+        return INVISIBLE;  // 这行是在 ReadView 生成后修改的
+    }
+
+    // ========== 条件 4: 活跃事务的修改不可见 ==========
+    if (row_trx_id IN read_view.m_ids) {
+        return INVISIBLE;  // 这行是未提交事务修改的
+    }
+
+    return VISIBLE;  // 其他情况可见
+}
+```
+
+### 2.2 四条件总结
+
+| 条件 | 逻辑 | 简化判断 |
+| --- | --- | --- |
+| 条件 1 | row_trx_id == creator_trx_id | 自己改的自己看得到 |
+| 条件 2 | row_trx_id < min_trx_id | ReadView 之前提交的可见 |
+| 条件 3 | row_trx_id >= max_trx_id | ReadView 之后改的不可见 |
+| 条件 4 | row_trx_id IN m_ids | 活跃事务改的不可见 |
+
+### 2.3 ❌ 错误示范
+
+**候选人原话**："只要事务 ID 在 m_ids 列表里就不可见。"
+
+**问题诊断**：忽略了其他三个条件。只看 m_ids 会误判 ReadView 生成前就已经提交的事务。
+
+**候选人原话 2**："ReadView 只包含活跃事务列表。"
+
+**问题诊断**：ReadView 的四要素缺一不可。min_trx_id 和 max_trx_id 是快速判断的关键，可以避免遍历 m_ids。
+
+【面试官心理】
+这道题我通常会出一个具体场景让候选人分析。比如："假设 ReadView 的 min_trx_id=10，max_trx_id=50，m_ids={20, 30}，creator_trx_id=40。那么 trx_id=15、25、35、40 的数据分别可见吗？"能准确判断的候选人，说明他真正理解了四条件的含义。
+
+## 三、具体场景分析 🔴
+
+### 3.1 场景一：数据在 ReadView 之前提交
+
+```
+事务时间线：
+T1(id=10) ─ T2(id=20) ─ T3(id=30) ─ T4(id=40) ─ T5(id=50)
+commit     commit      commit      active       active
+
+ReadView 在 T4 时创建：
+- min_trx_id = 40
+- max_trx_id = 55
+- m_ids = {40, 50}
+
+判断：
+- trx_id=10: 10 < 40 → 可见 ✅
+- trx_id=20: 20 < 40 → 可见 ✅
+- trx_id=30: 30 < 40 → 可见 ✅
+- trx_id=40: 40 IN {40, 50} → 不可见 ❌
+- trx_id=50: 50 IN {40, 50} → 不可见 ❌
+```
+
+### 3.2 场景二：活跃事务在中间
+
+```
+事务时间线：
+T1(10) ─ T2(20) ─ T3(30, active) ─ T4(40) ─ T5(50, active)
+
+ReadView 在 T4 时创建：
+- min_trx_id = 30
+- max_trx_id = 55
+- m_ids = {30, 50}
+
+判断：
+- trx_id=10: 可见 ✅
+- trx_id=20: 可见 ✅
+- trx_id=30: 在 m_ids 中 → 不可见 ❌（T3 未提交）
+- trx_id=40: 可见 ✅（T4 在 ReadView 生成前提交）
+- trx_id=50: 在 m_ids 中 → 不可见 ❌（T5 未提交）
+```
+
+## 四、RC vs RR 的核心区别 🟡
+
+### 4.1 ReadView 的生成时机决定可见范围
+
+```sql
+-- 读已提交（RC）：每次快照读都生成新 ReadView
+-- 可重复读（RR）：事务开始时生成一次 ReadView，之后复用
+```
+
+**读已提交**：
+```sql
+-- T1: BEGIN;
+-- T1: SELECT * FROM orders WHERE id = 1;  -- ReadView A
+-- T2: UPDATE orders SET amount = 500; COMMIT;
+-- T1: SELECT * FROM orders WHERE id = 1;  -- ReadView B（新！）
+-- 结果：能看到 T2 的修改（因为新的 ReadView 中 T2 不在 m_ids）
+```
+
+**可重复读**：
+```sql
+-- T1: BEGIN;
+-- T1: SELECT * FROM orders WHERE id = 1;  -- ReadView A
+-- T2: UPDATE orders SET amount = 500; COMMIT;
+-- T1: SELECT * FROM orders WHERE id = 1;  -- 复用 ReadView A
+-- 结果：看不到 T2 的修改（ReadView A 创建时 T2 未提交）
+```
+
+### 4.2 为什么 RC 能看到新提交的数据？
+
+因为 RC 每次快照读都生成新的 ReadView。在新的 ReadView 中，之前"活跃"的事务如果已经提交，就不在 m_ids 中了，因此可见。
+
+## 五、生产避坑 🟡
+
+### 5.1 ReadView 和 undo log 的配合
+
+```sql
+-- 当可见性判断命中条件 4（row_trx_id IN m_ids）时
+-- 需要沿 roll_pointer 找到更早的版本
+
+-- 过程：
+-- 1. 读取当前行，trx_id=35
+-- 2. 判断：35 >= max_trx_id？或在 m_ids 中？
+-- 3. 如果不可见，沿 roll_pointer 找到 undo log 中的历史版本
+-- 4. 重复判断，直到找到可见版本或链尾
+```
+
+### 5.2 性能陷阱
+
+undo log 链越长，MVCC 的遍历成本越高。
+
+```sql
+-- 长事务导致的问题：
+-- T1: BEGIN; SELECT * FROM orders;  -- 生成 ReadView，链长=0
+-- T2~T100: 大量事务修改同一批数据
+-- T1: SELECT * FROM orders;  -- 链长=100，每次判断都需要遍历
+-- T1 迟迟不提交，undo log 无法清理
+```
+
+:::warning ⚠️
+ReadView 的可见性判断看似简单，但 MVCC 的真正性能开销在于 undo log 链的遍历。事务越长，undo log 越多，性能越差。线上一定要避免长事务。
+:::
+
+【面试官心理】
+这道题我能从基础问到进阶。基础是"ReadView 四要素是什么"，进阶是"给一个场景判断可见性"，更深一层是"RC 和 RR 在 ReadView 上的本质区别"。能答出全部的候选人，对 InnoDB 的理解已经到了很高的层次。
+
+---
+
+| 级别 | 考察重点 | 期望回答 |
+| --- | --- | --- |
+| P5 | 基本结构 | ReadView 包含 m_ids、min_trx_id、max_trx_id |
+| P6 | 完整判断 | 四个可见性条件，及其简化逻辑 |
+| P7 | 场景应用 | RC vs RR 的区别、undo log 链遍历、性能影响 |

@@ -1,0 +1,399 @@
+---
+title: 自定义类加载器
+description: 从一道源码级别面试题出发，深入剖析自定义类加载器的实现方法：findClass与loadClass的区别、加密类加载、热部署，以及常见的踩坑点。
+---
+
+# 自定义类加载器
+
+面试官问："如果让你实现一个自定义的类加载器，你会怎么做？"
+
+候选人小马说："继承 ClassLoader，重写 findClass。"面试官追问："为什么是 findClass 而不是 loadClass？"
+
+小马说："因为..."面试官："loadClass 和 findClass 的区别是什么？"
+
+小马答不上来。
+
+这道题看似简单，但 90% 的候选人说不清 `loadClass` 和 `findClass` 的边界，也不理解为什么 JDK 推荐重写 `findClass`。
+
+## 一、自定义类加载器的标准实现 🔴
+
+### 1.1 最简实现
+
+```java
+// 自定义类加载器：从指定目录加载类
+class DirectoryClassLoader extends ClassLoader {
+
+    private final File classDir;
+
+    public DirectoryClassLoader(String path) {
+        this.classDir = new File(path);
+    }
+
+    @Override
+    protected Class<?> findClass(String name) throws ClassNotFoundException {
+        // 将类名转换为文件路径
+        // com.example.Foo -> com/example/Foo.class
+        String classFileName = name.replace('.', File.separatorChar) + ".class";
+        File classFile = new File(classDir, classFileName);
+
+        if (!classFile.exists()) {
+            throw new ClassNotFoundException(name);
+        }
+
+        // 读取字节码文件
+        byte[] bytecode;
+        try {
+            bytecode = Files.readAllBytes(classFile.toPath());
+        } catch (IOException e) {
+            throw new ClassNotFoundException(name, e);
+        }
+
+        // 调用 defineClass 将字节码转换为 Class 对象
+        return defineClass(name, bytecode, 0, bytecode.length);
+    }
+}
+```
+
+### 1.2 `loadClass` vs `findClass`：为什么要重写 findClass？
+
+这是理解自定义类加载器的核心。
+
+```java
+// ClassLoader.loadClass() 的完整逻辑（JDK 8 源码简化）
+protected Class<?> loadClass(String name, boolean resolve) throws ClassNotFoundException {
+    // 1. 检查是否已加载
+    Class<?> c = findLoadedClass(name);
+    if (c != null) return c;
+
+    // 2. 委派给父加载器（递归）
+    ClassLoader parent = this.parent;
+    if (parent != null) {
+        c = parent.loadClass(name, false);
+    } else {
+        c = findBootstrapClassOrNull(name);
+    }
+    if (c != null) return c;
+
+    // 3. 调用 findClass 由子类实现
+    c = findClass(name);
+
+    // 4. 如果 resolve 为 true，执行 resolveClass
+    if (resolve) {
+        resolveClass(c);
+    }
+    return c;
+}
+```
+
+**`loadClass` 实现了双亲委派的逻辑，`findClass` 是留给子类实现加载逻辑的钩子。**
+
+如果你重写了 `loadClass`，就意味着你要**自己实现双亲委派逻辑**。但大多数情况下，你不需要打破委派，只需要提供自己的加载方式——重写 `findClass` 是更安全的做法。
+
+| 方法 | 职责 | 是否需要重写 |
+| --- | --- | --- |
+| `loadClass()` | 完整的类加载流程：查找缓存 → 父加载器 → `findClass` | ❌ 不重写（除非打破委派） |
+| `findClass()` | 具体的类查找和字节码加载逻辑 | ✅ 重写 |
+| `defineClass()` | 将字节码数组转换为 Class 对象 | ❌ 不重写（JVM 提供） |
+
+### 1.3 `defineClass` 的正确使用
+
+```java
+// defineClass 是 final 方法，不能重写
+// 它的作用是将字节码数组转化为 Class 对象
+
+// ✅ 正确用法：在 findClass 中调用
+@Override
+protected Class<?> findClass(String name) {
+    byte[] bytecode = loadBytecode(name);
+    return defineClass(name, bytecode, 0, bytecode.length);
+}
+
+// ❌ 错误用法：直接 new ClassLoader 并调用 defineClass
+// 这样做违反了类的安全原则
+
+// ✅ 正确用法：处理包名的情况
+@Override
+protected Class<?> findClass(String name) {
+    // 如果类在某个包下，需要先设置包
+    int lastDot = name.lastIndexOf('.');
+    if (lastDot > 0) {
+        String packageName = name.substring(0, lastDot);
+        Package pkg = getPackage(packageName);
+        if (pkg == null) {
+            definePackage(packageName, null, null, null, null, null, null, null);
+        }
+    }
+
+    byte[] bytecode = loadBytecode(name);
+    return defineClass(name, bytecode, 0, bytecode.length);
+}
+```
+
+## 二、常见应用场景 🟡
+
+### 2.1 场景一：加密类加载（代码保护）
+
+```java
+// 加密工具类：运行时加密字节码
+class EncryptUtil {
+    public static byte[] encrypt(byte[] data, byte key) {
+        for (int i = 0; i < data.length; i++) {
+            data[i] ^= key;  // XOR 加密
+        }
+        return data;
+    }
+}
+
+// 加密类加载器
+class EncryptedClassLoader extends ClassLoader {
+
+    private final byte secretKey;
+
+    public EncryptedClassLoader(byte key) {
+        this.secretKey = key;
+    }
+
+    @Override
+    protected Class<?> findClass(String name) throws ClassNotFoundException {
+        String fileName = name.replace('.', '/') + ".class.enc";  // 加密后的文件
+        URL url = getResource(fileName);
+        if (url == null) throw new ClassNotFoundException(name);
+
+        try (InputStream is = url.openStream()) {
+            byte[] encrypted = is.readAllBytes();
+            byte[] decrypted = EncryptUtil.encrypt(encrypted, secretKey);
+            return defineClass(name, decrypted, 0, decrypted.length);
+        } catch (IOException e) {
+            throw new ClassNotFoundException(name, e);
+        }
+    }
+}
+```
+
+**限制**：这种加密方式只是增加了反编译的门槛，不能完全防止逆向工程（因为密钥终究要嵌入代码中）。
+
+### 2.2 场景二：从网络加载类
+
+```java
+// 网络类加载器：从远程服务器加载类字节码
+class NetworkClassLoader extends ClassLoader {
+
+    private final String remoteHost;
+    private final int port;
+
+    public NetworkClassLoader(String host, int port) {
+        this.remoteHost = host;
+        this.port = port;
+    }
+
+    @Override
+    protected Class<?> findClass(String name) throws ClassNotFoundException {
+        String urlStr = "http://" + remoteHost + ":" + port + "/classes/" +
+                        name.replace('.', '/') + ".class";
+
+        try (InputStream is = new URL(urlStr).openStream()) {
+            byte[] bytecode = is.readAllBytes();
+            return defineClass(name, bytecode, 0, bytecode.length);
+        } catch (IOException e) {
+            throw new ClassNotFoundException(name, e);
+        }
+    }
+}
+```
+
+**生产警告**：网络加载类有严重的安全风险，除非在完全受控的内网环境中，否则禁止使用。
+
+### 2.3 场景三：热部署（类更新）
+
+热部署是自定义 ClassLoader 最复杂的应用场景。
+
+```java
+// 热部署类加载器：同一个类的不同版本可以同时存在
+class HotSwapClassLoader extends ClassLoader {
+
+    // 存储已加载的类信息，用于判断是否需要重新加载
+    private final Map<String, Long> classTimestamps = new HashMap<>();
+
+    public HotSwapClassLoader() {
+        super(HotSwapClassLoader.class.getClassLoader());  // 父加载器为 AppClassLoader
+    }
+
+    public Class<?> loadClass(String name, byte[] bytecode)
+            throws ClassNotFoundException {
+        // 1. 检查是否已加载
+        Class<?> existing = findLoadedClass(name);
+        if (existing != null) {
+            // 2. 检查字节码是否更新
+            Long cachedTimestamp = classTimestamps.get(name);
+            long newTimestamp = getClassTimestamp(bytecode);
+
+            if (cachedTimestamp != null && newTimestamp > cachedTimestamp) {
+                // 3. 重新加载（创建新的类加载器实例）
+                // 注意：不能复用同一个 ClassLoader 实例重新加载同一个类
+                // 因为 ClassLoader 加载的类会进入缓存，无法清除
+                throw new NeedNewClassLoaderException(name);
+            }
+        }
+
+        // 4. 加载类
+        classTimestamps.put(name, getClassTimestamp(bytecode));
+        return defineClass(name, bytecode, 0, bytecode.length);
+    }
+}
+```
+
+:::warning ⚠️
+热部署的坑：
+
+1. **同一个类加载器实例不能重复加载同一个类**：`findLoadedClass` 会返回缓存的类。
+
+2. **类的不变形**：一旦 Class 对象被创建，它的类加载器就不能改变。如果需要更新类，必须创建新的类加载器实例。
+
+3. **旧类实例的类加载器引用**：即使创建了新的类加载器，旧的对象仍然持有旧的 Class 对象引用。不同版本的对象之间**不能互相赋值**。
+
+4. **元空间泄漏**：频繁创建新的 ClassLoader 实例会导致 Metaspace 膨胀，必须及时清理不再使用的 ClassLoader。
+:::
+
+## 三、生产级自定义类加载器实现 🟡
+
+### 3.1 标准模板
+
+```java
+public class SecureClassLoader extends ClassLoader {
+
+    // 可信任的基础包列表（这些包必须由父加载器加载）
+    private static final Set<String> TRUSTED_PACKAGES = Set.of(
+        "java.", "javax.", "sun.", "oracle.",
+        "org.apache.catalina.", "org.apache.tomcat."
+    );
+
+    private final File classpath;
+
+    public SecureClassLoader(String classpathDir, ClassLoader parent) {
+        super(parent);
+        this.classpath = new File(classpathDir);
+    }
+
+    @Override
+    protected Class<?> findClass(String name) throws ClassNotFoundException {
+        // 安全检查：核心包不允许被覆盖
+        for (String trusted : TRUSTED_PACKAGES) {
+            if (name.startsWith(trusted)) {
+                throw new SecurityException(
+                    "Attempt to load restricted package: " + name);
+            }
+        }
+
+        // 查找字节码文件
+        String fileName = name.replace('.', File.separatorChar) + ".class";
+        File classFile = new File(classpath, fileName);
+
+        if (!classFile.exists()) {
+            throw new ClassNotFoundException(name);
+        }
+
+        try {
+            byte[] bytecode = Files.readAllBytes(classFile.toPath());
+            return defineClass(name, bytecode, 0, bytecode.length);
+        } catch (IOException e) {
+            throw new ClassNotFoundException(name, e);
+        }
+    }
+
+    // 提供显式加载方法
+    public Class<?> loadClassDirectly(String name) throws ClassNotFoundException {
+        return findClass(name);
+    }
+}
+```
+
+### 3.2 双亲委派的正确打破方式
+
+```java
+// 如果需要打破双亲委派（以 Tomcat 为例）
+class TomcatWebappClassLoader extends ClassLoader {
+
+    @Override
+    protected Class<?> loadClass(String name, boolean resolve) {
+        synchronized (getClassLoadingLock(name)) {
+            // 1. 检查是否已加载
+            Class<?> clazz = findLoadedClass(name);
+            if (clazz != null) return resolveIfNeeded(clazz, resolve);
+
+            // 2. 安全包（必须委派）
+            if (isSystemClass(name)) {
+                return super.loadClass(name, resolve);
+            }
+
+            // 3. 先尝试本地加载（打破！）
+            try {
+                clazz = findClass(name);
+                if (clazz != null) {
+                    return resolveIfNeeded(clazz, resolve);
+                }
+            } catch (ClassNotFoundException e) {
+                // 本地找不到，继续
+            }
+
+            // 4. 最后才委派给父加载器
+            return super.loadClass(name, resolve);
+        }
+    }
+
+    private boolean isSystemClass(String name) {
+        return name.startsWith("java.") ||
+               name.startsWith("javax.") ||
+               name.startsWith("org.apache.catalina.");
+    }
+}
+```
+
+## 四、面试追问 🟢
+
+### 4.1 追问：类加载器在 JDK 9+ 模块化后有变化吗？
+
+JDK 9 引入模块化（JPMS），类加载器的层级发生了变化：
+
+| JDK 8 | JDK 9+ |
+| --- | --- |
+| Bootstrap ClassLoader | Platform ClassLoader（从 Bootstrap 拆分出来） |
+| Extension ClassLoader | 移除（`java.ext.dirs` 被废弃） |
+| Application ClassLoader | Application ClassLoader（基本不变） |
+
+JDK 9 的类加载器结构：
+```
+Platform ClassLoader
+        ↓
+Application ClassLoader
+        ↓
+自定义 ClassLoader
+```
+
+:::tip 💡
+面试加分点：能说出"JDK 9 的模块化系统引入了 `ModuleLayer`，每个模块有自己的类加载器上下文。但模块化并不替代传统的类加载器，而是两者共存。模块化的目的是**强封装**（限制 `reflect` 访问内部 API），而不是替代类加载器的隔离功能"，说明他关注了 JDK 的演进方向。
+:::
+
+### 4.2 追问：如何查看类是由哪个类加载器加载的？
+
+```java
+// 方法一：打印类加载器信息
+Class<?> clazz = Class.forName("com.example.Foo");
+ClassLoader loader = clazz.getClassLoader();
+System.out.println(loader);  // AppClassLoader 或自定义加载器名
+
+// 方法二：获取类加载器链路
+ClassLoader cl = clazz.getClassLoader();
+while (cl != null) {
+    System.out.println(cl);
+    cl = cl.getParent();
+}
+System.out.println("Bootstrap");  // null 表示 Bootstrap
+
+// 方法三：使用 jcmd 查看
+jcmd <pid> VM.classloader_info
+```
+
+【架构权衡】
+自定义类加载器是 Java 动态性的核心能力。从 Tomcat 的热部署到 OSGi 的模块化，从加密类加载到动态代理，都离不开自定义类加载器。但这个能力也是一把双刃剑——打破类加载器的边界意味着打破安全的防护，所以每一个打破都必须是**有意为之**，而不是随意修改。
+
+理解自定义类加载器，不只是理解 `findClass` 的写法，更是理解**Java 动态性**的边界在哪里。

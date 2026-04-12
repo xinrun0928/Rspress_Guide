@@ -1,0 +1,366 @@
+---
+title: TCC 事务原理
+description: 深度解析 TCC（Try-Confirm-Cancel）分布式事务模式的原理、执行流程、与 2PC 的区别，以及在生产环境中的应用。
+---
+
+# TCC 事务原理
+
+某电商平台的双十一订单系统，需要保证下单、扣库存、扣余额的原子性。
+
+团队最开始使用了 Seata 的 AT 模式（自动补偿型分布式事务），但在压测中发现：由于锁住了太多行，系统的并发能力大幅下降。
+
+团队改用 TCC 模式（手动补偿型分布式事务）。通过业务层面的 Try（预留资源）、Confirm（确认使用）、Cancel（释放资源），将锁的粒度从"行锁"降到了"资源预留"级别。
+
+结果：并发能力恢复到单机水平，TPS 从 500 提升到 5000。
+
+【架构权衡】
+TCC 是"业务补偿型"分布式事务，与 2PC 的"数据库锁定型"完全不同。TCC 通过业务层面的 Try-Confirm-Cancel，将分布式事务的锁从数据库层面提升到了业务层面，大大提高了并发能力。但 TCC 对业务代码有侵入性，需要每个业务操作都实现 Try-Confirm-Cancel 三个方法。
+
+---
+
+## 一、核心问题 🔴
+
+### 1.1 TCC vs 2PC
+
+```
+2PC（数据库层面）：
+├─ 通过数据库锁保证原子性
+├─ 锁粒度：行锁/表锁
+├─ 对业务代码无侵入
+├─ 缺点：锁时间长，并发受限
+└─ 代表：Seata AT 模式
+
+TCC（业务层面）：
+├─ 通过业务补偿保证原子性
+├─ 锁粒度：业务预留资源
+├─ 对业务代码有侵入
+├─ 缺点：需要实现 Try-Confirm-Cancel
+└─ 优点：锁时间短，并发能力高
+```
+
+### 1.2 TCC 的三个阶段
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      阶段一：Try（预留资源）                        │
+│                                                                  │
+│  目的：检查业务可行性，预留业务资源                              │
+│                                                                  │
+│  示例：                                                          │
+│  ├─ 订单服务：创建"待确认"订单                                  │
+│  ├─ 库存服务：冻结库存（但不真正扣减）                          │
+│  └─ 余额服务：冻结余额（但不真正扣减）                          │
+│                                                                  │
+│  特点：                                                          │
+│  ├─ 所有参与者都执行 Try                                        │
+│  ├─ 如果任何一个 Try 失败，发送 Cancel 给所有参与者            │
+│  └─ 锁粒度：冻结资源（不影响其他业务）                          │
+└─────────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼ 全部 Try 成功
+┌─────────────────────────────────────────────────────────────────┐
+│                    阶段二：Confirm（确认使用）                    │
+│                                                                  │
+│  目的：真正执行业务操作                                         │
+│                                                                  │
+│  示例：                                                          │
+│  ├─ 订单服务：确认订单，状态改为"已创建"                         │
+│  ├─ 库存服务：真正扣减被冻结的库存                               │
+│  └─ 余额服务：真正扣减被冻结的余额                              │
+│                                                                  │
+│  特点：                                                          │
+│  ├─ Confirm 操作必须幂等                                        │
+│  ├─ 如果 Confirm 失败，不断重试                                  │
+│  └─ 如果长时间无法 Confirm，进入人工处理                        │
+└─────────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼ 任意 Confirm 失败
+┌─────────────────────────────────────────────────────────────────┐
+│                    阶段三：Cancel（释放资源）                     │
+│                                                                  │
+│  目的：回滚业务操作，释放预留资源                               │
+│                                                                  │
+│  示例：                                                          │
+│  ├─ 订单服务：取消"待确认"订单                                  │
+│  ├─ 库存服务：解冻被冻结的库存                                  │
+│  └─ 余额服务：解冻被冻结的余额                                  │
+│                                                                  │
+│  特点：                                                          │
+│  ├─ Cancel 操作必须幂等                                          │
+│  ├─ 如果 Confirm 已成功，不执行 Cancel                          │
+│  └─ 如果 Cancel 失败，不断重试                                    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 二、方案对比
+
+### 2.1 TCC 的代码实现
+
+```java
+// TCC 接口定义
+@Target(ElementType.TYPE)
+@Retention(RetentionPolicy.RUNTIME)
+public @interface TccTransaction {
+}
+
+public interface TccAction {
+    // Try：预留资源
+    boolean tryAction(Context context);
+
+    // Confirm：确认使用
+    boolean confirmAction(Context context);
+
+    // Cancel：释放资源
+    boolean cancelAction(Context context);
+}
+
+// 订单服务的 TCC 实现
+@Service
+public class OrderTccAction implements TccAction {
+
+    @Autowired
+    private OrderRepository orderRepository;
+
+    @Override
+    public boolean tryAction(Context context) {
+        String xid = context.getXid();
+        String orderId = context.get("orderId");
+        BigDecimal amount = context.get("amount");
+
+        // 1. 创建"待确认"订单
+        Order order = new Order();
+        order.setId(orderId);
+        order.setAmount(amount);
+        order.setStatus(OrderStatus.PENDING);
+        order.setXid(xid);
+        orderRepository.save(order);
+
+        // 2. 记录 TCC 分支事务
+        tccLogService.log(xid, "OrderTccAction", "TRY");
+
+        return true;
+    }
+
+    @Override
+    public boolean confirmAction(Context context) {
+        String orderId = context.get("orderId");
+
+        // 确认订单：状态改为"已创建"
+        Order order = orderRepository.findById(orderId);
+        order.setStatus(OrderStatus.CREATED);
+        orderRepository.update(order);
+
+        tccLogService.log(context.getXid(), "OrderTccAction", "CONFIRM");
+        return true;
+    }
+
+    @Override
+    public boolean cancelAction(Context context) {
+        String orderId = context.get("orderId");
+
+        // 取消订单：状态改为"已取消"
+        Order order = orderRepository.findById(orderId);
+        order.setStatus(OrderStatus.CANCELLED);
+        orderRepository.update(order);
+
+        tccLogService.log(context.getXid(), "OrderTccAction", "CANCEL");
+        return true;
+    }
+}
+
+// 库存服务的 TCC 实现
+@Service
+public class InventoryTccAction implements TccAction {
+
+    @Autowired
+    private InventoryRepository inventoryRepository;
+
+    @Override
+    public boolean tryAction(Context context) {
+        String itemId = context.get("itemId");
+        int count = context.get("count");
+
+        // 冻结库存（不真正扣减）
+        // UPDATE inventory SET frozen = frozen + count WHERE id = itemId
+        int affected = inventoryRepository.freezeStock(itemId, count);
+        if (affected == 0) {
+            return false; // 库存不足，Try 失败
+        }
+
+        return true;
+    }
+
+    @Override
+    public boolean confirmAction(Context context) {
+        String itemId = context.get("itemId");
+        int count = context.get("count");
+
+        // 真正扣减冻结的库存
+        // UPDATE inventory SET frozen = frozen - count, stock = stock - count WHERE id = itemId
+        inventoryRepository.deductFrozenStock(itemId, count);
+
+        return true;
+    }
+
+    @Override
+    public boolean cancelAction(Context context) {
+        String itemId = context.get("itemId");
+        int count = context.get("count");
+
+        // 解冻库存（回滚 Try）
+        // UPDATE inventory SET frozen = frozen - count WHERE id = itemId
+        inventoryRepository.unfreezeStock(itemId, count);
+
+        return true;
+    }
+}
+```
+
+### 2.2 TCC 协调者实现
+
+```java
+// TCC 协调者（简化版）
+@Service
+public class TccCoordinator {
+
+    @Autowired
+    private List<TccAction> actions;
+
+    public boolean executeTccTransaction(String xid, Map<String, Object> params) {
+        // 阶段一：执行 Try
+        Map<String, Boolean> tryResults = new HashMap<>();
+        for (TccAction action : actions) {
+            Context context = new Context(xid, params);
+            try {
+                boolean success = action.tryAction(context);
+                tryResults.put(action.getClass().getName(), success);
+            } catch (Exception e) {
+                tryResults.put(action.getClass().getName(), false);
+            }
+        }
+
+        // 如果所有 Try 都成功，执行 Confirm
+        if (tryResults.values().stream().allMatch(r -> r)) {
+            confirmAll(xid);
+            return true;
+        } else {
+            // 任意一个 Try 失败，执行 Cancel
+            cancelAll(xid);
+            return false;
+        }
+    }
+
+    private void confirmAll(String xid) {
+        for (TccAction action : actions) {
+            Context context = loadContext(xid);
+            try {
+                action.confirmAction(context);
+            } catch (Exception e) {
+                // Confirm 失败，不断重试
+                retryLater(action, "CONFIRM", xid);
+            }
+        }
+    }
+
+    private void cancelAll(String xid) {
+        for (TccAction action : actions) {
+            Context context = loadContext(xid);
+            try {
+                action.cancelAction(context);
+            } catch (Exception e) {
+                // Cancel 失败，不断重试
+                retryLater(action, "CANCEL", xid);
+            }
+        }
+    }
+}
+```
+
+【架构权衡】
+TCC 的核心挑战是"幂等性"和"空回滚"：
+- **幂等性**：Try、Confirm、Cancel 都可能被调用多次，必须保证幂等
+- **空回滚**：Try 还没执行，Cancel 就被调用了（网络分区导致），需要处理
+
+## 三、TCC 的关键技术问题
+
+### 3.1 幂等性保证
+
+```java
+// 每个 TCC 操作都必须幂等
+@Service
+public class IdempotentInventoryTccAction implements TccAction {
+
+    @Autowired
+    private TccLogRepository tccLogRepository;
+
+    @Override
+    public boolean confirmAction(Context context) {
+        String xid = context.getXid();
+        String actionName = "InventoryTccAction";
+
+        // 检查是否已经 Confirm 过（幂等性保证）
+        if (tccLogRepository.exists(xid, actionName, "CONFIRM")) {
+            return true; // 幂等：已经 Confirm 过，直接返回成功
+        }
+
+        // 执行真正的 Confirm
+        String itemId = context.get("itemId");
+        int count = context.get("count");
+        inventoryRepository.deductFrozenStock(itemId, count);
+
+        // 记录 Confirm 日志
+        tccLogRepository.save(xid, actionName, "CONFIRM");
+
+        return true;
+    }
+}
+```
+
+### 3.2 空回滚处理
+
+```java
+// 空回滚：Try 还没执行，Cancel 就被调用了
+@Override
+public boolean cancelAction(Context context) {
+    String xid = context.getXid();
+    String actionName = "InventoryTccAction";
+
+    // 检查 Try 是否执行过
+    if (!tccLogRepository.exists(xid, actionName, "TRY")) {
+        // Try 未执行，这是空回滚
+        // 记录日志，但不做任何操作
+        tccLogRepository.save(xid, actionName, "CANCEL_EMPTY");
+        return true;
+    }
+
+    // Try 执行过，执行真正的 Cancel
+    String itemId = context.get("itemId");
+    int count = context.get("count");
+    inventoryRepository.unfreezeStock(itemId, count);
+
+    tccLogRepository.save(xid, actionName, "CANCEL");
+    return true;
+}
+```
+
+## 四、工程代价评估
+
+| 维度 | 评估 |
+| --- | --- |
+| **实现复杂度** | 高（需要实现 Try-Confirm-Cancel） |
+| **业务侵入性** | 高（每个业务操作都要实现 TCC 接口） |
+| **锁粒度** | 细（业务层面，可控） |
+| **并发能力** | 高（无数据库锁） |
+| **一致性** | 最终一致 |
+| **补偿可靠性** | 高（Try-Confirm-Cancel 三阶段） |
+| **适用场景** | 跨服务、跨数据库的分布式事务 |
+
+## 五、落地 Checklist
+
+- [ ] **业务改造**：识别需要分布式事务的业务场景
+- [ ] **TCC 实现**：为每个参与者实现 Try-Confirm-Cancel
+- [ ] **幂等设计**：每个 TCC 操作都要幂等
+- [ ] **空回滚处理**：处理 Try 未执行但 Cancel 被调用的情况
+- [ ] **重试机制**：Confirm/Cancel 失败后的重试策略
+- [ ] **监控告警**：监控超时未 Confirm/Cancel 的事务
+- [ ] **人工补偿**：长时间未完成的事务的人工处理流程

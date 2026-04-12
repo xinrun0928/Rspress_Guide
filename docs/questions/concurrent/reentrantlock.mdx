@@ -1,0 +1,273 @@
+---
+title: ReentrantLock 公平锁与非公平锁
+description: 从 AQS 源码出发，深入剖析公平锁和非公平锁的实现差异、CAS 竞争模型、公平性的工程权衡，以及在生产环境中的正确选择策略。
+---
+
+# ReentrantLock 公平锁与非公平锁
+
+候选人小郑在面试 B站 P6 时，面试官问道：
+
+"ReentrantLock 的公平锁和非公平锁有什么区别？默认是哪种？"
+
+小郑说："非公平锁不排队，公平锁排队..."面试官追问："为什么默认是非公平锁？它具体是怎么实现的？"
+
+小郑答不上来。面试官继续："非公平锁有饥饿风险吗？什么场景下应该选公平锁？"
+
+小郑彻底卡住了...
+
+## 一、核心问题：公平锁 vs 非公平锁 🔴
+
+### 1.1 问题拆解
+
+```
+第一层：实现差异（怎么区分？）
+  "公平锁和非公平锁在 tryAcquire 中的实现有什么区别？"
+  考察点：hasQueuedPredecessors() 检查、CAS 插队
+
+第二层：性能对比（哪个快？）
+  "为什么非公平锁吞吐量更高？公平锁的代价是什么？"
+  考察点：唤醒延迟、队列开销、插队策略
+
+第三层：饥饿风险（会饿吗？）
+  "非公平锁会导致线程饥饿吗？JDK 是怎么处理的？"
+  考察点：公平性的真正含义、clh 队列的 FIFO
+
+第四层：选型决策（怎么选？）
+  "生产环境中应该选哪种？为什么很多团队用非公平锁？"
+  考察点：业务特征、性能需求、死锁风险
+```
+
+### 1.2 ❌ 错误示范
+
+**候选人原话 A**："公平锁和非公平锁的性能差很多，非公平锁快很多。"
+
+**问题诊断**：这个说法不完全准确。在低竞争场景下，两者性能差距很小。在高竞争场景下，非公平锁的"插队"优势才明显（因为新线程可能趁老线程还没从队列头部唤醒时就抢到锁）。
+
+**候选人原话 B**："公平锁不会饥饿，所以应该总用公平锁。"
+
+**问题诊断**：公平锁的"公平"是指**请求顺序（FIFO）**，但它不能防止饥饿——如果新请求的到达速率持续超过队列中线程的释放速率，队列中的线程仍然可能长期等待。实际上 JDK 的公平锁实现已经经过优化，饥饿风险极低。
+
+### 1.3 标准回答
+
+#### P5 级别：核心差异
+
+> **默认选择**：
+>
+> `ReentrantLock` 的默认构造函数创建**非公平锁**：
+>
+> ```java
+> public ReentrantLock() {
+>         sync = new NonfairSync();  // 默认非公平
+>     }
+>
+>     public ReentrantLock(boolean fair) {
+>         sync = fair ? new FairSync() : new NonfairSync();
+>     }
+> ```
+>
+> **tryAcquire 的核心差异**：
+>
+> ```java
+> // 非公平锁（NonfairSync）
+> protected final boolean tryAcquire(int acquires) {
+>     // 直接 CAS，不检查队列
+>     if (compareAndSetState(0, acquires)) {
+>         setExclusiveOwnerThread(Thread.currentThread());
+>         return true;
+>     }
+>     return nonfairTryAcquire(acquires);
+> }
+>
+> // 公平锁（FairSync）
+> protected final boolean tryAcquire(int acquires) {
+>     if (getState() == 0) {  // 先检查 state
+>         if (!hasQueuedPredecessors()) {  // 再检查队列
+>             if (compareAndSetState(0, acquires)) {
+>                 setExclusiveOwnerThread(Thread.currentThread());
+>                 return true;
+>             }
+>         }
+>     }
+>     return nonfairTryAcquire(acquires);
+> }
+> ```
+>
+> **关键区别**：`hasQueuedPredecessors()` 检查 CLH 队列中是否有等待时间更长的线程：
+>
+> ```java
+> public final boolean hasQueuedPredecessors() {
+>     Node t = tail;
+>     Node h = head;
+>     Node s;
+>     return h != t && ((s = h.next) == null || s.thread != Thread.currentThread());
+>     // 返回 true = 有更早的等待者 = 必须排队
+> }
+> ```
+
+#### P6 级别：性能差异的根源
+
+> **非公平锁的"插队"优势**：
+>
+> 当一个线程释放锁后，下一个时间片可能被新来的请求线程抢到（而不是等待队列头部的线程）。这避免了"刚释放-新请求-唤醒-等待时间片"这一长串延迟。
+>
+> ```mermaid
+> sequenceDiagram
+>     participant T1 as 线程A(持有锁)
+>     participant T2 as 线程B(队列头部等待)
+>     participant T3 as 线程C(新请求)
+>
+>     T1->>T1: 释放锁
+>     Note over T3: lock() 调用，CAS 成功！<br/>插队成功
+>     T3->>T3: 获取锁，执行业务
+>
+>     Note over T2: B 在 AQS 队列中等待，<br/>等待被唤醒
+> ```
+>
+> **公平锁的代价**：
+>
+> 公平锁多了 `hasQueuedPredecessors()` 检查（至少一次额外的 volatile 读取和判断），在高竞争场景下，公平锁的吞吐量约为非公平锁的 80%。
+>
+> **为什么非公平锁吞吐量更高**：
+>
+> 1. **减少唤醒延迟**：被唤醒的线程从 park 到真正执行需要 CPU 调度（新线程可能在这个窗口内插队）
+> 2. **减少上下文切换**：如果新线程能直接 CAS 成功，就不需要挂起线程（无需 OS 调度介入）
+> 3. **减少队列操作**：新线程直接从 tail CAS 入队，不需要额外的 predecessor 检查
+
+#### P7 级别：饥饿风险与工程权衡
+
+> **非公平锁的饥饿问题**：
+>
+> 理论上，非公平锁可能导致饥饿——如果新请求持续到达，老线程可能一直得不到锁。但在实践中，JDK 的 CLH 队列是严格的 FIFO，且 `hasQueuedPredecessors()` 只检查 head 的下一个节点，**非 head 的新请求必须排队**。
+>
+> 真正的饥饿风险极低，因为锁持有时间通常很短（毫秒级），而新请求到达的速率不可能持续超过释放速率。
+>
+> **公平锁的适用场景**：
+>
+> | 场景 | 推荐 | 原因 |
+> | --- | --- | --- |
+> | 高并发 Web 服务 | 非公平锁 | 吞吐量优先 |
+> | 数据库连接池 | 公平锁 | 保证 FIFO，避免连接耗尽 |
+> | 线程池 worker 调度 | 非公平锁 | 吞吐量优先 |
+> | FIFO 任务调度 | 公平锁 | 保证请求顺序 |
+> | 限流器 | 非公平锁 | 性能优先 |
+>
+> **一个反直觉的结论**：
+>
+> 即使在需要公平性的场景下，很多专家也推荐用非公平锁 + 额外的公平机制（如票据队列、优先级队列）来实现，而非直接用公平锁。这是因为：
+>
+> 1. 公平锁的实现复杂（hasQueuedPredecessors + 队列操作）
+> 2. 在需要强公平的场景下，公平锁的性能仍然可能不够
+
+【面试官心理】
+这道题我能问到 P7 级别，是因为公平/非公平锁涉及性能、公平性、系统设计的权衡。能说出非公平锁的"插队"时机和公平锁代价的候选人说明他理解了原理。能正确选择公平/非公平锁的候选人说明他有工程判断力。
+
+### 1.4 追问升级
+
+**追问 1：ReentrantLock 的可重入性是怎么实现的？**
+
+> 通过 AQS 的 `state`（重入计数）和 `exclusiveOwnerThread`（持有线程）实现：
+>
+> ```java
+> // tryAcquire 中
+> if (getState() == 0) {
+>     // state=0，无锁 → 尝试获取
+>     if (compareAndSetState(0, acquires)) {
+>         setExclusiveOwnerThread(Thread.currentThread());
+>         return true;
+>     }
+> } else if (getExclusiveOwnerThread() == Thread.currentThread()) {
+>     // 同一线程重入：state++
+>     int nextc = getState() + acquires;
+>     setState(nextc);
+>     return true;
+> }
+> return false;  // 其他线程持有，不能重入
+>
+> // tryRelease 中
+> int nextc = getState() - releases;
+> if (getExclusiveOwnerThread() != Thread.currentThread()) {
+>     throw new IllegalMonitorStateException();
+> }
+> if (nextc == 0) {
+>     setExclusiveOwnerThread(null);  // 完全释放
+>     setState(nextc);
+>     return true;
+> }
+> setState(nextc);  // 重入计数 -1
+> return false;  // 未完全释放
+> ```
+
+**追问 2：读写锁的公平性是怎么实现的？**
+
+> `ReentrantReadWriteLock` 对读锁和写锁分别应用公平/非公平策略：
+>
+> - **公平读写锁**：等待队列中的请求按 FIFO 顺序执行（读锁可能需要等待写锁释放）
+> - **非公平读写锁**：读锁可以"插队"（新来的读锁请求可以在队列中已等待的写锁前获取），只要当前没有活跃的写锁
+>
+> 非公平读写锁可能导致"写饥饿"（持续有新读锁请求，写锁长期等待），这是读写锁设计中一个经典权衡。
+
+## 二、生产避坑 🟡
+
+### 2.1 非公平锁在长临界区的问题
+
+```java
+ReentrantLock lock = new ReentrantLock();  // 非公平
+
+// 线程 A 持有锁，执行业务
+lock.lock();
+try {
+    Thread.sleep(1000);  // 长时间持有锁
+} finally {
+    lock.unlock();
+}
+
+// 在 A 持有锁期间，大量新线程到达
+// 它们可能插队（如果 A 释放锁时恰好有新线程在 CAS）
+// 但如果 A 释放锁时队列头部没有活跃线程，CLH 队列中的线程会被公平唤醒
+```
+
+**问题**：如果临界区很长，非公平锁的插队优势不明显，反而可能因为队列调度不公平导致某些线程等待过长。
+
+### 2.2 在 tryLock() 中使用公平锁的坑
+
+```java
+ReentrantLock fairLock = new ReentrantLock(true);
+
+// 在公平锁中使用 tryLock()
+if (fairLock.tryLock()) {  // tryLock() 不遵守公平性——它不检查 hasQueuedPredecessors()
+    try {
+>            // 业务
+>        } finally {
+>            fairLock.unlock();
+>        }
+>    }
+```
+
+**注意**：`tryLock()` 和 `tryLock(timeout)` **不遵守公平性**——它们不检查 `hasQueuedPredecessors()`。这是设计决策，目的是让 `tryLock()` 在超时时间内尽快获取锁。
+
+## 三、公平锁的实现细节
+
+### 3.1 hasQueuedPredecessors 的边界条件
+
+> ```java
+> public final boolean hasQueuedPredecessors() {
+>     Node t = tail;
+>     Node h = head;
+>     Node s;
+>     return h != t &&  // 队列非空
+>            ((s = h.next) == null ||  // 正在入队（head 和 tail 都在更新中）
+>             s.thread != Thread.currentThread());  // 头部不是当前线程
+> }
+> ```
+>
+> - `h != t`：队列非空
+> - `s == null`：tail 正在更新中（CAS 入队过程中的短暂状态），返回 true（保守判断：有竞争）
+> - `s.thread != Thread.currentThread()`：head 的后继不是当前线程，说明有更早的等待者
+
+:::tip 💡
+面试加分点：能说出"JDK 12 引入了 `getQueuedLength()` 方法可以获取等待队列的长度，`ReentrantLock.getWaitingThreads()` 可以获取等待队列中的线程集合"，说明他对 JUC 的演进有跟进。
+:::
+
+:::warning ⚠️
+面试陷阱：被问到"非公平锁会不会导致活锁"，很多人会说"不会"。实际上，在极端情况下（非公平锁 + 高竞争 + 极短的临界区），可能出现类似活锁的情况——所有线程都在不断插队和失败，但没有人能真正获取锁。现实中几乎不会发生。
+:::

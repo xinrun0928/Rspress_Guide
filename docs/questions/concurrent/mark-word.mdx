@@ -1,0 +1,200 @@
+---
+title: 对象头与 Mark Word
+description: 从对象内存布局出发，深入剖析 Mark Word 的数据结构设计、64位 JVM 的 bit 分布、不同锁状态下的状态转换，以及 Klass Pointer 压缩指针的工作原理。
+---
+
+# 对象头与 Mark Word
+
+候选人小林在面试美团 P7 时，面试官问道：
+
+"你知道 Java 对象的内存布局吗？Mark Word 在哪里，存储了什么？"
+
+小林说："对象头包含 Mark Word 和类型指针..."面试官追问："Mark Word 在 64 位 JVM 中占多少字节？不同锁状态下它的内容怎么变化？"
+
+小林答不上来了。面试官继续："对象头中的 Klass Pointer 在什么情况下会被压缩？压缩后占多少字节？"
+
+小林彻底卡住...
+
+## 一、核心问题：对象头与 Mark Word 🔴
+
+### 1.1 问题拆解
+
+```
+第一层：对象内存布局（是什么？）
+  "Java 对象的内存布局由哪几部分组成？"
+  考察点：对象头、实例数据、对齐填充
+
+第二层：Mark Word 数据结构（存什么？）
+  "Mark Word 在不同锁状态下存储的内容是什么？"
+  考察点：64位 bit 分布、锁状态与字段复用
+
+第三层：Klass Pointer（类型信息在哪？）
+  "对象头中的类型指针指向哪里？压缩指针是什么？"
+  考察点：Metaspace、类元数据、OOP-Klass 模型
+
+第四层：内存对齐（为什么？）
+  "对象为什么要对齐？对齐会浪费空间吗？"
+  考察点：缓存行、false sharing、性能优化
+```
+
+### 1.2 ❌ 错误示范
+
+**候选人原话 A**："对象头就是 Mark Word 和类型指针，每个对象都是 16 字节。"
+
+**问题诊断**：对象头大小取决于 JVM 配置。开启压缩指针（`-XX:+UseCompressedOops`，默认开启）时， Klass Pointer 是 4 字节；关闭时是 8 字节。Mark Word 始终是 8 字节。所以对象头可能是 12 字节（压缩指针）或 16 字节（未压缩）。
+
+**候选人原话 B**："Mark Word 存储的是对象的 hashCode。"
+
+**问题诊断**：hashCode 只是 Mark Word 在无锁状态下的一种存储内容。在偏向锁、轻量锁、重量锁状态下，hashCode 字段被不同数据覆盖（线程ID、Lock Record 指针、ObjectMonitor 指针）。
+
+### 1.3 标准回答
+
+#### P5 级别：对象内存布局
+
+> **Java 对象的内存布局**（以 64位 JVM 为例，开启压缩指针）：
+>
+> ```
+> [Mark Word: 8 bytes][Klass Pointer: 4 bytes][Padding: 4 bytes]
+> [Instance Data: variable]
+> [Padding: to 8-byte boundary]
+> ```
+>
+> **1. Mark Word（8 字节 = 64 bits）**：存储对象的运行时数据，包括哈希码、GC 分代年龄、锁状态等信息。**Mark Word 是对象头的核心**，它的内容随着锁状态变化而动态覆盖。
+>
+> **2. Klass Pointer（4 字节）**：指向类元数据（Klass）的指针，存储该对象的类型信息。开启压缩指针时为 4 字节（最大寻址 32GB 堆），关闭时为 8 字节。
+>
+> **3. Instance Data（实例数据）**：父类中定义的实例字段 + 子类定义的实例字段，按 4/8 字节对齐。
+>
+> **4. Padding（对齐填充）**：JVM 要求对象大小是 8 字节的倍数，不足时填充。
+
+#### P6 级别：Mark Word 详细设计
+
+> **Mark Word 的 64 位 bit 布局**：
+>
+> | 锁状态 | Mark Word 内容（从高位到低位） | lock bits |
+> | --- | --- | --- |
+> | **无锁** | `[unused:25][hashcode:31][age:4][biased:0][01]` | `01` |
+> | **偏向锁** | `[thread:54][epoch:2][age:4][biased:1][01]` | `01` |
+> | **轻量锁** | `[ptr to displaced header:62][00]` | `00` |
+> | **重量锁** | `[ptr to monitor:62][10]` | `10` |
+> | **GC 标记** | `[__:62][11]` | `11` |
+>
+> **hashcode 的存储**：
+>
+> 对象第一次调用 `hashCode()`（`System.identityHashCode(obj)` 或 `obj.hashCode()`）时，JVM 将 31 位的 hashCode 写入 Mark Word 的 hashcode 字段。这个值**一旦计算，永不改变**（除非对象被 GC）。
+>
+> **关键陷阱**：如果对象已经计算过 hashcode，则无法进入偏向锁状态——因为 Mark Word 的偏向锁字段（thread ID）被 hashcode 占用了。
+
+#### P7 级别：OOP-Klass 模型与压缩指针
+
+> **OOP-Klass 模型**：
+>
+> JVM 使用了**两套类元数据模型**：
+> - **OOP（Ordinary Object Pointer）**：描述对象的实例数据，即我们在代码中操作的对象引用
+> - **Klass**：描述类的元数据（方法表、虚函数表、静态字段等），存在于 Metaspace 中
+>
+> 对象头中的 **Klass Pointer** 指向 Metaspace 中的 Klass 对象。
+>
+> ```
+> 栈上的局部变量表          对象头中的 Klass Pointer     Metaspace
+>     │                          │                         │
+>     │                          │                         │
+>     ▼                          ▼                         ▼
+>   [ref] ──────────────► [MarkWord][Klass*] ──────► [Klass]
+>   (oop)                   对象头                    [方法表]
+>                                                    [虚函数表]
+>                                                    [静态字段]
+> ```
+>
+> **压缩指针（Compressed OOP）**：
+>
+> 当堆大小 `< 32GB` 时，JVM 默认开启压缩指针（`-XX:+UseCompressedOops`）。指针从 8 字节压缩到 4 字节，节省内存。
+>
+> **工作原理**：
+>
+> 压缩指针存储的是对象的**相对地址**（偏移量），而非绝对地址。解压时：`实际地址 = 压缩指针 << 3 + NMS_base`（Narrow Klass Base Address）。
+>
+> 压缩 3 位是因为 32GB 堆按 8 字节对齐后，任意对象的地址低 3 位都是 0（因为对象头按 8 字节对齐）。这 3 位正好可以用于其他用途。
+>
+> 当堆 `>= 32GB` 时，无法用 4 字节编码，压缩指针失效，必须关闭（`-XX:-UseCompressedOops`），每个对象引用占 8 字节。
+
+【面试官心理】
+这道题我通常用来探测候选人对 JVM 底层结构的理解程度。Mark Word 的 bit 分布是 JVM 的核心数据结构，理解了它就能理解 synchronized 的所有优化原理。能说清 OOP-Klass 分离设计的候选人，说明他看过《深入理解JVM虚拟机》或 JVM 源码，这是 P6/P7 的标志性知识。
+
+### 1.4 追问升级
+
+**追问 1：为什么 JVM 要用 OOP 和 Klass 两套模型？**
+
+> 这是 HotSpot 的设计决策：
+> - **Klass** 包含类的方法、字节码、常量池等信息，这些是**类的元数据**，不需要在每次对象访问时检查
+> - **OOP** 只包含对象的实例数据（字段值），作为普通对象访问
+> - 通过分离，JVM 可以用普通 C++ 对象（OOP）描述实例，用单独的 Klass 描述类型元数据，职责清晰
+> - 一些 JVM（如 JRocket）使用不同设计，但 HotSpot 的 OOP-Klass 模型被广泛研究和引用
+
+**追问 2：数组的对象头和普通对象有什么区别？**
+
+> 数组的对象头比普通对象多了一个 **length 字段**：
+>
+> ```
+> [Mark Word: 8 bytes][Klass Pointer: 4/8 bytes][Array Length: 4 bytes][Padding]
+> ```
+>
+> 这个设计使得 `array.length` 操作无需去 Klass 中查找，直接从对象头读取，性能最优。
+
+## 二、缓存行与对象对齐 🟡
+
+### 2.1 缓存行的影响
+
+> CPU 缓存以**缓存行（Cache Line）**为单位工作，通常是 64 字节。两个频繁修改的 volatile 变量如果在同一个缓存行中，一个修改会导致另一个的缓存行失效——这就是**伪共享（False Sharing）**。
+>
+> ```java
+> // 伪共享示例
+> class FalseSharingDemo {
+>     volatile long x;  // 如果 x 和 y 在同一个缓存行
+>     volatile long y;  // 修改 y 导致 x 的缓存行失效
+> }
+> ```
+>
+> `LongAdder` 的 Cell 数组通过 `@sun.misc.Contended` 注解（或手动 padding）让每个 Cell 占据独立缓存行：
+>
+> ```java
+> @Contended
+> static final class Cell {
+>     volatile long value;
+>     Cell(long x) { value = x; }
+>     // ...
+> }
+> ```
+
+### 2.2 对象对齐的好处
+
+> **空间换时间的权衡**：
+> - 对象按 8 字节对齐后，Mark Word、实例数据的起始地址都是 8 的倍数
+> - 对象引用访问时，CPU 可以直接用 `[base + offset]` 的方式计算地址，无需额外处理
+> - GC 标记阶段，对象头固定偏移也简化了遍历逻辑
+
+## 三、生产避坑
+
+### 3.1 压缩指针与 32GB 边界
+
+**场景**：JVM 堆配置为 30GB 正常运行，配置为 33GB 后性能急剧下降。
+
+**根因**：堆超过 32GB 时，压缩指针失效（因为 4 字节只能寻址 32GB），对象引用从 4 字节膨胀到 8 字节。同等对象数量下，内存占用增加约 50%~100%（引用本身 + 引用指向的对象内部对齐）。
+
+**解决**：如果内存充足，优先使用 31GB（`31 * 1024^3`）而不是 32GB；或接受压缩指针失效并配置更大堆。
+
+### 3.2 大对象直接进入老年代
+
+**场景**：大对象（如 10MB 的数组）直接分配到老年代，导致频繁 Full GC。
+
+**根因**：大对象直接进入老年代的阈值（`PretenureSizeThreshold`）默认为 0，即所有对象优先在 Eden 区分配。如果 Eden 放不下大对象，触发 Young GC。
+
+**解决**：通过 `-XX:PretenureSizeThreshold=*` 设置大对象阈值，或使用对象池复用大对象。
+
+:::tip 💡
+面试加分点：能说出"JDK 8 的 String.intern() 在不同区域的实现差异（永久代 vs 元空间），以及字符串常量池的位置变化"，说明他对 JDK 8 的核心变更有深入理解。
+:::
+
+:::warning ⚠️
+面试陷阱：被问到"一个对象有 hashCode 后还能加偏向锁吗"，很多人会说"能"。错！hashCode 存储在 Mark Word 中，与偏向锁字段重叠。一旦计算过 hashCode，Mark Word 中已存储了 31 位数据，无法同时存储偏向线程信息，该对象无法偏向。
+:::

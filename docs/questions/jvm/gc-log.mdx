@@ -1,0 +1,260 @@
+---
+title: GC 日志解读
+description: 从生产事故中的 GC 日志出发，深入剖析各款垃圾收集器的日志格式、日志参数、停顿原因分析，以及如何通过 GC 日志定位性能瓶颈。
+---
+
+# GC 日志解读
+
+2024年双十一前两周，我们订单服务的 P99 响应时间从 8ms 飙升到 350ms，DBA、网络、基础设施全部排查了一遍，没问题。
+
+最后是我看了 GC 日志，发现 Young GC 的频率从每分钟 3 次变成了每分钟 15 次，每次停顿时间从 50ms 飙升到 200ms。
+
+问题很简单：促销预热期间用户行为数据缓存失效，导致大量短期对象涌入堆区，Young GC 被击穿了。
+
+如果当时工程师能读懂 GC 日志，这个问题的排查时间可以从 3 小时缩短到 20 分钟。
+
+## 一、GC 日志基础参数 🔴
+
+### 1.1 日志开关参数
+
+```bash
+# 基础开关
+-XX:+PrintGCDetails          # 详细模式（推荐生产开启）
+-XX:+PrintGCDateStamps       # 日期时间戳（可读性更好）
+-XX:+PrintGCTimeStamps       # 从 JVM 启动的相对时间戳
+-XX:+PrintHeapAtGC           # GC 前后打印堆内存使用
+-XX:+PrintTenuringDistribution  # 对象晋升年龄分布
+
+# 输出到文件（防止 stdout 被撑满）
+-Xloggc:/var/log/java/gc.log
+-XX:+UseGCLogFileRotation    # 滚动日志
+-XX:NumberOfGCLogFiles=10    # 保留 10 个文件
+-XX:GCLogFileSize=50m        # 每个文件最大 50MB
+```
+
+:::warning ⚠️
+GC 日志是排查 GC 问题的第一手资料。生产环境**必须开启** GC 日志，但不要开启过于冗余的参数（如 `-XX:+PrintReferenceGC`，会产生海量日志）。推荐组合：`-XX:+PrintGCDetails -XX:+PrintGCDateStamps -Xloggc:/var/log/java/gc.log`。
+:::
+
+### 1.2 GC 日志格式解析
+
+#### Serial GC 日志（ParNew/CMS）
+
+```
+2024-11-10T02:15:32.156+0800: 12345.789: [GC (Allocation Failure)
+  [ParNew: 1024K->128K(1024K), 0.0523145 secs]
+  2056K->1248K(4096K), 0.0528912 secs]
+  [Times: user=0.10 sys=0.01, real=0.05 secs]
+```
+
+逐段解析：
+
+| 字段 | 含义 |
+| --- | --- |
+| `2024-11-10T02:15:32.156+0800` | GC 发生时间 |
+| `12345.789` | JVM 启动后的相对时间（秒） |
+| `GC` | GC 类型（GC = Young GC，Full GC = Full GC） |
+| `Allocation Failure` | 触发原因（Eden 区分配失败） |
+| `ParNew: 1024K->128K(1024K)` | ParNew 区：GC 前占用 -> GC 后占用（总容量） |
+| `2056K->1248K(4096K)` | 整个 Young 区：GC 前 -> GC 后（总容量） |
+| `0.0528912 secs` | GC 总耗时 |
+| `user=0.10 sys=0.01, real=0.05` | user=CPU用户态耗时，sys=内核态耗时，real=墙钟时间 |
+
+**关键点**：当 `real > user + sys` 时，说明 GC 线程在等待其他资源（如 I/O 或锁竞争）。
+
+#### G1 日志格式
+
+```
+2024-11-10T02:15:32.156+0800: [GC pause (G1 Evacuation Pause) (young), 0.0482314 secs]
+  [Eden: 512M->0.0B(512M)]
+  [Survivor: 64M->128M(128M)]
+  [Humongous Regions: 0->0]
+  [Heap: 2048M->1792M(4096M)]
+  [Root Region Scan Time: 0.2ms]
+  [Update RS Time: 1.5ms]
+  [Scan RS Time: 0.8ms]
+  [Code Root Fixup: 0.1ms]
+  [Code Root Purge: 0.0ms]
+  [Clear CT: 0.3ms]
+  [Expand Heap: 0.0ms]
+  [SSS: 0.0ms]
+```
+
+G1 日志的分阶段时间拆解是调优的宝藏：
+
+- **Root Region Scan**：扫描 GC Roots 引用，发生在并发阶段之后
+- **Update RS / Scan RS**：更新/扫描 Remembered Set，G1 的核心开销
+- **Object Copy**：对象复制阶段，这是 GC 停顿的主体
+
+#### ZGC 日志格式
+
+```
+[2024-11-10T02:15:32.156] GC(12345) Garbage Collection
+  Collection Set: 8.0GB
+  Healthy: 6.2GB (77.5%)
+  Start: 2024-11-10T02:15:32.156
+  Finish: 2024-11-10T02:15:32.204
+  Runtime: 48ms
+ gc-pause(Stall) 48ms
+```
+
+ZGC 的日志相对简洁，因为大部分工作都在并发阶段完成了。
+
+## 二、GC 日志核心指标分析 🟡
+
+### 2.1 Young GC 分析
+
+```
+# 从日志中提取关键指标
+GC频率 = Young GC 总次数 / 运行时间
+GC耗时 = sum(各次 Young GC 耗时) / 总次数
+对象晋升率 = 晋升到老年代的对象大小 / Eden 区总大小
+```
+
+**危险信号**：
+
+| 指标 | 正常范围 | 危险信号 |
+| --- | --- | --- |
+| Young GC 频率 | 1~5 次/分钟 | > 10 次/分钟 |
+| Young GC 耗时 | < 100ms | > 200ms |
+| 晋升率 | < 10% | > 30% |
+
+### 2.2 Full GC 分析
+
+Full GC 日志是最需要关注的，因为停顿时间通常最长：
+
+```
+2024-11-10T02:20:11.234+0800: 12624.889: [Full GC (Allocation Failure)
+  [CMS: 3072M->2816M(4096M), 3.2341234 secs]
+  4096M->1024M(4096M), 3.2345678 secs]
+  [Times: user=12.10 sys=0.50, real=3.23 secs]
+```
+
+这个 Full GC 持续了 3.2 秒，已经会严重影响服务响应。
+
+**CMS Full GC 的原因诊断**：
+
+- **concurrent mode failure**：CMS 并发阶段还没完成，Old 区就满了
+- **promotion failed**：Young GC 晋升时，Old 区没有足够连续空间
+- **OOM**：真正的内存不足
+
+### 2.3 GC 日志中的隐藏陷阱
+
+```bash
+# 常见误区：只关注 GC 耗时，不关注 GC 频率
+```
+
+**场景还原**：有个工程师排查了一个月的 GC 问题，盯着 GC 日志里的单次停顿时间，但始终没发现真正的问题——GC 频率从每小时 10 次增加到了每小时 200 次。
+
+单次停顿没问题，但频率增加 20 倍意味着**吞吐量损失了 95%**。
+
+真正要看的指标是**GC 时间占比**：
+
+```
+GC 时间占比 = (Young GC 耗时 + Full GC 耗时) / 总运行时间
+目标：< 5%
+```
+
+## 三、生产 GC 日志分析实战 🟡
+
+### 3.1 常见问题日志识别
+
+**问题一：对象晋升过早**
+
+```
+[ParNew: 9216K->9216K(9216K), 0.0000000 secs]
+```
+
+Eden 区满了，但一个对象都没回收掉，全部晋升 Survivor 区或 Old 区。这说明**对象的生命周期比预想的要长**，或者 Survivor 区太小导致对象直接晋升 Old 区。
+
+**问题二：Old 区持续增长**
+
+```
+2024-11-10T02:00:00: [CMS-initial-mark: 2048M->2048M(4096M)]
+2024-11-10T02:10:00: [CMS-initial-mark: 2400M->2400M(4096M)]
+2024-11-10T02:20:00: [CMS-initial-mark: 2800M->2800M(4096M)]
+```
+
+Old 区使用量在持续增长，说明**老年代对象的生产速度 > 回收速度**，需要排查是否有内存泄漏或短期对象误入老年代。
+
+**问题三：Humongous 对象过多**
+
+```
+[GC pause (G1 Evacuation Pause) (young)
+  [Eden: 512M->0.0B(512M)]
+  [Humongous Regions: 100M->100M]  ← Humongous 占用过高
+```
+
+Humongous 对象（超过 Region 50% 大小的对象）在 G1 中回收优先级低，容易导致 Old 区碎片化。
+
+### 3.2 日志分析工具
+
+| 工具 | 适用场景 | 优缺点 |
+| --- | --- | --- |
+| **gceasy.io** | 在线分析，上传 GC 日志文件 | 可视化好，支持趋势图，但需要上传日志 |
+| **GCViewer** | 本地分析，小文件 | 开源免费，但界面较老 |
+| **Arthas** | 生产在线分析 | 不需要上传日志，但功能较简单 |
+| **IBM GC & Memory Visualizer** | 企业级分析 | 功能最全，但学习成本高 |
+
+:::tip 💡
+面试加分点：能说出"通过 gceasy.io 分析 GC 日志，发现 GC 时间占比从 3% 飙升到 25%，进而定位到代码中存在大量 `new Byte[1024 * 1024]` 的临时缓冲区申请"，说明他不仅会看日志，还有实际的排查经验。
+:::
+
+## 四、GC 日志与调优闭环 🟢
+
+### 4.1 日志驱动的调优流程
+
+```
+日志采集 → 指标提取 → 问题定位 → 参数调整 → 验证回归
+```
+
+**Step 1：提取关键指标**
+
+```bash
+# 统计 Young GC 次数和总耗时
+grep "GC (Allocation Failure)" gc.log | wc -l
+grep "GC (Allocation Failure)" gc.log | awk '{sum+=$NF} END {print sum}'
+
+# 统计 Full GC 次数
+grep "Full GC" gc.log | wc -l
+
+# 提取 GC 耗时柱状图
+grep "real=" gc.log | awk -F'real=' '{print $2}' | awk '{print $1}' | sort -n
+```
+
+**Step 2：判断调优方向**
+
+| GC 日志特征 | 调优方向 |
+| --- | --- |
+| Young GC 频繁，Eden 使用率高 | 增大 Eden 区，降低对象晋升年龄 |
+| Full GC 频繁，CMS/Old 增长快 | 排查内存泄漏或调整 Old 区比例 |
+| GC 耗时长，但频率不高 | 优化 GC 参数（增加线程数、调整 Region 大小） |
+| 对象晋升率高 | 调整 Survivor 区大小（`-XX:SurvivorRatio`） |
+
+### 4.2 调优案例
+
+**案例：G1 调优**
+
+```
+# 原始参数
+-Xmx8g -Xms8g -XX:+UseG1GC
+
+# 现象
+Young GC 频率：每分钟 8 次，每次 80ms
+Mixed GC 频率：每小时 2 次，每次 400ms
+
+# 调优后
+-Xmx8g -Xms8g -XX:+UseG1GC -XX:G1HeapRegionSize=8m \
+  -XX:MaxGCPauseMillis=100 -XX:G1NewSizePercent=30
+
+# 效果
+Young GC 频率：每分钟 4 次，每次 40ms
+Mixed GC 频率：每小时 1 次，每次 150ms
+```
+
+:::warning ⚠️
+GC 调优是一个反复验证的过程。**不要同时修改多个参数**，因为无法判断哪个参数起了作用。每次只改一个参数，观察 GC 日志的变化，再决定下一步。
+:::
+
+【架构权衡】
+GC 日志分析是 JVM 调优的第一步，但日志只是症状，不是病因。真正的高手会从 GC 日志出发，反推到代码层面——是哪个数据结构的生命周期设计不合理？是哪个缓存没有设置过期时间？是哪个对象池泄漏了？GC 调优的终点不是参数，而是代码。

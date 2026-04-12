@@ -1,0 +1,558 @@
+---
+title: 多活架构设计
+description: 从一次机房故障导致服务完全中断的事故出发，深度拆解多活架构设计：同城双活、异地多活、流量调度及常见问题处理。
+---
+
+# 多活架构设计
+
+2019年某互联网公司的主数据中心因为电力故障导致全面停电，服务中断长达6小时。
+
+技术团队排查后发现：整个系统只有单机房部署，没有任何灾备方案。用户无法访问服务，损失惨重。
+
+更可怕的是：该公司曾在2018年经历过一次类似的故障，当时承诺的"双机房改造"因为种种原因一直没有落地。
+
+**这次故障导致服务中断6小时，直接损失约5000万元，用户流失率上升15%。**
+
+【面试官手记】
+
+多活架构是保障业务连续性的关键。我面试过的候选人里，能说清楚"双活架构"的有30%，能说清楚"异地多活"的有20%，能说清楚"流量调度"的有15%。多活架构的关键词是**数据同步 + 流量切换**。
+
+## 一、多活的四种模式 🔴
+
+### 1.1 四种模式详解
+
+```
+多活四种模式：
+
+1. 主备模式
+   - 主机房对外服务
+   - 备机房待命
+   - 主挂后切换到备
+   - 缺点：资源利用率低，切换时间长
+
+2. 同城双活
+   - 两个机房都在同城
+   - 同时对外服务
+   - 网络延迟<1ms
+   - 优点：切换快，资源利用率高
+   - 缺点：不能防城市级灾难
+
+3. 两地三中心
+   - 同城两个机房
+   - 异地一个备份机房
+   - 优点：既能防机房故障，又能防城市灾难
+   - 缺点：成本高，切换复杂
+
+4. 异地多活
+   - 多个机房分布在不同城市
+   - 同时对外服务
+   - 优点：最高的可用性
+   - 缺点：成本高，数据一致性难
+```
+
+### 1.2 模式对比
+
+```
+模式对比：
+
+| 模式 | 成本 | 切换时间 | 防灾能力 | 复杂度 |
+|------|------|----------|----------|--------|
+| 主备 | 低 | 小时级 | 单机房 | 低 |
+| 同城双活 | 中 | 分钟级 | 单机房 | 中 |
+| 两地三中心 | 高 | 分钟级 | 城市级 | 高 |
+| 异地多活 | 很高 | 秒级 | 城市级 | 很高 |
+```
+
+## 二、同城双活架构 🔴
+
+### 2.1 架构设计
+
+```
+同城双活架构：
+
+                    ┌─────────────────────────────────────┐
+                    │           负载均衡层                  │
+                    │     （DNS + GSLB流量调度）            │
+                    └──────────┬──────────────┬──────────────┘
+                              │              │
+              ┌───────────────┴───┐   ┌──────┴───────────────┐
+              │    机房A           │   │    机房B              │
+              │  ┌──────────────┐  │   │  ┌──────────────┐    │
+              │  │  网关集群    │  │   │  │  网关集群    │    │
+              │  └──────┬───────┘  │   │  └──────┬───────┘    │
+              │         │          │   │         │            │
+              │  ┌──────┴───────┐  │   │  ┌──────┴───────┐    │
+              │  │  应用集群    │  │   │  │  应用集群    │    │
+              │  └──────┬───────┘  │   │  └──────┬───────┘    │
+              │         │          │   │         │            │
+              │  ┌──────┴───────┐  │   │  ┌──────┴───────┐    │
+              │  │  数据层      │  │   │  │  数据层      │    │
+              │  │  MySQL主从   │  │   │  │  MySQL主从   │    │
+              │  │  Redis集群   │  │   │  │  Redis集群   │    │
+              │  └──────────────┘  │   │  └──────────────┘    │
+              └────────────────────┘   └─────────────────────┘
+                              │              │
+                    ┌─────────┴──────────────┴─────────┐
+                    │         同步层（光缆直连）          │
+                    │   MySQL binlog同步 / Redis同步    │
+                    └───────────────────────────────────┘
+```
+
+### 2.2 数据同步方案
+
+```java
+// MySQL双主同步配置
+// 机房A MySQL配置
+[mysqld]
+server-id = 1
+log-bin = mysql-bin
+binlog-format = ROW
+gtid-mode = ON
+enforce-gtid-consistency = ON
+
+# 双主配置
+log-slave-updates = ON
+auto-increment-offset = 1
+auto-increment-increment = 2
+
+# 机房间同步
+replicate-do-db = business_db
+replicate-ignore-db = mysql
+
+// 机房B MySQL配置
+[mysqld]
+server-id = 2
+auto-increment-offset = 2
+auto-increment-increment = 2
+# 其他配置同机房A
+```
+
+```java
+// Redis双活同步
+@Service
+public class RedisMultiActiveService {
+
+    @Autowired
+    private RedisTemplate redisTemplateA;  // 机房A
+
+    @Autowired
+    private RedisTemplate redisTemplateB;  // 机房B
+
+    @Autowired
+    private RedisClusterClient clusterClientA;
+
+    /**
+     * 写入：双写
+     */
+    public void set(String key, String value) {
+        // 写入本机房
+        redisTemplateA.opsForValue().set(key, value);
+
+        // 异步同步到另一个机房
+        CompletableFuture.runAsync(() -> {
+            try {
+                redisTemplateB.opsForValue().set(key, value);
+            } catch (Exception e) {
+                log.error("Redis同步失败，key={}", key, e);
+                // 记录同步失败，等待重试
+                syncFailedKey(key, value);
+            }
+        });
+    }
+
+    /**
+     * 读取：本机房优先
+     */
+    public String get(String key) {
+        // 优先读本机房
+        String value = (String) redisTemplateA.opsForValue().get(key);
+        if (value != null) {
+            return value;
+        }
+
+        // 本机房没有，读另一个机房
+        value = (String) redisTemplateB.opsForValue().get(key);
+        if (value != null) {
+            // 回填本机房
+            redisTemplateA.opsForValue().set(key, value);
+        }
+
+        return value;
+    }
+}
+```
+
+## 三、异地多活架构 🟡
+
+### 3.1 数据分类
+
+```
+异地多活数据分类：
+
+1. 可合并数据（最终一致）
+   - 用户行为日志
+   - 消息记录
+   - 访问统计
+   - 特点：可以异步同步，允许短暂不一致
+
+2. 单元闭环数据（强一致）
+   - 用户Session
+   - 分布式锁
+   - 库存扣减
+   - 特点：必须在本机房处理
+
+3. 全局一致数据（实时同步）
+   - 账户余额
+   - 订单状态
+   - 支付流水
+   - 特点：必须实时同步
+```
+
+### 3.2 流量路由
+
+```java
+// 流量路由服务
+@Service
+public class TrafficRouter {
+
+    @Autowired
+    private ConfigService configService;
+
+    /**
+     * 根据用户ID路由到机房
+     * 路由规则：hash(userId) % 机房数
+     */
+    public String route机房(Long userId) {
+        // 从配置中心获取机房列表
+        List<String> regions = configService.getRegions();
+
+        // 按用户ID哈希
+        int index = Math.abs(userId.hashCode()) % regions.size();
+
+        return regions.get(index);
+    }
+
+    /**
+     * 根据地域路由
+     */
+    public String routeByRegion(String region) {
+        Map<String, String> regionMapping = Map.of(
+            "华南", "广州机房",
+            "华东", "上海机房",
+            "华北", "北京机房",
+            "西北", "西安机房"
+        );
+        return regionMapping.getOrDefault(region, "北京机房");
+    }
+
+    /**
+     * 故障切换
+     */
+    public void switchTo(String targetRegion) {
+        // 更新DNS/负载均衡配置
+        configService.setActiveRegion(targetRegion);
+
+        // 发送告警
+        alertService.sendAlert("机房切换", "切换到" + targetRegion);
+
+        log.info("流量切换到{}", targetRegion);
+    }
+}
+```
+
+### 3.3 数据同步策略
+
+```java
+// 异地数据同步
+@Service
+public class CrossRegionSyncService {
+
+    @Autowired
+    private KafkaTemplate kafkaTemplate;
+
+    /**
+     * 异步同步：消息队列
+     */
+    public void asyncSync(String table, Object data) {
+        // 发送消息到跨机房Topic
+        kafkaTemplate.send("cross-region-sync",
+            table,
+            JSON.toJSONString(new SyncEvent(table, data, System.currentTimeMillis()))
+        );
+    }
+
+    /**
+     * 同步：强一致数据用DTS
+     */
+    @Transactional
+    public void syncBalance(Long userId, BigDecimal change) {
+        // 1. 本机房更新
+        accountService.updateBalance(userId, change);
+
+        // 2. 发送同步消息
+        kafkaTemplate.send("balance-sync",
+            String.valueOf(userId),
+            JSON.toJSONString(new BalanceSyncEvent(userId, change))
+        );
+    }
+
+    /**
+     * 冲突处理：后写者胜出
+     */
+    @KafkaListener(topics = "balance-sync")
+    public void handleBalanceSync(String message) {
+        BalanceSyncEvent event = JSON.parseObject(message, BalanceSyncEvent.class);
+
+        // 检查版本
+        AccountDO local = accountService.getByUserId(event.getUserId());
+        if (local.getVersion() >= event.getVersion()) {
+            // 本地版本更新，跳过
+            return;
+        }
+
+        // 更新本地
+        accountService.updateBalanceWithVersion(event);
+    }
+}
+```
+
+## 四、故障切换 🟡
+
+### 4.1 切换流程
+
+```
+故障切换流程：
+
+发现阶段：
+1. 监控告警：机房故障
+2. 自动探测：健康检查失败
+3. 人工确认：值班人员确认
+
+决策阶段：
+4. 影响评估：多少用户受影响
+5. 切换决策：是否切换
+6. 切换方案：切哪个机房
+
+执行阶段：
+7. DNS切换：流量切到备用机房
+8. 数据同步：确保数据一致
+9. 验证服务：确认服务正常
+
+恢复阶段：
+10. 故障修复：恢复原机房
+11. 灰度回切：逐步切回
+12. 故障总结：复盘分析
+```
+
+### 4.2 自动切换实现
+
+```java
+// 自动故障切换
+@Service
+public class FailoverService {
+
+    @Autowired
+    private HealthCheckService healthCheck;
+
+    @Autowired
+    private TrafficRouter trafficRouter;
+
+    @Autowired
+    private KafkaTemplate kafkaTemplate;
+
+    private final AtomicInteger failureCount = new AtomicInteger(0);
+    private static final int FAILURE_THRESHOLD = 3;
+
+    /**
+     * 健康检查
+     */
+    @Scheduled(fixedRate = 5000)
+    public void healthCheck() {
+        String currentRegion = configService.getCurrentRegion();
+
+        boolean healthy = healthCheck.checkRegion(currentRegion);
+        if (!healthy) {
+            int count = failureCount.incrementAndGet();
+            if (count >= FAILURE_THRESHOLD) {
+                log.error("机房{}健康检查连续失败{}次，触发切换", currentRegion, count);
+                triggerFailover(currentRegion);
+            }
+        } else {
+            failureCount.set(0);
+        }
+    }
+
+    /**
+     * 触发故障切换
+     */
+    private void triggerFailover(String failedRegion) {
+        // 1. 找到备用机房
+        String standbyRegion = findStandbyRegion(failedRegion);
+        if (standbyRegion == null) {
+            log.error("没有可用备用机房！");
+            alertService.sendCriticalAlert("无备用机房可用");
+            return;
+        }
+
+        // 2. 切换流量
+        trafficRouter.switchTo(standbyRegion);
+
+        // 3. 发送切换事件
+        kafkaTemplate.send("failover-event",
+            failedRegion,
+            JSON.toJSONString(new FailoverEvent(failedRegion, standbyRegion))
+        );
+
+        // 4. 记录切换日志
+        log.warn("故障切换完成：{} -> {}", failedRegion, standbyRegion);
+
+        // 5. 发送告警
+        alertService.sendAlert("机房切换", failedRegion + "切换到" + standbyRegion);
+    }
+
+    private String findStandbyRegion(String failedRegion) {
+        List<String> allRegions = configService.getAllRegions();
+        return allRegions.stream()
+            .filter(r -> !r.equals(failedRegion))
+            .filter(this::checkRegionHealth)
+            .findFirst()
+            .orElse(null);
+    }
+
+    private boolean checkRegionHealth(String region) {
+        try {
+            return healthCheck.checkRegion(region);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+}
+```
+
+## 五、生产避坑 🟡
+
+### 5.1 多活架构的五大坑
+
+**坑1：数据同步延迟**
+
+```
+问题：异地同步有延迟，导致数据不一致
+场景：用户在北京注册，在广州下单
+解决方案：
+- 按用户ID单元化，同一用户在同一机房处理
+- 关键数据实时同步
+- 非关键数据异步同步
+```
+
+**坑2：双写数据冲突**
+
+```
+问题：两个机房同时写入，冲突了
+场景：用户同时在两个机房下单
+解决方案：
+- 按用户ID路由，保证同一用户在同一机房
+- 冲突时后写者胜出
+- 或使用分布式事务
+```
+
+**坑3：跨机房调用**
+
+```
+问题：业务逻辑需要跨机房调用
+场景：订单服务在A机房，要查用户在B机房
+解决方案：
+- 数据跟着用户走，用户在哪个机房，数据就在哪个机房
+- 避免跨机房调用
+```
+
+**坑4：切换后数据丢失**
+
+```
+问题：切换后，本机房未同步的数据丢失
+场景：binlog同步有延迟
+解决方案：
+- 切换前检查同步延迟
+- 延迟超过阈值不能切换
+- 或接受短暂数据丢失
+```
+
+**坑5：切换后不回切**
+
+```
+问题：故障恢复后没有回切
+场景：一直在备机房运行
+解决方案：
+- 故障恢复后自动/手动回切
+- 回切前检查数据一致性
+```
+
+### 5.2 多活检查清单
+
+```
+架构规范：
+- [ ] 流量按用户ID路由
+- [ ] 数据单元化处理
+- [ ] 同步延迟可监控
+
+运维规范：
+- [ ] 健康检查配置
+- [ ] 故障切换预案
+- [ ] 回切流程
+- [ ] 数据一致性检查
+
+监控规范：
+- [ ] 机房健康状态
+- [ ] 同步延迟
+- [ ] 流量分布
+- [ ] 切换次数
+```
+
+## 六、真实面试回放 🟡
+
+> **面试官**：多活架构怎么设计？
+>
+> **候选人**（小张）：四种模式：
+>
+> 一是主备。
+>
+> 二是同城双活，两个机房都在同城，同时对外服务，网络延迟低。
+>
+> 三是两地三中心，同城两个机房加异地一个备份。
+>
+> 四是异地多活，多个机房分布在不同城市。
+>
+> **面试官**：数据怎么同步？
+>
+> 小张：三类数据：
+>
+> 一是可合并数据，用消息队列异步同步，允许短暂不一致。
+>
+> 二是单元闭环数据，必须在本机房处理，不能跨机房。
+>
+> 三是全局一致数据，比如余额，实时同步。
+>
+> **面试官**：怎么保证同一用户在同一机房？
+>
+> 小张：按用户ID哈希。
+>
+> 比如hash(userId) % 2，用户ID确定后，就路由到固定的机房。
+>
+> 【面试官手记】
+>
+> 小张这场面试的亮点：
+>
+> 1. 知道四种多活模式
+>
+> 2. 知道数据分类处理
+>
+> 3. 知道按用户ID路由
+>
+> 多活架构是P7工程师必备知识点，能完整回答的候选人，说明有高可用架构经验。
+
+多活架构的核心是**数据同步 + 流量切换**。记住三个要点：
+
+1. **数据分类**：可合并异步同步，单元闭环本机房处理
+2. **流量路由**：按用户ID哈希，保证同用户同机房
+3. **故障切换**：健康检查→流量切换→数据一致性验证
+
+多活架构是业务连续性的最后一道防线，必须提前规划。

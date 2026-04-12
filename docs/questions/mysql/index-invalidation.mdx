@@ -1,0 +1,271 @@
+---
+title: 索引失效场景全解
+description: 从一道高频面试题出发，总结 MySQL 索引失效的 12 种常见场景，分析隐式转换、函数、OR 条件等导致的索引失效原因与优化方案。
+---
+
+# 索引失效场景全解
+
+面试官问："什么情况下索引会失效？"
+
+小孙说："LIKE 前面有 `%` 会失效，不满足最左前缀会失效。"
+
+面试官追问："还有呢？"
+
+小孙："...用 OR 的时候？"
+
+面试官继续追问："`WHERE a = 1 AND b > 2 AND c = 3`，联合索引 `(a, b, c)` 能用几列？"
+
+小孙："...a 和 b？"
+
+面试官："`WHERE name = 'Tom' AND age = 25`，name 是 VARCHAR，age 是 INT，`name = age` 会怎样？"
+
+小孙彻底卡住了。
+
+索引失效是 MySQL 面试中出现频率最高的场景题之一。这道题不在于背得多全，而在于能否解释**为什么**会失效，以及**如何优化**。今天这篇，把索引失效讲透。
+
+## 一、索引失效的 12 种场景 🔴
+
+### 1.1 最左前缀原则违反
+
+```sql
+-- 索引 idx(a, b, c)
+WHERE b = 1                               ❌ 跳过 a
+WHERE c = 1                               ❌ 跳过 a、b
+WHERE a = 1 AND c = 1                     ❌ 跳过 b
+```
+
+B+ 树按组合键排序，不从最左列开始就无法二分查找。
+
+### 1.2 LIKE 前缀通配符
+
+```sql
+-- 索引 idx(name)
+WHERE name LIKE '%Tom%'                   ❌ 前缀通配，无法二分
+WHERE name LIKE '%Tom'                    ❌ 同上
+WHERE name LIKE 'Tom%'                    ✅ 后缀通配，可以二分
+```
+
+LIKE `'%xxx'` 的本质是字符串从头开始模糊匹配，B+ 树的排序字符串无法定位，`%` 在前时只能全扫描。
+
+### 1.3 范围查询切断后续列
+
+```sql
+-- 索引 idx(a, b, c)
+WHERE a = 1 AND b > 2 AND c = 3            -- a、b 命中，c 不命中
+WHERE a = 1 AND b BETWEEN 1 AND 10 AND c = 3  -- 同上
+WHERE a > 1 AND b = 2                      -- 只有 a 命中
+```
+
+范围查询（`<`、`>`、`<=`、`>=`、`BETWEEN`、`LIKE`）会破坏索引的连续性，后续列无法二分查找。
+
+### 1.4 索引列使用函数或运算
+
+```sql
+-- 索引 idx(created_at)
+WHERE YEAR(created_at) = 2024             ❌ 对索引列使用函数
+WHERE created_at + INTERVAL 1 DAY = '...'  ❌ 对索引列进行运算
+WHERE LEFT(name, 4) = 'Tom'               ❌ 函数包裹索引列
+
+-- ✅ 正确的写法
+WHERE created_at >= '2024-01-01' AND created_at < '2025-01-01'
+```
+
+MySQL 优化器无法识别函数包裹的表达式等价于原列值，所以无法使用索引。
+
+### 1.5 隐式类型转换
+
+```sql
+-- name 是 VARCHAR，phone 是 VARCHAR
+WHERE phone = 13800138000                  ❌ 字符串列用数字比较
+
+-- age 是 INT，score 是 DECIMAL
+WHERE age = '25'                           ✅ INT 兼容字符串，可以命中
+WHERE score = '95.5'                      ✅ DECIMAL 兼容字符串
+WHERE name = 123                          ❌ 字符串列用数字比较
+```
+
+MySQL 在比较不同类型时会进行隐式类型转换。VARCHAR 列和数字比较时，VARCHAR 被转换为数字，导致无法使用索引。
+
+### 1.6 OR 条件中包含非索引列
+
+```sql
+-- name 有索引，status 没有索引
+WHERE name = 'Tom' OR status = 1          ❌ OR 涉及无索引列，全表扫描
+WHERE name = 'Tom' OR id = 5              ✅ 两个条件都有索引
+```
+
+OR 条件中，只要有一个条件没有索引，MySQL 就会放弃使用索引，执行全表扫描。
+
+### 1.7 NOT 操作
+
+```sql
+-- 索引 idx(status)
+WHERE status != 1                          ❌ NOT 等值
+WHERE status NOT IN (1, 2, 3)              ❌ NOT IN
+WHERE NOT (status = 1)                    ❌ 等效于上一条
+WHERE status IS NOT NULL                   ⚠️ 部分场景可命中索引
+```
+
+NOT 操作无法利用 B+ 树的有序性，MySQL 倾向于全表扫描。
+
+### 1.8 全表扫描比索引更优
+
+```sql
+-- 表只有 1000 行，idx(a) 选择性极低（80% 的行 a=1）
+SELECT * FROM orders WHERE a = 1;           -- MySQL 可能选择全表扫描而非索引
+```
+
+MySQL 优化器基于代价选择执行计划。当索引的选择性很差（命中行数很多）时，全表扫描可能更快，优化器会放弃索引。
+
+### 1.9 使用 <> 或 !=
+
+```sql
+-- 索引 idx(status)
+WHERE status <> 1                          ❌ 不等于
+WHERE status != 1                          ❌ 同上
+```
+
+不等于操作无法利用 B+ 树的有序性，和 NOT 类似。
+
+### 1.10 模糊匹配数字类型
+
+```sql
+-- order_no 是 VARCHAR 类型存储数字
+WHERE order_no = 12345                     ❌ 字符串列用数字比较
+WHERE order_no LIKE '12345%'               ✅ 可以命中
+```
+
+### 1.11 字符串比较未指定字符集/排序规则
+
+```sql
+-- 表字符集 utf8mb4，字段排序规则 utf8mb4_general_ci
+-- 查询用 utf8_general_ci 排序规则比较
+WHERE name = 'Tom' COLLATE utf8_general_ci  ❌ 排序规则不一致可能导致索引失效
+```
+
+排序规则不同时，MySQL 可能无法使用索引。
+
+### 1.12 统计信息不准确
+
+```sql
+-- 表数据变化后，统计信息未更新
+ANALYZE TABLE orders;                       -- 刷新统计信息
+```
+
+MySQL 优化器依赖统计信息选择执行计划。统计信息过期时，优化器可能选择错误的索引。
+
+### 1.13 ❌ 错误示范汇总
+
+| 错误写法 | 问题 | 解决方案 |
+| --- | --- | --- |
+| `WHERE b = 1`（跳 a） | 违反最左前缀 | 补充 a 的查询条件 |
+| `WHERE name LIKE '%Tom'` | 前缀通配 | 改用后缀通配或 ES |
+| `WHERE YEAR(d) = 2024` | 函数包裹列 | 改为范围查询 |
+| `WHERE phone = 138...` | 隐式类型转换 | 保证类型一致 |
+| `WHERE a = 1 OR b = 2` | OR 涉及无索引列 | 为所有 OR 条件列加索引 |
+| `WHERE status <> 1` | 不等于 | 改用正向查询组合 |
+| `WHERE col = 1 / 2` | 列运算 | 移项避免列运算 |
+
+【面试官心理】
+这道题我能问很多轮。我通常从最左前缀切入，然后追问隐式转换，再追问函数包裹。三个都能答出来的候选人，我再问生产场景："你线上遇到过索引失效导致的慢查询吗？怎么排查的？"能说出生产案例的是加分项。
+
+## 二、隐式类型转换详解 🟡
+
+### 2.1 为什么 VARCHAR 和数字比较会失效？
+
+```sql
+-- phone 是 VARCHAR
+WHERE phone = 13800138000
+```
+
+MySQL 实际执行的是：
+
+```sql
+WHERE CAST(phone AS SIGNED INT) = 13800138000
+```
+
+对 phone 列做了 CAST，等价于对索引列使用了函数，因此索引失效。
+
+### 2.2 数字和 VARCHAR 比较
+
+```sql
+-- age 是 INT，值为 25
+WHERE age = '25'                           ✅ 数字兼容字符串，可以命中索引
+```
+
+MySQL 将字符串 '25' 转换为数字 25，age 列本身没有被转换，所以索引有效。
+
+## 三、生产排查方法 🟡
+
+### 3.1 EXPLAIN 分析
+
+```sql
+EXPLAIN SELECT * FROM orders WHERE status = 1;
+-- type: ALL 表示全表扫描，ref 或 range 表示用了索引
+-- key: 显示实际使用的索引
+-- rows: 预计扫描行数
+```
+
+### 3.2 常见慢查询场景
+
+```sql
+-- 场景：订单查询按 order_no（VARCHAR）查
+-- 实际数据中 order_no 全是数字字符串
+WHERE order_no = 12345                     -- 隐式转换，索引失效
+WHERE order_no = '12345'                   -- 正常命中
+```
+
+### 3.3 使用 FORCE INDEX
+
+```sql
+-- MySQL 优化器选错了索引时，强制指定索引
+SELECT * FROM orders FORCE INDEX (idx_status)
+WHERE status = 1 AND created_at > '2024-01-01';
+```
+
+:::warning ⚠️
+FORCE INDEX 是万不得已的手段。优化器选错索引通常是因为统计信息不准或者数据分布变了，解决问题根因比强制指定索引更重要。
+:::
+
+## 四、优化策略 💡
+
+### 4.1 索引设计原则
+
+1. **高频查询优先**：把最常用的查询条件的列放在联合索引前面
+2. **高选择性列优先**：选择性高（不同值多）的列优先，减少索引扫描行数
+3. **范围查询放后**：范围查询会切断后续列，将范围查询列放在联合索引的最后
+4. **覆盖索引**：尽量让查询在索引中完成，避免回表
+
+### 4.2 SQL 改写技巧
+
+```sql
+-- ❌ 改写前
+WHERE YEAR(created_at) = 2024 AND status = 1
+
+-- ✅ 改写后（区间查询代替函数）
+WHERE created_at >= '2024-01-01' AND created_at < '2025-01-01' AND status = 1
+
+-- ❌ 改写前
+WHERE name LIKE '%Tom%'
+
+-- ✅ 改写后（前置搜索引擎）
+-- 改用 Elasticsearch 处理模糊匹配
+
+-- ❌ 改写前
+WHERE status != 1
+
+-- ✅ 改写后
+WHERE status = 2 OR status = 3 OR status = 4 ...
+-- 或分开查询后合并
+```
+
+【面试官心理】
+索引失效这道题，我不是在考候选人的记忆力。我在考的是：他有没有能力从 B+ 树的结构原理出发，自己推导出各种失效场景。能从原理推导出结论的，说明他真的理解了这门技术。
+
+---
+
+| 级别 | 考察重点 | 期望回答 |
+| --- | --- | --- |
+| P5 | 常见场景 | 最左前缀、LIKE 前缀通配、OR 条件 |
+| P6 | 原理理解 | 能解释为什么这些场景会失效（B+ 树原理） |
+| P7 | 排查优化 | 生产排查方法、SQL 改写技巧、索引设计能力 |

@@ -1,0 +1,275 @@
+---
+title: ThreadLocal 内存泄漏
+description: 从一道生产事故出发，深入剖析 ThreadLocal 内存泄漏的全链路原因：弱引用设计、ThreadLocalMap 生命周期、线程池复用、expungeStaleEntry 清理机制，以及正确的防御策略。
+---
+
+# ThreadLocal 内存泄漏
+
+候选人小任在面试美团 P7 时，面试官问道：
+
+"ThreadLocal 为什么会内存泄漏？你知道完整的泄漏链路吗？"
+
+小任说："因为 Entry 用弱引用..."面试官追问："Entry 用弱引用了，ThreadLocal 已经被 GC 了，泄漏的到底是什么？"
+
+小任答不上来。面试官继续："ThreadLocalMap 的 expungeStaleEntry 什么时候被调用？"
+
+小任彻底卡住了...
+
+## 一、核心问题：ThreadLocal 内存泄漏全链路 🔴
+
+### 1.1 问题拆解
+
+```
+第一层：引用类型（为什么用弱引用？）
+  "Entry 为什么要用 WeakReference<ThreadLocal>？"
+  考察点：WeakReference vs StrongReference、GC 对弱引用的处理
+
+第二层：泄漏链路（漏了什么？）
+  "ThreadLocal 被 GC 后，什么还在泄漏？"
+  考察点：Entry.value、ThreadLocalMap、Thread 对象生命周期
+
+第三层：清理机制（什么时候清理？）
+  "ThreadLocalMap 什么时候清理过期 Entry？"
+  考察点：expungeStaleEntry、set/get 时惰性清理
+
+第四层：防御策略（怎么避免？）
+  "生产环境中如何正确使用 ThreadLocal？"
+  考察点：remove()、try-finally、TransmittableThreadLocal
+```
+
+### 1.2 ❌ 错误示范
+
+**候选人原话 A**："ThreadLocal 内存泄漏是因为弱引用，GC 时会回收弱引用，Entry 就空了。"
+
+**问题诊断**：大错特错！GC 时会回收 WeakReference 的 referent（即 ThreadLocal 对象），但 Entry.value（Object 类型，是强引用）不会被 GC 回收！泄漏的正是 value。
+
+**候选人原话 B**："ThreadLocal 用完只要设为 null 就行了。"
+
+**问题诊断**：ThreadLocal 设为 null 后，ThreadLocal 对象可以被 GC，但 Entry 仍然在 ThreadLocalMap 中，value 仍然被 Entry 持有。必须调用 `remove()` 才能彻底清理。
+
+### 1.3 标准回答
+
+#### P5 级别：引用类型基础
+
+> **四种引用类型**：
+>
+> ```java
+> // 强引用（默认）
+> Object obj = new Object();  // 只要有强引用，GC 永不回收
+>
+> // 软引用（SoftReference）
+> SoftReference<Object> soft = new SoftReference<>(new Object());
+> // GC 时，内存不足才会回收软引用对象
+>
+> // 弱引用（WeakReference）
+> WeakReference<Object> weak = new WeakReference<>(new Object());
+> // 下一次 GC 时必定回收弱引用对象
+>
+> // 虚引用（PhantomReference）
+> PhantomReference<Object> phantom = new PhantomReference<>(new Object());
+> // GC 时直接回收，无法通过 get() 获取
+> ```
+>
+> **ThreadLocal 的 Entry 使用弱引用的原因**：
+>
+> 如果使用强引用，当 ThreadLocal 对象不再被需要时（业务代码不再引用它），它仍然被 Entry.key 持有，无法被 GC。这会导致 ThreadLocal 对象和它持有的 value 一起泄漏。
+>
+> 使用弱引用后，ThreadLocal 对象在不再被需要时可以被 GC，Entry.key 变为 null。但 value 仍然是强引用，被 Entry 持有。
+
+#### P6 级别：完整泄漏链路
+
+> **泄漏的四个环节**：
+>
+> ```
+> 1. threadLocal.set(value) → Entry(ThreadLocal, value) 存入 ThreadLocalMap
+> 2. threadLocal = null（外部不再引用 ThreadLocal 对象）
+> 3. GC 发生 → Entry.key 被清空（WeakReference 被回收）
+>    但 Entry.value 仍然是强引用 → 如果线程是长生命周期的，value 无法被 GC
+> 4. Thread 对象的 threadLocals 持久存在 → value 持续占用内存
+> ```
+>
+> **关键：线程池导致 ThreadLocalMap 长寿**
+>
+> ```java
+> ExecutorService pool = Executors.newFixedThreadPool(4);
+>
+> // 线程 1 处理请求 A
+> pool.submit(() -> {
+>     threadLocal.set(userA);  // userA 存入线程 1 的 ThreadLocalMap
+>     // ... 处理请求 A
+>     // 如果忘记 remove()，userA 泄漏
+> });
+>
+> // 线程 1 继续处理请求 B
+> pool.submit(() -> {
+>     // 线程 1 被复用
+>     // threadLocal.get() 仍然能获取 userA（数据错乱！）
+>     // 或者 userA 因为 Entry.key 为 null 而被清理
+> });
+> ```
+>
+> **泄漏的真正罪魁祸首**：
+>
+> 不是弱引用，而是**线程对象的生命周期**和** ThreadLocalMap 没有自动清理机制**。
+
+#### P7 级别：expungeStaleEntry 清理机制
+
+> **惰性清理**：
+>
+> ThreadLocalMap 不是每次 set/get 都全量清理，而是**遇到过期 Entry 时进行惰性清理**：
+>
+> ```java
+> private int expungeStaleEntry(int staleSlot) {
+>     Entry[] tab = table;
+>     int len = tab.length;
+>
+>     // 1. 删除 stale 元素
+>     tab[staleSlot].value = null;
+>     tab[staleSlot] = null;
+>     size--;
+>
+>     // 2. 重新散列：清理后续的过期元素
+>     Entry e;
+>     int i;
+>     for (i = nextIndex(staleSlot, len); (e = tab[i]) != null; i = nextIndex(i, len)) {
+>         ThreadLocal<?> k = e.get();
+>         if (k == null) {  // 过期 Entry
+>             e.value = null;
+>             tab[i] = null;
+>             size--;
+>         } else {  // 有效 Entry，重新散列
+>             int h = k.threadLocalHashCode & (len - 1);
+>             if (h != i) {  // 不在原位
+>                 tab[i] = null;
+>                 while (tab[h] != null) {
+>                     h = nextIndex(h, len);
+>                 }
+>                 tab[h] = e;
+>             }
+>         }
+>     }
+>     return i;
+> }
+> ```
+>
+> **清理触发的时机**：
+>
+> 1. `set()` 时：如果遇到过期 Entry，调用 `replaceStaleEntry()`
+> 2. `get()` 时：如果探测到过期 Entry，调用 `expungeStaleEntry()`
+> 3. `remove()` 时：显式删除并清理后续过期元素
+> 4. `rehash()` 时：全量扫描清理（size 超过阈值时触发）
+>
+> **为什么清理是惰性的？**
+>
+> 为了减少每次操作的性能开销。ThreadLocal 通常数量很少，过期 Entry 也不多，惰性清理的均摊成本很低。
+>
+> **防御策略——必须使用 remove()**：
+>
+> ```java
+> // 正确做法：在 finally 中清理
+> threadLocal.set(value);
+> try {
+>     doWork();
+> } finally {
+>     threadLocal.remove();  // 显式清理
+> }
+>
+> // remove() 的实现
+> public void remove() {
+>     ThreadLocalMap m = Thread.currentThread().threadLocals;
+>     if (m != null) {
+>         m.remove(this);  // 移除 Entry 并清理后续过期元素
+>     }
+> }
+> ```
+
+【面试官心理】
+这道题我能问到 P7 级别，是因为内存泄漏链路涉及了引用类型、GC 机制、线程池生命周期、惰性清理等多个维度。能画出完整泄漏链路的候选人说明他有系统性理解。能说出 expungeStaleEntry 清理逻辑的候选人说明他看过 JDK 源码。
+
+### 1.4 追问升级
+
+**追问 1：ThreadLocalMap 会不会在 Entry 过多时 OOM？**
+
+> 会。ThreadLocalMap 的初始容量是 16，负载因子 2/3。最多存储约 10 个有效 Entry（超过阈值会扩容）。如果 value 持有大对象且不断泄漏，最终会 OOM。
+
+**追问 2：Alibaba TransmittableThreadLocal 是什么？**
+
+> 淘宝开源的库，解决了线程池复用时 ThreadLocal 值不传递的问题。它在线程池任务提交时自动复制父线程的 ThreadLocal 值到子线程，在任务完成后自动清理。
+>
+> ```java
+> TtlRunnable runnable = TtlRunnable.get(() -> {
+>     // 子线程可以获取父线程的 ThreadLocal 值
+>     // 任务完成后自动清理
+> });
+> executor.submit(runnable);
+> ```
+
+## 二、生产避坑
+
+### 2.1 用错了 Reference 类型导致泄漏
+
+**场景**：自定义 Entry 类时错误使用强引用：
+
+```java
+// 错误：自定义 Entry 使用强引用
+class MyEntry {
+    ThreadLocal<?> key;  // 强引用
+    Object value;
+    MyEntry(ThreadLocal<?> k, Object v) {
+        key = k;
+        value = v;
+    }
+}
+```
+
+### 2.2 ThreadLocal 作为缓存导致 OOM
+
+```java
+// 错误：用 ThreadLocal 做缓存（大量 Entry）
+ThreadLocal<Cache> cache = new ThreadLocal<>();
+cache.set(new Cache());  // Cache 可能很大
+```
+
+如果 Cache 对象很大且线程池中的线程数很多，很快就会 OOM。
+
+## 三、正确使用 ThreadLocal 的 checklist 🟡
+
+### 3.1 必须执行的规则
+
+- [ ] `try-finally` 包裹，在 `finally` 中调用 `remove()`
+- [ ] 使用线程池时，必须在任务完成后清理
+- [ ] 不要用 ThreadLocal 存储大对象
+- [ ] 使用 `InheritableThreadLocal` 时也要注意清理
+
+### 3.2 自动化清理方案
+
+```java
+// 方案 1：包装 Runnable/Callable
+class ThreadLocalCleaner implements Runnable {
+    private final Runnable task;
+    private final ThreadLocal<?>[] threadLocals;
+
+    ThreadLocalCleaner(Runnable task, ThreadLocal<?>[] threadLocals) {
+>        this.task = task;
+>        this.threadLocals = threadLocals;
+>    }
+>
+>    public void run() {
+>        try {
+>            task.run();
+>        } finally {
+>            for (ThreadLocal<?> tl : threadLocals) {
+>                tl.remove();
+>            }
+>        }
+>    }
+}
+```
+
+:::tip 💡
+面试加分点：能说出"JDK 9 的 `Thread::stackDepth` 方法和 ThreadLocal 的实现无关，但 JDK 内部使用 ThreadLocal 存储 JVM 统计数据（如分配计数），这些数据如果泄漏会导致内存占用持续增长"，说明他对 JVM 内部有了解。
+:::
+
+:::warning ⚠️
+面试陷阱：被问到"ThreadLocal 的 Entry 如果 value 也被 GC 了会怎样"，很多人会说"不会"。准确答案是：Entry 的 `value` 是强引用，只有在 ThreadLocalMap 中被显式清除或 Entry 被清理时，value 才能被 GC。GC 无法主动回收被 Entry.value 强引用的对象。
+:::

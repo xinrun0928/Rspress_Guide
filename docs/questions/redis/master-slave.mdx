@@ -1,0 +1,203 @@
+---
+title: Redis 主从复制
+description: 从一道面试题出发，深入剖析 Redis 主从复制的原理——全量同步、增量同步、replication id、offset，理解主从延迟与数据一致性。
+---
+
+# Redis 主从复制
+
+面试官问："Redis 主从复制是怎么实现的？"
+
+小张说："主库写，从库读。"
+
+面试官追问："主从同步的流程是什么？"
+
+小张说："...把数据同步过去？"
+
+面试官继续追问："全量同步和增量同步分别什么时候触发？"
+
+小陈答不上来。
+
+Redis 主从复制是 Redis 高可用和数据分发的基石。这道题能说清楚全量同步（PSYNC）、增量同步（replication id + offset）的候选人，对 Redis 的复制机制有深入理解。
+
+## 一、主从复制架构 🔴
+
+### 1.1 复制架构
+
+```
+┌─────────────┐
+│   Master    │
+│  (主库)     │
+└──────┬──────┘
+       │
+   ┌───┴───┐
+   ↓       ↓
+┌──────┐ ┌──────┐
+│ Slave │ │ Slave│
+│  (从) │ │  (从)│
+└──────┘ └──────┘
+```
+
+### 1.2 复制流程
+
+```sql
+-- 从库连接主库：
+SLAVEOF master_ip master_port
+
+-- 或者配置文件：
+replicaof master_ip master_port
+
+-- 从库获取主库数据：
+-- 1. 从库发送 PSYNC 命令
+-- 2. 主库 BGSAVE 生成 RDB
+-- 3. 主库发送 RDB 给从库
+-- 4. 主库发送缓冲区中的增量命令
+-- 5. 从库加载 RDB + 增量命令
+```
+
+## 二、全量同步 vs 增量同步 🔴
+
+### 2.1 全量同步（PSYNC ?-1）
+
+```
+触发条件：
+- 从库第一次连接主库
+- 从库 replication id 与主库不匹配
+- 主库的 replication backlog buffer 溢出
+
+流程：
+1. 从库发送 PSYNC ? -1（请求全量同步）
+2. 主库返回 FULLRESYNC replication_id offset
+3. 主库执行 BGSAVE，生成 RDB
+4. 主库将 RDB 发送给从库
+5. 从库清空本地数据，加载 RDB
+6. 主库发送缓冲区中的增量命令
+7. 从库执行增量命令
+```
+
+### 2.2 增量同步（PSYNC replication_id offset）
+
+```
+触发条件：
+- 从库已经和主库同步过
+- 从库 replication id 与主库匹配
+- 从库 offset 在主库 replication backlog buffer 范围内
+
+流程：
+1. 从库发送 PSYNC replication_id offset
+2. 主库检查 replication backlog buffer
+3. 如果 offset 在 buffer 中，返回 CONTINUE + 增量命令
+4. 从库执行增量命令
+```
+
+### 2.3 replication backlog buffer
+
+```
+主库维护一个环形缓冲区：
+┌──────────────────────────────────────────┐
+│  命令1 │ 命令2 │ 命令3 │ ... │ 命令N    │
+└──────────────────────────────────────────┘
+大小由 repl_backlog_size 控制（默认 1048576 = 1MB）
+
+新命令覆盖旧命令
+如果从库 offset 已被覆盖，从库需要全量同步
+```
+
+### 2.4 ❌ 错误示范
+
+**候选人原话**："主从同步就是把数据复制一份到从库。"
+
+**问题诊断**：不够精确。主从同步有全量同步和增量同步之分，全量同步需要生成 RDB 并传输，增量同步只传输增量命令。
+
+【面试官心理】
+这道题我会从 PSYNC 命令的参数追问。能说清楚"为什么需要 replication id"和"offset 的作用"的候选人，说明他理解了增量同步的核心原理。
+
+## 三、replication id 与 offset 🟡
+
+### 3.1 replication id
+
+```sql
+-- replication id 是主库的身份标识
+-- 每个主库有唯一的 replication id
+-- 从库记住主库的 replication id
+
+-- 如果从库的 replication id 和主库不同：
+-- 说明从库的数据版本和主库不同
+-- 需要全量同步
+
+-- 从库还记录自己的 offset：
+SHOW REPLICATION INFO
+# replicationid: xxx  (主库 id)
+# master_repl_offset: 1000  (主库已发送的命令偏移)
+```
+
+### 3.2 offset 的作用
+
+```sql
+-- offset 用于增量同步
+-- 主库记录：每个从库同步到了哪个 offset
+-- 从库记录：自己的 offset
+
+-- 如果从库断开后重连：
+-- 1. 发送 PSYNC replication_id offset
+-- 2. 主库检查 offset 是否在 backlog buffer 中
+-- 3. 如果在，返回增量命令
+-- 4. 如果不在，返回 FULLRESYNC，全量同步
+```
+
+## 四、主从延迟 🟡
+
+### 4.1 延迟原因
+
+```sql
+-- 网络延迟
+-- 主库到从库的网络传输有延迟
+-- offset 差距 = 网络延迟 × 命令大小
+
+-- 从库处理速度
+-- 从库执行命令的速度可能慢于主库
+-- especially when 从库正在执行 BGSAVE/RDB LOAD
+
+-- replication backlog buffer 溢出
+-- 如果从库延迟太久，buffer 被覆盖
+-- 只能全量同步
+```
+
+### 4.2 监控延迟
+
+```sql
+-- 在从库查看延迟
+SLAVEOF NO ONE  -- 停止复制，成为主库（测试用）
+
+-- 查看主库和从库的 offset
+INFO REPLICATION
+# master_repl_offset: 12345678
+# second_repl_offset: 12345600  (从库2)
+
+# offset 差 = 78
+# 如果每秒主库写入 1000 条命令，延迟约 78ms
+```
+
+### 4.3 减少延迟
+
+```sql
+-- 1. 优化网络
+-- 2. 调整 repl_backlog_size（大一些）
+repl_backlog_size 104857600  # 100MB
+
+-- 3. 使用压缩
+repl-diskless-sync yes  # 无盘复制，不写磁盘直接通过网络发送
+
+-- 4. 适当的数据分片
+-- 分担单个主库的压力
+```
+
+【面试官心理】
+主从复制是 Redis 面试中的高频题。能说清楚 PSYNC 参数和 replication backlog buffer 作用的候选人，说明他对 Redis 复制机制有源码级别的理解。
+
+---
+
+| 级别 | 考察重点 | 期望回答 |
+| --- | --- | --- |
+| P5 | 基本流程 | 主写从读、复制流程 |
+| P6 | 核心机制 | PSYNC、replication id、offset |
+| P7 | 延迟问题 | backlog buffer、延迟监控优化 |

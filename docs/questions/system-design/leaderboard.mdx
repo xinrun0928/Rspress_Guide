@@ -1,0 +1,516 @@
+---
+title: 排行榜系统设计
+description: 从游戏排行榜刷新卡顿的线上故障切入，深度拆解排行榜系统的核心架构：有序集合、实时排名、分页查询，以及分布式环境下的数据同步策略。
+---
+
+# 排行榜系统设计
+
+2022年春节，某游戏平台的"战力排行榜"在除夕夜出现了严重的性能问题：玩家刷新排行榜时，页面卡顿长达10秒，有3万名玩家同时在线刷新。
+
+技术团队排查后发现：排行榜数据存在MySQL中，每次刷新都要做 `ORDER BY score DESC LIMIT 100` 的全表扫描。10万玩家、每秒1000次查询，数据库被打成了筛子。
+
+更糟糕的是：由于查询太慢，很多玩家重复点击刷新，导致QPS从1000飙升到5000，彻底雪崩。
+
+这是一个典型的**读多写少场景下的数据库瓶颈**问题。
+
+【架构权衡】
+
+排行榜系统的核心是**有序数据的存储和查询**。MySQL的 `ORDER BY` 在数据量大时性能差，Redis的Sorted Set是天然的有序集合。理解这个技术选型，是设计排行榜系统的基础。
+
+## 一、排行榜系统核心问题 🔴
+
+### 1.1 四大核心问题
+
+```
+排行榜系统的四座大山：
+
+1. 实时排序
+   - 用户分数变化时，排名要实时更新
+   - 不能有延迟，否则影响游戏体验
+   - 高并发写入怎么扛？
+
+2. 分数去重
+   - 同一用户可能有多条分数记录
+   - 排行榜只显示最高分
+   - 怎么保证去重准确？
+
+3. 排名查询
+   - 查询某用户的排名
+   - 查询Top N用户
+   - 按分数区间查询用户
+
+4. 分页展示
+   - 排行榜要支持分页
+   - 第1页是Top 100，第2页是101-200
+   - 跨页查询怎么实现？
+```
+
+### 1.2 量化指标
+
+```
+排行榜系统的关键数字：
+
+数据规模：
+- 日活用户：1000万
+- 实时更新频率：每秒10万次
+- 查询频率：每秒100万次
+
+性能要求：
+- 分数更新延迟：<10ms
+- 排名查询延迟：P99 < 50ms
+- TopN查询延迟：P99 < 100ms
+
+Redis性能：
+- ZADD操作：10万/秒
+- ZREVRANK操作：5万/秒
+- ZREVRANGE操作：3万/秒
+```
+
+### 1.3 面试核心问题
+
+> 面试官：排行榜用Redis的Sorted Set怎么实现？
+>
+> 候选人：用 `ZADD` 添加/更新分数，用 `ZREVRANGE` 查询TopN，用 `ZREVRANK` 查询单个用户排名。
+>
+> 面试官：分数变化时排名怎么更新？
+>
+> 候选人：直接用 `ZADD` 覆盖分数，Redis自动重新排序，不需要手动处理。
+>
+> 面试官：分页怎么实现？
+>
+> 候选人：用 `ZREVRANGE key start stop`，`start=0, stop=9`是第一页10个，`start=10, stop=19`是第二页。
+
+【面试官心理】
+
+排行榜是Redis Sorted Set的经典应用场景。能回答出基本命令的候选人，说明会用Redis；能回答出分数更新和排名查询细节的候选人，说明理解有序集合的原理。
+
+## 二、Redis Sorted Set实现 🔴
+
+### 2.1 基本命令
+
+```bash
+# 添加/更新用户分数
+ZADD leaderboard:score 1000 "user_10001"
+ZADD leaderboard:score 1500 "user_10002"
+ZADD leaderboard:score 1200 "user_10001"  # 更新分数
+
+# 查询Top N
+ZREVRANGE leaderboard:score 0 9 WITHSCORES
+
+# 查询某用户的排名（0-based）
+ZREVRANK leaderboard:score "user_10001"
+# 返回：1（user_10001排第2名）
+
+# 查询某用户的分数
+ZSCORE leaderboard:score "user_10001"
+# 返回：1200
+
+# 查询分数区间的用户
+ZRANGEBYSCORE leaderboard:score 1000 1500
+```
+
+### 2.2 Java实现
+
+```java
+@Service
+public class LeaderboardService {
+
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+
+    /**
+     * 更新用户分数
+     */
+    public void updateScore(Long userId, long score) {
+        String key = "leaderboard:score";
+        redisTemplate.opsForZSet().add(key, "user_" + userId, score);
+    }
+
+    /**
+     * 查询Top N
+     */
+    public List<RankItem> getTopN(int n) {
+        String key = "leaderboard:score";
+        Set<ZSetOperations.TypedTuple<String>> result =
+            redisTemplate.opsForZSet().reverseRangeWithScores(key, 0, n - 1);
+
+        List<RankItem> items = new ArrayList<>();
+        int rank = 1;
+        for (ZSetOperations.TypedTuple<String> tuple : result) {
+            Long userId = parseUserId(tuple.getValue());
+            items.add(new RankItem(rank++, userId, tuple.getScore().longValue()));
+        }
+        return items;
+    }
+
+    /**
+     * 查询某用户的排名
+     */
+    public RankInfo getUserRank(Long userId) {
+        String key = "leaderboard:score";
+        String member = "user_" + userId;
+
+        Long rank = redisTemplate.opsForZSet().reverseRank(key, member);
+        Double score = redisTemplate.opsForZSet().score(key, member);
+
+        if (rank == null) {
+            return null;
+        }
+        return new RankInfo(rank.longValue() + 1, score.longValue());  // rank转为1-based
+    }
+
+    /**
+     * 查询某用户的分数区间排名
+     */
+    public List<RankItem> getRankByScoreRange(long minScore, long maxScore, int limit) {
+        String key = "leaderboard:score";
+        Set<String> members = redisTemplate.opsForZSet()
+            .reverseRangeByScore(key, maxScore, minScore, 0, limit);
+
+        List<RankItem> items = new ArrayList<>();
+        for (String member : members) {
+            Double score = redisTemplate.opsForZSet().score(key, member);
+            items.add(new RankItem(0, parseUserId(member), score.longValue()));
+        }
+        return items;
+    }
+}
+```
+
+### 2.3 多维度排行榜
+
+```
+游戏排行榜通常有多个维度：
+
+1. 总战力榜：total_score
+2. 竞技场榜：arena_score
+3. 每日任务榜：daily_score
+4. 公会战力榜：guild_score
+
+每个维度一个Sorted Set：
+ZADD leaderboard:total_score 10000 "user_10001"
+ZADD leaderboard:arena_score 5000 "user_10001"
+ZADD leaderboard:daily_score 2000 "user_10001"
+
+查询时按维度选择key。
+```
+
+## 三、分数更新策略 🟡
+
+### 3.1 增量更新
+
+```
+场景：玩家打怪获得100经验值
+
+方案1：全量更新
+- 读取当前分数
+- 计算新分数 = 当前分数 + 100
+- 写入Redis
+- 问题：并发时可能丢失更新
+
+方案2：增量更新（推荐）
+- ZINCRBY leaderboard:score 100 "user_10001"
+- Redis自动原子递增
+- 问题：分数可能变负数（需要检查下限）
+
+方案3：Lua脚本原子更新
+EVAL "
+  local current = redis.call('ZSCORE', KEYS[1], ARGV[1])
+  if current then
+    local newScore = tonumber(current) + tonumber(ARGV[2])
+    if newScore > 0 then
+      return redis.call('ZADD', KEYS[1], newScore, ARGV[1])
+    end
+    return 0
+  else
+    return redis.call('ZADD', KEYS[1], ARGV[2], ARGV[1])
+  end
+" 1 leaderboard:score user_10001 100
+```
+
+### 3.2 批量更新
+
+```java
+public void batchUpdateScores(List<ScoreUpdate> updates) {
+    String key = "leaderboard:score";
+
+    // 批量ZINCRBY
+    for (ScoreUpdate update : updates) {
+        redisTemplate.opsForZSet().incrementScore(key, "user_" + update.getUserId(), update.getDelta());
+    }
+
+    // 或者用Pipeline减少网络开销
+    RedisCallback<Object> callback = connection -> {
+        for (ScoreUpdate update : updates) {
+            connection.zSetCommands().zIncrBy(
+                key.getBytes(),
+                update.getDelta(),
+                ("user_" + update.getUserId()).getBytes()
+            );
+        }
+        return null;
+    };
+    redisTemplate.executePipelined(callback);
+}
+```
+
+### 3.3 分数过期
+
+```
+场景：每日排行榜需要在每天零点重置
+
+方案1：DEL + 重建
+- 零点时删除旧的Sorted Set
+- 定时任务从数据库重新加载
+- 缺点：零点时刻有空白期
+
+方案2：双Set切换（推荐）
+- 每天创建新的Sorted Set
+- 零点时切换指针到新Set
+- 旧Set异步删除
+- 优点：零时延切换
+
+方案3：时间戳作为分数的一部分
+- 分数 = 实际分数 × 10^13 + (MAX_TIMESTAMP - 当前时间戳)
+- 查询时用 ZRANGEBYSCORE
+- 缺点：计算复杂，精度问题
+```
+
+## 四、分页与展示 🟡
+
+### 4.1 基础分页
+
+```
+Redis分页命令：
+ZREVRANGE key 0 9      # 第1页（Top 1-10）
+ZREVRANGE key 10 19    # 第2页（Top 11-20）
+ZREVRANGE key 20 29    # 第3页（Top 21-30）
+
+注意：start/stop 是0-based，stop是inclusive
+```
+
+### 4.2 带排名的分页
+
+```java
+public PageResult<RankItem> getLeaderboardPage(int pageNum, int pageSize) {
+    String key = "leaderboard:score";
+    int start = (pageNum - 1) * pageSize;
+    int stop = start + pageSize - 1;
+
+    Set<ZSetOperations.TypedTuple<String>> result =
+        redisTemplate.opsForZSet().reverseRangeWithScores(key, start, stop);
+
+    List<RankItem> items = new ArrayList<>();
+    int baseRank = start + 1;  // 基础排名
+    for (ZSetOperations.TypedTuple<String> tuple : result) {
+        items.add(new RankItem(
+            baseRank++,
+            parseUserId(tuple.getValue()),
+            tuple.getScore().longValue()
+        ));
+    }
+
+    // 查询总数
+    Long total = redisTemplate.opsForZSet().zCard(key);
+
+    return new PageResult<>(items, total, pageNum, pageSize);
+}
+```
+
+### 4.3 我的排名（跨页定位）
+
+```
+场景：用户在第50页，想知道自己在哪一页
+
+普通方案：先查排名，再计算页码
+rank = ZREVRANK(key, member)
+page = rank / pageSize + 1
+
+优化方案：用 ZSCAN 或 Lua脚本一次获取
+
+Redis ZSCAN：
+ZSCAN leaderboard:score 0 MATCH user_10001 COUNT 1000
+# 返回包含该用户的游标结果
+```
+
+## 五、数据持久化 🟡
+
+### 5.1 Redis + MySQL双写
+
+```
+数据流：
+用户分数变化 → Redis Sorted Set → MySQL（异步）
+                 ↓
+             排行榜查询
+
+定时同步：
+- 每5分钟从Redis同步到MySQL
+- MySQL作为持久化存储
+- Redis作为实时计算层
+```
+
+### 5.2 从MySQL恢复
+
+```java
+public void reloadFromDB() {
+    // Step 1: 清空Redis
+    redisTemplate.delete("leaderboard:score");
+
+    // Step 2: 从MySQL批量加载
+    int batchSize = 1000;
+    int offset = 0;
+    while (true) {
+        List<UserScore> batch = userScoreDAO.selectAll(offset, batchSize);
+        if (batch.isEmpty()) {
+            break;
+        }
+
+        // 批量写入Redis
+        for (UserScore us : batch) {
+            redisTemplate.opsForZSet().add(
+                "leaderboard:score",
+                "user_" + us.getUserId(),
+                us.getScore()
+            );
+        }
+
+        offset += batchSize;
+    }
+
+    log.info("排行榜已从数据库恢复，共加载 {} 条记录", offset);
+}
+```
+
+### 5.3 数据一致性
+
+```
+Redis和MySQL不一致的原因：
+1. Redis写入成功，MySQL写入失败
+2. Redis和MySQL同时更新时序问题
+
+解决方案：
+1. 最终一致：定时对账，发现差异后修正
+2. Redis优先：游戏场景下，Redis是权威数据源
+3. MySQL优先：财务场景下，数据库是权威数据源
+```
+
+## 六、生产避坑 🟡
+
+### 6.1 排行榜系统的五大坑
+
+**坑1：分数精度问题**
+
+```
+问题：浮点数排序不准确
+场景：用浮点数存储分数
+影响：0.999999和1.0排序不稳定
+解决方案：
+- 用整数存储：分数 × 10000转为整数
+- 或用String类型存储，手动解析
+```
+
+**坑2：用户不存在问题**
+
+```
+问题：用户注销后，排行榜还显示他
+场景：用户删号，但分数还在Sorted Set里
+解决方案：
+- 定期清理：检查用户是否存在
+- 或者用 Set 存储有效用户列表，过滤时检查
+```
+
+**坑3：并发更新丢失**
+
+```
+问题：两个进程同时更新用户分数，后面的覆盖前面的
+场景：玩家同时打两个怪，经验值计算
+解决方案：
+- ZINCRBY原子递增
+- 或Lua脚本保证原子性
+```
+
+**坑4：内存爆炸**
+
+```
+问题：Sorted Set存储了太多数据
+场景：百万用户，数据量 > 100GB
+解决方案：
+- 分段存储：分段Key，前缀=age_range
+- 冷热分离：活跃用户存Redis，历史存MySQL
+- 数据归档：超过30天的数据归档
+```
+
+**坑5：零点雪崩**
+
+```
+问题：每日排行榜零点重置，大量请求同时查询
+场景：零点时Redis被清空，大量请求穿透到MySQL
+解决方案：
+- 双Set切换：提前创建新Set，零点切换
+- 限流降级：零点限流，避免雪崩
+- 预加载：提前加载好零点数据
+```
+
+【架构权衡】
+
+排行榜系统的核心矛盾是**实时性和一致性的权衡**。Redis Sorted Set提供了毫秒级的实时排序能力，但如果只用Redis，数据丢失的风险不可接受。通常的做法是：**Redis作为计算层提供实时查询，MySQL作为持久化层提供数据保障**。
+
+## 七、真实面试回放 🟡
+
+> **面试官**：设计一个游戏战力排行榜，支持实时更新和Top100查询，日活1000万，怎么实现？
+>
+> **候选人**（游戏架构师）：核心用Redis Sorted Set：
+>
+> 1. 分数更新：玩家每次战斗后，用ZINCRBY原子递增分数
+>
+> 2. Top100查询：用ZREVRANGE查询，毫秒级响应
+>
+> 3. 我的排名：用ZREVRANK查询，返回1-based排名
+>
+> 架构是：
+>
+> 1. 客户端上报分数变化 → 游戏服务器 → Redis
+>
+> 2. 排行榜查询 → Redis → 返回Top100
+>
+> 3. 异步同步 → Redis → MySQL（每5分钟）
+>
+> **面试官**：1000万用户的排行榜，Redis能存下吗？
+>
+> 候选人：能。
+>
+> Sorted Set每个元素约50字节（member + score），1000万用户 = 500MB。加上主从复制和高可用，2GB够用。
+>
+> 如果数据量更大，可以按区分Shard：leaderboard:1、leaderboard:2...每个Shard存100万用户。
+>
+> **面试官**：如果需要查询某个分数段的用户列表，比如查询5000-6000战力的所有用户，怎么实现？
+>
+> 候选人：用 ZRANGEBYSCORE 命令。
+>
+> ZRANGEBYSCORE leaderboard:score 5000 6000 返回分数在5000-6000之间的所有用户。
+>
+> 如果数据量太大，可以用分桶策略：按1000分一个桶，每个桶一个Key，leaderboard:0_999存0-999分，leaderboard:1000_1999存1000-1999分。
+>
+> 查询时根据分数范围定位到桶，再在桶内查询。
+>
+> 【面试官手记】
+>
+> 游戏架构师这场面试的亮点：
+>
+> 1. 正确选择了技术栈：Redis Sorted Set
+>
+> 2. 知道量化分析：1000万用户 × 50字节 = 500MB
+>
+> 3. 知道分桶策略：ZRANGEBYSCORE在大数据量下效率下降，分桶是常见优化
+>
+> 4. 知道Shard策略：单Redis实例扛不住时，可以按用户分Shard
+>
+> 这场面试属于P6+级别，Redis Sorted Set是排行榜的经典方案，能回答出分桶和Shard的候选人，说明有实际优化经验。
+
+排行榜系统设计的核心是**Redis Sorted Set**，记住三个要点：
+
+1. **分数更新**：用 ZINCRBY 原子递增，避免并发问题
+2. **排名查询**：用 ZREVRANK 查排名，ZREVRANGE 查TopN
+3. **分桶优化**：大数据量时分桶查询，避免ZRANGEBYSCORE全表扫描
+
+当你能在面试中讲清楚Redis Sorted Set的使用，排行榜这关就算过了。

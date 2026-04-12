@@ -1,0 +1,400 @@
+---
+title: 线上内存泄漏排查
+description: 从一个OOM导致服务重启的线上事故出发，深度拆解内存泄漏的排查方法：OOM原因分析、堆内存分析、常见泄漏场景，让你快速定位内存杀手。
+---
+
+# 线上内存泄漏排查
+
+2021年某电商平台的订单服务在双十一当天发生了3次重启，每次重启间隔约2小时。
+
+技术团队排查后发现：服务启动时内存使用正常，但每处理10万个订单后，内存就增长1GB。
+
+3天后内存耗尽，JVM触发OOM Killer杀死进程。
+
+根因分析让所有人无语：**开发人员在订单处理方法里，每处理一个订单就往一个静态Map里存一条记录，用于"调试"和"问题追溯"**。
+
+这个Map没有任何清理逻辑，订单越来越多，Map越来越大，直到内存耗尽。
+
+这是一个典型的"代码习惯问题导致内存泄漏"的案例。
+
+【面试官手记】
+
+内存泄漏是Java服务最常见的问题之一。我面试过的候选人里，能说清楚"OOM的原因"的不超过50%，能说清楚"如何定位泄漏点"的不超过20%。内存问题排查的关键是**两个方向**：一是内存确实不够（需要扩容），二是内存泄漏（需要修复代码）。
+
+## 一、OOM的常见原因 🔴
+
+### 1.1 五大原因
+
+```
+OOM的五大原因：
+
+1. 内存泄漏
+   - 对象无法被GC回收
+   - 典型场景：集合未清理、静态引用、监听器未移除
+   - 特点：内存缓慢增长，最终OOM
+
+2. 内存溢出
+   - 一次性创建超大对象
+   - 典型场景：加载大文件、一次性加载全量数据
+   - 特点：突然OOM
+
+3. 堆内存设置过小
+   - -Xmx设置不合理
+   - 典型场景：数据量大但堆内存只有2G
+   - 特点：启动即OOM或运行不久OOM
+
+4. 永久代/元空间不足
+   - JDK 7：永久代不足
+   - JDK 8+：元空间不足
+   - 典型场景：大量类加载、动态生成类
+   - 特点：Full GC时OOM
+
+5. 栈内存溢出
+   - 递归调用过深
+   - 典型场景：死递归、没有尾递归优化
+   - 特点：StackOverflowError
+```
+
+### 1.2 量化指标
+
+```
+内存使用监控：
+- HeapUsed：已使用的堆内存
+- HeapCommitted：已分配的堆内存
+- HeapMax：最大堆内存
+
+GC监控：
+- YoungGC频率：正常约几秒到几十秒一次
+- FullGC频率：正常约几分钟到几小时一次
+- FullGC耗时：正常 < 1秒
+
+内存泄漏特征：
+- 内存使用曲线：缓慢上升，不下降
+- YoungGC频率：越来越快
+- FullGC频率：越来越快
+- 内存释放：GC后内存不下降
+```
+
+### 1.3 面试追问
+
+> 面试官：内存泄漏怎么排查？
+>
+> 候选人：首先用jstat看看GC情况，如果FullGC频繁且内存不下降，基本就是内存泄漏。
+>
+> 面试官：确认是内存泄漏后，怎么定位泄漏点？
+>
+> 候选人：用jmap dump出堆内存，然后用MAT分析。
+>
+> 面试官：MAT分析要看什么？
+>
+> 候选人：看dominator tree，找内存占用大的对象；看unreachable objects，看有哪些对象应该被回收但没被回收。
+
+【面试官心理】
+
+内存泄漏的追问通常围绕"工具"和"分析思路"展开。能回答出"jstat看GC"的候选人，说明知道监控工具；能回答出"jmap + MAT分析"的候选人，说明有实际排查经验；能回答出"dominator tree和unreachable objects"的候选人，说明有深度分析能力。
+
+## 二、排查流程 🔴
+
+### 2.1 第一步：确认是否泄漏
+
+```bash
+# 查看GC情况
+jstat -gcutil <pid> 1000
+
+# 输出示例：
+S0     S1     E      O      M     YGC     YGCT    FGC    FGCT     GCT
+0.00  100.00  45.21  95.67  98.34     23    0.456    15    2.345    2.801
+
+# 关键指标：
+# - O：Old区使用率 > 90% 说明有问题
+# - YGC越来越快、FGCT越来越大 说明内存紧张
+```
+
+### 2.2 第二步：Dump堆内存
+
+```bash
+# 生成堆转储文件
+jmap -dump:format=b,file=heap.hprof <pid>
+
+# 生成指定时刻的dump（生产环境建议用这个，避免影响服务）
+jmap -dump:live,format=b,file=heap_live.hprof <pid>
+
+# 查看堆内存概要
+jmap -heap <pid>
+```
+
+### 2.3 第三步：MAT分析
+
+```
+MAT分析重点：
+
+1. Histogram（直方图）
+   - 按类分组统计对象数量和内存占用
+   - 找内存占用大的类
+
+2. Dominator Tree（支配树）
+   - 找内存占用的根节点
+   - 快速定位泄漏点
+
+3. Top Consumers
+   - 按包名、类名分组
+   - 找异常占用的包
+
+4. Leak Suspects（泄漏怀疑）
+   - MAT自动分析
+   - 给出可能的泄漏点
+```
+
+### 2.4 第四步：代码定位
+
+```java
+// 常见泄漏场景示例
+
+// 场景1：静态集合未清理
+public class UserService {
+    private static Map<Long, User> cache = new HashMap<>();  // 静态Map
+
+    public void processUser(Long userId) {
+        User user = userDAO.get(userId);
+        cache.put(userId, user);  // 只加不减 → 泄漏
+    }
+}
+
+// 场景2：监听器未移除
+public class EventBusManager {
+    public void register() {
+        EventBus.getDefault().register(this);  // 注册
+        // 如果不调用 unregister() → 泄漏
+    }
+}
+
+// 场景3：ThreadLocal未清理
+public class RequestContext {
+    private static ThreadLocal<User> currentUser = new ThreadLocal<>();
+
+    public static void set(User user) {
+        currentUser.set(user);  // set后没remove → 泄漏
+    }
+}
+```
+
+## 三、常见泄漏场景 🟡
+
+### 3.1 静态集合
+
+```java
+// 错误写法
+public class Cache {
+    private static Map<String, Object> cache = new HashMap<>();
+
+    public void put(String key, Object value) {
+        cache.put(key, value);  // 只加不减
+    }
+}
+
+// 正确写法：定期清理 或 使用带TTL的缓存
+public class Cache {
+    private static Map<String, CacheEntry> cache = new ConcurrentHashMap<>();
+
+    public void put(String key, Object value) {
+        cache.put(key, new CacheEntry(value, System.currentTimeMillis()));
+    }
+
+    public void cleanup() {
+        long now = System.currentTimeMillis();
+        cache.entrySet().removeIf(e ->
+            now - e.getValue().getTimestamp() > TTL
+        );
+    }
+}
+```
+
+### 3.2 ThreadLocal
+
+```java
+// 错误写法
+public class UserInterceptor {
+    private static ThreadLocal<User> currentUser = new ThreadLocal<>();
+
+    public boolean preHandle(HttpServletRequest request) {
+        User user = parseToken(request);
+        currentUser.set(user);  // 只set，不remove
+        return true;
+    }
+}
+
+// 正确写法
+public class UserInterceptor {
+    private static ThreadLocal<User> currentUser = new ThreadLocal<>();
+
+    public void afterCompletion(HttpServletRequest request) {
+        currentUser.remove();  // 显式清理
+    }
+}
+```
+
+### 3.3 连接池未关闭
+
+```java
+// 错误写法
+public void query() {
+    Connection conn = dataSource.getConnection();
+    // ... 使用conn
+    // 忘记 conn.close() → 连接泄漏
+}
+
+// 正确写法
+public void query() {
+    try (Connection conn = dataSource.getConnection()) {
+        // ... 使用conn
+    }  // 自动关闭
+}
+```
+
+## 四、生产避坑 🟡
+
+### 4.1 内存排查的五大坑
+
+**坑1：只dump一次**
+
+```
+问题：只在OOM时dump，此时JVM可能已经崩溃
+解决方案：
+- 用 Arthas 的 heapdump 命令，不影响服务
+- 定期dump分析内存趋势
+- 在GC前后各dump一次，对比差异
+```
+
+**坑2：只看对象数量**
+
+```
+问题：只看对象数量，没看对象大小
+解决方案：
+- MAT里按 shallow size 排序
+- MAT里按 retained size 排序
+- shallow size 小但 retained size 大的对象可能是泄漏点
+```
+
+**坑3：忽略NIO直接内存**
+
+```
+问题：只看堆内存，忽略了堆外内存
+场景：Netty/直接内存缓冲、Native内存
+解决方案：
+- jmap -heap 显示的是堆内存
+- 用 -XX:MaxDirectMemorySize 限制
+- 用 Native Memory Tracking 分析
+```
+
+**坑4：OOM后不分析**
+
+```
+问题：OOM发生后就重启，没保留现场
+解决方案：
+- 添加 -XX:+HeapDumpOnOutOfMemoryError
+- 添加 -XX:HeapDumpPath=/path/to/dumps
+- OOM后自动dump，方便事后分析
+```
+
+**坑5：忽略Metaspace**
+
+```
+问题：只看Heap，没看Metaspace
+场景：大量反射、动态代理、字节码生成
+JDK 7解决方案：
+- -XX:PermSize=256m -XX:MaxPermSize=512m
+JDK 8+解决方案：
+- -XX:MetaspaceSize=256m -XX:MaxMetaspaceSize=512m
+```
+
+### 4.2 快速止血方案
+
+```
+内存泄漏时的紧急处理：
+
+1. 重启
+   - 紧急重启服务
+   - 配合健康检查
+
+2. 扩容
+   - 增加堆内存
+   - 撑到修复上线
+
+3. 降级
+   - 关闭非核心功能
+   - 减少数据加载
+
+4. 快速修复
+   - 定位到代码后
+   - 立即修复并上线
+```
+
+## 五、排查工具速查 🟢
+
+| 工具 | 用途 | 使用场景 |
+| --- | --- | --- |
+| jstat | GC统计 | 判断是否有泄漏 |
+| jmap | 堆dump | dump堆内存 |
+| MAT | 堆分析 | 分析泄漏点 |
+| Arthas | 线上诊断 | 不影响服务 |
+| heaphero | 在线分析 | 快速定位 |
+| GCEasy | GC日志分析 | 分析GC问题 |
+
+## 六、真实面试回放 🟡
+
+> **面试官**：线上服务内存缓慢增长，最终OOM，怎么排查？
+>
+> **候选人**（小李）：先确认是不是内存泄漏。
+>
+> 用 jstat -gcutil 看GC情况，如果 Old 区使用率一直很高，而且 FullGC 后内存不下降，基本就是泄漏。
+>
+> 然后用 jmap dump 堆内存，用 MAT 分析。
+>
+> 看 dominator tree，找内存占用大的对象链。
+>
+> **面试官**：MAT里dominator tree是什么？
+>
+> 小李：dominator tree 是对象的支配关系。如果 A 支配 B，说明所有从根节点到 B 的路径都经过 A。
+>
+> 在 dominator tree 里，一个对象的子树都是被它支配的对象。如果某个节点下的对象特别多、特别大，基本就是泄漏点。
+>
+> **面试官**：你说说常见的内存泄漏场景。
+>
+> 小李：主要有三个：
+>
+> 一是静态集合。比如 HashMap 作为缓存，只加不减。
+>
+> 二是 ThreadLocal。用完没 remove。
+>
+> 三是监听器/回调。注册了 listener 但没注销。
+>
+> **面试官**：ThreadLocal的泄漏是因为什么？
+>
+> 小李：因为 ThreadLocal 是线程级别的，每个线程有自己的 ThreadLocalMap。如果线程是长生命周期的（比如线程池），ThreadLocalMap 的 Entry 就不会被回收。
+>
+> 除非显式调用 remove()。
+>
+> 【面试官手记】
+>
+> 小李这场面试的亮点：
+>
+> 1. 排查流程清晰：jstat → jmap → MAT
+>
+> 2. 知道 dominator tree 的含义：支配关系
+>
+> 3. 知道常见泄漏场景：静态集合、ThreadLocal、监听器
+>
+> 4. 知道 ThreadLocal 泄漏的原因：线程池 + Entry 不清理
+>
+> 内存泄漏是P6工程师必备技能，能完整回答的候选人，说明有实际排查经验。
+>
+> 追问方向：会问"JVM哪些区域会发生OOM"，这个问题考验候选人对JVM内存结构的理解。
+
+内存泄漏排查的核心是**确认泄漏 → dump分析 → 定位代码**。记住四步排查法：
+
+1. **jstat**：看GC情况，确认是否泄漏
+2. **jmap**：dump堆内存
+3. **MAT**：分析dominator tree
+4. **代码**：修复泄漏点
+
+OOM止血：扩容 → 重启 → 修复代码。

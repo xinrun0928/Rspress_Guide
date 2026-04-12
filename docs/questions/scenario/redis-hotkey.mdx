@@ -1,0 +1,519 @@
+---
+title: Redis热Key问题
+description: 从一次热Key导致Redis被击穿的事故出发，深度拆解热Key问题：识别方法、本地缓存、热点探测及常见问题处理。
+---
+
+# Redis热Key问题
+
+2021年双十一零点，某电商平台的Redis集群突然出现雪崩，集群中某个节点的QPS飙升到100万+，直接宕机。
+
+技术团队排查后发现：当天主推的爆款商品被数百万用户同时访问，这个商品的详情缓存Key被集中在同一台Redis节点上。
+
+更可怕的是：Redis集群用的是客户端哈希分区，这个热Key的所有请求都打到了同一台机器。
+
+**这次故障导致商品页无法访问1小时，直接损失约500万元。**
+
+【面试官手记】
+
+热Key是Redis集群最危险的场景之一。我面试过的候选人里，能说清楚"热Key识别"的有40%，能说清楚"热Key应对"的有30%，能说清楚"热点探测"的有20%。热Key的关键词是**分散热点 + 本地缓存**。
+
+## 一、热Key的识别标准 🔴
+
+### 1.1 热Key定义
+
+```
+热Key定义：
+
+Redis热Key指被高频访问的Key，可能导致以下问题：
+- 单节点QPS过高
+- CPU使用率飙升
+- 网络带宽占满
+- 请求延迟增加
+
+热Key的典型场景：
+
+1. 爆款商品
+   - 双十一主推商品
+   - 热搜商品
+   - 明星塌房相关话题
+
+2. 热点用户
+   - 大V用户数据
+   - 官方账号数据
+
+3. 公共配置
+   - 首页配置
+   - Banner配置
+   - 通用字典
+
+识别标准：
+- 单Key QPS > 10万
+- 单Key访问量占集群总访问量 > 10%
+- 单Key带宽占用 > 集群带宽50%
+```
+
+### 1.2 热Key识别方法
+
+```bash
+# 方法1：redis-cli --hotkeys（扫描热Key）
+redis-cli -h 127.0.0.1 -p 6379 --hotkeys
+
+# 输出：
+# Scanning 1 billion keys...
+# hot key is 'product:detail:10000'
+#     with 123456789 accesses
+
+# 方法2：MONITOR采样分析
+redis-cli
+> MONITOR > monitor.log &
+# 采样10秒后分析
+$ awk '{print $2}' monitor.log | sort | uniq -c | sort -rn | head -10
+
+# 方法3：使用Redis内置统计
+# 在redis.conf中启用：
+# latency-monitor-threshold 100
+# notify-keyspace-events Ex
+
+# 查看latency事件
+redis-cli latency history
+```
+
+```java
+// 方法4：代码层热Key识别
+@Component
+public class HotKeyDetector {
+
+    private final ConcurrentHashMap<String, AtomicLong> counter = new ConcurrentHashMap<>();
+    private final long windowMs = 60000;  // 1分钟窗口
+
+    @Scheduled(fixedRate = 60000)
+    public void reportHotKeys() {
+        long now = System.currentTimeMillis();
+        counter.entrySet().removeIf(e -> now - e.getValue().get() > windowMs);
+
+        // 找出访问量超过10万的Key
+        counter.entrySet().stream()
+            .filter(e -> e.getValue().get() > 100000)
+            .forEach(e -> {
+                log.warn("热Key发现：{} 访问量：{}", e.getKey(), e.getValue().get());
+                alertService.sendAlert("热Key", e.getKey(), e.getValue().get());
+            });
+    }
+
+    /**
+     * 拦截Redis操作，统计访问量
+     */
+    public Object intercept(RedisTemplate template, String key, Runnable action) {
+        counter.computeIfAbsent(key, k -> new AtomicLong()).incrementAndGet();
+        return action.run();
+    }
+}
+```
+
+## 二、热Key应对方案 🔴
+
+### 2.1 本地缓存
+
+```java
+// 热Key解决方案1：本地缓存
+@Service
+public class ProductCacheService {
+
+    @Autowired
+    private RedisTemplate redisTemplate;
+
+    // 本地缓存：Guava Cache
+    private LoadingCache<String, String> localCache = CacheBuilder.newBuilder()
+        .maximumSize(10000)                    // 最大10000个
+        .expireAfterWrite(30, TimeUnit.SECONDS) // 30秒过期
+        .recordStats()                         // 记录统计
+        .build(new CacheLoader<String, String>() {
+            @Override
+            public String load(String key) {
+                // 本地缓存未命中，从Redis加载
+                return (String) redisTemplate.opsForValue().get(key);
+            }
+        });
+
+    /**
+     * 读取热Key：先读本地缓存，未命中再读Redis
+     */
+    public String getProductDetail(Long productId) {
+        String key = "product:detail:" + productId;
+
+        // 1. 先读本地缓存
+        try {
+            return localCache.get(key);
+        } catch (Exception e) {
+            // 本地缓存未命中
+        }
+
+        // 2. 读Redis
+        String value = (String) redisTemplate.opsForValue().get(key);
+
+        // 3. 写入本地缓存
+        if (value != null) {
+            localCache.put(key, value);
+        }
+
+        return value;
+    }
+
+    /**
+     * 写入：双写
+     */
+    public void setProductDetail(Long productId, String value) {
+        String key = "product:detail:" + productId;
+
+        // 1. 写Redis
+        redisTemplate.opsForValue().set(key, value, 1, TimeUnit.HOURS);
+
+        // 2. 写本地缓存
+        localCache.put(key, value);
+    }
+}
+```
+
+### 2.2 Redis集群热点Key分散
+
+```java
+// 热Key解决方案2：Key后缀随机化
+@Service
+public class HotKeyService {
+
+    private static final int BUCKET_COUNT = 10;  // 分成10个桶
+
+    /**
+     * 写操作：随机写入不同桶
+     */
+    public void setHotKey(String key, String value) {
+        // 随机选择桶
+        int bucket = new Random().nextInt(BUCKET_COUNT);
+        String bucketKey = key + ":" + bucket;
+        redisTemplate.opsForValue().set(bucketKey, value);
+    }
+
+    /**
+     * 读操作：随机选择一个桶读取
+     */
+    public String getHotKey(String key) {
+        int bucket = new Random().nextInt(BUCKET_COUNT);
+        String bucketKey = key + ":" + bucket;
+        return (String) redisTemplate.opsForValue().get(bucketKey);
+    }
+
+    /**
+     * 或使用MGET批量读取
+     */
+    public List<String> getHotKeyAll(String key) {
+        List<String> bucketKeys = new ArrayList<>();
+        for (int i = 0; i < BUCKET_COUNT; i++) {
+            bucketKeys.add(key + ":" + i);
+        }
+        return redisTemplate.opsForValue().multiGet(bucketKeys);
+    }
+}
+```
+
+### 2.3 多级缓存架构
+
+```java
+// 热Key解决方案3：多级缓存
+@Service
+public class MultiLevelCacheService {
+
+    // L1：本地缓存（热点数据）
+    private final LoadingCache<String, String> l1Cache;
+
+    // L2：Redis缓存
+    @Autowired
+    private RedisTemplate redisTemplate;
+
+    // L3：数据库
+    @Autowired
+    private ProductDAO productDAO;
+
+    public MultiLevelCacheService() {
+        l1Cache = CacheBuilder.newBuilder()
+            .maximumSize(10000)
+            .expireAfterWrite(10, TimeUnit.SECONDS)  // L1过期最短
+            .recordStats()
+            .build();
+    }
+
+    public String getProduct(Long productId) {
+        String key = "product:" + productId;
+
+        // L1：本地缓存
+        try {
+            String result = l1Cache.get(key);
+            if (result != null) return result;
+        } catch (Exception ignored) {}
+
+        // L2：Redis缓存
+        String result = (String) redisTemplate.opsForValue().get(key);
+        if (result != null) {
+            l1Cache.put(key, result);
+            return result;
+        }
+
+        // L3：数据库
+        Product product = productDAO.selectById(productId);
+        if (product != null) {
+            result = JSON.toJSONString(product);
+            redisTemplate.opsForValue().set(key, result, 5, TimeUnit.MINUTES);
+            l1Cache.put(key, result);
+        }
+
+        return result;
+    }
+
+    /**
+     * 缓存更新：删除缓存而非更新
+     */
+    public void updateProduct(Product product) {
+        String key = "product:" + product.getId();
+        productDAO.update(product);
+        // 删除缓存，让下次访问时加载最新数据
+        l1Cache.invalidate(key);
+        redisTemplate.delete(key);
+    }
+}
+```
+
+## 三、热点探测 🟡
+
+### 3.1 主动探测
+
+```java
+// 热点探测服务
+@Service
+public class HotSpotDetector {
+
+    @Autowired
+    private RedisTemplate redisTemplate;
+
+    private final ScheduledExecutorService executor = Executors.newScheduledThreadPool(2);
+
+    /**
+     * 启动热点探测
+     */
+    @PostConstruct
+    public void startHotSpotDetection() {
+        // 每秒采样
+        executor.scheduleAtFixedRate(this::sample, 0, 1, TimeUnit.SECONDS);
+
+        // 每分钟上报
+        executor.scheduleAtFixedRate(this::report, 0, 1, TimeUnit.MINUTES);
+    }
+
+    private final ConcurrentHashMap<String, AtomicLong> samples = new ConcurrentHashMap<>();
+
+    /**
+     * 采样：拦截Redis操作
+     */
+    public void sample(String key) {
+        // 忽略非业务Key
+        if (key.startsWith("monitor:") || key.startsWith("log:")) {
+            return;
+        }
+
+        samples.computeIfAbsent(key, k -> new AtomicLong()).incrementAndGet();
+    }
+
+    /**
+     * 上报并分析热点
+     */
+    private void report() {
+        if (samples.isEmpty()) return;
+
+        long total = samples.values().stream().mapToLong(AtomicLong::get).sum();
+
+        samples.entrySet().stream()
+            .filter(e -> e.getValue().get() > 10000)  // QPS > 1万
+            .forEach(e -> {
+                String key = e.getKey();
+                long count = e.getValue().get();
+                double ratio = (double) count / total;
+
+                if (ratio > 0.1) {  // 占比 > 10%
+                    log.warn("发现热Key：{} QPS：{} 占比：{:.2%}", key, count, ratio);
+                    notifyHotKeyHandler(key, count, ratio);
+                }
+            });
+
+        samples.clear();
+    }
+
+    private void notifyHotKeyHandler(String key, long qps, double ratio) {
+        // 1. 发送告警
+        alertService.sendAlert("热Key告警", key, qps);
+
+        // 2. 触发本地缓存预热
+        localCacheService.preheat(key);
+
+        // 3. 记录到热点库
+        hotKeyDAO.insert(new HotKeyDO(key, qps, ratio, new Date()));
+    }
+}
+```
+
+### 3.2 热点数据预热
+
+```java
+// 热点数据预热
+@Service
+public class HotDataPreheatService {
+
+    @Autowired
+    private ProductDAO productDAO;
+
+    @Autowired
+    private MultiLevelCacheService cacheService;
+
+    /**
+     * 大促前预热热点数据
+     */
+    @PostConstruct
+    public void preheat() {
+        // 获取历史热点数据
+        List<HotKeyDO> hotKeys = hotKeyDAO.selectRecentHotKeys();
+
+        for (HotKeyDO hotKey : hotKeys) {
+            // 模拟访问，预热本地缓存
+            for (int i = 0; i < 100; i++) {
+                cacheService.getProduct(hotKey.getProductId());
+            }
+        }
+
+        log.info("热点数据预热完成，共预热{}个Key", hotKeys.size());
+    }
+}
+```
+
+## 四、生产避坑 🟡
+
+### 4.1 热Key的五大坑
+
+**坑1：所有请求打到同一节点**
+
+```
+问题：热Key在Redis集群中分布不均
+场景：客户端哈希分区，热Key集中在某一Slot
+解决方案：
+- Key后缀随机化，分散到多个Key
+- 使用本地缓存减轻Redis压力
+```
+
+**坑2：本地缓存数据不一致**
+
+```
+问题：本地缓存和Redis数据不同步
+场景：数据更新后，本地缓存未失效
+解决方案：
+- 本地缓存设置短过期时间
+- 写操作删除缓存而非更新
+```
+
+**坑3：没有热点探测**
+
+```
+问题：热Key出现时没有告警
+场景：热Key慢慢积累，直到压垮节点
+解决方案：
+- 实时监控Key的访问频率
+- 设置热Key告警阈值
+```
+
+**坑4：本地缓存未命中后击穿**
+
+```
+问题：本地缓存未命中，大量请求同时穿透到Redis
+场景：本地缓存过期瞬间
+解决方案：
+- 使用分布式锁
+- 或使用单flight机制
+```
+
+**坑5：热Key更新问题**
+
+```
+问题：热Key更新时，本地缓存无法及时更新
+场景：商品价格实时更新
+解决方案：
+- 缩短本地缓存过期时间
+- 或使用主动推送更新
+```
+
+### 4.2 热Key检查清单
+
+```
+开发规范：
+- [ ] 热点数据使用本地缓存
+- [ ] 热Key使用Key后缀随机化
+- [ ] 本地缓存设置合理过期时间
+
+监控规范：
+- [ ] 监控单Key QPS
+- [ ] 监控单节点CPU使用率
+- [ ] 设置热Key告警
+
+运维规范：
+- [ ] 大促前预热热点数据
+- [ ] 准备热Key降级方案
+- [ ] 准备扩容方案
+```
+
+## 五、真实面试回放 🟡
+
+> **面试官**：Redis热Key怎么识别和处理？
+>
+> **候选人**（小张）：识别方法：
+>
+> 一是redis-cli --hotkeys扫描。
+>
+> 二是MONITOR采样分析。
+>
+> 三是代码层统计访问量。
+>
+> 处理方案：
+>
+> 一是本地缓存。用Guava Cache或Caffeine，热点数据放本地。
+>
+> 二是Key后缀随机化。把一个热Key分散成10个Key，读的时候随机选。
+>
+> **面试官**：本地缓存和Redis数据不一致怎么办？
+>
+> 小张：两个原则：
+>
+> 一是写操作删除缓存，不更新缓存。
+>
+> 二是本地缓存过期时间尽量短，比如10-30秒。
+>
+> **面试官**：本地缓存未命中后击穿怎么办？
+>
+> 小张：用分布式锁。
+>
+> 缓存未命中时，只允许一个请求去查数据库，其他请求等待。
+>
+> 或者用单flight机制，请求共享结果。
+>
+> 【面试官手记】
+>
+> 小张这场面试的亮点：
+>
+> 1. 知道三种热Key识别方法
+>
+> 2. 知道本地缓存和Key随机化方案
+>
+> 3. 知道缓存击穿的解决方案
+>
+> 热Key是P7工程师必备知识点，能完整回答的候选人，说明有高并发实战经验。
+
+Redis热Key的核心是**分散热点 + 本地缓存**。记住三个要点：
+
+1. **识别方法**：--hotkeys扫描、MONITOR采样
+2. **应对方案**：本地缓存、Key随机化、多级缓存
+3. **预防措施**：热点探测、大促预热、降级方案
+
+热Key是Redis集群的隐形杀手，宁可提前准备，不要临时抱佛脚。

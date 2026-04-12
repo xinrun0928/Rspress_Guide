@@ -1,0 +1,293 @@
+---
+title: ThreadLocal 原理
+description: 从线程隔离数据出发，深入剖析 ThreadLocal 的实现：ThreadLocalMap 的结构、Entry 的弱引用设计、set/get/remove 流程，以及与线程池配合使用时的坑。
+---
+
+# ThreadLocal 原理
+
+候选人小沈在面试拼多多 P6 时，面试官问道：
+
+"ThreadLocal 是什么？它是怎么实现线程隔离的？"
+
+小沈说："每个线程有自己的变量副本..."面试官追问："ThreadLocalMap 存在哪里？它的结构和 HashMap 有什么不同？"
+
+小沈支支吾吾答不上来。面试官继续："ThreadLocal 的 Entry 为什么用弱引用？如果用强引用会怎样？"
+
+小沈彻底卡住了...
+
+## 一、核心问题：ThreadLocal 原理 🔴
+
+### 1.1 问题拆解
+
+```
+第一层：概念（是什么？）
+  "ThreadLocal 是什么？它解决了什么问题？"
+  考察点：线程隔离、上下文传递、无锁设计
+
+第二层：底层结构（怎么存？）
+  "ThreadLocalMap 在哪里？它的结构和 HashMap 有什么不同？"
+  考察点：Thread 对象持有、Entry 数组、线性探测
+
+第三层：引用设计（弱引用的坑）
+  "ThreadLocal 的 Entry 为什么要用弱引用？"
+  考察点：WeakReference、内存泄漏、清理机制
+
+第四层：使用场景（怎么用？）
+  "ThreadLocal 适用于什么场景？什么场景不适合用？"
+  考察点：ConnectionHolder、SimpleDateFormat、线程池问题
+```
+
+### 1.2 ❌ 错误示范
+
+**候选人原话 A**："ThreadLocal 就是给每个线程创建一个独立的变量副本，所以不需要同步。"
+
+**问题诊断**：ThreadLocal 确实不需要同步（因为每个线程有自己的副本），但这并不意味着所有场景都适合。如果需要在多个线程间共享数据，ThreadLocal 帮不了你。
+
+**候选人原话 B**："ThreadLocal 用完要 remove，否则会内存泄漏。"
+
+**问题诊断**：这个说法不完全准确。ThreadLocalMap 的 Entry 使用**弱引用**，ThreadLocal 本身被 GC 后，Entry 的 key 变为 null，但 value 仍然被 Entry 持有。如果线程是长生命周期的（如线程池中的线程），value 不会被 GC，导致内存泄漏。
+
+### 1.3 标准回答
+
+#### P5 级别：概念与使用
+
+> **ThreadLocal 的设计目标**：
+>
+> ThreadLocal 解决了**在线程内传递数据**的问题，避免了方法参数层层传递的麻烦：
+>
+> ```java
+> // 使用 ThreadLocal 存储线程上下文
+> ThreadLocal<UserContext> context = new ThreadLocal<>();
+>
+> // 设置
+> context.set(new UserContext(userId, token));
+>
+> // 在任何地方获取（同一线程内）
+> UserContext ctx = context.get();
+>
+> // 使用完毕后清理（重要！）
+> context.remove();
+> ```
+>
+> **ThreadLocal 存储在哪里？**
+>
+> ThreadLocal 不是存在 ThreadLocal 对象里的，而是存在**Thread 对象**里：
+>
+> ```java
+> public class Thread implements Runnable {
+>     ThreadLocal.ThreadLocalMap threadLocals = null;  // Thread 对象持有
+>     ThreadLocal.ThreadLocalMap inheritableThreadLocals = null;  // 可继承版本
+> }
+> ```
+>
+> 所以 ThreadLocal 只是这个 Map 的**键**（ThreadLocal 对象本身），实际的值存在 Thread 对象中。
+
+#### P6 级别：ThreadLocalMap 详解
+
+> **ThreadLocalMap 的结构**：
+>
+> ThreadLocalMap 是 ThreadLocal 自己实现的一个定制化哈希表，与 HashMap 有显著差异：
+>
+> ```java
+> static class ThreadLocalMap {
+>     // Entry 使用弱引用（关键！）
+>     static class Entry extends WeakReference<ThreadLocal<?>> {
+>         Object value;
+>         Entry(ThreadLocal<?> k, Object v) {
+>             super(k);  // 弱引用 key
+>             value = v;
+>         }
+>     }
+>
+>     private Entry[] table;  // Entry 数组
+>     private int size = 0;
+>     private int threshold;  // 扩容阈值（2/3 * len）
+>
+>     // 散列方式：开放地址法（线性探测）
+>     private int expungeStaleEntry(int staleSlot) {
+>         // 删除 stale 元素，清理后续的过期元素
+>     }
+> }
+> ```
+>
+> **ThreadLocalMap vs HashMap 的关键区别**：
+>
+> | 维度 | ThreadLocalMap | HashMap |
+> | --- | --- | --- |
+> | 冲突解决 | 线性探测（开放地址） | 链地址法（桶+链表/红黑树） |
+> | 哈希冲突 | ThreadLocal 的 hashCode 是线性的（nextHashCode 累加） | 对象 hashCode + 扰动函数 |
+> | 桶结构 | 无桶概念，直接 Entry[] | Node[] 数组 + 链表/红黑树 |
+> | 清理策略 | 惰性清理（expungeStaleEntry） | 主动清理（put/get 时触发） |
+> | 扩容 | 2倍扩容，但仅清理部分条目 | 2倍扩容，清理全部 |
+>
+> **set() 流程**：
+>
+> ```java
+> public void set(T value) {
+>     Thread t = Thread.currentThread();
+>     ThreadLocalMap map = t.threadLocals;
+>     if (map == null) {
+>         createMap(t, value);  // 首次创建
+>     } else {
+>         map.set(this, value);  // 添加或更新
+>     }
+> }
+>
+> // ThreadLocalMap.set() 中包含 stale 元素清理
+> private void set(ThreadLocal<?> key, Object value) {
+>     Entry[] tab = table;
+>     int len = tab.length;
+>     int i = key.threadLocalHashCode & (len - 1);
+>
+>     for (Entry e = tab[i]; e != null; e = tab[i = nextIndex(i, len)]) {
+>         if (e.get() == key) {  // key 为 null 说明已过期
+>             e.value = value;
+>             return;
+>         }
+>         if (e.get() == null) {  // 遇到过期 Entry
+>             replaceStaleEntry(key, value, i);
+>             return;
+>         }
+>     }
+>     tab[i] = new Entry(key, value);
+>     size++;
+>     if (size >= threshold) rehash();
+> }
+> ```
+
+#### P7 级别：弱引用与内存泄漏
+
+> **Entry 为什么用弱引用？**
+>
+> 如果 Entry 使用**强引用**：
+>
+> ```java
+> // 如果 Entry 用强引用持有 key
+> Object key;  // 强引用
+> Object value;
+>
+> // 线程 A
+> threadLocal.set(connection);  // threadLocal 被 Entry 持有，Entry 被 ThreadLocalMap 持有
+> threadLocal = null;  // 手动置 null
+> // → 但 Entry.key 仍然引用 threadLocal → threadLocal 无法被 GC
+> ```
+>
+> 使用**弱引用**后：
+>
+> ```java
+> // 弱引用
+> WeakReference<ThreadLocal<?>> keyRef;  // Entry 持有弱引用
+>
+> threadLocal.set(connection);
+> threadLocal = null;
+> // → threadLocal 可以被 GC（WeakReference.get() 返回 null）
+> // → 但 Entry.value 仍然持有 connection 对象！
+> ```
+>
+> **内存泄漏的真正原因**：
+>
+> ```
+> Thread 对象（长生命周期）
+>   └─ ThreadLocalMap
+>         └─ Entry[] table
+>               └─ Entry[staleSlot]
+>                     ├─ key = null（ThreadLocal 已被 GC）
+>                     └─ value = connection（未被 GC！）
+> ```
+>
+> 如果线程是**短生命周期**的（每次请求创建新线程），线程结束后 ThreadLocalMap 随 Thread 对象一起被 GC，不会有泄漏。
+>
+> 但在**线程池**中，Thread 对象被复用，ThreadLocalMap 持久存在。如果不调用 `remove()`，过期的 Entry（key=null 但 value 存在）会持续占用内存。
+>
+> **解决方案**：
+>
+> 1. **每次使用后 remove()**：`threadLocal.remove()`（最重要）
+> 2. **用 try-finally 包裹**：
+>     ```java
+>     try {
+>         threadLocal.set(value);
+>         doWork();
+>     } finally {
+>         threadLocal.remove();
+>     }
+>     ```
+> 3. **ThreadLocal 的替代方案**：`InheritableThreadLocal`（子线程继承父线程的值，但也有泄漏风险）
+
+【面试官心理】
+这道题我能问到 P7 级别，是因为 ThreadLocal 的弱引用设计是 Java 内存管理的经典问题。能说清为什么用弱引用以及仍然可能内存泄漏的候选人说明他理解了引用类型和线程池的交互。能正确使用 remove() 的候选人说明他有生产安全意识。
+
+### 1.4 追问升级
+
+**追问 1：ThreadLocalMap 为什么不使用链地址法？**
+
+> ThreadLocal 通常使用数量较少（每个线程几个），不需要 HashMap 那样处理大量冲突。ThreadLocal 的 hashCode 是线性的（`HASH_INCREMENT = 0x61c88647`，斐波那契哈希保证均匀分布），通过线性探测解决冲突，减少了内存开销（无链表节点）。
+
+**追问 2：ThreadLocal 在 Spring 框架中的应用？**
+
+> Spring 使用 `RequestContextHolder` 和 `TransactionSynchronizationManager`，它们内部使用 `ThreadLocal` 存储当前请求上下文和事务上下文。这样在 Service 层和 DAO 层不需要层层传递 HttpServletRequest 对象。
+
+## 二、生产避坑
+
+### 2.1 线程池中的 ThreadLocal 泄漏
+
+```java
+// 错误：在 Runnable/Callable 中使用 ThreadLocal，不清理
+ExecutorService pool = Executors.newFixedThreadPool(4);
+for (int i = 0; i < 10; i++) {
+    pool.submit(() -> {
+        threadLocal.set(value);  // value 被存入线程的 ThreadLocalMap
+        // ... 使用
+        // 如果忘记 remove()，value 泄漏
+    });
+}
+```
+
+**正确做法**：
+```java
+pool.submit(() -> {
+    try {
+        threadLocal.set(value);
+        // 业务
+    } finally {
+        threadLocal.remove();  // 必须在 finally 中清理
+    }
+});
+```
+
+### 2.2 ThreadLocal 与继承
+
+线程池中的任务使用主线程创建 ThreadLocal，但子线程（worker 线程）无法继承主线程的 ThreadLocal。
+
+**解决**：使用 `InheritableThreadLocal`（但要注意线程复用后仍需清理）。
+
+## 三、ThreadLocal 的常见应用场景 🟡
+
+### 3.1 ConnectionHolder
+
+```java
+class ConnectionHolder {
+    private static final ThreadLocal<Connection> holder = new ThreadLocal<>();
+>
+>    public static Connection get() {
+>        if (holder.get() == null) {
+>            Connection conn = DriverManager.getConnection(url);
+>            holder.set(conn);
+>        }
+>        return holder.get();
+>    }
+}
+```
+
+但注意：如果连接需要跨线程共享，不要用 ThreadLocal。ThreadLocal 是线程本地的。
+
+### 3.2 替代 ThreadLocal 的方案
+
+> 对于跨线程传递数据，考虑使用 `Alibaba TransmittableThreadLocal`（淘宝开源，解决了线程池场景下的 ThreadLocal 继承问题）。
+
+:::tip 💡
+面试加分点：能说出"JDK 9 引入了 `Thread.ofPlatform()` 和 `Thread.ofVirtual()` 可以创建不同类型的线程，且 Virtual Thread 的 ThreadLocal 行为与平台线程有所不同"，说明他对 JDK 21 的虚拟线程有了解。
+:::
+
+:::warning ⚠️
+面试陷阱：被问到"ThreadLocal 在线程池中会导致数据错乱吗"，很多人会说"不会"。准确答案是：**如果线程复用且 ThreadLocal 未清理，会导致数据泄漏**；如果清理了，不会错乱。但如果有多个请求复用同一个线程且忘记清理，会导致请求 A 的数据被请求 B 读到（严重安全问题）。
+:::

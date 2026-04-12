@@ -1,0 +1,310 @@
+---
+title: AQS 原理
+description: 从 ReentrantLock 源码出发，深入剖析 AQS 的核心设计：state 状态管理、CLH 队列、独占/共享模式、tryAcquire 与 tryRelease 的模板方法模式，以及 ConditionObject 条件队列的实现。
+---
+
+# AQS 原理
+
+候选人小唐在面试拼多多 P7 时，面试官问道：
+
+"你能手写一个简单的 ReentrantLock 吗？"
+
+小唐说："可以用 synchronized..."面试官说："我们聊聊 AQS 吧。AQS 的核心结构是什么？它是怎么管理等待队列的？"
+
+小唐彻底答不上来了...
+
+## 一、核心问题：AQS 原理 🔴
+
+### 1.1 问题拆解
+
+```
+第一层：定位（是什么？）
+  "AQS 在 JUC 中的位置是什么？哪些类依赖 AQS？"
+  考察点：AbstractQueuedSynchronizer 的作用
+
+第二层：核心结构（有什么？）
+  "AQS 的核心数据结构和状态管理是什么？"
+  考察点：volatile state、CLH 队列、Node
+
+第三层：模板方法（怎么用？）
+  "AQS 为什么用模板方法模式？tryAcquire 和 tryRelease 是什么角色？"
+  考察点：设计模式、模板方法
+
+第四层：独占与共享（两种模式）
+  "AQS 的独占模式和共享模式有什么区别？分别在哪些场景使用？"
+  考察点：CountDownLatch、CyclicBarrier、Semaphore
+```
+
+### 1.2 ❌ 错误示范
+
+**候选人原话 A**："AQS 是一个队列，用来管理线程。"
+
+**问题诊断**：AQS 不只是一个队列。它是**一个状态管理 + 等待队列的框架**。CLH 队列只是 AQS 的一部分，核心是 `volatile int state` 的状态管理。
+
+**候选人原话 B**："AQS 的 acquire() 就是获取锁，release() 就是释放锁。"
+
+**问题诊断**：AQS 有两种模式——独占（acquire/release）和共享（acquireShared/releaseShared）。CountDownLatch、CyclicBarrier、Semaphore 使用共享模式，ReentrantLock、ReentrantReadWriteLock.WriteLock 使用独占模式。
+
+### 1.3 标准回答
+
+#### P5 级别：AQS 定位与核心结构
+
+> **AQS 的定位**：
+>
+> `AbstractQueuedSynchronizer`（队列同步器）是 JUC 包中**几乎所有锁和同步器的底层实现**，包括：
+>
+> - `ReentrantLock`（可重入独占锁）
+> - `ReentrantReadWriteLock`（读写锁）
+> - `Semaphore`（信号量）
+> - `CountDownLatch`（倒计时门栓）
+> - `CyclicBarrier`（循环栅栏）
+>
+> **核心结构**：
+>
+> ```java
+> public abstract class AbstractQueuedSynchronizer extends AbstractOwnableSynchronizer {
+>     // 1. 状态：volatile int state
+>     // 0 = 未占用，正数 = 已占用（可重入计数）
+>     private volatile int state;
+>
+>     // 2. CLH 队列（等待队列）
+>     // 双向链表，头尾指针，存储等待线程
+>     private transient volatile Node head;
+>     private transient volatile Node tail;
+>
+>     // 3. Node（等待节点）
+>     static final class Node {
+>         volatile Node prev;
+>         volatile Node next;
+>         volatile Thread thread;  // 等待的线程
+>         int waitStatus;  // SIGNAL/CANCELLED/CONDITION/SHARED/PROPAGATE
+>         boolean isShared; // 共享模式标记
+>     }
+> }
+> ```
+>
+> **AQS 的设计哲学**：
+>
+> AQS 使用**模板方法模式**——框架定义获取/释放的骨架算法，子类实现具体的**获取策略**（tryAcquire）和**释放策略**（tryRelease）。
+
+#### P6 级别：acquire 与 release 流程
+
+> **独占模式获取锁（acquire）**：
+>
+> ```java
+> public final void acquire(int arg) {
+>     if (!tryAcquire(arg)) {  // 子类实现：尝试获取锁
+>         if (acquireQueued(addWaiter(Node.EXCLUSIVE), arg)) {
+>             selfInterrupt();  // 线程中断标志设置
+>         }
+>     }
+> }
+>
+> // 1. addWaiter：将当前线程封装为 Node，加入 CLH 队列尾部
+> private Node addWaiter(Node mode) {
+>     Node node = new Node(Thread.currentThread(), mode);
+>     Node pred = tail;
+>     if (pred != null) {
+>         node.prev = pred;
+>         if (compareAndSetTail(pred, node)) {  // CAS 快速插入
+>             pred.next = node;
+>             return node;
+>         }
+>     }
+>     enq(node);  // CAS 失败，进入 enq 自旋插入
+>     return node;
+> }
+>
+> // 2. acquireQueued：在队列中自旋等待获取锁
+> final boolean acquireQueued(Node node, int arg) {
+>     boolean failed = true;
+>     try {
+>         boolean interrupted = false;
+>         for (;;) {
+>             Node p = node.predecessor();  // 前驱节点
+>             if (p == head && tryAcquire(arg)) {  // 前驱是 head 且获取成功
+>                 setHead(node);  // 出队，当前节点变为 head
+>                 p.next = null;  // 帮助 GC
+>                 failed = false;
+>                 return interrupted;
+>             }
+>             if (shouldParkAfterFailedAcquire(p, node)) {  // 阻塞前调整
+>                 if (parkAndCheckInterrupt()) {  // 挂起线程
+>                     interrupted = true;
+>                 }
+>             }
+>         }
+>     } finally {
+>         if (failed) cancelAcquire(node);
+>     }
+> }
+> ```
+>
+> **CLH 队列的精髓**：
+>
+> CLH 队列（Craig, Landin, and Hagersten）是**自旋锁的变体**，但这里的"自旋"不在 CPU 忙等，而是在 `LockSupport.park()` 挂起。线程在 park 后不消耗 CPU，通过前驱节点的 unpark 唤醒。
+>
+> **独占模式释放锁（release）**：
+>
+> ```java
+> public final boolean release(int arg) {
+>     if (tryRelease(arg)) {  // 子类实现：尝试释放锁
+>         Node h = head;
+>         if (h != null && h.waitStatus != 0) {
+>             unparkSuccessor(h);  // 唤醒后继节点
+>         }
+>         return true;
+>     }
+>     return false;
+> }
+>
+> // 唤醒后继节点
+> private void unparkSuccessor(Node node) {
+>     int ws = node.waitStatus;
+>     if (ws < 0) {
+>         compareAndSetWaitStatus(node, ws, 0);  // 清理 waitStatus
+>     }
+>     Node s = node.next;  // 后继节点
+>     if (s == null || s.waitStatus > 0) {  // 后继为空或已取消
+>         s = null;
+>         for (Node t = tail; t != null && t != node; t = t.prev) {
+>             if (t.waitStatus <= 0) s = t;  // 从尾部向前找最接近的可唤醒节点
+>         }
+>     }
+>     if (s != null) LockSupport.unpark(s.thread);  // 唤醒线程
+> }
+> ```
+
+#### P7 级别：共享模式与 ConditionObject
+
+> **共享模式（Semaphore、CountDownLatch）**：
+>
+> 共享模式下，多个线程可以同时获取锁：
+>
+> ```java
+> public final void acquireShared(int arg) {
+>     if (tryAcquireShared(arg) < 0) {  // 返回剩余资源数，负数表示获取失败
+>         doAcquireShared(arg);         // 加入共享队列并阻塞
+>     }
+> }
+>
+> public final boolean releaseShared(int arg) {
+>     if (tryReleaseShared(arg)) {  // 原子释放资源
+>         doReleaseShared();         // 唤醒后继节点（可能多个）
+>         return true;
+>     }
+>     return false;
+> }
+> ```
+>
+> **CountDownLatch 的实现**：
+>
+> ```java
+> // Sync（继承 AQS）
+> protected int tryAcquireShared(int acquires) {
+>     return getState() == 0 ? 1 : -1;  // state=0 表示 latch 已打开
+> }
+>
+> protected boolean tryReleaseShared(int releases) {
+>     for (;;) {
+>         int c = getState();
+>         if (c == 0) return false;  // 已打开，不能再 release
+>         int nextc = c - 1;
+>         if (compareAndSetState(c, nextc)) {  // CAS 递减
+>             return nextc == 0;  // 返回 true 时唤醒所有等待线程
+>         }
+>     }
+> }
+> ```
+>
+> **ConditionObject（条件队列）**：
+>
+> 每个 `Condition` 对应一个独立的等待队列，与 AQS 的 CLH 队列分离：
+>
+> - **await()**：释放已持有的锁，将线程加入 Condition 队列
+> - **signal()**：将 Condition 队列的头节点移到 CLH 队列，等待获取锁
+
+【面试官心理】
+这道题我能问到 P7 级别，是因为 AQS 是 JUC 的核心框架，理解了 AQS 就理解了 JUC 的半壁江山。能画出 CLH 队列出队/入队流程的候选人说明他真正看过源码。能区分独占模式和共享模式的候选人说明他对 AQS 的设计有系统理解。
+
+### 1.4 追问升级
+
+**追问 1：CLH 队列为什么要从尾部入队、从头部出队？**
+
+> - **尾部入队**：减少与 head 节点的竞争（head 是最接近持有锁的节点，竞争最激烈）
+> - **头部出队**：head 代表已经获取锁的节点，线程被唤醒后直接继承 head 位置（不需要移动节点，只需要替换 head）
+>
+> 这种设计的本质是：CLH 队列中，**head 表示当前持有锁的节点**（可能已释放但尚未被 GC），**tail 表示队列尾部**。新节点从 tail 入队，head 的后继节点尝试获取锁。
+
+**追问 2：为什么需要 PROPAGATE 状态？**
+
+> PROPAGATE 是 JDK 9 引入的，用于修复共享模式下的**传播问题**。
+>
+> 场景：head 释放后唤醒多个节点，但唤醒过程中 head 的状态可能被修改，导致某些节点未收到唤醒。
+>
+> PROPAGATE 确保唤醒信号能正确传播到所有等待的共享模式节点。
+
+## 二、ReentrantLock 的 AQS 实现 🟡
+
+### 2.1 NonfairSync vs FairSync
+
+```java
+// 非公平锁的 tryAcquire
+protected final boolean tryAcquire(int acquires) {
+    if (compareAndSetState(0, acquires)) {  // 直接 CAS，不检查队列
+        setExclusiveOwnerThread(Thread.currentThread());
+        return true;
+    }
+    return nonfairTryAcquire(acquires);
+}
+
+// 公平锁的 tryAcquire
+protected final boolean tryAcquire(int acquires) {
+    if (getState() == 0 && !hasQueuedPredecessors() &&  // 额外检查：队列中是否有更早的等待者
+        compareAndSetState(0, acquires)) {
+        setExclusiveOwnerThread(Thread.currentThread());
+        return true;
+    }
+    return false;
+}
+```
+
+## 三、生产避坑
+
+### 3.1 自定义同步器的常见错误
+
+```java
+// 错误实现：tryAcquire 中直接修改 state
+protected boolean tryAcquire(int arg) {
+    if (state == 0) {
+        state = arg;  // ❌ 不是原子操作，应该用 CAS
+        return true;
+    }
+    return false;
+}
+
+// 正确实现
+protected boolean tryAcquire(int arg) {
+    return compareAndSetState(0, arg);
+}
+```
+
+### 3.2 中断与超时
+
+`tryAcquireNanos()` 允许限时等待，同时响应中断：
+
+```java
+public final boolean tryAcquireNanos(int arg, long nanosTimeout) {
+    if (Thread.interrupted()) return true;  // 先检查中断
+    return tryAcquire(arg) ||
+>            doAcquireNanos(arg, nanosTimeout);
+}
+```
+
+:::tip 💡
+面试加分点：能说出"JDK 15 引入了 `peek()` 和 `remove()` 等方法用于检查 CLH 队列状态，`getQueuedLength()` 可以获取等待线程数"，说明他对 JUC 的演进有跟进。
+:::
+
+:::warning ⚠️
+面试陷阱：被问到"AQS 的 state 可以是负数吗"，答"不可以"是错的。独占模式下 state 通常 >= 0（重入计数），但共享模式下 tryAcquireShared 可以返回负数表示获取失败，返回正数表示还有剩余资源可继续获取。
+:::

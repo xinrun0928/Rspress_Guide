@@ -1,0 +1,250 @@
+---
+title: HashMap 扩容机制
+description: 深入剖析 HashMap 的扩容触发条件、扩容过程、JDK 7 vs JDK 8 的扩容差异，以及生产中的扩容性能优化。
+---
+
+# HashMap 扩容机制
+
+面试官问："HashMap 什么时候会触发扩容？"
+
+候选人小邓答："元素数量超过阈值的时候，阈值是容量乘以负载因子。"
+
+面试官点点头："那 JDK 7 和 JDK 8 的扩容有什么区别？"
+
+小邓说："JDK 8 引入了红黑树...扩容应该也改了？"
+
+面试官追问："JDK 7 扩容可能导致什么问题？"
+
+小邓愣住了。
+
+【面试官心理】
+JDK 7 扩容死循环是 Java 历史上最著名的并发 bug。能说出"扩容死循环原因"的候选人，说明对 HashMap 的演进有深入了解。这也是生产中为什么不推荐高并发场景使用 HashMap 的原因。
+
+## 一、扩容触发条件 🔴
+
+```java
+public class HashMap<K, V> {
+    static final float DEFAULT_LOAD_FACTOR = 0.75f;
+    int threshold; // 触发扩容的阈值
+
+    public V put(K key, V value) {
+        // 在 putVal 最后检查：
+        if (++size > threshold) {
+            resize(); // 触发扩容
+        }
+    }
+}
+
+// threshold = capacity * loadFactor
+// 默认：16 * 0.75 = 12
+// 当 size 从 12 增加到 13 时，触发扩容
+```
+
+### 负载因子的影响
+
+| 负载因子 | 优点 | 缺点 |
+| --- | --- | --- |
+| 0.5 | 哈希冲突少，查找 O(1) 稳定 | 空间利用率低（50%） |
+| 0.75（默认） | 时间和空间的平衡 | 哈希冲突增加 |
+| 1.0 | 空间利用率最高 | 哈希冲突多，链表/红黑树退化 |
+
+## 二、resize 方法核心逻辑 🔴
+
+```java
+final Node<K, V>[] resize() {
+    Node<K, V>[] oldTab = table;
+    int oldCap = (oldTab == null) ? 0 : oldTab.length;
+    int oldThr = threshold;
+
+    int newCap, newThr = 0;
+
+    if (oldCap > 0) {
+        // 容量已达到最大值，不扩容，只调整阈值
+        if (oldCap >= MAXIMUM_CAPACITY) {
+            threshold = Integer.MAX_VALUE;
+            return oldTab;
+        }
+        // 新容量 = 旧容量 * 2
+        else if ((newCap = oldCap << 1) < MAXIMUM_CAPACITY &&
+                 oldCap >= DEFAULT_INITIAL_CAPACITY)
+            newThr = oldThr << 1; // 阈值也翻倍
+    } else if (oldThr > 0) {
+        // 有参构造器：使用指定的初始容量
+        newCap = oldThr;
+    } else {
+        // 无参构造器：使用默认值
+        newCap = DEFAULT_INITIAL_CAPACITY; // 16
+        newThr = (int)(DEFAULT_LOAD_FACTOR * DEFAULT_INITIAL_CAPACITY); // 12
+    }
+
+    // 计算新阈值
+    if (newThr == 0) {
+        float ft = (float) newCap * loadFactor;
+        newThr = (newCap < MAXIMUM_CAPACITY && ft < (float)MAXIMUM_CAPACITY ?
+                  (int) ft : Integer.MAX_VALUE);
+    }
+
+    threshold = newThr;
+
+    // 创建新数组
+    Node<K, V>[] newTab = (Node<K, V>[]) new Node[newCap];
+    table = newTab;
+
+    // 迁移数据（核心）
+    if (oldTab != null) {
+        for (int j = 0; j < oldCap; ++j) {
+            Node<K, V> e;
+            if ((e = oldTab[j]) != null) {
+                oldTab[j] = null; // 释放旧表引用
+
+                if (e.next == null) {
+                    // 只有一个节点，直接重新计算位置
+                    newTab[e.hash & (newCap - 1)] = e;
+                } else if (e instanceof TreeNode) {
+                    // 红黑树节点
+                    ((TreeNode<K, V>) e).split(this, newTab, j, oldCap);
+                } else {
+                    // JDK 8+ 优化：拆分为两个链表（低位和高位）
+                    // 不再递归 transfer
+                    Node<K, V> loHead = null, loTail = null;
+                    Node<K, V> hiHead = null, hiTail = null;
+                    Node<K, V> next;
+
+                    do {
+                        next = e.next;
+                        // 判断节点属于低位桶还是高位桶
+                        if ((e.hash & oldCap) == 0) {
+                            // 低位链表
+                            if (loTail == null) loHead = e;
+                            else loTail.next = e;
+                            loTail = e;
+                        } else {
+                            // 高位链表
+                            if (hiTail == null) hiHead = e;
+                            else hiTail.next = e;
+                            hiTail = e;
+                        }
+                    } while ((e = next) != null);
+
+                    if (loTail != null) {
+                        loTail.next = null;
+                        newTab[j] = loHead; // 原位置
+                    }
+                    if (hiTail != null) {
+                        hiTail.next = null;
+                        newTab[j + oldCap] = hiHead; // 新位置 = 原位置 + oldCap
+                    }
+                }
+            }
+        }
+    }
+    return newTab;
+}
+```
+
+## 三、JDK 7 vs JDK 8 扩容对比 🔴
+
+### JDK 7：递归 transfer（头插法）
+
+```java
+// JDK 7 的扩容方法
+void transfer(Entry[] newTable) {
+    Entry[] src = table;
+    int newCapacity = newTable.length;
+
+    for (int j = 0; j < src.length; j++) {
+        Entry<K, V> e = src[j];
+        if (e != null) {
+            src[j] = null; // 释放旧表
+            do {
+                Entry<K, V> next = e.next;
+                // ❌ 头插法：链表节点顺序会反转
+                int i = indexFor(e.hash, newCapacity);
+                e.next = newTable[i];
+                newTable[i] = e;
+                e = next;
+            } while (e != null);
+        }
+    }
+}
+```
+
+**JDK 7 扩容的问题**：
+- **头插法**导致链表节点顺序反转
+- 多线程并发扩容时，可能形成**环形链表**
+- 调用 get 时遍历环形链表 → **死循环**
+- CPU 100%
+
+### JDK 8：拆分链表（尾插法）
+
+```java
+// JDK 8 的扩容优化
+// 不再反转链表，而是拆分为两个链表
+// loHead: 留在原位置 (j)
+// hiHead: 移到新位置 (j + oldCap)
+
+// 关键判断：(e.hash & oldCap) == 0
+// 等价于 (hash % oldCap) < oldCap
+// 即：hash 在新数组中属于低位桶还是高位桶
+```
+
+**JDK 8 改进**：
+- **尾插法**（隐式，通过 loHead/hiHead 实现）
+- 链表节点顺序**保持不变**
+- 不再使用递归，避免栈溢出
+- 支持并发扩容（JDK 11+）
+
+## 四、扩容时机的影响 🟡
+
+### 4.1 一次性大数据量
+
+```java
+// ❌ 如果你知道需要存 100 万个元素，但用默认容量
+Map<String, Object> map = new HashMap<>();
+for (int i = 0; i < 1_000_000; i++) {
+    map.put("key" + i, value);
+}
+
+// 扩容次数（从 16 开始）：
+// 16 → 32 → 64 → 128 → 256 → 512 → 1024 → 2048 → 4096 → 8192 → 16384 → 32768 → 65536 → 131072 → 262144 → 524288 → 1048576
+// 需要扩容 17 次！
+// 每次扩容都要重新 hash 所有元素（百万级数据）
+```
+
+### 4.2 正确做法
+
+```java
+// ✅ 预估容量，一次到位
+// 初始容量 = 期望数量 / 负载因子（向上取整到 2 的幂次）
+int expectedSize = 1_000_000;
+int initialCapacity = (int) (expectedSize / 0.75) + 1;
+initialCapacity = Integer.highestOneBit((initialCapacity - 1) << 1); // 向上取整到 2 的幂次
+
+Map<String, Object> map = new HashMap<>(initialCapacity);
+// 或者更简单：使用 Guava 的 Maps.newHashMapWithExpectedSize()
+```
+
+## 五、追问升级
+
+**面试官**："HashMap 的容量上限是多少？"
+
+```java
+static final int MAXIMUM_CAPACITY = 1 << 30; // 约 10 亿
+
+// 如果达到上限，put 操作仍然可以，但不会再扩容
+// 实际上很少能达到这个值（需要 1 << 30 个桶的数组）
+```
+
+**面试官**："扩容过程中，put 操作会发生什么？"
+
+```java
+// JDK 7：在 transfer 过程中，如果其他线程正在 put
+// 可能导致死循环或数据丢失
+
+// JDK 8：改进后不再死循环
+// 但扩容期间，get 操作可能找不到正在 transfer 的数据
+// 这是 HashMap 在并发场景下的已知限制
+```
+
+【面试官心理】
+能说出 JDK 7 和 JDK 8 扩容差异的候选人，说明对 HashMap 的演进有深入了解。这也是生产中为什么不推荐使用 HashMap 而推荐 ConcurrentHashMap 的原因。

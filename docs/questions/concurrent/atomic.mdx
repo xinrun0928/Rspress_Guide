@@ -1,0 +1,252 @@
+---
+title: Atomic 原子类原理
+description: 从 AtomicInteger 出发，深入剖析 JUC 原子类的实现体系：Unsafe 机制、CAS 循环、无锁算法的设计，以及 AtomicIntegerFieldUpdater 等特殊原子类的使用场景与限制。
+---
+
+# Atomic 原子类原理
+
+候选人小韩在面试字节 P6 时，面试官问道：
+
+"你知道 JUC 中的原子类有哪些吗？它们的实现原理是什么？"
+
+小韩说："有 AtomicInteger、AtomicLong...用的是 CAS..."面试官追问："Unsafe 是什么？为什么原子类要依赖 Unsafe？"
+
+小韩说："Unsafe 是 sun.misc 包下的..."面试官继续追问："Unsafe.getAndAddInt 和 AtomicInteger.incrementAndGet 内部实现有什么区别？AtomicIntegerFieldUpdater 有什么限制？"
+
+小韩彻底答不上来了...
+
+## 一、核心问题：Atomic 原子类原理 🔴
+
+### 1.1 问题拆解
+
+```
+第一层：体系认知（有哪几类？）
+  "JUC 中的原子类有哪些？分别用于什么场景？"
+  考察点：基础类型、引用类型、字段更新器、数组类型、累加器
+
+第二层：Unsafe 机制（为什么用它？）
+  "为什么原子类要使用 Unsafe 而不用普通变量操作？"
+  考察点：Unsafe 的作用、volatile vs 普通字段、CAS 原子性
+
+第三层：源码实现（怎么做到的？）
+  "AtomicInteger.incrementAndGet() 的完整源码是什么？"
+  考察点：CAS 循环、do-while、volatile 读取
+
+第四层：特殊原子类（有什么不同？）
+  "AtomicIntegerFieldUpdater 和 AtomicReference 的使用限制是什么？"
+  考察点：可见性问题、反射限制、性能权衡
+```
+
+### 1.2 ❌ 错误示范
+
+**候选人原话 A**："AtomicInteger 就是把 int 变量变成 volatile 的，然后加 synchronized。"
+
+**问题诊断**：完全错误。原子类是无锁算法，使用 CAS 循环实现，完全不涉及 synchronized。volatile 只保证可见性，不保证复合操作的原子性。
+
+**候选人原话 B**："AtomicInteger 比 synchronized 性能好，所有并发场景都应该用原子类。"
+
+**问题诊断**：原子类适用于低竞争、单变量更新场景。在高竞争场景下，大量 CAS 失败导致的自旋反而比 synchronized 的阻塞更消耗 CPU。
+
+### 1.3 标准回答
+
+#### P5 级别：原子类体系
+
+> **JUC 原子类分为五类**：
+>
+> **1. 基础类型原子类**：`AtomicInteger`、`AtomicLong`、`AtomicBoolean`
+>
+> **2. 引用类型原子类**：`AtomicReference<V>`、`AtomicMarkableReference<V>`、`AtomicStampedReference<V>`
+>
+> **3. 字段更新器原子类**：`AtomicIntegerFieldUpdater<T>`、`AtomicLongFieldUpdater<T>`、`AtomicReferenceFieldUpdater<T, V>`
+>
+> **4. 数组类型原子类**：`AtomicIntegerArray`、`AtomicLongArray`、`AtomicReferenceArray<E>`
+>
+> **5. 累加器**：`LongAdder`、`LongAccumulator`、`DoubleAdder`、`DoubleAccumulator`
+>
+> **原子类的核心价值**：在不使用 synchronized 的前提下，保证单一变量的原子性操作。避免了 synchronized 的重量级加锁/解锁开销。
+
+#### P6 级别：Unsafe 与 CAS 实现
+
+> **Unsafe 的作用**：
+>
+> `Unsafe` 是 JDK 内部使用的工具类，提供了**绕过 Java 安全检查**直接操作内存的能力：
+>
+> ```java
+> // Unsafe 的核心方法
+> public native int getIntVolatile(Object o, long offset);           // volatile 读取
+> public native boolean compareAndSwapInt(Object o, long offset, int expected, int newValue);  // CAS
+> public native void putIntVolatile(Object o, long offset, int newValue);  // volatile 写入
+> ```
+>
+> 原子类依赖 Unsafe 的原因是：**普通字段操作（如 `i++`）在字节码层面是多个指令，Unsafe 提供了单个 CAS 指令的包装**。
+>
+> **AtomicInteger.incrementAndGet() 完整源码**：
+>
+> ```java
+> // JDK 8 AtomicInteger.java
+> private static final Unsafe unsafe = Unsafe.getUnsafe();
+> private static final long valueOffset;  // value 字段在对象中的内存偏移量
+>
+> static {
+>     try {
+>         // 通过反射获取 value 字段的内存偏移量
+>         valueOffset = unsafe.objectFieldOffset(
+>             AtomicInteger.class.getDeclaredField("value"));
+>     } catch (Exception e) { throw new Error(e); }
+> }
+>
+> private volatile int value;  // 实际存储的值
+>
+> public final int incrementAndGet() {
+>     // 调用 Unsafe 的 getAndAddInt，返回旧值，然后 +1
+>     return unsafe.getAndAddInt(this, valueOffset, 1) + 1;
+> }
+>
+> // Unsafe.getAndAddInt 的实现（JDK 8）
+> public final int getAndAddInt(Object o, long offset, int delta) {
+>     int expected;
+>     do {
+>         expected = unsafe.getIntVolatile(o, offset);  // 获取当前值（volatile 语义）
+>     } while (!unsafe.compareAndSwapInt(o, offset, expected, expected + delta));
+>     // 如果 CAS 失败，自旋重试
+>     return expected;
+> }
+> ```
+>
+> **为什么用 do-while 而不是 while？**
+>
+> `do-while` 确保至少执行一次，返回值是修改前的值（与 `getAndAddInt` 的语义一致）。`while` 是 `getAndAddInt` 的内部循环，外部调用 `incrementAndGet()` 得到的是 `expected + delta`（修改后的值）。
+
+#### P7 级别：字段更新器与性能权衡
+
+> **AtomicIntegerFieldUpdater 的设计**：
+>
+> 字段更新器允许在**已有对象**上实现原子操作，而无需用 AtomicInteger 包装整个对象：
+>
+> ```java
+> class User {
+>     volatile int score;
+> }
+>
+> AtomicIntegerFieldUpdater<User> updater =
+>     AtomicIntegerFieldUpdater.newUpdater(User.class, "score");
+>
+> User user = new User();
+> updater.incrementAndGet(user);  // 原子更新 user.score
+> ```
+>
+> **优势**：比包装类节省内存（一个 User 对象 vs User + AtomicInteger 两个对象）。
+>
+> **限制**：
+>
+> 1. **字段必须是 volatile**：`updater` 只能更新 volatile 字段
+> 2. **字段类型必须匹配**：`AtomicIntegerFieldUpdater` 只能用于 `int` 字段
+> 3. **可见性问题**：如果 `updater` 和 `User` 对象在不同的字段更新器实例上操作，不保证原子性
+> 4. **性能**：字段更新器的性能通常略低于包装类原子变量（因为需要额外的参数传递和偏移量计算），但节省内存
+>
+> ```java
+> // 常见错误：两个不同的 updater 实例操作同一字段
+> AtomicIntegerFieldUpdater<User> u1 = AtomicIntegerFieldUpdater.newUpdater(User.class, "score");
+> AtomicIntegerFieldUpdater<User> u2 = AtomicIntegerFieldUpdater.newUpdater(User.class, "score");
+>
+> User user = new User();
+> u1.incrementAndGet(user);  // updater 1
+> u2.incrementAndGet(user);  // updater 2 —— 不是原子操作！
+> ```
+>
+> **为什么需要反射获取 offset？**
+>
+> 对象在内存中的布局由 JVM 决定，不同 JVM 实现、不同压缩指针配置下，字段偏移量不同。通过 `unsafe.objectFieldOffset()` 在类加载时动态获取，确保在不同 JVM 上都能正确定位字段。
+
+【面试官心理】
+这道题我能问到 P7 级别，是因为它涉及了 Unsafe 机制、CAS 实现、JVM 内存布局、反射等多个层次。能说出 Unsafe.getUnsafe() 和通过反射获取 Unsafe 的区别的候选人，说明他理解了类加载器限制。能说出字段更新器的限制和适用场景，说明他有工程实践的思考。
+
+### 1.4 追问升级
+
+**追问 1：Unsafe.getUnsafe() 和通过反射获取 Unsafe 有什么区别？**
+
+> `Unsafe.getUnsafe()` 只能从 Bootstrap ClassLoader 加载的类调用。如果从应用程序类加载器加载的类调用，会抛出 `SecurityException`。
+>
+> 框架（如 Netty、Hadoop）通常通过反射获取 Unsafe 实例：
+>
+> ```java
+> Field f = Unsafe.class.getDeclaredField("theUnsafe");
+> f.setAccessible(true);
+> Unsafe unsafe = (Unsafe) f.get(null);
+> ```
+
+**追问 2：为什么 LongAdder 比 AtomicLong 在高并发下性能好？**
+
+> `AtomicLong` 所有线程竞争同一个 value 字段，导致同一个缓存行被频繁 invalidate。
+>
+> `LongAdder` 使用分段设计：
+> - `base`：无竞争时直接 CAS 更新
+> - `cells[]`：竞争激烈时，每个线程累加到不同的 Cell（不同的缓存行）
+> - `sum()` 时将 `base` 和所有 `cells[]` 相加
+>
+> 空间换时间，将单点竞争变为多点竞争。
+
+## 二、原子类与 volatile 的关系 🟡
+
+### 2.1 volatile 只保证可见性，不保证原子性
+
+```java
+volatile int count = 0;
+
+// 线程 1
+count++;  // 线程 2 看到的 count 可能不一致
+
+// 线程 2
+count++;  // 即使 count 是 volatile，仍然不是线程安全的
+```
+
+`count++` 在字节码层面是三条指令：
+
+```asm
+mov  count, %eax     // 1. 读取 count 到寄存器
+inc  %eax            // 2. 寄存器 +1
+mov  %eax, count     // 3. 写回 count
+```
+
+volatile 只保证第 1 步和第 3 步的可见性，但第 2 步（寄存器操作）不受 volatile 影响，两个线程可能同时读到 count=0，各自写回 count=1。
+
+## 三、生产避坑
+
+### 3.1 原子引用与野指针
+
+```java
+AtomicReference<Node> top = new AtomicReference<>();
+top.set(new Node("A"));
+
+// 线程 A
+Node oldTop = top.get();     // 读到 Node A
+Node newTop = new Node("B", oldTop);
+// ← 在这里，线程 B 可能修改了 top
+top.compareAndSet(oldTop, newTop);  // CAS 失败，正确处理
+
+// 但如果 Node A 被 GC 回收，且被重新创建并用另一个值
+// 可能出现 ABA 问题
+```
+
+**解决**：使用 `AtomicStampedReference` 或 `AtomicMarkableReference`。
+
+### 3.2 LongAdder 的 sum() 不是原子快照
+
+```java
+LongAdder adder = new LongAdder();
+adder.add(1);
+
+// 线程 A: adder.sum()
+// 线程 B: adder.add(1)
+// sum() 返回的是调用时刻的近似值，不是精确快照
+```
+
+**解决**：如果需要精确快照，用 `LongAdder.sumThenReset()`（但仍然不是完美的快照）或使用 `AtomicLong`。
+
+:::tip 💡
+面试加分点：能说出"JDK 9 的 VarHandle API 替代了部分 Unsafe 的直接内存访问功能，提供了更安全的 API（`AccessMode`、内存排序控制）和更好的性能（JIT 可以更好地内联）"，说明他关注了 JDK 9+ 的并发演进。
+:::
+
+:::warning ⚠️
+面试陷阱：被问到"AtomicInteger 和 Integer 的区别"，很多人会说"AtomicInteger 是原子类，更线程安全"。更准确的回答是：Integer 是不可变包装类（immutable），一旦创建就不能修改，天然线程安全但不适合作为共享可变状态；AtomicInteger 是可变原子类，适合作为共享计数器。不可变对象和原子类是两种不同的线程安全策略。
+:::

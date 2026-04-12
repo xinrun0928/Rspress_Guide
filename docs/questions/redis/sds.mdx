@@ -1,0 +1,190 @@
+---
+title: String 底层 SDS 结构
+description: 从一道面试题出发，深入剖析 Redis String 类型的底层实现 SDS（Simple Dynamic String），理解 SDS 的数据结构、空间预分配、惰性删除与二进制安全。
+---
+
+# String 底层 SDS 结构
+
+面试官问："Redis 的 String 是用什么数据结构存储的？"
+
+小陈说："SDS，Simple Dynamic String。"
+
+面试官追问："SDS 和 C 的 char 数组有什么区别？"
+
+小陈说："SDS 可以自动扩展。"
+
+面试官继续追问："SDS 的 header 里存了什么？空间预分配是怎么做的？"
+
+小陈开始卡壳。
+
+SDS 是 Redis 最基础的数据结构，也是理解 Redis 源码的第一道门槛。但大多数候选人只知道"SDS 是动态字符串"，说不清楚 header 结构、空间预分配策略和惰性删除机制。
+
+## 一、SDS 数据结构 🔴
+
+### 1.1 SDS 结构
+
+```c
+// SDS 内存布局
+struct sdshdr {
+    int len;         // 已使用的字节数
+    int alloc;       // 已分配的字节数（不包括 header 和 \0）
+    unsigned char flags;  // 类型（SDS_TYPE_5/8/16/32/64）
+    char buf[];      // 柔性数组，存储实际数据
+};
+
+// buf 是柔性数组，不占用额外空间
+// buf[len] 始终是 '\0'，兼容 C 字符串函数
+```
+
+**内存布局图示**：
+
+```
+SDS 字符串 "Redis":
+┌────────────────────────────────────┐
+│ sdshdr                             │
+│  len = 5, alloc = 8, flags = 1     │
+├────────────────────────────────────┤
+│ buf: | R | e | d | i | s | \0 | _ | _ | _ |  ← _ 表示未使用空间
+└────────────────────────────────────┘
+        ↑
+        buf[len] 仍然是 '\0'，兼容 C 函数
+```
+
+### 1.2 SDS 的五种类型
+
+```c
+// SDS_TYPE_5  : 0字节 header（不使用，仅存储长度在 flags 中）
+// SDS_TYPE_8  : 1字节 header，字符串最长 2^8 - 1 = 255
+// SDS_TYPE_16 : 2字节 header，字符串最长 2^16 - 1 = 65535
+// SDS_TYPE_32 : 4字节 header，字符串最长 2^32 - 1
+// SDS_TYPE_64 : 8字节 header，字符串最长 2^64 - 1
+```
+
+Redis 根据字符串长度选择最小的 header 类型。小字符串用小 header，省内存。
+
+### 1.3 ❌ 错误示范
+
+**候选人原话**："SDS 就是 C 的字符串加了个长度。"
+
+**问题诊断**：不完全对。SDS 还有 alloc 字段（区分已用/未用空间）、flags 字段（存储类型）、空间预分配和惰性删除机制。
+
+**候选人原话 2**："SDS 是二进制安全的，可以存任何数据。"
+
+**问题诊断**：部分正确。SDS 可以存储二进制数据（因为不依赖 `\0` 判断长度），但 Redis String 存 JSON/Protobuf 时，二进制安全是业务层保证的，不是 SDS 保证的。
+
+【面试官心理】
+这道题我能从 SDS 的三个核心优势切入：O(1) 长度获取、空间预分配、二进制安全。能说清楚三个优势的底层实现细节的是 P6+ 水平。
+
+## 二、SDS vs C 字符串 🔴
+
+### 2.1 长度获取
+
+```c
+// C 字符串
+strlen(s)  // O(n)：需要遍历到 \0 才停止
+
+// SDS
+sdslen(s)   // O(1)：直接读 header.len
+```
+
+### 2.2 缓冲区溢出
+
+```c
+// C 字符串：可能溢出
+char buf[10];
+strcpy(buf, "Hello World");  // 溢出！写入未知内存
+
+// SDS：自动扩展，不会溢出
+sds s = sdsnew("Hello");
+s = sdscat(s, " World");  // 自动分配足够空间
+```
+
+### 2.3 内存重分配
+
+```c
+// C 字符串：每次增长都需要 realloc
+strcpy(buf, "Hello");
+strcat(buf, " World");  // 可能需要重新分配内存并复制
+
+// SDS：空间预分配，减少重分配次数
+// 如果 len < 1MB，预分配 2 倍空间
+// 如果 len >= 1MB，预分配 +1MB
+s = sdscat(s, "!");
+// 新 alloc = max(原alloc*2, 新len)
+// 如果原来 alloc=10，预分配后 alloc=20
+```
+
+## 三、惰性删除（Lazy Free）🟡
+
+### 3.1 SDS 的惰性删除
+
+```c
+// SDS 截断字符串
+sds s = sdsnew("Hello World");
+sdsrange(s, 0, 4);  // 截断为 "Hello"
+
+// 不释放多余空间：alloc 保持 11，len 变为 5
+// buf = ['H','e','l','l','o',' ','W','o','r','l','d','\0']
+//                     ↑ len=5，alloc=11
+
+// 释放空间
+sdsfree(s);  // 释放整个 sdshdr 和 buf
+```
+
+**惰性删除的好处**：不立即释放内存，减少系统调用开销。适合渐进式删除大量数据。
+
+### 3.2 与字符串追加的关系
+
+```sql
+SET str "Hello"
+APPEND str " World"    -- "Hello World"，SDS 内部空间预分配
+APPEND str "!"         -- "Hello World!"，不需要重新分配
+```
+
+Redis 的 `APPEND` 命令利用 SDS 的空间预分配机制，避免每次追加都重新分配内存。
+
+## 四、生产避坑 🟡
+
+### 4.1 字符串的"计数器"陷阱
+
+```sql
+-- ❌ 每次 INCR 都会创建新字符串
+INCR page:view:2024-01-01  -- 第一次：创建字符串 "0"，再 INCR
+INCR page:view:2024-01-01  -- 已有字符串，INCR 直接操作
+
+-- 实际上：
+-- 第一次 INCR：SET page:view:2024-01-01 0，然后 INCR
+-- 性能影响：第一次有两次网络往返
+```
+
+### 4.2 SDS 与 String 的关系
+
+```sql
+-- String 类型底层用 SDS 存储
+SET key "value"  -- 用 sdsnew("value") 创建
+
+-- 但不是所有 SDS 都是 String
+-- HSET key field value  -- hash field 也用 SDS 存储
+-- ZADD key score member  -- ZSet member 也用 SDS 存储
+```
+
+### 4.3 内存优化
+
+```sql
+-- 小整数会被 Redis 内部缓存
+SET num 100
+GETRANGE num 0 0  -- "1"，整数被优化
+
+-- 字符串存储数字有时比整数更省内存（需要实测）
+```
+
+【面试官心理】
+SDS 是 Redis 源码中最基础的结构。问 SDS 的候选人里，能说清楚空间预分配和惰性删除机制的是少数。能解释"为什么 SDS 的 buf[len] 仍然是 '\0'"的候选人，说明他真正看过 Redis 源码。
+
+---
+
+| 级别 | 考察重点 | 期望回答 |
+| --- | --- | --- |
+| P5 | 基本结构 | SDS 名称、SDS vs C 字符串的优点 |
+| P6 | 深度实现 | header 结构、五种类型、空间预分配 |
+| P7 | 机制理解 | 惰性删除、SDS_TYPE 动态切换 |

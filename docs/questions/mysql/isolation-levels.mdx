@@ -1,0 +1,210 @@
+---
+title: 事务隔离级别
+description: 从一道面试题出发，深入剖析 MySQL InnoDB 的四种事务隔离级别，理解读未提交、读已提交、可重复读、串行化的实现原理与性能差异。
+---
+
+# 事务隔离级别
+
+面试官问："MySQL 有哪几种事务隔离级别？默认是哪个？"
+
+小张说："有读未提交、读已提交、可重复读、串行化，默认是读已提交。"
+
+面试官点点头："那可重复读是怎么实现的？"
+
+小张说："...用锁？"
+
+面试官追问："用的是什么锁？表锁还是行锁？"
+
+小张说："...行锁？"
+
+面试官继续追问："那可重复读下，普通的 SELECT 快照读不加锁，怎么保证不会读到其他事务修改的数据？"
+
+小张彻底卡住了。
+
+这道题，考的是候选人对事务隔离级别背后实现机制的理解。只知道名字和定义的人太多，能说清 MVCC 和锁机制区别的，不到 30%。
+
+## 一、隔离级别定义 🔴
+
+### 1.1 四种隔离级别
+
+| 隔离级别 | 英文 | 脏读 | 不可重复读 | 幻读 | 说明 |
+| --- | --- | --- | --- | --- | --- |
+| 读未提交 | Read Uncommitted | ✅ 可能 | ✅ 可能 | ✅ 可能 | 最低级别，性能最好，安全性最差 |
+| 读已提交 | Read Committed | ❌ 不可能 | ✅ 可能 | ✅ 可能 | Oracle 默认级别 |
+| 可重复读 | Repeatable Read | ❌ 不可能 | ❌ 不可能 | ✅ 可能* | MySQL InnoDB 默认级别 |
+| 串行化 | Serializable | ❌ 不可能 | ❌ 不可能 | ❌ 不可能 | 最高级别，性能最差 |
+
+MySQL InnoDB 在可重复读级别下，通过 Next-Key Lock 解决了幻读问题（*标注意味着某些场景下仍可能有幻读）。
+
+### 1.2 问题定义
+
+```sql
+-- 脏读：读到其他事务未提交的数据
+-- T1: UPDATE users SET balance = 500 WHERE id = 1;  (未提交)
+-- T2: SELECT balance FROM users WHERE id = 1;  --> 读到 500（脏数据）
+
+-- 不可重复读：同一事务中两次读取结果不一致
+-- T1: SELECT balance FROM users WHERE id = 1;  --> 1000
+-- T2: UPDATE users SET balance = 500 WHERE id = 1; COMMIT;
+-- T1: SELECT balance FROM users WHERE id = 1;  --> 500（和第一次不同）
+
+-- 幻读：同一事务中两次查询结果集不一致（新增或删除行）
+-- T1: SELECT * FROM orders WHERE status = 0;  --> 10 行
+-- T2: INSERT INTO orders VALUES (...status=0...); COMMIT;
+-- T1: SELECT * FROM orders WHERE status = 0;  --> 11 行（多了 1 行）
+```
+
+### 1.3 ❌ 错误示范
+
+**候选人原话**："MySQL 默认是可重复读，Oracle 默认是读已提交。"
+
+**问题诊断**：记住了默认值，但不理解为什么 MySQL 要选择可重复读作为默认级别。
+
+**候选人原话 2**："串行化是用锁实现的，可重复读也是用锁实现的。"
+
+**问题诊断**：混淆了快照读和当前读。串行化通过锁实现，但可重复读的快照读是通过 MVCC 实现的，不是锁。
+
+【面试官心理】
+这道题我能从多个维度追问。第一层问隔离级别名称和常见问题，第二层问每个级别解决了什么问题，第三层问实现机制（MVCC vs 锁），第四层问 MySQL 为什么选可重复读作为默认级别。能答到第三层的候选人占 30%，第四层的不到 10%。
+
+## 二、MVCC 在各隔离级别的表现 🔴
+
+### 2.1 快照读 vs 当前读
+
+```sql
+-- 快照读（Snapshot Read）：读取历史版本，不加锁
+SELECT ... FROM orders;  -- 普通 SELECT
+
+-- 当前读（Current Read）：读取最新版本，加锁
+SELECT ... FROM orders LOCK IN SHARE MODE;   -- 共享锁
+SELECT ... FROM orders FOR UPDATE;          -- 排他锁
+INSERT INTO orders ...;                       -- 插入锁
+UPDATE orders ...;                            -- 更新锁
+DELETE orders ...;                            -- 删除锁
+```
+
+**MVCC 只作用于快照读，不作用于当前读。**
+
+### 2.2 各隔离级别的 MVCC 行为
+
+| 隔离级别 | 快照读生成 ReadView 时机 | 可见性 |
+| --- | --- | --- |
+| 读未提交 | 不生成 ReadView，直接读最新数据 | 脏读 |
+| 读已提交 | 每次快照读都生成新 ReadView | 每次读到已提交的最新数据 |
+| 可重复读 | 事务开始时生成 ReadView，之后复用 | 事务内始终读到同一版本 |
+| 串行化 | 快照读退化为当前读 | 强制串行执行 |
+
+### 2.3 读已提交 vs 可重复读的核心区别
+
+```sql
+-- 场景：账户余额初始 1000
+-- T1: 开启事务（可重复读模式）
+-- T2: 修改余额为 500，提交
+-- T1: 再次读取余额
+
+-- 可重复读（RR）：
+-- T1 在事务开始时生成了 ReadView
+-- ReadView 包含 T2 的事务 ID（因为 T2 已提交）
+-- T1 看不到 T2 的修改，余额 = 1000
+
+-- 读已提交（RC）：
+-- T1 再次读取时生成新的 ReadView
+-- 新 ReadView 不包含 T2 的事务 ID
+-- T1 能看到 T2 的修改，余额 = 500
+```
+
+## 三、Next-Key Lock 解决幻读 🟡
+
+### 3.1 幻读问题
+
+可重复读下，快照读通过 MVCC 保证不读到其他事务的修改。但当前读需要加锁，如果其他事务插入新行，当前读可能返回新增的行——这就是幻读。
+
+```sql
+-- T1: SELECT * FROM orders WHERE status = 0 FOR UPDATE;
+-- 结果: 10 行
+-- T2: INSERT INTO orders VALUES (...status=0...); COMMIT;
+-- T1: SELECT * FROM orders WHERE status = 0 FOR UPDATE;
+-- 结果: 11 行（幻读！）
+```
+
+### 3.2 Next-Key Lock 的解法
+
+InnoDB 在可重复读隔离级别下，使用 **Next-Key Lock**（记录锁 + 间隙锁的组合）来锁定索引范围，防止其他事务在范围内插入新行。
+
+```sql
+-- 索引状态：orders 表 id 列为 1, 5, 10, 15, 20
+-- T1: SELECT * FROM orders WHERE id = 6 FOR UPDATE;
+
+-- Next-Key Lock 锁住的范围：
+-- 索引区间 [5, 10) 之间的间隙
+-- 即：5 < id < 10 的范围都被锁住
+
+-- T2: INSERT INTO orders VALUES (7, ...);  --> 被阻塞！
+-- T2: INSERT INTO orders VALUES (11, ...);  --> 可以插入（不在锁范围内）
+```
+
+### 3.3 记录锁、间隙锁、临键锁
+
+| 锁类型 | 作用 | 锁住的范围 |
+| --- | --- | --- |
+| 记录锁（Record Lock） | 锁住单条索引记录 | 单行 |
+| 间隙锁（Gap Lock） | 锁住索引之间的间隙 | 开区间 (a, b) |
+| 临键锁（Next-Key Lock） | 记录锁 + 间隙锁的组合 | 左开右闭 [a, b) |
+
+```sql
+-- 临键锁的锁住范围
+-- 索引值：1, 5, 10
+-- SELECT * FROM orders WHERE id > 3 AND id < 10 FOR UPDATE;
+-- 临键锁覆盖： (1, 5] 和 (5, 10)
+```
+
+## 四、生产选型建议 🟡
+
+### 4.1 为什么 MySQL 默认是可重复读？
+
+1. **历史原因**：MySQL 很早就用 InnoDB，而 InnoDB 的 MVCC 机制在可重复读下工作得最好
+2. **主从一致性**：binlog 复制需要事务隔离级别的一致性保证
+3. **业务便利**：很多业务依赖"事务内多次查询结果一致"的语义
+
+### 4.2 隔离级别选择
+
+```sql
+-- 读已提交（RC）适用场景：
+-- 报表查询：每次查最新数据，不需要事务内一致
+-- 数据分析：OLAP 场景，隔离级别低一些性能更好
+
+-- 可重复读（RR）适用场景：
+-- 核心业务：订单、支付、库存等，需要强一致性
+-- 余额计算：同一事务内多次读取金额必须一致
+
+-- 串行化（Serializable）适用场景：
+-- 极高一致性要求的场景（但性能很差，互联网业务很少用）
+```
+
+### 4.3 设置隔离级别
+
+```sql
+-- 查看当前会话隔离级别
+SELECT @@tx_isolation;
+SELECT @@transaction_isolation;
+
+-- 设置当前会话隔离级别
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+
+-- 设置全局隔离级别
+SET GLOBAL transaction_isolation = 'READ-COMMITTED';
+
+-- 开启事务时指定
+START TRANSACTION ISOLATION LEVEL READ COMMITTED;
+```
+
+【面试官心理】
+这道题我能一直追问到 MySQL 的内部实现细节。比如我会问："MySQL 5.7 和 MySQL 8.0 在隔离级别的实现上有什么区别？"或者："可重复读下，如果我用当前读加锁，会不会产生幻读？"能答出 Next-Key Lock 的候选人是少数，能解释为什么 InnoDB 在 RR 下默认使用 Next-Key Lock 的更是凤毛麟角。
+
+---
+
+| 级别 | 考察重点 | 期望回答 |
+| --- | --- | --- |
+| P5 | 级别名称 | 四种隔离级别名称、解决的问题 |
+| P6 | 实现机制 | MVCC vs 锁的区别、ReadView 生成时机 |
+| P7 | 深度细节 | Next-Key Lock、间隙锁解决幻读、两者的协同 |

@@ -1,0 +1,194 @@
+---
+title: Saga 事务
+description: 深度解析 Saga 模式的分布式事务原理，对比 TCC 与 Saga 的区别，以及 Saga 的编排方式和补偿策略。
+---
+
+# Saga 事务
+
+某电商平台的订单系统需要处理一个超长链路：创建订单 → 扣库存 → 扣余额 → 扣积分 → 发优惠券 → 发短信 → 发邮件。
+
+团队评估了 TCC 方案，发现每个服务都要实现 Try-Confirm-Cancel 三个方法，工作量巨大。
+
+最终选择了 Saga 模式：每个服务只需要实现"正向操作"和"补偿操作"，通过编排器协调整个事务流程。
+
+【架构权衡】
+Saga 模式是最适合"长链路、多服务"场景的分布式事务方案。与 TCC 不同，Saga 不需要 Try 阶段，每个服务只需要实现"做"和"撤销"两个操作。这大大降低了实现复杂度，但牺牲了"隔离性"——Saga 没有 TCC 那样的资源预留机制。
+
+---
+
+## 一、核心问题 🔴
+
+### 1.1 Saga vs TCC
+
+| 对比 | TCC | Saga |
+| --- | --- | --- |
+| **阶段** | Try-Confirm-Cancel（3阶段） | Do-Undo/Redo（2阶段） |
+| **锁定资源** | 有（通过 Try 预留） | 无 |
+| **补偿方式** | Confirm/Cancel | 补偿（Compensation） |
+| **一致性** | 最终一致 | 最终一致 |
+| **隔离性** | 有（通过 Try 预留） | 无（天然弱隔离） |
+| **实现复杂度** | 高 | 低 |
+| **适用场景** | 短链路 | 长链路 |
+
+### 1.2 Saga 的两种模式
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                       Saga 的两种模式                             │
+│                                                                  │
+│  1. 编排式 Saga（Choreography）                                   │
+│     ├─ 每个服务订阅其他服务的事件                                  │
+│     ├─ 通过事件驱动协调                                           │
+│     └─ 适合：链路短、服务少                                       │
+│                                                                  │
+│     示例：                                                       │
+│     OrderService ──► InventoryService ──► PaymentService           │
+│        ▲               ▲                                           │
+│        │               │                                           │
+│        └───────────────┘                                           │
+│              事件驱动                                             │
+│                                                                  │
+│  2. 编排器 Saga（Orchestration）                                  │
+│     ├─ 中央编排器控制整个事务流程                                  │
+│     ├─ 编排器调用各服务的 API                                     │
+│     └─ 适合：链路长、服务多                                       │
+│                                                                  │
+│     示例：                                                       │
+│                    ┌─────────────────┐                          │
+│                    │   Orchestrator   │                          │
+│                    └────────┬────────┘                          │
+│              ┌─────────────┼─────────────┐                      │
+│              ▼             ▼             ▼                        │
+│        OrderService   InventoryService  PaymentService             │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 二、方案实现
+
+### 2.1 编排器 Saga 实现
+
+```java
+// Saga 编排器
+@Service
+public class OrderSagaOrchestrator {
+
+    @Autowired
+    private OrderService orderService;
+    @Autowired
+    private InventoryService inventoryService;
+    @Autowired
+    private PaymentService paymentService;
+    @Autowired
+    private SagaLogRepository sagaLogRepository;
+
+    public boolean executeOrderSaga(OrderSagaRequest request) {
+        String sagaId = UUID.randomUUID().toString();
+
+        try {
+            // 1. 创建订单
+            String orderId = orderService.createOrder(request.getUserId(), request.getItems());
+            sagaLogRepository.save(sagaId, "CreateOrder", "SUCCESS", orderId);
+
+            // 2. 扣库存
+            try {
+                inventoryService.deductStock(request.getItems());
+                sagaLogRepository.save(sagaId, "DeductStock", "SUCCESS", null);
+            } catch (StockException e) {
+                // 补偿：取消订单
+                orderService.cancelOrder(orderId);
+                sagaLogRepository.save(sagaId, "DeductStock", "COMPENSATED", null);
+                return false;
+            }
+
+            // 3. 扣余额
+            try {
+                paymentService.deductBalance(request.getUserId(), request.getAmount());
+                sagaLogRepository.save(sagaId, "DeductBalance", "SUCCESS", null);
+            } catch (BalanceException e) {
+                // 补偿：恢复库存 + 取消订单
+                inventoryService.restoreStock(request.getItems());
+                orderService.cancelOrder(orderId);
+                sagaLogRepository.save(sagaId, "DeductBalance", "COMPENSATED", null);
+                return false;
+            }
+
+            // 4. 发送通知（可选，不影响主事务）
+            try {
+                notificationService.sendOrderNotification(orderId);
+            } catch (Exception e) {
+                // 通知失败不影响主事务
+                log.warn("发送通知失败", e);
+            }
+
+            sagaLogRepository.save(sagaId, "Saga", "COMPLETED", orderId);
+            return true;
+
+        } catch (Exception e) {
+            log.error("Saga 执行失败", e);
+            return false;
+        }
+    }
+}
+```
+
+### 2.2 Saga 的补偿策略
+
+```java
+// Saga 补偿策略
+@Service
+public class SagaCompensationExecutor {
+
+    public void compensate(String sagaId) {
+        // 1. 从 Saga 日志中获取所有已执行的操作
+        List<SagaLog> executedSteps = sagaLogRepository.findExecutedSteps(sagaId);
+
+        // 2. 逆序执行补偿
+        Collections.reverse(executedSteps);
+
+        for (SagaLog step : executedSteps) {
+            if ("CreateOrder".equals(step.getStepName())) {
+                // 补偿创建订单：取消订单
+                try {
+                    orderService.cancelOrder((String) step.getResult());
+                    log.info("补偿成功：取消订单 {}", step.getResult());
+                } catch (Exception e) {
+                    log.error("补偿失败：取消订单 {}", step.getResult(), e);
+                    // 补偿失败的处理
+                    handleCompensationFailure(sagaId, step, e);
+                }
+            } else if ("DeductStock".equals(step.getStepName())) {
+                // 补偿扣库存：恢复库存
+                try {
+                    inventoryService.restoreStock(step.getParams());
+                    log.info("补偿成功：恢复库存");
+                } catch (Exception e) {
+                    log.error("补偿失败：恢复库存", e);
+                    handleCompensationFailure(sagaId, step, e);
+                }
+            }
+        }
+    }
+}
+```
+
+【架构权衡】
+Saga 的核心问题是"缺乏隔离性"。如果 Saga 执行到一半，用户查询订单状态，会看到"部分完成"的状态（TCC 通过 Try 预留解决了这个问题）。
+
+## 三、工程代价评估
+
+| 维度 | TCC | Saga |
+| --- | --- | --- |
+| **实现复杂度** | 高 | 中 |
+| **链路长度** | 短 | 长 |
+| **资源隔离** | 有 | 无 |
+| **补偿复杂度** | 低 | 高 |
+| **适用场景** | 强一致性要求 | 长链路业务 |
+
+## 四、落地 Checklist
+
+- [ ] **链路设计**：明确每个服务的正向和补偿操作
+- [ ] **幂等设计**：每个操作都要幂等
+- [ ] **补偿日志**：持久化 Saga 执行状态
+- [ ] **补偿策略**：设计补偿的执行顺序
+- [ ] **异常处理**：处理补偿失败的情况
+- [ ] **监控告警**：监控 Saga 的执行状态

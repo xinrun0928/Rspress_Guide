@@ -1,0 +1,210 @@
+---
+title: JOIN 查询优化
+description: 从一道面试题出发，深入剖析 MySQL JOIN 的执行原理、驱动表选择、JOIN 缓冲机制，以及 NL/Hash Join 等不同 JOIN 算法的优化策略。
+---
+
+# JOIN 查询优化
+
+面试官问："JOIN 查询怎么优化？"
+
+小张说："给关联字段加索引。"
+
+面试官追问："JOIN 的执行过程是怎样的？"
+
+小张说："...先查左表再查右表？"
+
+面试官继续追问："那驱动表和被驱动表有什么区别？怎么选？"
+
+小张开始支支吾吾。
+
+JOIN 是 MySQL 面试中出现频率最高的复杂查询题之一。但 90% 的候选人只知道"加索引"，说不清楚 JOIN 的执行过程、驱动表选择原理、以及 Nested Loop Join 和 Hash Join 的区别。
+
+## 一、JOIN 执行原理 🔴
+
+### 1.1 嵌套循环 JOIN（NLJ）
+
+```sql
+SELECT * FROM orders o JOIN users u ON o.user_id = u.id WHERE o.status = 1;
+```
+
+**执行过程**：
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ Nested Loop Join 执行流程                                 │
+│                                                          │
+│  Step 1: 选驱动表（假设 orders 是驱动表）                 │
+│  Step 2: 扫描驱动表，筛选 status=1 的行                   │
+│          得到 1000 行结果                                  │
+│                                                          │
+│  Step 3: 对驱动表的每一行，去被驱动表找匹配行               │
+│          1000 × u.id 索引查找                              │
+│                                                          │
+│  Step 4: 连接结果，返回                                   │
+└─────────────────────────────────────────────────────────┘
+```
+
+**驱动表选择原则**：
+- 驱动表行数要少（减少被驱动表的访问次数）
+- 被驱动表的关联字段要有索引
+
+### 1.2 驱动表 vs 被驱动表
+
+```sql
+-- 假设：orders 表 1000 万行，users 表 10 万行
+-- 查询：SELECT * FROM orders o JOIN users u ON o.user_id = u.id
+
+-- 方案 1：orders 是驱动表
+-- 1000 万行驱动，每行去 users 表索引查找
+-- 总访问：1000 万 × 1 次（索引查找）= 1000 万次
+
+-- 方案 2：users 是驱动表
+-- 10 万行驱动，每行去 orders 表索引查找
+-- 总访问：10 万 × 1 次（索引查找）= 10 万次
+
+-- 结论：让小表（users）做驱动表
+```
+
+### 1.3 ❌ 错误示范
+
+**候选人原话**："LEFT JOIN 就是驱动表在左边，所以 orders 在前就是驱动表。"
+
+**问题诊断**：LEFT JOIN 的关键字位置和驱动表选择无关。MySQL 优化器会自己判断哪个表做驱动表效率更高。
+
+**候选人原话 2**："JOIN 慢是因为数据量大，加索引就能解决。"
+
+**问题诊断**：加索引可以加速被驱动表的查找，但如果驱动表行数太多（没有筛选条件），性能仍然很差。
+
+【面试官心理】
+这道题我会从 JOIN 执行过程切入。如果候选人能说清楚驱动表和被驱动表的关系，说明他对 JOIN 的底层原理有理解。
+
+## 二、JOIN 缓冲区 🟡
+
+### 2.1 Block Nested Loop Join（BNLJ）
+
+当被驱动表没有索引时，MySQL 使用 BNLJ 算法：
+
+```sql
+-- 被驱动表（users）没有索引
+SELECT * FROM orders o JOIN users u ON o.user_id = u.id;
+```
+
+**执行过程**：
+
+```
+Step 1: 读取驱动表 orders 一批行到 JOIN buffer（内存）
+Step 2: 扫描被驱动表 users 全表
+Step 3: 在内存中匹配 JOIN buffer 中的行
+Step 4: 重复 Step 1~3，直到驱动表读完
+```
+
+### 2.2 JOIN Buffer 的配置
+
+```sql
+-- 查看 JOIN buffer 大小
+SHOW VARIABLES LIKE 'join_buffer_size';
+-- 默认 256KB
+
+-- 优化：如果 JOIN 的列没有索引，可以增大 JOIN buffer
+SET GLOBAL join_buffer_size = 1048576;  -- 1MB
+```
+
+:::warning ⚠️
+BNLJ 算法在被驱动表没有索引时性能很差，因为需要全表扫描被驱动表多次。驱动表有多大，就需要扫描被驱动表多少次。
+:::
+
+## 三、JOIN 优化策略 🟡
+
+### 3.1 充分利用索引
+
+```sql
+-- ✅ 好的设计
+-- orders.user_id 有索引
+-- users.id（主键）有索引
+
+SELECT * FROM orders o JOIN users u ON o.user_id = u.id;
+-- 驱动表 orders，扫描 1000 万行
+-- 每行在 users.id 上索引查找 1 次
+-- 总成本：O(驱动表行数 × log(被驱动表行数))
+
+-- ❌ 差的设计
+-- orders.user_id 和 users.id 都没有索引
+SELECT * FROM orders o JOIN users u ON o.user_id = u.id;
+-- BNLJ 算法，扫描被驱动表多次
+```
+
+### 3.2 控制驱动表行数
+
+```sql
+-- ❌ 驱动表行数太多
+SELECT * FROM orders o
+JOIN users u ON o.user_id = u.id
+WHERE o.status = 1;
+-- orders 表 1000 万行全扫描
+
+-- ✅ 先筛选再 JOIN
+SELECT * FROM (
+    SELECT * FROM orders WHERE status = 1  -- 先筛选，假设只剩 10 万行
+) o
+JOIN users u ON o.user_id = u.id;
+-- 驱动表变成 10 万行
+```
+
+### 3.3 小表驱动大表
+
+```sql
+-- ✅ 显式指定小表在前（部分场景有效）
+SELECT STRAIGHT_JOIN * FROM users u
+JOIN orders o ON u.id = o.user_id;
+-- STRAIGHT_JOIN 强制左表为驱动表
+-- 当优化器选错驱动表时可以用
+```
+
+### 3.4 避免 SELECT *
+
+```sql
+-- ❌ SELECT * 增加网络传输和内存占用
+SELECT * FROM orders o JOIN users u ON o.user_id = u.id;
+
+-- ✅ 只查需要的字段
+SELECT o.order_no, o.amount, u.name
+FROM orders o JOIN users u ON o.user_id = u.id;
+-- 同时可以利用覆盖索引优化
+```
+
+## 四、Hash Join 🟢
+
+### 4.1 Hash Join 的原理
+
+MySQL 8.0+ 支持 Hash Join：
+
+```sql
+-- MySQL 8.0+
+SELECT * FROM orders o JOIN users u ON o.user_id = u.id;
+```
+
+**执行过程**：
+
+```
+Step 1: 选小表（users）作为构建表
+Step 2: 读取 users 表，构建 hash 表（user_id → row）
+Step 3: 扫描大表（orders），在 hash 表中查找匹配行
+Step 4: 返回结果
+```
+
+### 4.2 Hash Join 的限制
+
+- MySQL 8.0+ 才支持
+- 被驱动表需要有等值 JOIN 条件
+- 大表 JOIN 大表时，需要足够大的 `join_buffer_size`
+
+【面试官心理】
+Hash Join 是 MySQL 8.0 的新特性。知道 Hash Join 和 NLJ 的适用场景差异的候选人，说明他对 MySQL 的演进有关注。
+
+---
+
+| 级别 | 考察重点 | 期望回答 |
+| --- | --- | --- |
+| P5 | 基础理解 | JOIN 基本执行过程、驱动表/被驱动表概念 |
+| P6 | 优化策略 | 索引优化、小表驱动大表、BNLJ vs NLJ |
+| P7 | 深度机制 | Hash Join、JOIN buffer 调优 |

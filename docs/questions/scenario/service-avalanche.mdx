@@ -1,0 +1,572 @@
+---
+title: 服务雪崩与熔断降级
+description: 从一次服务雪崩导致全站宕机的事故出发，深度拆解服务雪崩问题：熔断器原理、隔离策略、降级方案及常见问题处理。
+---
+
+# 服务雪崩与熔断降级
+
+2019年双十一当天，某电商平台的商品服务因为数据库连接池耗尽开始变慢。
+
+一开始只有部分接口超时，但很快所有依赖商品服务的模块都开始超时，进而拖垮了订单服务、支付服务。
+
+30分钟后，整个系统完全不可用。
+
+技术团队排查后发现：商品服务的慢查询导致线程堆积，线程堆积导致连接池耗尽，连接池耗尽导致所有请求失败。商品服务的故障像滚雪球一样，拖垮了整个系统。
+
+**这次故障导致全站宕机2小时，直接损失约2000万元。**
+
+【面试官手记】
+
+服务雪崩是分布式系统最危险的场景之一。我面试过的候选人里，能说清楚"雪崩原因"的有50%，能说清楚"熔断机制"的有30%，能说清楚"降级策略"的有20%。服务雪崩的关键词是**快速失败 + 快速恢复**。
+
+## 一、服务雪崩的原因 🔴
+
+### 1.1 三大原因
+
+```
+服务雪崩三大原因：
+
+1. 服务提供者不可用
+   - 硬件故障：服务器宕机、网络抖动
+   - 软件故障：OOM、Full GC、连接池耗尽
+   - 流量过大：压垮服务
+
+2. 大量请求积压
+   - 同步调用阻塞
+   - 线程池耗尽
+   - 请求队列满
+
+3. 连锁故障
+   - A服务慢 → B服务等待 → B服务也慢
+   - A服务挂 → B服务超时 → B服务也挂
+   - 级联放大，最终全挂
+```
+
+### 1.2 雪崩形成过程
+
+```
+雪崩形成过程：
+
+时刻1：商品服务数据库查询变慢（100ms → 10s）
+   ↓
+
+时刻2：商品服务线程池堆积
+   ↓
+
+时刻3：线程池耗尽，新请求被拒绝
+   ↓
+
+时刻4：调用商品服务的订单服务开始超时
+   ↓
+
+时刻5：订单服务线程池也开始堆积
+   ↓
+
+时刻6：订单服务也挂
+   ↓
+
+时刻7：所有服务互相影响，最终全站宕机
+
+耗时：30分钟
+```
+
+### 1.3 快速失败 vs 等待
+
+```
+快速失败 vs 等待：
+
+等待策略（错误）：
+- 线程一直等待，不释放
+- 导致线程池堆积
+- 最终拖垮调用方
+
+快速失败策略（正确）：
+- 超时立即返回
+- 释放线程
+- 调用方可以降级处理
+
+建议配置：
+- HTTP调用超时：100-500ms
+- 数据库查询超时：1-3s
+- Redis操作超时：50-200ms
+```
+
+## 二、熔断器原理 🔴
+
+### 2.1 熔断器状态
+
+```
+熔断器三状态：
+
+1. CLOSED（关闭状态）
+   - 正常请求通过
+   - 统计失败率
+   - 失败率超阈值 → OPEN
+
+2. OPEN（打开状态）
+   - 所有请求直接失败
+   - 不调用下游服务
+   - 经过冷却时间 → HALF_OPEN
+
+3. HALF_OPEN（半开状态）
+   - 允许部分请求通过
+   - 测试下游服务是否恢复
+   - 成功 → CLOSED
+   - 失败 → OPEN
+```
+
+### 2.2 熔断器实现
+
+```java
+// 熔断器实现
+@Service
+public class CircuitBreaker {
+
+    private volatile State state = State.CLOSED;
+    private AtomicInteger failureCount = new AtomicInteger(0);
+    private AtomicInteger successCount = new AtomicInteger(0);
+    private long lastFailureTime;
+
+    // 配置
+    private static final int FAILURE_THRESHOLD = 5;      // 失败5次
+    private static final int SUCCESS_THRESHOLD = 3;      // 成功3次恢复
+    private static final long RECOVERY_TIMEOUT = 60000;  // 60秒冷却
+
+    public enum State { CLOSED, OPEN, HALF_OPEN }
+
+    /**
+     * 调用服务
+     */
+    public <T> T call(Callable<T> callable) throws Exception {
+        if (state == State.OPEN) {
+            // 熔断中，检查是否超时
+            if (System.currentTimeMillis() - lastFailureTime > RECOVERY_TIMEOUT) {
+                state = State.HALF_OPEN;
+            } else {
+                throw new CircuitBreakerOpenException("熔断器打开，拒绝请求");
+            }
+        }
+
+        try {
+            T result = callable.call();
+            onSuccess();
+            return result;
+        } catch (Exception e) {
+            onFailure();
+            throw e;
+        }
+    }
+
+    private void onSuccess() {
+        failureCount.set(0);
+        if (state == State.HALF_OPEN) {
+            if (successCount.incrementAndGet() >= SUCCESS_THRESHOLD) {
+                state = State.CLOSED;
+                successCount.set(0);
+            }
+        }
+    }
+
+    private void onFailure() {
+        lastFailureTime = System.currentTimeMillis();
+        if (state == State.HALF_OPEN) {
+            // 半开状态失败，重新打开
+            state = State.OPEN;
+        } else {
+            if (failureCount.incrementAndGet() >= FAILURE_THRESHOLD) {
+                state = State.OPEN;
+            }
+        }
+    }
+
+    public State getState() {
+        return state;
+    }
+}
+```
+
+### 2.3 Sentinel熔断配置
+
+```java
+// Sentinel熔断配置
+@Configuration
+public class SentinelConfig {
+
+    @Bean
+    public InitFunc> sentinelInitFunc() {
+        return (element, configProvider, configuration) -> {
+            // 配置熔断规则
+            List<DegradeRule> rules = Arrays.asList(
+                new DegradeRule("orderService")
+                    .setGrade(CircuitBreakerStrategy.ERROR_RATIO.getType())
+                    .setCount(0.5)                    // 50%错误率触发
+                    .setSlowRatioThreshold(1.0)       // 慢请求比例
+                    .setMinRequestAmount(10)          // 最小请求数
+                    .setStatIntervalMs(10000)         // 10秒窗口
+                    .setTimeWindow(10),               // 10秒熔断时间
+
+                new DegradeRule("productService")
+                    .setGrade(CircuitBreakerStrategy.SLOW_RATIO.getType())
+                    .setSlowRatioThreshold(0.5)       // 50%慢请求触发
+                    .setMinRequestAmount(10)
+                    .setStatIntervalMs(10000)
+                    .setTimeWindow(30)                // 30秒熔断时间
+            );
+            DegradeRuleManager.loadRules(rules);
+        };
+    }
+}
+
+// 使用Sentinel
+@RestController
+public class OrderController {
+
+    @Autowired
+    private SentinelConfigManager sentinelConfig;
+
+    @GetMapping("/order/{id}")
+    @SentinelResource(value = "getOrder",
+        blockHandler = "getOrderBlockHandler",
+        fallback = "getOrderFallback")
+    public Order getOrder(@PathVariable Long id) {
+        return orderService.getOrder(id);
+    }
+
+    // 降级处理
+    public Order getOrderFallback(Long id, Throwable ex) {
+        log.warn("Order服务降级，orderId={}, error={}", id, ex.getMessage());
+        return new Order(id, "降级订单");
+    }
+
+    // 限流/熔断处理
+    public Order getOrderBlockHandler(Long id, BlockException ex) {
+        return new Order(id, "系统繁忙，请稍后再试");
+    }
+}
+```
+
+## 三、隔离策略 🟡
+
+### 3.1 线程池隔离
+
+```java
+// 线程池隔离
+@Service
+public class IsolatedService {
+
+    // 商品服务线程池（独立）
+    private final ExecutorService productExecutor = new ThreadPoolExecutor(
+        20, 20, 60L, TimeUnit.SECONDS,
+        new LinkedBlockingQueue<>(1000),
+        new ThreadFactoryBuilder().setNameFormat("product-pool-%d").build(),
+        new ThreadPoolExecutor.CallerRunsPolicy()
+    );
+
+    // 用户服务线程池（独立）
+    private final ExecutorService userExecutor = new ThreadPoolExecutor(
+        20, 20, 60L, TimeUnit.SECONDS,
+        new LinkedBlockingQueue<>(1000),
+        new ThreadFactoryBuilder().setNameFormat("user-pool-%d").build(),
+        new ThreadPoolExecutor.CallerRunsPolicy()
+    );
+
+    public ProductVO getProduct(Long productId) {
+        return productExecutor.submit(() -> {
+            return productService.getProduct(productId);
+        }).get(3, TimeUnit.SECONDS);
+    }
+
+    public UserVO getUser(Long userId) {
+        return userExecutor.submit(() -> {
+            return userService.getUser(userId);
+        }).get(3, TimeUnit.SECONDS);
+    }
+}
+
+// Hystrix线程池隔离
+@HystrixCommand(
+    groupKey = "productGroup",
+    threadPoolKey = "productPool",
+    threadPoolProperties = {
+        @HystrixProperty(name = "coreSize", value = "20"),
+        @HystrixProperty(name = "maxQueueSize", value = "1000"),
+        @HystrixProperty(name = "queueSizeRejectionThreshold", value = "800"),
+        @HystrixProperty(name = "keepAliveTimeMinutes", value = "1")
+    }
+)
+public ProductVO getProduct(Long productId) {
+    return productService.getProduct(productId);
+}
+```
+
+### 3.2 信号量隔离
+
+```java
+// 信号量隔离（轻量级）
+@Service
+public class SemaphoreIsolationService {
+
+    // 信号量隔离：限制并发数
+    private final Semaphore semaphore = new Semaphore(100, true);
+
+    public String callService() {
+        if (!semaphore.tryAcquire(100, TimeUnit.MILLISECONDS)) {
+            // 获取失败，快速失败
+            return "系统繁忙";
+        }
+
+        try {
+            return remoteService.call();
+        } finally {
+            semaphore.release();
+        }
+    }
+}
+
+// Resilience4j信号量隔离
+@Configuration
+public class Resilience4jConfig {
+
+    @Bean
+    public BulkheadRegistry bulkheadRegistry() {
+        return BulkheadRegistry.ofDefaults();
+    }
+
+    @Bean
+    public RegistryEventPublisher publisher() {
+        // 配置信号量隔离规则
+        BulkheadConfig config = BulkheadConfig.custom()
+            .maxConcurrentCalls(100)       // 最大并发数
+            .maxWaitDuration(Duration.ofMillis(500))  // 等待时间
+            .build();
+
+        return publisher -> publisher
+            .addConfiguration("default", config);
+    }
+}
+```
+
+## 四、降级方案 🟡
+
+### 4.1 降级策略
+
+```
+降级策略：
+
+1. 读取降级
+   - 服务不可用 → 返回缓存数据
+   - 服务慢 → 返回默认值
+
+2. 写入降级
+   - 服务不可用 → 写入消息队列
+   - 服务慢 → 异步写入
+
+3. 功能降级
+   - 非核心功能 → 关闭
+   - 核心功能 → 简化处理
+
+4. 页面降级
+   - 静态页面代替动态内容
+   - 友好错误提示
+```
+
+### 4.2 降级实现
+
+```java
+// 降级实现
+@Service
+public class ProductService {
+
+    @Autowired
+    private ProductFeignClient productFeign;
+
+    @Autowired
+    private ProductCacheService cacheService;
+
+    /**
+     * 降级方案：缓存兜底
+     */
+    public ProductVO getProduct(Long productId) {
+        try {
+            // 尝试调用远程服务
+            ProductVO product = productFeign.getProduct(productId);
+            // 更新缓存
+            cacheService.set(productId, product);
+            return product;
+        } catch (Exception e) {
+            log.warn("获取商品失败，尝试降级，productId={}", productId, e);
+            // 降级：读缓存
+            ProductVO cached = cacheService.get(productId);
+            if (cached != null) {
+                return cached;
+            }
+            // 降级：返回默认值
+            return getDefaultProduct(productId);
+        }
+    }
+
+    /**
+     * 降级：默认值兜底
+     */
+    private ProductVO getDefaultProduct(Long productId) {
+        ProductVO product = new ProductVO();
+        product.setId(productId);
+        product.setName("商品信息加载中");
+        product.setStatus("UNAVAILABLE");
+        return product;
+    }
+}
+
+// 使用@FeignClient的fallback
+@FeignClient(
+    name = "product-service",
+    fallback = ProductFeignClientFallback.class
+)
+public interface ProductFeignClient {
+
+    @GetMapping("/product/{id}")
+    ProductVO getProduct(@PathVariable("id") Long id);
+}
+
+@Component
+public class ProductFeignClientFallback implements ProductFeignClient {
+
+    @Override
+    public ProductVO getProduct(Long id) {
+        ProductVO product = new ProductVO();
+        product.setId(id);
+        product.setName("商品信息加载中");
+        return product;
+    }
+}
+```
+
+## 五、生产避坑 🟡
+
+### 5.1 服务雪崩的五大坑
+
+**坑1：没有熔断机制**
+
+```
+问题：服务慢的时候仍然调用
+场景：依赖服务超时，调用方一直等待
+解决方案：
+- 使用熔断器
+- 配置熔断规则
+```
+
+**坑2：超时设置过长**
+
+```
+问题：超时10秒，导致线程长时间阻塞
+场景：网络抖动
+解决方案：
+- HTTP调用超时：500ms
+- 数据库查询：3s
+- Redis操作：200ms
+```
+
+**坑3：没有降级方案**
+
+```
+问题：服务不可用时无法降级
+场景：商品服务挂，订单页完全不可用
+解决方案：
+- 提供降级接口
+- 返回缓存数据或默认值
+```
+
+**坑4：线程池不隔离**
+
+```
+问题：所有服务共用一个线程池
+场景：一个服务慢，影响所有服务
+解决方案：
+- 按服务隔离线程池
+- 使用信号量隔离
+```
+
+**坑5：没有监控告警**
+
+```
+问题：熔断发生时不知道
+场景：系统已降级，但用户投诉才发现
+解决方案：
+- 监控熔断状态
+- 监控降级次数
+- 设置告警
+```
+
+### 5.2 雪崩防护检查清单
+
+```
+设计规范：
+- [ ] 配置合理的超时时间
+- [ ] 使用熔断器
+- [ ] 线程池隔离
+- [ ] 提供降级方案
+
+配置规范：
+- [ ] 熔断错误率阈值
+- [ ] 熔断恢复时间
+- [ ] 线程池核心线程数
+- [ ] 队列容量
+
+监控规范：
+- [ ] 监控熔断状态变化
+- [ ] 监控降级次数
+- [ ] 监控超时次数
+- [ ] 监控线程池状态
+```
+
+## 六、真实面试回放 🟡
+
+> **面试官**：什么是服务雪崩？怎么防止？
+>
+> **候选人**（小张）：服务雪崩是连锁故障。
+>
+> A服务挂了，B服务调用A超时，B服务的线程堆积，B服务也挂，最终全挂。
+>
+> 防止方案：
+>
+> 一是熔断器。服务失败率超过阈值，打开熔断，直接返回失败。
+>
+> 二是超时设置。HTTP调用设置500ms超时，不要等太久。
+>
+> 三是降级方案。服务不可用时返回缓存或默认值。
+>
+> 四是线程隔离。按服务分配独立线程池。
+>
+> **面试官**：熔断器的状态有哪些？
+>
+> 小张：三个状态：
+>
+> CLOSED关闭状态，正常请求通过。
+>
+> OPEN打开状态，所有请求失败。
+>
+> HALF_OPEN半开状态，放行部分请求测试是否恢复。
+>
+> **面试官**：降级方案有哪些？
+>
+> 小张：读取降级返回缓存，写入降级写入MQ，功能降级关闭非核心功能。
+>
+> 【面试官手记】
+>
+> 小张这场面试的亮点：
+>
+> 1. 知道雪崩形成过程
+>
+> 2. 知道熔断器三状态
+>
+> 3. 知道多种降级方案
+>
+> 服务雪崩是P7工程师必备知识点，能完整回答的候选人，说明有高可用架构经验。
+
+服务雪崩防护的核心是**快速失败 + 快速恢复**。记住三个要点：
+
+1. **熔断器**：失败率超阈值打开熔断，保护下游
+2. **降级方案**：服务不可用时返回兜底数据
+3. **隔离策略**：线程池隔离，防止故障蔓延
+
+服务雪崩是分布式系统的生死劫，必须提前规划。

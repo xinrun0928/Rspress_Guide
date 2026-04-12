@@ -1,0 +1,328 @@
+---
+title: TCC 空回滚与防悬挂
+description: 深度解析 TCC 分布式事务中的两大核心问题——空回滚和悬挂，剖析其产生原因、解决方案，以及 Seata AT 模式的应对机制。
+---
+
+# TCC 空回滚与防悬挂
+
+某团队在使用 TCC 分布式事务时，遇到了一个诡异的问题：
+
+用户下单后，订单创建成功，但库存没有被扣减。查看日志发现：TCC 的 Cancel 操作被执行了，但 Try 操作从未执行过。
+
+这就是 TCC 的经典问题：**空回滚**。
+
+更诡异的是，后续用户再次下单时，库存仍然没有被扣减——因为 TCC 记录了"Cancel 已执行"，认为这个订单的事务已经结束。
+
+这就是 TCC 的另一个问题：**悬挂**。
+
+【架构权衡】
+TCC 的空回滚和悬挂问题是分布式事务领域的经典问题。任何使用 TCC 的团队都必须正面面对并解决这两个问题。Seata 等框架已经提供了成熟的解决方案，理解其原理才能正确使用 TCC。
+
+---
+
+## 一、问题背景
+
+### 1.1 什么是空回滚？
+
+```
+空回滚（Empty Rollback）：
+
+场景：
+├─ Try 操作被发送
+├─ Try 操作超时（未收到响应）
+├─ TCC 协调者认为 Try 失败
+├─ 发送 Cancel 操作
+└─ Cancel 操作执行了 —— 但此时 Try 根本没执行
+
+问题：
+├─ 业务数据没有变化
+├─ 但 TCC 日志记录了 Cancel
+└─ 后续的 Confirm 会被忽略（因为已有 Cancel 记录）
+```
+
+### 1.2 什么是悬挂？
+
+```
+悬挂（Hanging）：
+
+场景：
+├─ Try 操作被发送
+├─ Try 操作超时（未收到响应）
+├─ 发送 Cancel 操作
+├─ Cancel 操作执行了
+├─ 网络恢复
+├─ Try 操作收到了（之前超时，实际已执行）
+└─ Try 操作也执行了
+
+结果：
+├─ Try 预留了资源
+├─ Cancel 释放了资源（空操作）
+├─ 但资源已被 Try 预留
+└─ 资源永远不会被释放 —— 悬挂
+
+更严重的情况：
+├─ Try 操作超时
+├─ 发送 Cancel
+├─ Cancel 被执行（空操作）
+├─ Try 后续执行了（预留了资源）
+├─ Confirm 被调用
+└─ Confirm 确认了资源（但这个资源原本该被释放）
+```
+
+## 二、问题详解
+
+### 2.1 空回滚的产生原因
+
+```
+空回滚的触发时序：
+
+T1: 协调者发送 Try 操作 ──────────────────────────────► 参与者
+                                                          │
+T2: 参与者开始执行 Try                                    │
+                                                          │
+T3: 网络抖动，消息丢失                                     │
+                                                          │
+T4: 协调者等待超时                                        │
+                                                          │
+T5: 协调者发送 Cancel ──────────────────────────────► 参与者
+                                                          │
+T6: 参与者收到 Cancel，执行 Cancel ────────────────────► 数据库
+                                                          │
+T7: 参与者收到 Try 执行完成的消息                         │
+    （但此时 Cancel 已执行，数据库没有变化）                │
+```
+
+### 2.2 悬挂的产生原因
+
+```
+悬挂的触发时序：
+
+T1: 协调者发送 Try 操作 ──────────────────────────────► 参与者
+                                                          │
+T2: 网络严重抖动                                         │
+                                                          │
+T3: 协调者等待超时，发送 Cancel ──────────────────────► 参与者
+                                                          │
+T4: Cancel 执行（空操作）                                 │
+                                                          │
+T5: 网络恢复                                             │
+                                                          │
+T6: Try 操作终于到达参与者                                │
+                                                          │
+T7: Try 执行（预留了资源）                                │
+                                                          │
+T8: 参与者回复 Try 成功                                   │
+                                                          │
+T9: 协调者收到 Try 成功，发送 Confirm                    │
+                                                          │
+T10: Confirm 执行（但此时资源已被预留，不受影响）          │
+                                                          │
+问题：Try 预留了资源，但没有被正确处理
+     资源状态处于不一致状态
+```
+
+## 三、解决方案
+
+### 3.1 空回滚的解决方案
+
+```java
+// 方案：检查 Try 是否执行过
+@Service
+public class TccActionWithEmptyRollback implements TccAction {
+
+    @Autowired
+    private TccTransactionLogRepository logRepository;
+
+    @Override
+    public boolean tryAction(Context context) {
+        String xid = context.getXid();
+        String actionName = "InventoryTccAction";
+
+        // 记录 Try 开始
+        logRepository.save(new TccLog(xid, actionName, "TRY_START"));
+
+        try {
+            // 执行预留逻辑
+            inventoryRepository.freezeStock(itemId, count);
+
+            // 记录 Try 成功
+            logRepository.updateStatus(xid, actionName, "TRY_SUCCESS");
+            return true;
+        } catch (Exception e) {
+            logRepository.updateStatus(xid, actionName, "TRY_FAILED");
+            return false;
+        }
+    }
+
+    @Override
+    public boolean cancelAction(Context context) {
+        String xid = context.getXid();
+        String actionName = "InventoryTccAction";
+
+        // 关键：检查 Try 是否执行过
+        TccLog log = logRepository.find(xid, actionName);
+
+        if (log == null) {
+            // Try 从未执行 —— 空回滚
+            // 记录空回滚，但不做任何操作
+            logRepository.save(new TccLog(xid, actionName, "CANCEL_EMPTY"));
+            return true;
+        }
+
+        if ("CANCELLED".equals(log.getStatus())) {
+            // 已经被 Cancel 过 —— 幂等，直接返回
+            return true;
+        }
+
+        // Try 执行过，执行真正的 Cancel
+        inventoryRepository.unfreezeStock(itemId, count);
+        logRepository.updateStatus(xid, actionName, "CANCELLED");
+
+        return true;
+    }
+}
+```
+
+### 3.2 悬挂的解决方案
+
+```java
+// 悬挂的处理策略
+@Service
+public class TccActionWith悬挂处理 implements TccAction {
+
+    @Override
+    public boolean tryAction(Context context) {
+        String xid = context.getXid();
+        String actionName = "InventoryTccAction";
+
+        // 检查是否已有 Cancel 记录（悬挂检测）
+        TccLog cancelLog = logRepository.find(xid, actionName, "CANCEL");
+        TccLog cancelEmptyLog = logRepository.find(xid, actionName, "CANCEL_EMPTY");
+
+        if (cancelLog != null || cancelEmptyLog != null) {
+            // 已有 Cancel 记录 —— 这是悬挂情况
+            // Try 不执行，标记为悬挂
+            logRepository.save(new TccLog(xid, actionName, "TRY_SUSPENDED"));
+            return false; // Try 失败
+        }
+
+        // 正常执行 Try
+        inventoryRepository.freezeStock(itemId, count);
+        logRepository.save(new TccLog(xid, actionName, "TRY_SUCCESS"));
+
+        return true;
+    }
+
+    @Override
+    public boolean confirmAction(Context context) {
+        // Confirm 需要处理悬挂情况
+        String xid = context.getXid();
+        String actionName = "InventoryTccAction";
+
+        TccLog tryLog = logRepository.find(xid, actionName, "TRY_SUCCESS");
+        TccLog suspendedLog = logRepository.find(xid, actionName, "TRY_SUSPENDED");
+
+        if (suspendedLog != null) {
+            // 发生了悬挂 —— Try 未执行，不需要 Confirm
+            // 标记并忽略
+            return true;
+        }
+
+        if (tryLog == null) {
+            // Try 未执行 —— 幂等，直接返回
+            return true;
+        }
+
+        // 正常执行 Confirm
+        inventoryRepository.deductFrozenStock(itemId, count);
+        return true;
+    }
+}
+```
+
+### 3.3 Seata TCC 的解决方案
+
+Seata 框架提供了完整的 TCC 解决方案，通过分支事务记录管理 Try/Confirm/Cancel 状态：
+
+```java
+// Seata TCC 的标准实现
+@LocalTCC
+public interface TccAction {
+
+    @TwoPhaseBusinessAction(
+        name = "inventoryTccAction",
+        commitMethod = "commit",
+        rollbackMethod = "rollback"
+    )
+    boolean prepare(
+        @BusinessActionContextParameter(paramName = "xid") String xid,
+        @BusinessActionContextParameter(paramName = "itemId") String itemId,
+        @BusinessActionContextParameter(paramName = "count") int count
+    );
+
+    boolean commit(BusinessActionContext context);
+
+    boolean rollback(BusinessActionContext context);
+}
+
+@Service
+public class InventoryTccActionImpl implements TccAction {
+
+    @Override
+    public boolean prepare(BusinessActionContext context) {
+        String xid = context.getXid();
+        String itemId = context.getActionContext("itemId");
+        int count = Integer.parseInt(context.getActionContext("count"));
+
+        // Seata 自动管理 Try 状态
+        // 如果 prepare 返回 true，Seata 记录 TRY_SUCCESS
+        // 如果 prepare 返回 false，Seata 自动发送 Cancel
+
+        return inventoryService.freezeStock(itemId, count);
+    }
+
+    @Override
+    public boolean commit(BusinessActionContext context) {
+        // Seata 保证幂等
+        // Seata 保证只调用一次
+        return inventoryService.confirmFrozenStock(itemId, count);
+    }
+
+    @Override
+    public boolean rollback(BusinessActionContext context) {
+        // Seata 处理空回滚和悬挂
+        // 如果 Try 未执行，rollback 被调用 —— 空回滚，忽略
+        // 如果 Try 执行了但有悬挂状态 —— 正常回滚
+
+        return inventoryService.unfreezeStock(itemId, count);
+    }
+}
+```
+
+【架构权衡】
+TCC 的空回滚和悬挂问题，本质上是"网络不可靠"导致的。解决方案的核心是**状态管理**：
+1. 每个分支事务都要有明确的状态（TRY_PENDING / TRY_SUCCESS / CONFIRMED / CANCELLED）
+2. 每个操作都要检查状态后再执行
+3. 通过幂等性来容忍重复调用
+
+Seata 等框架已经封装了这些逻辑，使用时只需要实现 Try/Confirm/Cancel 三个方法。
+
+## 四、工程代价评估
+
+| 维度 | 评估 |
+| --- | --- |
+| **实现复杂度** | 高（需要处理空回滚和悬挂） |
+| **Seata 支持** | 框架已封装大部分逻辑 |
+| **幂等设计** | 必须实现 |
+| **状态管理** | 必须精确 |
+| **测试覆盖率** | 需要覆盖各种异常场景 |
+
+## 五、落地 Checklist
+
+- [ ] **状态机设计**：设计完整的状态转换图
+- [ ] **幂等实现**：每个操作都要幂等
+- [ ] **空回滚处理**：检查 Try 是否执行过
+- [ ] **悬挂处理**：检查 Cancel 是否执行过
+- [ ] **日志持久化**：TCC 日志必须持久化
+- [ ] **监控告警**：监控悬挂和空回滚的发生频率
+- [ ] **异常测试**：模拟网络分区、节点崩溃等场景

@@ -1,0 +1,285 @@
+---
+title: synchronized 与 ReentrantLock 对比
+description: 从源码层面深度对比 synchronized 和 ReentrantLock 的实现差异：API 设计、AQS 原理、公平/非公平锁、condition 条件队列，以及生产场景下的选型决策。
+---
+
+# synchronized 与 ReentrantLock 对比
+
+候选人小郑在面试字节 P6 时，面试官问道：
+
+" synchronized 和 ReentrantLock 有什么区别？什么时候用哪个？"
+
+小郑说："synchronized 是 JVM 层面的，ReentrantLock 是 JDK 层面的..."面试官追问："ReentrantLock 的 AQS 是什么？公平锁和非公平锁的实现有什么区别？"
+
+小郑答不上来。面试官继续："那 Condition 条件队列呢？synchronized 能不能实现类似功能？"
+
+小郑彻底答不上来了...
+
+## 一、核心问题：synchronized vs ReentrantLock 🔴
+
+### 1.1 问题拆解
+
+```
+第一层：表面区别（有什么不同？）
+  "synchronized 和 ReentrantLock 的使用方式有什么区别？"
+  考察点：API 差异、是否可重入、是否支持超时
+
+第二层：底层实现（怎么做？）
+  "synchronized 的 monitorenter 和 ReentrantLock 的 tryAquire 底层有什么区别？"
+  考察点：ObjectMonitor vs AQS、CLH 队列、LockSupport.park
+
+第三层：高级特性（功能对比）
+  "ReentrantLock 支持的 Condition、公平/非公平模式，synchronized 支持吗？"
+  考察点：Condition 条件队列、多条件等待、响应中断
+
+第四层：性能与选型（工程实践）
+  "生产环境中应该怎么选？为什么很多团队优先选 ReentrantLock？"
+  考察点：性能对比、团队规范、可测试性
+```
+
+### 1.2 ❌ 错误示范
+
+**候选人原话 A**："synchronized 是悲观锁，ReentrantLock 是乐观锁。"
+
+**问题诊断**：这是混淆概念。两者都是悲观锁（互斥锁），都是阻塞式同步。ReentrantLock 的 tryLock() 可以选择"尝试获取锁"（类似乐观锁的思路），但锁本身是悲观互斥的。
+
+**候选人原话 B**："ReentrantLock 性能比 synchronized 好，所以应该总用 ReentrantLock。"
+
+**问题诊断**：JDK 6+ 之后 synchronized 经过大量优化，在低到中竞争场景下两者性能相当。ReentrantLock 的优势在于功能丰富，不在于绝对性能。
+
+**候选人原话 C**："synchronized 不能响应中断，ReentrantLock 可以。"
+
+**问题诊断**：synchronized 的 `Thread.interrupt()` 同样可以中断等待中的线程（在 Object.wait() 中）。ReentrantLock 的优势在于可以**在获取锁的过程中**响应中断（`lockInterruptibly()`），而 synchronized 的 lock() 不支持。
+
+### 1.3 标准回答
+
+#### P5 级别：API 差异
+
+> **使用方式的区别**：
+>
+> ```java
+> // synchronized（自动释放锁）
+> synchronized (obj) {
+>     // 临界区
+> } // 自动释放锁，异常时也会自动释放
+>
+> // ReentrantLock（手动释放锁）
+> ReentrantLock lock = new ReentrantLock();
+> lock.lock();
+> try {
+>     // 临界区
+> } finally {
+>     lock.unlock();  // 必须手动释放
+> }
+> ```
+>
+> **ReentrantLock 的优势 API**：
+>
+> | API | 功能 | synchronized 等价 |
+> | --- | --- | --- |
+> | `tryLock()` | 尝试获取锁，立即返回 | 无（会一直阻塞） |
+> | `tryLock(timeout)` | 限时尝试获取锁 | 无 |
+> | `lockInterruptibly()` | 可中断的获取锁 | `wait()` 可响应中断 |
+> | `newCondition()` | 创建条件队列 | `Object.wait()` |
+> | `isHeldByCurrentThread()` | 查询是否被当前线程持有 | 无直接等价 |
+> | `getQueueLength()` | 查询等待队列长度 | 无直接等价 |
+>
+> **可重入性**：两者都支持重入——同一个线程可以多次获取同一把锁，重入计数器累加。
+
+#### P6 级别：AQS 原理与公平/非公平
+
+> **AQS（AbstractQueuedSynchronizer）核心结构**：
+>
+> ```java
+> public abstract class AbstractQueuedSynchronizer {
+>     // 核心状态：volatile int state
+>     // 持有锁的线程由 CLH 队列管理
+>
+>     private volatile int state;  // 0=未占用, >0=已占用（重入计数）
+>     private transient volatile Node head;  // CLH 队列头
+>     private transient volatile Node tail;  // CLH 队列尾
+>
+>     static final class Node {
+>         volatile Node prev;
+>         volatile Node next;
+>         volatile Thread thread;  // 等待的线程
+>         int waitStatus;  // CANCELLED/SIGNAL/PROPAGATE/CONDITION
+>         boolean isShared; // 共享/独占模式
+>     }
+> }
+> ```
+>
+> **ReentrantLock 的 lock() 流程（非公平锁）**：
+>
+> ```java
+> // NonfairSync.tryAcquire()
+> protected final boolean tryAcquire(int acquires) {
+>     if (compareAndSetState(0, 1)) {  // CAS 修改 state
+>         setExclusiveOwnerThread(Thread.currentThread());  // 设置持有者
+>         return true;
+>     }
+>     // CAS 失败，调用 addWaiter() 加入等待队列
+>     // 并在 acquireQueued() 中自旋或 park
+>     return false;
+> }
+> ```
+>
+> **公平锁 vs 非公平锁的关键差异**：
+>
+> | 特性 | 非公平锁 | 公平锁 |
+> | --- | --- | --- |
+> | tryAcquire | 直接 CAS，不检查队列 | 先检查 `hasQueuedPredecessors()` |
+> | 新线程机会 | 插队（在队首的线程可插队） | 不能插队（必须排队） |
+> | 吞吐量 | 更高（减少唤醒延迟） | 较低（严格的 FIFO） |
+> | 饥饿风险 | 极低 | 存在（但 JDK 公平锁实现已优化） |
+>
+> ```java
+> // 公平锁的 tryAcquire（额外检查）
+> protected final boolean tryAcquire(int acquires) {
+>     if (hasQueuedPredecessors()) {  // 检查队列中是否有等待更久的线程
+>         return false;  // 有，放弃获取
+>     }
+>     if (compareAndSetState(0, 1)) {
+>         setExclusiveOwnerThread(Thread.currentThread());
+>         return true;
+>     }
+>     return false;
+> }
+> ```
+
+#### P7 级别：Condition 与生产选型
+
+> **Condition 的实现**：
+>
+> `Condition` 是 AQS 的条件变量，每个 `Condition` 对应一个等待队列（独立于 CLH 队列）：
+>
+> ```java
+> // AQS 中的 Condition 队列
+> public class ConditionObject implements Condition {
+>     private transient Node firstWaiter;  // 条件队列头
+>     private transient Node lastWaiter;   // 条件队列尾
+>
+>     // await()：释放锁，加入条件队列
+>     public final void await() throws InterruptedException {
+>         // 1. 释放已持有的锁（state - 1）
+>         // 2. 创建 Node 节点，加入 Condition 队列
+>         // 3. 自旋等待，直到被 signal 或中断
+>     }
+>
+>     // signal()：唤醒条件队列中的一个线程
+>     public final void signal() {
+>         // 1. 从 Condition 队列中取出第一个 Node
+>         // 2. 移到 CLH 队列（AQS 主队列）
+>         // 3. 等待获取锁
+>     }
+> }
+> ```
+>
+> **Condition 的优势**：
+>
+> - **多条件等待**：一个锁可以有多个 Condition，实现更精细的等待/通知
+> - **精准唤醒**：只唤醒等待特定条件的线程，而不是所有等待线程
+>
+> ```java
+> // 生产者-消费者模式：两个不同的条件队列
+> ReentrantLock lock = new ReentrantLock();
+> Condition notFull = lock.newCondition();   // 队列不满
+> Condition notEmpty = lock.newCondition();  // 队列不空
+>
+> // 生产者线程
+> lock.lock();
+> try {
+>     while (queue.isFull()) notFull.await();
+>     queue.add(item);
+>     notEmpty.signal();  // 只唤醒消费者
+> } finally { lock.unlock(); }
+>
+> // 消费者线程
+> lock.lock();
+> try {
+>     while (queue.isEmpty()) notEmpty.await();
+>     Object item = queue.remove();
+>     notFull.signal();  // 只唤醒生产者
+> } finally { lock.unlock(); }
+> ```
+>
+> synchronized 的 `Object.wait()` 只有一个等待集合（Wait Set），无法像 Condition 一样区分不同条件。
+>
+> **生产选型**：
+>
+> | 场景 | 推荐 | 理由 |
+> | --- | --- | --- |
+> | 简单互斥 | synchronized | 代码简洁，自动释放，JVM 锁优化完善 |
+> | 需要限时等待 | ReentrantLock | `tryLock(timeout)` 无等价替代 |
+> | 需要中断响应 | ReentrantLock | `lockInterruptibly()` |
+> | 多条件等待 | ReentrantLock | 多个 Condition 队列 |
+> | 需要读写分离 | ReentrantReadWriteLock | 读读不互斥 |
+> | 高并发读多写少 | StampedLock（JDK 8） | 乐观读，性能最优 |
+
+【面试官心理】
+这道题我能问到 P7 级别，是因为它涉及了 AQS 这个 Java 并发包的核心框架。能说出 CLH 队列、AQS state、CAS 竞争的候选人，说明他对 java.util.concurrent 的设计有深入理解。能正确选型的候选人，说明他有工程实践的经验。知道 StampedLock 的候选人，说明他关注了 JDK 8 的新特性。
+
+### 1.4 追问升级
+
+**追问 1：为什么 ReentrantLock 默认是非公平锁？**
+
+> 非公平锁性能更好。公平锁需要检查 `hasQueuedPredecessors()`（遍历队列），在锁竞争激烈时，锁持有时间很短，非公平锁的"插队"优势明显（刚释放的锁被新来的线程直接 CAS 抢走，避免唤醒等待线程的开销）。
+>
+> 但在某些场景下，公平锁更合适——需要严格保证请求顺序（如数据库连接池、FIFO 调度）。
+
+**追问 2：synchronized 能不能实现类似 Condition 的功能？**
+
+> 基本等价：`synchronized` + `Object.wait()/notify()/notifyAll()` 可以实现单条件等待。但 synchronized 只有一个 Wait Set，无法像 ReentrantLock 那样创建多个 Condition 队列。
+>
+> 如果需要"队列A满了等队列A，队列B空了等队列B"这种多条件场景，synchronized 无法优雅实现。
+
+## 二、ReentrantReadWriteLock 🟡
+
+### 2.1 读写锁的设计
+
+> `ReentrantReadWriteLock` 将锁分为读锁和写锁：
+>
+> - **读锁**：共享锁，多个线程可以同时持有读锁
+> - **写锁**：独占锁，同时只能有一个线程持有写锁
+>
+> **读锁和写锁的交互**：
+>
+> - 读锁持有时，写锁无法获取（写锁是独占的）
+> - 写锁持有时，读锁无法获取（读锁也是独占的，因为需要看到一致的数据）
+>
+> **适用场景**：读多写少场景，如缓存、配置、只读数据等。
+
+## 三、生产避坑
+
+### 3.1 ReentrantLock 忘记 unlock()
+
+```java
+// 错误：忘记释放锁
+ReentrantLock lock = new ReentrantLock();
+lock.lock();
+try {
+    if (condition()) return;  // 提前返回，锁未释放！
+} finally {
+    lock.unlock();
+}
+```
+
+**解决**：使用 try-with-resources（`Lock` 继承 `AutoCloseable`）：
+```java
+lock.lock();
+try (var ignored = new LockHolder(lock)) {
+    // 临界区
+} // 自动释放
+```
+
+### 3.2 死锁：signalAll vs signal
+
+使用 `Condition` 时，如果使用 `signal()` 只唤醒一个线程，但该线程的条件不满足（所有等待线程的条件都不满足），系统会死锁。使用 `signalAll()` 唤醒所有等待线程，但有惊群效应。
+
+:::tip 💡
+面试加分点：能说出"StampedLock 的乐观读（validate）比 ReadWriteLock 的读锁性能更好，因为乐观读不需要 CAS 操作，直接读取版本号进行验证"，说明他关注了 JDK 8+ 的锁优化技术。
+:::
+
+:::warning ⚠️
+面试陷阱：被问到"ReentrantLock 的 lock() 和 lockInterruptibly() 有什么区别"，很多人会说"后者可以响应中断"。更准确的回答是：lock() 不响应中断（等待中被中断会转换为 InterruptedException）；lockInterruptibly() 在等待过程中**立即**响应中断并抛出 InterruptedException。
+:::

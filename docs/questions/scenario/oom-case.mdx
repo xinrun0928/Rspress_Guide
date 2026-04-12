@@ -1,0 +1,506 @@
+---
+title: OOM故障实战复盘
+description: 从一次OOM导致服务不可用的事故出发，深度拆解OOM故障的排查与处理：内存模型分析、堆外内存、GC日志解读及常见OOM场景。
+---
+
+# OOM故障实战复盘
+
+2022年双十一当天凌晨2点，某电商平台的订单服务突然大规模宕机。
+
+监控告警疯狂弹出：JVM进程OOMKilled，堆内存使用率100%，GC次数每小时超过5000次。
+
+技术团队紧急排查后发现：开发同学在一次需求迭代中，把一个List<Map<String, Object>>的结果集直接塞进了缓存，没有设置过期时间和大小限制。
+
+双十一流量峰值时，这个缓存吃掉了20GB内存。
+
+**这次故障导致订单服务宕机2小时，直接损失约500万元。**
+
+【面试官手记】
+
+OOM是生产环境最严重的故障之一。我面试过的候选人里，能说清楚"OOM排查方法"的超过50%，能说清楚"OOM根因分析"的不到30%，能说清楚"预防方案"的不到20%。OOM排查的关键词是**快速定位 + 彻底解决**。
+
+## 一、OOM的六大类型 🔴
+
+### 1.1 六种OOM类型
+
+```
+OOM六大类型：
+
+1. Java堆内存溢出（Heap OOM）
+   - 原因：对象创建过多，GC回收不了
+   - 表现：java.lang.OutOfMemoryError: Java heap space
+   - 常见场景：大数据查询、缓存无限制
+
+2. 虚拟机栈溢出（Stack Overflow）
+   - 原因：递归调用过深，栈帧过多
+   - 表现：java.lang.StackOverflowError
+   - 常见场景：无限递归、死循环调用
+
+3. 虚拟机栈内存溢出（Stack OOM）
+   - 原因：线程创建过多，栈内存不足
+   - 表现：java.lang.OutOfMemoryError: unable to create native thread
+   - 常见场景：线程池滥用、高并发请求
+
+4. 方法区溢出（Metaspace OOM）
+   - 原因：类加载过多，CG-LIB动态代理
+   - 表现：java.lang.OutOfMemoryError: Metaspace
+   - 常见场景：动态类生成、热部署
+
+5. 直接内存溢出（Direct Memory OOM）
+   - 原因：NIO直接内存未及时释放
+   - 表现：java.lang.OutOfMemoryError: Direct buffer memory
+   - 常见场景：Netty大数据传输
+
+6. 交换区溢出（Swap OOM）
+   - 原因：物理内存不足，Swap被用满
+   - 表现：系统变慢、进程被OOM Killer杀掉
+   - 常见场景：内存泄漏、物理内存不足
+```
+
+### 1.2 根因分类
+
+```
+快速判断OOM类型：
+
+1. 看错误信息
+   - "Java heap space" → 堆内存
+   - "StackOverflowError" → 栈溢出
+   - "Metaspace" → 方法区
+   - "Direct buffer memory" → 直接内存
+
+2. 看监控
+   - 堆内存持续上升 → 堆内存泄漏
+   - Metaspace持续上升 → 类加载过多
+   - 线程数持续上升 → 线程泄漏
+
+3. 看GC日志
+   - FGC频繁但回收不掉 → 内存泄漏
+   - YGC频繁但对象多 → 短生命周期对象多
+```
+
+## 二、Heap OOM排查实战 🔴
+
+### 2.1 事故现场
+
+```
+故障现象：
+- 服务响应时间从50ms飙升到10s
+- 错误率从0.1%飙升到50%
+- JVM进程被OOM Killer杀掉
+
+监控数据：
+- 堆内存使用：18GB / 20GB（持续100%）
+- GC频率：每小时5000+次
+- Full GC后内存回收：几乎为0
+```
+
+### 2.2 排查步骤
+
+```bash
+# 1. 查看JVM进程状态
+jps -l | grep order-service
+# 输出：12345 com.example.OrderServiceApplication
+
+# 2. 查看JVM内存使用
+jmap -heap 12345
+# Heap Configuration:
+#    HeapSize: 20480MB
+#    Used: 18432MB (90%)
+# GC Configuration:
+#    G1GC
+
+# 3. 查看对象分布
+jmap -histo 12345 | head -50
+#  num     #instances         #bytes  class name
+#  1:      12,345,678     890,123,456  [Ljava/lang/Object;
+#  2:       5,678,901     456,789,012  java/util/HashMap$Node
+#  3:       3,456,789     234,567,890  com/example/OrderDO
+
+# 4. 生成堆转储文件
+jmap -dump:format=b,file=heap.hprof 12345
+```
+
+### 2.3 MAT分析
+
+```
+使用Eclipse MAT分析堆转储文件：
+
+1. 打开堆转储
+   File → Open Heap Dump → heap.hprof
+
+2. 查看大对象
+   Actions → Open Dominator Tree
+   - 第一名：HashMap$Node × 5000万 → 内存泄漏
+
+3. 查看对象引用链
+   Right Click → Path To GC Roots → with all references
+   - 发现：OrderCache.put() → HashMap → 永不清理
+
+4. 定位根因
+   - 代码中使用了HashMap作为缓存
+   - 没有设置过期时间
+   - 没有设置大小上限
+```
+
+### 2.4 Arthas在线排查
+
+```bash
+# 使用Arthas在线排查
+# 1. 启动Arthas
+java -jar arthas-boot.jar 12345
+
+# 2. 查看内存使用
+dashboard -i 5000
+
+# 3. 查找最大的对象
+heapdump --live /tmp/heap.hprof
+
+# 4. 监控指定类
+watch com.example.OrderCache put '{params, returnObj}'
+# 观察：每次put都成功，但从不清理
+
+# 5. 查看方法调用
+stack com.example.OrderCache put
+# 追踪调用链路
+```
+
+## 三、Metaspace OOM排查 🟡
+
+### 3.1 事故场景
+
+```
+故障现象：
+- 服务启动正常，运行3天后开始变慢
+- 元空间使用：500MB / 512MB
+- 错误：OutOfMemoryError: Metaspace
+
+根因：
+- 使用了CG-LIB动态代理
+- 每个接口都生成一个新的代理类
+- 旧代理类没有卸载
+```
+
+### 3.2 排查方法
+
+```bash
+# 1. 查看Metaspace使用
+jmap -clstats 12345
+# Metaspace:
+#    Capacity: 524288 KB
+#    Used: 512000 KB (97%)
+#    Free: 12288 KB
+
+# 2. 查看类加载器
+jmap -clstats 12345 | grep ClassLoader
+#  num     #instances         #bytes  class name
+#  1234          5,678       123,456  com/example$$EnhancerByCGLIB$$
+
+# 3. 查看GC Roots引用
+jcmd 12345 GC.class_histogram | grep -A 10 "ClassLoader"
+
+# 4. 使用Arthas查看类加载
+arthas> classloader -l
+# 查看所有类加载器及加载的类数量
+```
+
+### 3.3 解决方案
+
+```java
+// 解决方案1：限制动态代理生成
+@Configuration
+public class CglibConfig {
+    @Bean
+    public CglibProxyFactory cglibProxyFactory() {
+        CglibProxyFactory factory = new CglibProxyFactory();
+        // 限制代理类生成数量
+        factory.setMaxCachedProxyCount(100);
+        // 限制方法调用次数
+        factory.setCacheSeconds(300);
+        return factory;
+    }
+}
+
+// 解决方案2：使用静态代理替代CGLIB
+// 不用动态代理，直接写代理类
+
+// 解决方案3：监控Metaspace
+@Scheduled(fixedRate = 60000)
+public void monitorMetaspace() {
+    MemoryMXBean metaspace = ManagementFactory.getMemoryMXBean();
+    MemoryUsage usage = metaspace.getMetaspaceUsage();
+    long used = usage.getUsed();
+    long max = usage.getMax();
+
+    if (used * 100 / max > 80) {
+        alert("Metaspace使用率超过80%");
+    }
+}
+```
+
+## 四、Stack Overflow排查 🟡
+
+### 4.1 事故场景
+
+```
+故障现象：
+- 特定请求报错：StackOverflowError
+- 调用链路超过10000层
+
+根因：
+- 递归调用没有终止条件
+- AOP切面循环调用
+- 模板引擎循环渲染
+```
+
+### 4.2 排查方法
+
+```bash
+# 1. 查看线程栈
+jstack 12345 > thread.log
+
+# 2. 搜索异常线程
+grep -A 50 "StackOverflowError" thread.log
+
+# 3. 分析调用链路
+# 发现：
+#     at com.example递归方法A(RecursiveService.java:25)
+#     at com.example递归方法A(RecursiveService.java:25)
+#     ... 重复10000次 ...
+```
+
+### 4.3 代码问题
+
+```java
+// 问题代码1：递归没有终止条件
+public int calculateSum(List<Integer> list) {
+    // 缺少终止条件
+    return list.get(0) + calculateSum(list.subList(1, list.size()));
+}
+
+// 问题代码2：AOP循环调用
+@Aspect
+@Component
+public class LoggingAspect {
+    @Around("execution(* com.example..*.*(..))")
+    public Object log(ProceedingJoinPoint point) {
+        // 切面调用Service方法
+        // Service方法又触发AOP
+        // 导致无限循环
+        return point.proceed();
+    }
+}
+
+// 问题代码3：互相调用
+@Service
+public class ServiceA {
+    @Autowired private ServiceB serviceB;
+    public void methodA() { serviceB.methodB(); }
+}
+@Service
+public class ServiceB {
+    @Autowired private ServiceA serviceA;
+    public void methodB() { serviceA.methodA(); }  // 互相调用，死循环
+}
+```
+
+## 五、Direct Memory OOM 🟡
+
+### 5.1 事故场景
+
+```
+故障现象：
+- 错误：OutOfMemoryError: Direct buffer memory
+- Netty连接大量泄漏
+
+根因：
+- Netty使用直接内存
+- 直接内存没有及时释放
+- ByteBuf没有正确release
+```
+
+### 5.2 排查方法
+
+```bash
+# 1. 查看直接内存使用
+jcmd 12345 VM.native_memory summary
+# Native Memory Tracking:
+# Direct Memory: 1024 MB used / 2048 MB max
+
+# 2. 查看NIO Buffer
+jcmd 12345 VM.flags | grep MaxDirectMemory
+# -XX:MaxDirectMemorySize=2g
+
+# 3. 跟踪直接内存分配
+# 添加启动参数：
+# -XX:NativeMemoryTracking=detail
+# -XX:+PrintGCDetails
+```
+
+### 5.3 解决方案
+
+```java
+// 解决方案1：ByteBuf必须release
+public class NettyServerHandler extends ChannelInboundHandlerAdapter {
+    @Override
+    public void channelRead(ChannelHandlerContext ctx, Object msg) {
+        ByteBuf buf = (ByteBuf) msg;
+        try {
+            // 处理数据
+            process(buf);
+        } finally {
+            // 必须释放，否则内存泄漏
+            buf.release();
+        }
+    }
+}
+
+// 解决方案2：使用引用计数
+public class SafeByteBufHandler {
+    public void handle(ByteBuf buf) {
+        // 复制引用，计数+1
+        ByteBuf duplicate = buf.duplicate().retain();
+
+        // 使用完毕后释放
+        try {
+            process(duplicate);
+        } finally {
+            duplicate.release();
+        }
+    }
+}
+
+// 解决方案3：监控直接内存
+@Scheduled(fixedRate = 60000)
+public void monitorDirectMemory() {
+    MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
+    ObjectName name = new ObjectName("java.nio:type=BufferPool,name=direct");
+    Long used = (Long) mbs.getAttribute(name, new Attribute("Count", null));
+    if (used > 1024 * 1024 * 1024) {
+        alert("直接内存使用超过1GB");
+    }
+}
+```
+
+## 六、生产避坑 🟡
+
+### 6.1 OOM的五大坑
+
+**坑1：缓存没有上限**
+
+```
+问题：缓存无限制增长
+场景：用HashMap/ConcurrentHashMap做缓存
+解决方案：
+- 使用带过期时间的缓存
+- 使用LinkedHashMap实现LRU
+- 使用Guava Cache/Caffeine
+```
+
+**坑2：大数据查询没有分页**
+
+```
+问题：一次查询返回百万级数据
+场景：SELECT * FROM orders
+解决方案：
+- 分页查询
+- 流式处理
+- 限制返回数量
+```
+
+**坑3：线程池配置过大**
+
+```
+问题：线程数太多，内存耗尽
+场景：newFixedThreadPool(10000)
+解决方案：
+- 合理配置线程数
+- 使用有界队列
+- 监控线程数
+```
+
+**坑4：静态集合持有对象**
+
+```
+问题：静态集合持有大量对象
+场景：static Map<Long, Object> cache
+解决方案：
+- 使用WeakHashMap
+- 定期清理
+- 设置容量上限
+```
+
+**坑5：资源没有及时关闭**
+
+```
+问题：流、连接没有关闭
+场景：InputStream没有在finally中关闭
+解决方案：
+- 使用try-with-resources
+- finally中关闭
+- 使用自动关闭框架
+```
+
+### 6.2 OOM检查清单
+
+```
+代码规范：
+- [ ] 缓存必须设置上限和过期时间
+- [ ] 大数据查询必须分页
+- [ ] 线程池必须合理配置
+- [ ] 资源必须及时关闭
+- [ ] 递归必须有终止条件
+
+监控告警：
+- [ ] 堆内存使用率告警（>80%）
+- [ ] Metaspace使用率告警（>80%）
+- [ ] 线程数告警（>500）
+- [ ] GC频率告警（>10次/分钟）
+```
+
+## 七、真实面试回放 🟡
+
+> **面试官**：遇到过OOM吗？怎么排查的？
+>
+> **候选人**（小张）：遇到过。
+>
+> 当时是堆内存OOM，先是看监控发现堆使用率持续100%，然后用jmap导出堆转储，用MAT分析。
+>
+> MAT的Dominator Tree一看，最大的对象是一个HashMap，里面存了5000万个订单。
+>
+> 追溯代码发现是缓存没有设置上限，导致无限增长。
+>
+> **面试官**：怎么解决和预防？
+>
+> 小张：两个方向：
+>
+> 一是治标。用Caffeine替代HashMap，设置最大容量和过期时间。
+>
+> 二是治本。分析为什么会缓存这么多数据，从架构上优化。
+>
+> **面试官**：如果是Metaspace OOM呢？
+>
+> 小张：Metaspace OOM一般是类加载过多。
+>
+> 常见原因是CGLIB动态代理生成了太多代理类。
+>
+> 排查用jmap -clstats看类加载器，或者用Arthas的classloader命令。
+>
+> 【面试官手记】
+>
+> 小张这场面试的亮点：
+>
+> 1. 排查思路清晰：监控→堆转储→MAT分析
+>
+> 2. 知道MAT的Dominator Tree用法
+>
+> 3. 能区分不同类型OOM的排查方法
+>
+> OOM排查是P6工程师必备技能，能完整回答的候选人，说明有生产排障经验。
+
+OOM排查的核心是**快速定位 + 彻底解决**。记住三个要点：
+
+1. **分类判断**：根据错误信息判断OOM类型
+2. **工具排查**：jmap/jstack/MAT/Arthas
+3. **预防为主**：缓存设上限、资源及时关闭
+
+OOM是生产环境最严重的故障，宁可提前预防，不要事后救火。

@@ -1,0 +1,477 @@
+---
+title: 分布式 ID 生成器
+description: 深度拆解分布式ID生成器的核心方案：UUID、雪花算法、号段模式、Leaf方案，以及各种方案的优缺点对比与选型建议。
+---
+
+# 分布式 ID 生成器
+
+2018年，某电商平台的订单系统出现了严重的重复下单问题：同一笔订单被提交了两次，数据库里出现了两条不同的订单记录。
+
+技术团队排查后发现：两台应用服务器同时生成了相同的订单ID。
+
+原因是：他们用本地时间戳 + 随机数作为订单ID，而两台服务器的系统时间差了0.5秒。服务器A生成了 `20180101120000_12345678`，服务器B生成了 `20180101115930_87654321`。两个ID完全不同，不会冲突。
+
+等等，这两个ID确实不同...那冲突是怎么发生的？
+
+问题出在另一个地方：**随机数生成器种子相同**。两台服务器的JVM启动时间相同，随机数种子相同，导致短时间内生成的随机数序列相同。
+
+这是一个典型的**分布式ID不唯一**的问题。
+
+【架构权衡】
+
+分布式ID是分布式系统的基础组件。订单ID、消息ID、用户ID，都需要全局唯一。单机时代的自增ID不再适用，需要分布式ID生成器。选择什么方案，取决于你的**性能要求**、**有序性要求**和**实现复杂度**。
+
+## 一、分布式ID的核心要求 🔴
+
+### 1.1 四大要求
+
+```
+分布式ID的四大要求：
+
+1. 唯一性：绝对不能重复
+   - 这是最基本的要求
+   - 重复ID会导致数据覆盖或冲突
+
+2. 有序性：ID随时间增长而增长
+   - 有利于数据库索引
+   - 有利于分库分表
+   - 有利于业务排序
+
+3. 高性能：每秒能生成足够多的ID
+   - 高并发场景：需要支持百万QPS
+   - 低并发场景：万级QPS够用
+
+4. 可解读：能从ID反推业务含义
+   - 方便排查问题
+   - 方便数据治理
+```
+
+### 1.2 不推荐的方案
+
+```
+【不推荐：UUID】
+- 优点：本地生成，无网络开销
+- 缺点：无序、字符串太长（36字符）、无法反推含义
+- 适用：内部唯一标识，不适合业务ID
+
+【不推荐：数据库自增ID + Proxy】
+- 优点：简单可靠
+- 缺点：单点性能瓶颈（< 10万QPS）
+- 适用：QPS不高的场景
+
+【不推荐：Redis INCR】
+- 优点：性能好，有序
+- 缺点：依赖Redis，需要考虑Redis挂了怎么办
+- 适用：Redis已经作为基础设施的场景
+```
+
+### 1.3 面试核心问题
+
+> 面试官：分布式ID有哪些生成方案？
+>
+> 候选人：主要有四种：
+>
+> 一是UUID，简单但无序且太长
+>
+> 二是雪花算法，时间戳+机器ID+序列号，高性能有序
+>
+> 三是号段模式，本地缓存ID段，减少数据库依赖
+>
+> 四是数据库自增，简单可靠但性能有限
+>
+> 面试官：雪花算法怎么保证全局唯一？
+>
+> 候选人：靠三个字段叠加：
+>
+> - 时间戳：精确到毫秒，不同时间的ID一定不同
+> - 机器ID：不同服务器的ID不同
+> - 序列号：同一毫秒内递增，保证递增
+>
+> 三个字段组合起来，冲突概率极低。
+
+【面试官心理】
+
+分布式ID是面试中的高频考点。能回答出基本方案的候选人，说明理解了分布式系统的基本问题；能说出各方案优缺点的候选人，说明有工程经验；能给出具体选型建议的候选人，说明有全局视野。
+
+## 二、雪花算法详解 🔴
+
+### 2.1 算法原理
+
+```
+雪花ID（Snowflake）结构：
+
+  1bit      41bit          10bit         12bit
+ +------+---------------+------------+-------------+
+ | 符号 |   时间戳差值   |   机器ID   |   序列号     |
+ +------+---------------+------------+-------------+
+ 
+- 符号位：固定为0，保留
+- 时间戳差值：2^41 ≈ 2.2万亿，约69年不重复
+- 机器ID：2^10 = 1024个节点
+- 序列号：2^12 = 4096个/毫秒/节点
+```
+
+### 2.2 实现代码
+
+```java
+public class SnowflakeIdGenerator {
+
+    private static final long EPOCH = 1609459200000L;  // 2021-01-01
+    private static final long MACHINE_BITS = 10L;
+    private static final long SEQUENCE_BITS = 12L;
+
+    private static final long MAX_MACHINE_ID = ~(-1L << MACHINE_BITS);  // 1023
+    private static final long MAX_SEQUENCE = ~(-1L << SEQUENCE_BITS);  // 4095
+
+    private final long machineId;
+    private long sequence = 0L;
+    private long lastTimestamp = -1L;
+
+    public SnowflakeIdGenerator(long machineId) {
+        if (machineId > MAX_MACHINE_ID || machineId < 0) {
+            throw new IllegalArgumentException("机器ID必须在0-1023之间");
+        }
+        this.machineId = machineId;
+    }
+
+    public synchronized long nextId() {
+        long timestamp = System.currentTimeMillis();
+
+        // 时钟回拨处理
+        if (timestamp < lastTimestamp) {
+            timestamp = lastTimestamp;
+        }
+
+        // 同一毫秒内序列号递增
+        if (timestamp == lastTimestamp) {
+            sequence = (sequence + 1) & MAX_SEQUENCE;
+            if (sequence == 0) {
+                timestamp = tilNextMillis(lastTimestamp);
+            }
+        } else {
+            sequence = 0L;
+        }
+
+        lastTimestamp = timestamp;
+
+        return ((timestamp - EPOCH) << 22)
+             | (machineId << 12)
+             | sequence;
+    }
+
+    private long tilNextMillis(long lastTimestamp) {
+        long timestamp = System.currentTimeMillis();
+        while (timestamp <= lastTimestamp) {
+            timestamp = System.currentTimeMillis();
+        }
+        return timestamp;
+    }
+}
+```
+
+### 2.3 时钟回拨处理
+
+```
+时钟回拨的三种处理策略：
+
+策略1：等待法（推荐）
+- 当timestamp < lastTimestamp时，等待到lastTimestamp
+- 优点：简单，ID严格递增
+- 缺点：等待期间服务阻塞
+
+策略2：降级法
+- 时钟回拨时抛出异常，返回错误码
+- 调用方降级处理（用随机ID或数据库ID）
+- 优点：不阻塞，缺点：部分请求失败
+
+策略3：预留机器ID法
+- 预留高位机器ID，时钟回拨时切换到备用机器ID
+- 优点：不阻塞，ID可能递减但不重复
+- 缺点：需要管理备用机器ID
+
+实际生产中，大多数公司用策略1或策略2。
+```
+
+## 三、号段模式 🟡
+
+### 3.1 原理
+
+```
+号段模式：批量从数据库/发号器获取ID段
+
+工作流程：
+1. 应用启动时，向发号器申请ID段（如 [10001, 20000]）
+2. 本地AtomicLong从10001开始递增
+3. 用到20000时，再次向发号器申请新段
+
+优点：
+- 本地生成QPS无限制
+- 减少了数据库/网络开销
+
+缺点：
+- ID不严格连续（段间可能有间隙）
+- 服务重启会浪费一段ID
+```
+
+### 3.2 实现
+
+```java
+public class SegmentIdGenerator {
+
+    private static final int STEP = 10000;
+    private final AtomicLong currentId = new AtomicLong(0);
+    private final AtomicLong nextId = new AtomicLong(0);
+
+    public SegmentIdGenerator() {
+        refresh();
+    }
+
+    public long nextId() {
+        if (currentId.get() >= nextId.get()) {
+            refresh();
+        }
+        return currentId.incrementAndGet();
+    }
+
+    private void refresh() {
+        // 向发号器申请新号段（用分布式锁保证线程安全）
+        long newSegment = idService.getNextSegment(STEP);
+        nextId.set(newSegment);
+        currentId.set(newSegment - STEP);
+    }
+}
+
+// 发号器服务
+public class IdService {
+
+    @Transactional
+    public long getNextSegment(int step) {
+        // 伪代码：实际需要分布式锁
+        SegmentDO segment = segmentDAO.selectForUpdate("main");
+        long newMaxId = segment.getMaxId() + step;
+        segmentDAO.updateMaxId("main", newMaxId);
+        return segment.getMaxId() + 1;
+    }
+}
+```
+
+### 3.3 号段 vs 雪花
+
+| 维度 | 雪花算法 | 号段模式 |
+| --- | --- | --- |
+| ID连续性 | 完全递增 | 段内递增，段间间隙 |
+| QPS | 4096/ms/节点 | 无限制（本地自增） |
+| 依赖 | 时钟 | 数据库/发号器 |
+| 机器ID | 需要1024个节点 | 不需要 |
+| 长度 | 19位整数 | 可控 |
+| 可预测性 | 递增可预测 | 不可预测 |
+
+## 四、Leaf方案 🟡
+
+### 4.1 Leaf核心设计
+
+```
+Leaf：美团的分布式ID生成方案
+
+Leaf-segment（号段模式改进版）：
+- 双Buffer：两个号段交替使用
+- 预加载：当前段用到50%时，异步加载下一段
+- 优点：号段用完前，新段已准备好
+
+Leaf-snowflake：
+- 引入Zookeeper解决时钟回拨问题
+- 每台机器从ZK获取时间戳
+- 时间戳有保障，不会回拨
+```
+
+### 4.2 双Buffer实现
+
+```java
+public class LeafSegmentService {
+
+    private static final int STEP = 10000;
+    private AtomicLong currentId = new AtomicLong(0);
+    private AtomicLong nextId = new AtomicLong(0);
+    private volatile boolean loading = false;
+
+    public long nextId() {
+        if (currentId.get() >= nextId.get() && !loading) {
+            loadNextSegment();
+        }
+        return currentId.incrementAndGet();
+    }
+
+    private void loadNextSegment() {
+        synchronized (this) {
+            if (currentId.get() >= nextId.get()) {
+                loading = true;
+                long newSegment = idService.getNextSegment(STEP);
+                nextId.set(newSegment);
+                currentId.set(newSegment - STEP);
+                loading = false;
+            }
+        }
+    }
+
+    // 预加载：当剩余号段 < 20%时，提前加载
+    public void checkAndLoad() {
+        if (currentId.get() >= nextId.get() * 0.8 && !loading) {
+            loadNextSegment();
+        }
+    }
+}
+```
+
+## 五、选型建议 🟢
+
+### 5.1 场景对比
+
+| 场景 | 推荐方案 | 理由 |
+| --- | --- | --- |
+| 订单ID | 雪花/Leaf | 高QPS，有序，适合分库分表 |
+| 消息ID | 雪花 | 高QPS，不需要业务含义 |
+| 用户ID | 雪花/UUID | 高QPS，不需要可解读 |
+| 活动券码 | 随机字符串+校验 | 防猜测，需要随机性 |
+| 短链ID | 雪花+Base62 | 高QPS，短编码 |
+| 交易流水号 | 雪花+业务前缀 | 高QPS，需要可解读 |
+
+### 5.2 雪花 vs UUID vs 数据库
+
+```
+选型决策树：
+
+QPS要求 > 100万？
+  是 → 雪花算法（单机4096万QPS）
+  否 → 下一步
+
+需要业务含义可解读？
+  是 → 雪花算法（可反推时间戳）
+  否 → 下一步
+
+数据量不大（< 1亿）？
+  是 → 数据库自增（简单可靠）
+  否 → 号段模式/雪花算法
+```
+
+## 六、生产避坑 🟡
+
+### 6.1 分布式ID的五大坑
+
+**坑1：时钟回拨**
+
+```
+问题：NTP同步导致时间回拨
+场景：机器时间被NTP同步到过去
+影响：生成重复ID
+解决方案：
+- 等待法：等待时钟追上来
+- 降级法：抛出异常，返回错误
+- 备用ID：时钟回拨时切换备用机器ID
+```
+
+**坑2：机器ID冲突**
+
+```
+问题：多台机器分配了相同的机器ID
+场景：配置中心故障，机器重启后获取到重复ID
+影响：两台机器生成相同的ID
+解决方案：
+- IP取模：机器IP % 1024，保证唯一
+- ZK分配：启动时从ZK获取唯一ID
+- 本地文件：写入本地文件，启动时读取
+```
+
+**坑3：序列号溢出**
+
+```
+问题：同一毫秒内序列号超过4096
+场景：单机QPS > 409万
+影响：等待下一毫秒，降低QPS
+解决方案：
+- 降低EPOCH：让时间戳差值变小，留更多空间
+- 改用微秒：精度提高1000倍
+- 多机分担：用更多机器ID分散
+```
+
+**坑4：ID太长**
+
+```
+问题：雪花ID转字符串后太长
+场景：19位整数不适合做短链码
+解决方案：
+- 转Base62：19位整数转Base62约11位
+- 截取低位：只取雪花ID的低48位
+- 号段模式：直接控制ID长度
+```
+
+**坑5：号段耗尽**
+
+```
+问题：号段用完，等待新号段时服务阻塞
+场景：号段=10000，用完时刷新阻塞
+影响：QPS骤降
+解决方案：
+- 双Buffer：当前段用到一半时异步加载下一段
+- 多级Buffer：本地+远程，本地用完前刷新远程
+- 降级：刷新失败时用雪花模式兜底
+```
+
+【架构权衡】
+
+分布式ID的选型，本质上是**性能、可靠性、可解读性**的权衡。雪花算法在大多数场景下是最优解——高QPS、有序、可解读、实现简单。但它的缺点是依赖时钟，需要处理时钟回拨问题。如果你的业务对ID有特殊要求（如不可预测、极短），则需要选择其他方案。
+
+## 七、真实面试回放 🟡
+
+> **面试官**：设计一个订单系统的分布式ID，日均1000万订单，需要支持分库分表，怎么选型？
+>
+> **候选人**（订单架构师）：先分析需求：
+>
+> 1. 订单ID需要支持分库分表路由
+>
+> 2. 日均1000万 = 峰值QPS约5000，单机雪花算法完全够用
+>
+> 3. 订单ID最好能反推时间，方便排查问题
+>
+> 我选择雪花算法，具体方案：
+>
+> 1. 10位机器ID = IP % 1024，保证每台机器唯一
+>
+> 2. 12位序列号 = 单机最高支持4096 QPS × 1000ms = 409万QPS，峰值5000QPS绑绑够
+>
+> 3. 19位雪花ID转字符串后，作为订单号
+>
+> **面试官**：如果将来分库分表数量变了（从8库8表变成16库16表），订单号怎么改？
+>
+> 候选人：两种方案：
+>
+> 方案一：雪花ID不变，分库路由用订单ID取模。如订单ID=12345678，分8库时路由到 12345678 % 8 = 2；分16库时路由到 12345678 % 16 = 6。
+>
+> 问题：数据需要全量迁移，因为路由规则变了。
+>
+> 方案二（推荐）：订单号中包含分库分表路由信息。
+>
+> 如雪花ID = AABBCCDD，D=分库路由。但这样路由信息和时间戳混在一起，不够干净。
+>
+> 更好的做法：订单号 = 雪花ID（作为主键）+ 路由字段（如时间戳 % 库数）。分库分表数变化时，只改路由算法，不需要迁移数据。
+>
+> 【面试官手记】
+>
+> 订单架构师这场面试的亮点：
+>
+> 1. 需求分析到位：知道需要支持分库分表路由
+>
+> 2. 量化计算正确：峰值5000QPS，单机雪花够用
+>
+> 3. 知道分库分表扩缩容的问题：路由规则变化需要数据迁移
+>
+> 4. 给出实际解法：雪花ID做主键，路由字段独立
+>
+> 这场面试属于P7级别，分库分表和ID设计是架构师必备技能。
+
+分布式ID生成器的选型，核心是**根据业务需求选择合适的方案**，记住三个要点：
+
+1. **雪花算法**：大多数场景最优，高QPS、有序、可解读
+2. **号段模式**：适合需要极高QPS但不关心ID连续的的场景
+3. **Leaf方案**：美团开源方案，双Buffer + Zookeeper双重保障
+
+理解各方案的trade-off，才能做出正确的选型决策。

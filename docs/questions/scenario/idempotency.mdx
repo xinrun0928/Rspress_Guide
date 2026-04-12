@@ -1,0 +1,483 @@
+---
+title: 接口幂等性设计
+description: 从一个重复提交导致资金重复扣款的线上事故出发，深度拆解接口幂等性的实现方案：唯一键、Token、状态机、防重表，让你彻底解决重复提交问题。
+---
+
+# 接口幂等性设计
+
+2021年某支付平台的退款接口被用户恶意利用：用户抓住退款请求，在1秒内提交了20次同样的退款申请。
+
+系统没有做幂等处理，20次退款申请全部被处理，用户退了20倍的钱。
+
+**这次事件导致平台损失了约8万元。**
+
+接口幂等性是分布式系统中最基础也最重要的设计之一。
+
+【面试官手记】
+
+接口幂等性是生产环境最常见的安全问题之一。我面试过的候选人里，能说清楚"幂等性实现方案"的不超过40%，能说出"防重复提交"具体实现的不超过20%。幂等性的关键是**理解幂等的场景和选择合适的方案**。
+
+## 一、幂等性的四个场景 🔴
+
+### 1.1 四大场景
+
+```
+幂等性的四大场景：
+
+1. 前端重复提交
+   - 用户点击按钮多次
+   - 网络抖动导致重试
+   - 典型接口：表单提交、支付下单
+
+2. MQ消息重复消费
+   - 生产者发送消息后没收到ACK
+   - 消费者处理失败后重新消费
+   - 典型接口：消息处理、异步任务
+
+3. 微服务调用重试
+   - HTTP调用超时后重试
+   - gRPC重试机制
+   - 典型接口：RPC调用
+
+4. 第三方回调
+   - 支付宝/微信支付回调
+   - 回调失败后重试
+   - 典型接口：支付回调
+```
+
+### 1.2 幂等性等级
+
+```
+幂等性等级：
+
+1. 完全幂等
+   - 多次执行结果完全相同
+   - 如：GET、DELETE（已删除）、设置固定值
+
+2. 结果幂等
+   - 最终结果相同，但中间状态可能不同
+   - 如：转账100元，第一次成功，后续都返回"已转账"
+
+3. 非幂等
+   - 每次执行结果都不同
+   - 如：计数器++
+```
+
+### 1.3 面试追问
+
+> 面试官：接口幂等性怎么实现？
+>
+> 候选人：四种方案：
+>
+> 一是基于唯一键：订单号、请求ID作为唯一索引
+>
+> 二是基于Token：提交前获取Token，提交时校验
+>
+> 三是基于状态机：订单状态只能正向流转
+>
+> 四是基于防重表：用Redis或数据库记录已处理的ID
+>
+> 【面试官心理】
+>
+> 幂等性的追问通常很务实。能回答出四种方案的候选人，说明知道全貌；能说出各方案适用场景的候选人，说明有实战经验。
+
+## 二、唯一键幂等 🔴
+
+### 2.1 原理
+
+```
+唯一键幂等：
+
+核心思想：利用数据库唯一索引或主键约束
+
+实现：
+1. 请求携带唯一标识（订单号、流水号）
+2. 数据库表设置唯一索引
+3. 重复插入时报错，直接返回成功
+
+适用场景：创建类操作
+```
+
+### 2.2 代码实现
+
+```java
+// 基于唯一键的幂等实现
+@Service
+public class OrderService {
+
+    @Autowired
+    private OrderDAO orderDAO;
+
+    @Transactional
+    public void createOrder(CreateOrderRequest request) {
+        // 业务校验
+        validateRequest(request);
+
+        // 构建订单（使用业务唯一键作为订单号）
+        Order order = new Order();
+        order.setOrderId(request.getOrderId());  // 业务唯一键
+        order.setUserId(request.getUserId());
+        order.setAmount(request.getAmount());
+        order.setStatus(OrderStatus.PENDING);
+        order.setCreateTime(new Date());
+
+        try {
+            orderDAO.insert(order);
+        } catch (DuplicateKeyException e) {
+            // 唯一键冲突，说明订单已存在，直接返回
+            log.info("订单已存在，orderId={}", request.getOrderId());
+            return;
+        }
+
+        // 后续业务处理
+        doAfterOrderCreated(order);
+    }
+}
+```
+
+```sql
+-- 数据库唯一索引
+CREATE TABLE orders (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    order_id VARCHAR(64) NOT NULL UNIQUE,  -- 唯一键幂等
+    user_id BIGINT NOT NULL,
+    amount DECIMAL(15,2) NOT NULL,
+    status TINYINT NOT NULL,
+    create_time DATETIME,
+    UNIQUE KEY uk_order_id (order_id)
+);
+```
+
+## 三、Token幂等 🟡
+
+### 3.1 原理
+
+```
+Token幂等：
+
+核心思想：提交前获取Token，提交时校验
+
+流程：
+1. 前端请求获取Token（服务端生成UUID存入Redis）
+2. 前端提交时携带Token
+3. 后端校验Token（Redis查询+删除）
+4. 校验成功执行业务，失败返回错误
+
+适用场景：表单提交、用户操作
+```
+
+### 3.2 代码实现
+
+```java
+// Token服务
+@Service
+public class TokenService {
+
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+
+    private static final String TOKEN_PREFIX = "submit:token:";
+    private static final long TOKEN_EXPIRE = 5 * 60;  // 5分钟过期
+
+    // 生成Token
+    public String generateToken() {
+        String token = UUID.randomUUID().toString().replace("-", "");
+        redisTemplate.opsForValue().set(TOKEN_PREFIX + token, "1", TOKEN_EXPIRE, TimeUnit.SECONDS);
+        return token;
+    }
+
+    // 校验并删除Token（原子操作）
+    public boolean validateAndRemoveToken(String token) {
+        String key = TOKEN_PREFIX + token;
+        // Redis SETNX + EXPIRE 的原子操作
+        Boolean result = redisTemplate.delete(key);
+        return Boolean.TRUE.equals(result);
+    }
+}
+
+// 业务接口
+@RestController
+public class SubmitController {
+
+    @Autowired
+    private TokenService tokenService;
+
+    @Autowired
+    private OrderService orderService;
+
+    @PostMapping("/submit")
+    public Result submit(@RequestBody @Validated SubmitRequest request,
+                        @RequestHeader("Token") String token) {
+        // 1. 校验Token
+        if (!tokenService.validateAndRemoveToken(token)) {
+            return Result.error("请勿重复提交");
+        }
+
+        // 2. 执行业务
+        orderService.createOrder(request);
+
+        return Result.success();
+    }
+}
+```
+
+## 四、状态机幂等 🟡
+
+### 4.1 原理
+
+```
+状态机幂等：
+
+核心思想：利用业务状态机的特性
+
+实现：
+1. 订单状态只能正向流转：待支付 → 已支付 → 已发货 → 已完成
+2. 只有在正确的状态下才能执行操作
+3. 重复操作会因为状态不匹配而失败
+
+适用场景：状态流转类业务
+```
+
+### 4.2 代码实现
+
+```java
+// 订单状态枚举
+public enum OrderStatus {
+    PENDING(0, "待支付"),
+    PAID(1, "已支付"),
+    SHIPPED(2, "已发货"),
+    COMPLETED(3, "已完成"),
+    CANCELLED(4, "已取消");
+
+    private final int value;
+    private final String desc;
+
+    OrderStatus(int value, String desc) {
+        this.value = value;
+        this.desc = desc;
+    }
+
+    // 状态流转规则
+    public boolean canTransferTo(OrderStatus target) {
+        return this.value < target.value;
+    }
+}
+
+// 订单服务
+@Service
+public class OrderService {
+
+    @Transactional
+    public void payOrder(Long orderId, String payMethod) {
+        Order order = orderDAO.selectById(orderId);
+
+        // 幂等检查：只有待支付状态才能支付
+        if (order.getStatus() != OrderStatus.PENDING) {
+            log.info("订单状态不是待支付，无法支付，orderId={}, status={}",
+                orderId, order.getStatus());
+            return;  // 幂等返回
+        }
+
+        // 执行支付
+        order.setStatus(OrderStatus.PAID);
+        order.setPayMethod(payMethod);
+        order.setPayTime(new Date());
+        orderDAO.update(order);
+    }
+
+    @Transactional
+    public void shipOrder(Long orderId) {
+        Order order = orderDAO.selectById(orderId);
+
+        // 幂等检查：只有已支付状态才能发货
+        if (order.getStatus() != OrderStatus.PAID) {
+            log.info("订单状态不是已支付，无法发货，orderId={}, status={}",
+                orderId, order.getStatus());
+            return;  // 幂等返回
+        }
+
+        // 执行发货
+        order.setStatus(OrderStatus.SHIPPED);
+        order.setShipTime(new Date());
+        orderDAO.update(order);
+    }
+}
+```
+
+## 五、防重表幂等 🟡
+
+### 5.1 原理
+
+```
+防重表幂等：
+
+核心思想：用防重表记录已处理的请求
+
+实现：
+1. 请求携带唯一标识（流水号、请求ID）
+2. 先插入防重表（唯一索引保证不重复）
+3. 防重成功后执行业务
+4. 失败则回滚防重记录
+
+适用场景：复杂业务逻辑、需要事务保证的场景
+```
+
+### 5.2 代码实现
+
+```java
+// 防重表
+// CREATE TABLE idempotent_records (
+//     id BIGINT PRIMARY KEY AUTO_INCREMENT,
+//     idempotent_key VARCHAR(128) NOT NULL UNIQUE,
+//     result TEXT,
+//     status TINYINT NOT NULL DEFAULT 0,
+//     create_time DATETIME,
+//     expire_time DATETIME,
+//     UNIQUE KEY uk_key (idempotent_key)
+// );
+
+@Service
+public class IdempotentService {
+
+    @Autowired
+    private IdempotentDAO idempotentDAO;
+
+    @Autowired
+    private BusinessService businessService;
+
+    @Transactional
+    public Result executeWithIdempotent(String idempotentKey, BusinessRequest request) {
+        // 1. 查询是否已处理
+        IdempotentRecord record = idempotentDAO.selectByKey(idempotentKey);
+        if (record != null) {
+            // 已处理，返回原结果
+            return JSON.parseObject(record.getResult(), Result.class);
+        }
+
+        // 2. 创建防重记录（进行中）
+        IdempotentRecord newRecord = new IdempotentRecord();
+        newRecord.setIdempotentKey(idempotentKey);
+        newRecord.setStatus(0);  // 进行中
+        newRecord.setCreateTime(new Date());
+        newRecord.setExpireTime(DateUtils.addHours(new Date(), 1));
+        idempotentDAO.insert(newRecord);
+
+        try {
+            // 3. 执行业务
+            Result result = businessService.doBusiness(request);
+
+            // 4. 更新防重记录（成功）
+            idempotentDAO.updateSuccess(idempotentKey, JSON.toJSONString(result));
+            return result;
+
+        } catch (Exception e) {
+            // 5. 更新防重记录（失败）
+            idempotentDAO.updateFailed(idempotentKey);
+            throw e;
+        }
+    }
+}
+```
+
+## 六、生产避坑 🟡
+
+### 6.1 幂等性的五大坑
+
+**坑1：Token校验后不删除**
+
+```
+问题：Token校验成功后没删除，导致重复使用
+场景：前端重复发送同一Token
+解决方案：
+- 校验后立即删除
+- 或使用Redis的GETDEL命令
+```
+
+**坑2：唯一键冲突不回滚**
+
+```
+问题：唯一键冲突了，但没有回滚前面的操作
+场景：部分操作已执行，发现重复时没回滚
+解决方案：
+- 使用事务，要么全成功要么全失败
+- 或者幂等操作只查不增
+```
+
+**坑3：超时导致重复执行**
+
+```
+问题：超时后重试，但上一次可能已经成功
+场景：支付回调超时
+解决方案：
+- 查订单状态，如果已支付就返回成功
+- 幂等返回而不是直接报错
+```
+
+**坑4：分布式环境下唯一键不可靠**
+
+```
+问题：分库分表后，唯一键无法保证全局唯一
+场景：订单分到不同库
+解决方案：
+- 使用分布式ID作为唯一键
+- 或使用统一的幂等服务
+```
+
+**坑5：状态机流转判断不严谨**
+
+```
+问题：状态判断用==而不是equals
+场景：Integer和int比较
+解决方案：
+- 使用枚举类的方法判断
+- 或者使用switch语句
+```
+
+## 七、真实面试回放 🟡
+
+> **面试官**：支付接口怎么保证幂等性？
+>
+> **候选人**（小张）：三种方案：
+>
+> 一是基于订单号。支付请求携带订单号，数据库设置唯一索引。重复支付时唯一键冲突，直接返回。
+>
+> 二是基于支付流水号。第三方支付回调时携带流水号，用流水号做幂等。
+>
+> 三是基于状态机。订单状态只有"待支付"才能支付，其他状态直接返回幂等成功。
+>
+> **面试官**：第三方支付回调怎么保证幂等？
+>
+> 小张：两个步骤：
+>
+> 一是查支付流水表。如果流水号已存在，说明已处理，直接返回成功。
+>
+> 二是插入防重记录。用第三方返回的支付流水号做唯一键，插入数据库。
+>
+> **面试官**：前端重复提交怎么防止？
+>
+> 小张：用Token方案。
+>
+> 用户点击提交时，先请求后端获取Token。提交时携带Token，后端用Redis的SETNX原子校验并删除。
+>
+> 如果Token已存在（被删除过），说明已提交过，拒绝。
+>
+> 【面试官手记】
+>
+> 小张这场面试的亮点：
+>
+> 1. 知道幂等性的三个实现方案：唯一键、状态机、Token
+>
+> 2. 知道第三方回调的幂等处理
+>
+> 3. 知道Token的Redis原子操作
+>
+> 幂等性是P6工程师必备技能，能完整回答的候选人，说明有实际项目经验。
+
+接口幂等性的核心是**根据场景选择合适方案**。记住四个要点：
+
+1. **唯一键**：创建类操作，用数据库唯一索引
+2. **Token**：表单提交，用Redis原子操作
+3. **状态机**：状态流转，用状态判断
+4. **防重表**：复杂业务，用防重表记录
+
+幂等性是系统安全的基础，不能心存侥幸。

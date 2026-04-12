@@ -1,0 +1,247 @@
+---
+title: synchronized 原理
+description: 从字节码到汇编指令，逐层剖析 synchronized 的底层实现：monitorenter/monitorexit、对象头锁状态、偏向锁/轻量锁/重量锁的升级过程，以及 JDK 6 的锁优化技术。
+---
+
+# synchronized 原理
+
+候选人小周在面试虾皮 P6 时，面试官问了一个看似基础但实际很深的问题：
+
+" synchronized 是怎么实现锁的？"
+
+小周说："通过 monitor 监视器实现的..."面试官追问："monitorenter 和 monitorexit 字节码指令具体做了什么？对象头中的 Mark Word 在加锁过程中怎么变化？"
+
+小周支支吾吾答不上来。面试官继续："JDK 6 对 synchronized 做了很多优化，你知道有哪些吗？"
+
+小周彻底答不上来了...
+
+## 一、核心问题：synchronized 原理 🔴
+
+### 1.1 问题拆解
+
+```
+第一层：字节码层面（怎么用？）
+  "synchronized 的字节码是什么？monitorenter 和 monitorexit 怎么用？"
+  考察点：是否看过反编译代码，了解编译器的处理
+
+第二层：对象头结构（锁存在哪？）
+  "synchronized 的锁信息和哪个对象关联？对象头怎么存储锁状态？"
+  考察点：Mark Word 的数据结构、不同锁状态下的 bit 分布
+
+第三层：monitor 实现（底层怎么做？）
+  "monitorenter 底层调用了什么系统调用？ObjectMonitor 是什么结构？"
+  考察点：HotSpot VM 的 monitor 实现、CAS + 链表队列
+
+第四层：锁优化技术（JDK 6+ 的改进）
+  "JDK 6 对 synchronized 做了哪些优化？偏向锁、轻量锁、锁消除是什么？"
+  考察点：是否了解 JDK 演进，对新特性有跟进
+```
+
+### 1.2 ❌ 错误示范
+
+**候选人原话 A**："synchronized 是通过操作系统互斥锁实现的，性能很差。"
+
+**问题诊断**：这是 JDK 5 之前的认知。JDK 6 引入了大量优化（偏向锁、轻量锁、自旋锁、锁消除、锁粗化），现代 JVM 中 synchronized 的性能已经接近甚至超过 ReentrantLock。不了解这些优化说明知识还停留在 10 年前。
+
+**候选人原话 B**："synchronized 加在方法上和加在代码块上效果一样。"
+
+**问题诊断**：实例方法加 synchronized 等同于对 `this` 对象加锁，静态方法等同于对 `Class` 对象加锁。方法级别的 synchronized 在字节码中通过 `ACC_SYNCHRONIZED` 标志实现，比代码块级别的同步多了方法调用/返回的检查开销。
+
+**候选人原话 C**："synchronized 能保证原子性、可见性和有序性，所以用它就够了。"
+
+**问题诊断**：synchronized 虽然功能全面，但大炮打蚊子在某些场景下性能代价过大。volatile、原子变量、无锁算法在特定场景下更优。
+
+### 1.3 标准回答
+
+#### P5 级别：字节码与 monitor
+
+> **字节码层面**：
+>
+> ```java
+> // 同步代码块
+> synchronized (obj) {
+>     doSomething();
+> }
+>
+> // 编译后生成的字节码：
+> //   16: monitorenter        // 进入同步块，获取 obj 的 monitor
+> //   17: aload_1
+> //   18: invokevirtual #7    // doSomething()
+> //   21: monitorexit         // 退出同步块，释放 monitor
+> //   22: goto 30
+> //   25: monitorexit         // 异常退出路径（必须释放锁）
+>
+> // 同步方法
+> public synchronized void method() {
+>     doSomething();
+> }
+>
+> // 编译后：
+> //   flags: ACC_SYNCHRONIZED  // 方法级别的标志，无需 monitorenter
+> // 方法内部无特殊字节码
+> ```
+>
+> **monitor 的工作原理**：
+>
+> 每个 Java 对象都有一个关联的 **monitor**（在 HotSpot 中实现为 `ObjectMonitor`）。monitorenter 尝试将 monitor 的 owner 设为当前线程：
+>
+> - 如果 owner 为空（无锁状态），CAS 设为当前线程，成功则进入同步块
+> - 如果 owner 为当前线程（重入），计数器 +1（reentry 计数）
+> - 如果 owner 为其他线程，当前线程被阻塞（进入 Entry Set 等待队列）
+>
+> monitorexit 释放 monitor：
+> - 重入计数 -1
+> - 如果重入计数归零，owner 设为 null，唤醒 Entry Set 中的一个等待线程
+
+#### P6 级别：对象头与 Mark Word
+
+> **对象头的组成**（64位 JVM）：
+>
+> ```mermaid
+> graph TD
+>     A[对象头 96bits/128bits] --> B[Mark Word 64bits]
+>     A --> C[Klass Pointer 32bits<br/>开启压缩指针时]
+>
+>     B --> D{无锁状态}
+>     B --> E{偏向锁状态}
+>     B --> F{轻量锁状态}
+>     B --> G{重量锁状态}
+>     B --> H{GC 标记状态}
+> ```
+>
+> **Mark Word 在不同锁状态下的存储**：
+>
+> | 锁状态 | Mark Word 内容（64位） | 说明 |
+> | --- | --- | --- |
+> | 无锁 | `[hashcode:25][age:4][biased:1][lock:2]` | GC 分代年龄、偏向锁标志 |
+> | 偏向锁 | `[thread:54][epoch:2][age:4][biased:1][lock:2]` | 线程ID、epoch |
+> | 轻量锁 | `[ptr to Lock Record:62][lock:2]` | 指向线程栈中 Lock Record 的指针 |
+> | 重量锁 | `[ptr to monitor:62][lock:2]` | 指向内核对象 ObjectMonitor 的指针 |
+> | GC 标记 | `[no bits]` | CMS 并发标记使用 |
+>
+> **偏向锁的获取过程**：
+>
+> 当一个线程首次进入同步块时，通过 CAS 将 Mark Word 中的线程 ID 设为自己的 ID（偏向锁标志位为 1）。之后的每次进入同步块，只需检查 Mark Word 中的线程 ID 是否指向自己：
+>
+> ```cpp
+> // 偏向锁获取（HotSpot 伪代码）
+> if (mark->has_bias_pattern()) {
+>     Thread* current = Thread::current();
+>     mark->biased_locker() == current  // 检查偏向线程
+>         ? continue                      // 重入，无需操作
+>         : try_to_bias(current, epoch)  // 尝试偏向当前线程
+>             : object_is_locked()      // 已锁定，可能有竞争
+> }
+> ```
+>
+> **偏向锁的撤销**：当另一个线程尝试获取已被偏向的锁时，VM 需要撤销偏向锁。安全点时，VM 遍历所有线程栈，修改锁对象头。这个过程有 Stop-The-World 开销，所以高并发场景下 JVM 可能默认禁用偏向锁（`-XX:-UseBiasedLocking`）。
+
+#### P7 级别：锁优化技术与演进
+
+> **JDK 6 引入的五种锁优化技术**：
+>
+> 1. **偏向锁（Biased Locking）**：无竞争情况下，消除同步开销。Mark Word 直接存储线程ID，后续进入无需任何原子操作。
+>
+> 2. **轻量锁（Thin Locking）**：轻度竞争时使用 CAS 自旋替代阻塞。当另一个线程尝试进入时，将 Mark Word 复制到当前线程的栈帧（Lock Record），尝试用 CAS 将 Mark Word 替换为指向 Lock Record 的指针。如果成功，获得轻量锁；如果失败，说明竞争激烈，膨胀为重量锁。
+>
+> 3. **自旋锁（Adaptive Spinning）**：轻量锁失败后不立即阻塞，而是自旋等待。JDK 6+ 使用自适应自旋：自旋次数根据之前的自旋成功率动态调整（成功率高则多自旋，竞争激烈则少自旋）。
+>
+> 4. **锁消除（Lock Elision）**：JIT 编译时，如果检测到某个锁不可能被共享（逃逸分析证明），直接消除该锁。
+>
+>     ```java
+>     // JIT 可能消除这个锁
+>     StringBuffer sb = new StringBuffer();
+>     sb.append("a");  // StringBuffer 的 append 是 synchronized
+>     // 但如果 sb 是线程本地的（不逃逸），锁会被消除
+>     ```
+>
+> 5. **锁粗化（Lock Coarsening）**：如果 JIT 检测到连续多个锁操作针对同一个对象，自动将它们合并为一个大同步块，减少锁的获取/释放次数。
+>
+>     ```java
+>     // JIT 优化前
+>     sb.append("a");
+>     sb.append("b");
+>     sb.append("c");
+>     // JIT 优化后
+>     synchronized (sb) {
+>         sb.append("a");
+>         sb.append("b");
+>         sb.append("c");
+>     }
+>     ```
+
+【面试官心理】
+这道题我能问到 P7 级别，是因为 synchronized 的实现涉及 JVM 底层、字节码、对象头结构、操作系统内核等多个层次。我最想听到的是候选人对 JDK 演进的了解——从 JDK 5 的性能灾难到 JDK 6+ 的全面优化，这个演进本身就是面试亮点。能说清 Mark Word 在不同锁状态下的 bit 分布的候选人，说明他真正看过相关资料。
+
+### 1.4 追问升级
+
+**追问 1：synchronized 和 ReentrantLock 的底层实现有什么区别？**
+
+> - **synchronized**：依赖对象头的 Mark Word 和 ObjectMonitor，通过 monitorenter/monitorexit 字节码指令实现
+> - **ReentrantLock**：依赖 AQS（AbstractQueuedSynchronizer），通过 `volatile int state` 和 CLH 队列实现
+>
+> 两者的等待队列：
+> - synchronized 的等待队列是 ObjectMonitor 的 `_EntryList`（内核对象，ParkEvent）
+> - AQS 的等待队列是 CLH 队列的变体（虚拟双向链表，LockSupport.park）
+>
+> 性能上，JDK 6+ 之后 synchronized 经过大量优化，在低竞争场景下两者性能相当；在高竞争场景下 ReentrantLock 的公平/非公平策略更可控。
+
+**追问 2：锁升级后能降级吗？**
+
+> **不能**。锁只能升级（偏向→轻量→重量），不能降级。这是 HotSpot 的设计决策，因为降级的代价（从重量锁退回轻量锁需要唤醒等待线程、修改 Mark Word）太大，没有实际收益。
+>
+> 但**锁偏向可以撤销**：当其他线程竞争偏向锁时，偏向锁被撤销（变为无锁或轻量锁），偏向线程下次进入时需要重新获取。
+
+## 二、ObjectMonitor 详解 🟡
+
+### 2.1 HotSpot ObjectMonitor 结构
+
+> ```cpp
+> class ObjectMonitor {
+>     volatile _header;        // Mark Word 的拷贝
+>     volatile _count;        // 等待计数
+>     volatile _waiters;      // 精确等待线程数
+>     volatile _owner;        // 持有者线程（ObjectWaiter*）
+>     WaitSet _WaitSet;       // 调用 wait() 的线程（双向链表）
+>     ObjectWaiter* _EntryList; // 等待获锁的线程（双向链表）
+>     int _recursions;        // 重入次数
+>     ObjectMonitor() {
+>         _header = NULL;
+>         _count = 0;
+>         _owner = NULL;
+>         _WaitSet = NULL;
+>         _EntryList = NULL;
+>         _recursions = 0;
+>     }
+> };
+> ```
+>
+> **竞争锁的流程**：
+> 1. `inflate()` 检查对象头，如果是重量锁直接用已有 monitor
+> 2. `_owner` 为 null？尝试 CAS 赋值给当前线程
+> 3. `_owner` 为当前线程？`_recursions++`（重入）
+> 4. 其他线程持有？加入 `_EntryList`，调用 `park()` 挂起
+
+## 三、生产避坑
+
+### 3.1 偏向锁在 GC 和高并发场景下的坑
+
+**场景**：JVM 启动时加 `-XX:+UseBiasedLocking`，在高并发场景下 GC Stop-The-World 时间异常增长。
+
+**根因**：当大量线程竞争同一个锁时，偏向锁需要"安全点撤销"。Stop-The-World 必须等待所有线程到达安全点后才能执行，偏向锁的撤销增加了这个过程的复杂度。
+
+**解决**：高并发服务建议使用 `-XX:-UseBiasedLocking` 或 `-XX:BiasedLockingStartupDelay=0`，或直接用 `-XX:+UseTLAB` 减少竞争。
+
+### 3.2 HashMap 的并发问题
+
+JDK 7 的 HashMap 在并发扩容时可能形成环形链表，导致 `get()` 死循环。虽然 synchronized 能解决，但在某些 JVM 配置下，即使加了 synchronized，HashMap 仍然不是线程安全的。
+
+**正确做法**：使用 `ConcurrentHashMap`。
+
+:::tip 💡
+面试加分点：能说出"JDK 15 废弃了偏向锁（deprecated），JDK 18 移除了偏向锁（removed）"，原因是现代服务中偏向锁的开销（安全点撤销、JIT 编译复杂性）大于收益。这说明你对 JDK 的演进有持续关注。
+:::
+
+:::warning ⚠️
+面试陷阱：被问到"synchronized 锁住的到底是对象还是代码"时，答"锁住代码"或"锁住对象"都不完整。正确答案是：**synchronized 锁住的是对象的 monitor，代码块只是临界区**。同步方法的锁是 this（实例方法）或 Class 对象（静态方法），不是代码本身。
+:::

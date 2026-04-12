@@ -1,0 +1,544 @@
+---
+title: AOP 原理与代理模式
+description: 从源码层面深度剖析 Spring AOP 的核心原理，解释代理对象的创建时机、JDK 动态代理与 CGLIB 的区别，以及各种通知的执行顺序。
+---
+
+# AOP 原理与代理模式
+
+候选人小钱在面试网易 P6 时，面试官问道：
+
+"Spring AOP 的原理是什么？"
+
+小钱说："通过代理对象实现的..."
+
+面试官追问："代理对象是什么时候创建的？"
+
+小钱说："运行的时候..."
+
+面试官："那具体是在 Bean 生命周期的哪个阶段创建的？"
+
+小钱说："初始化的时候？"
+
+面试官："初始化之前还是之后？"
+
+小钱彻底蒙了。
+
+【面试官心理】
+这道题我用来测试候选人是否真正理解 AOP 和 Spring 容器的结合点。知道"AOP 通过代理实现"的人很多，但能说出"代理在 postProcessAfterInitialization 中创建"的凤毛麟角。这道题能答到最后的，基本都看过 Spring 源码。
+
+---
+
+## 一、核心问题 🔴
+
+### 1.1 问题拆解
+
+**第一层：概念**
+- "AOP 是什么？用来解决什么问题？"
+- "AOP 和 OOP 是什么关系？"
+
+**第二层：原理**
+- "Spring AOP 的原理是什么？"
+- "代理对象在什么时候被创建？"
+- "Bean 生命周期中哪个阶段会创建代理？"
+
+**第三层：代理实现**
+- "JDK 动态代理和 CGLIB 代理有什么区别？"
+- "Spring 默认用哪个？为什么？"
+- "什么情况下会用 CGLIB 而不是 JDK 代理？"
+
+**第四层：执行流程**
+- "通知的执行顺序是什么？"
+- "织入（Weaving）是什么时机发生的？"
+
+### 1.2 ❌ 错误示范
+
+**候选人原话 A**："AOP 是面向切面编程，用来处理日志、事务这些横切关注点。"
+
+**问题诊断**：
+- 知道 AOP 是什么，但说不清楚原理
+- 没有提到代理对象
+- 说不清通知是在代理中执行的
+
+**候选人原话 B**："Spring AOP 使用了 JDK 动态代理，因为它是 JDK 自带的。"
+
+**问题诊断**：
+- 不完全正确，Spring 默认用 CGLIB
+- 不知道两者的区别和适用场景
+- 不知道什么情况下会从 JDK 代理切换到 CGLIB
+
+**候选人原话 C**："AOP 在 Bean 创建时就完成了织入。"
+
+**问题诊断**：
+- 知道织入概念，但不知道具体时机
+- 混淆了编译时织入（AspectJ）和运行时织入（Spring AOP）
+
+### 1.3 标准回答
+
+#### P5 回答：基本概念
+
+**AOP（Aspect-Oriented Programming，面向切面编程）**：
+OOP 解决的是"纵向继承"问题，而 AOP 解决的是"横向重复"问题。像日志记录、事务管理、性能监控这些横跨多个模块的关注点，用 OOP 很难优雅地实现，而 AOP 提供了统一管理这些横切关注点的能力。
+
+**核心概念**：
+- **Join Point（连接点）**：程序执行的某个位置，Spring AOP 中只有方法执行是连接点
+- **Pointcut（切点）**：用于匹配连接点的表达式
+- **Advice（通知）**：在切点处执行的增强逻辑
+- **Aspect（切面）**：切点和通知的组合
+- **Weaving（织入）**：将切面应用到目标对象的过程
+
+### 1.4 追问升级
+
+**追问 1：Spring AOP 代理创建时机**
+
+这是理解 AOP 的核心——代理对象不是在编译时创建的，而是在运行时、Bean 初始化阶段创建的：
+
+```java
+// Spring AOP 代理创建位置：postProcessAfterInitialization()
+// AbstractAutowireCapableBeanFactory.java
+
+protected Object initializeBean(String beanName, Object bean, RootBeanDefinition mbd) {
+    // 1. Aware 接口回调
+    invokeAwareMethods(beanName, bean);
+
+    // 2. BeanPostProcessor 前置处理
+    Object wrappedBean = applyBeanPostProcessorsBeforeInitialization(bean, beanName);
+
+    // 3. 初始化方法（@PostConstruct、InitializingBean、init-method）
+    invokeInitMethods(beanName, wrappedBean, mbd);
+
+    // 4. 【关键】BeanPostProcessor 后置处理 —— AOP 代理在这里创建！
+    wrappedBean = applyBeanPostProcessorsAfterInitialization(wrappedBean, beanName);
+
+    return wrappedBean;
+}
+```
+
+具体创建代理的是 `AbstractAutoProxyCreator.postProcessAfterInitialization()`：
+
+```java
+// AbstractAutoProxyCreator.java
+@Override
+public Object postProcessAfterInitialization(Object bean, String beanName) {
+    if (bean != null) {
+        // 【关键方法】判断是否需要创建代理
+        return wrapIfNecessary(bean, beanName, getCacheKey(bean.getClass(), beanName));
+    }
+    return bean;
+}
+
+protected Object wrapIfNecessary(Object bean, String beanName, Object cacheKey) {
+    // 1. 已经有代理了，直接返回
+    if (bean instanceof AopProxy) {
+        return bean;
+    }
+
+    // 2. 判断是否应该被代理（有没有匹配的切点）
+    Object[] specificInterceptors = getAdvicesAndAdvisorsForBean(
+        bean.getClass(), beanName, null);
+
+    if (specificInterceptors != DO_NOT_PROXY) {
+        // 3. 【关键】创建代理对象
+        Object proxy = createProxy(
+            bean.getClass(), beanName, specificInterceptors, new CglibProxyFactory());
+
+        // 4. 缓存代理对象
+        this.proxyTypes.put(cacheKey, proxy.getClass());
+
+        return proxy;
+    }
+
+    return bean;
+}
+
+protected Object createProxy(Class<?> beanClass, String beanName,
+        Object[] specificInterceptors, ProxyFactory proxyFactory) {
+
+    // 选择代理方式（JDK 或 CGLIB）
+    if (shouldProxyTargetClass(beanClass)) {
+        proxyFactory.setProxyTargetClass(true); // 强制使用 CGLIB
+    } else {
+        // 选择实现接口的 JDK 代理
+        proxyFactory.setProxyTargetClass(false);
+    }
+
+    // 添加切面
+    proxyFactory.addAdvisors(advisors);
+
+    // 【关键】创建代理
+    return proxyFactory.getProxy();
+}
+```
+
+:::warning ⚠️
+这里有个大坑：**BeanPostProcessor.postProcessAfterInitialization()** 中的 AOP 代理创建发生在 `@PostConstruct` 之后、InitializingBean 之后、自定义 init-method 之后。如果在这些初始化方法中直接调用 `this.method()`，调用的是原始对象而不是代理对象，通知不会生效！
+:::
+
+**追问 2：JDK 动态代理 vs CGLIB 代理**
+
+这是面试中的高频问题：
+
+| 对比维度 | JDK 动态代理 | CGLIB 代理 |
+| --- | --- | --- |
+| **实现方式** | 实现接口，运行时生成 `$Proxy` 类 | 继承类，运行时生成子类 |
+| **要求** | 目标类必须实现接口 | 目标类不能是 final |
+| **方法限制** | 无法代理非接口方法 | 可以代理任何方法 |
+| **性能** | Java 原生，较快 | 通过字节码生成，稍慢 |
+| **Spring 默认** | 当类有实现接口时使用 | 当类没有接口或强制使用时被使用 |
+
+```java
+// JDK 动态代理示例
+public class JdkProxyDemo {
+    public static void main(String[] args) {
+        // 目标对象
+        OrderService target = new OrderServiceImpl();
+
+        // JDK 动态代理
+        OrderService proxy = (OrderService) Proxy.newProxyInstance(
+            target.getClass().getClassLoader(),
+            target.getClass().getInterfaces(), // 必须有接口
+            (proxyObj, method, methodArgs) -> {
+                // 前置通知
+                System.out.println("before: " + method.getName());
+                Object result = method.invoke(target, methodArgs); // 调用目标方法
+                // 后置通知
+                System.out.println("after: " + method.getName());
+                return result;
+            }
+        );
+
+        proxy.createOrder(); // 通过代理调用
+    }
+}
+
+// CGLIB 代理示例
+public class CglibProxyDemo {
+    public static void main(String[] args) {
+        // 目标对象（不需要接口）
+        OrderService target = new OrderService();
+
+        // CGLIB 代理
+        Enhancer enhancer = new Enhancer();
+        enhancer.setSuperclass(target.getClass()); // 设置父类
+        enhancer.setCallback((MethodInterceptor) (obj, method, methodArgs, proxy) -> {
+            // 前置通知
+            System.out.println("before: " + method.getName());
+            Object result = proxy.invoke(target, methodArgs); // 调用目标方法
+            // 后置通知
+            System.out.println("after: " + method.getName());
+            return result;
+        });
+
+        OrderService proxy = (OrderService) enhancer.create(); // 创建子类
+        proxy.createOrder();
+    }
+}
+```
+
+Spring 的代理选择逻辑：
+
+```java
+// ProxyFactory.java
+public class ProxyFactory extends ProxyCreatorSupport {
+    // 判断是否使用 CGLIB
+    public void setProxyTargetClass(boolean proxyTargetClass) {
+        this.proxyTargetClass = proxyTargetClass;
+    }
+
+    // Spring 默认选择逻辑
+    // 1. 如果强制设置 proxyTargetClass=true → 使用 CGLIB
+    // 2. 如果目标类实现了接口 → 使用 JDK 代理
+    // 3. 如果目标类没有实现接口 → 使用 CGLIB
+}
+```
+
+:::tip 💡
+Spring Boot 2.x 开始，默认使用 CGLIB 代理（`@EnableAspectJAutoProxy(proxyTargetClass = true)` 是默认行为）。这是因为 CGLIB 更强大——它可以代理没有接口的类，而 JDK 代理必须依赖接口。Spring Boot 的 `@EnableTransactionManagement` 默认也是 `proxyTargetClass = true`。
+:::
+
+**追问 3：通知的执行顺序**
+
+当一个方法有多个切面时，通知的执行顺序由 `@Order` 或 `Ordered` 接口决定：
+
+```java
+@Aspect
+@Component
+@Order(1) // 数字越小优先级越高
+public class TransactionAspect {
+    @Around("execution(* com.example..*.*(..))")
+    public Object around(ProceedingJoinPoint pjp) throws Throwable {
+        System.out.println("[Transaction] 开启事务");
+        try {
+            Object result = pjp.proceed();
+            System.out.println("[Transaction] 提交事务");
+            return result;
+        } catch (Exception e) {
+            System.out.println("[Transaction] 回滚事务");
+            throw e;
+        }
+    }
+}
+
+@Aspect
+@Component
+@Order(2) // 后执行
+public class LoggingAspect {
+    @Around("execution(* com.example..*.*(..))")
+    public Object around(ProceedingJoinPoint pjp) throws Throwable {
+        System.out.println("[Log] 方法开始: " + pjp.getSignature());
+        try {
+            Object result = pjp.proceed();
+            System.out.println("[Log] 方法结束");
+            return result;
+        } catch (Exception e) {
+            System.out.println("[Log] 方法异常");
+            throw e;
+        }
+    }
+}
+```
+
+执行顺序（Order 数字越小越先执行）：
+
+```
+调用 proxy.method()
+  └─ [Transaction] 开启事务  ← Order(1)，最外层
+      └─ [Log] 方法开始      ← Order(2)
+          └─ 调用目标方法
+              └─ [目标方法执行]
+          └─ [Log] 方法结束  返回
+      └─ [Transaction] 提交事务 返回
+```
+
+`@Around` 的执行顺序遵循"洋葱模型"：
+- **外层切面先进入**（Order 小）
+- **内层切面先执行目标方法**
+- **内层切面先返回**
+- **外层切面后返回**
+
+**追问 4：织入（Weaving）时机**
+
+Spring AOP 是运行时织入（Runtime Weaving），与 AspectJ 的编译时织入不同：
+
+| 织入方式 | 时机 | 性能 | 灵活性 |
+| --- | --- | --- | --- |
+| **编译时织入** | 编译时 | 最优 | AspectJ compiler |
+| **类加载时织入** | 类加载时 | 较优 | Java agent |
+| **运行时织入** | 运行时代理创建时 | 有开销 | Spring AOP（默认） |
+
+```
+Spring AOP 运行时织入流程：
+
+Bean 创建流程：
+1. createBeanInstance()     → 创建实例
+2. populateBean()           → 注入属性
+3. initializeBean()
+   ├─ Aware 回调
+   ├─ postProcessBeforeInitialization()
+   ├─ @PostConstruct
+   ├─ InitializingBean.afterPropertiesSet()
+   ├─ 自定义 init-method
+   └─ postProcessAfterInitialization()  ← AOP 代理在这里创建并织入
+
+4. 返回代理对象（不是原始对象）
+
+后续方法调用：
+proxy.method() → 代理对象拦截 → 执行通知 → 执行目标方法 → 返回
+```
+
+## 二、延伸问题 🟡
+
+### 2.1 Spring AOP 和 AspectJ 的区别
+
+| 对比 | Spring AOP | AspectJ |
+| --- | --- | --- |
+| **织入方式** | 运行时（代理） | 编译时/类加载时 |
+| **切点** | 只能切方法 | 可以切构造器、字段、任意方法 |
+| **性能** | 有代理开销 | 编译后无运行时开销 |
+| **依赖** | Spring 容器 | 不依赖 Spring |
+| **配置复杂度** | 简单 | 复杂（需要 AspectJ 编译器或 agent） |
+
+```java
+// Spring AOP 支持的切点表达式
+execution(* com.example.service.*.*(..))           // 方法执行
+within(com.example.service.*)                       // 类型匹配
+this(com.example.service.OrderService)              // 代理类型匹配
+target(com.example.service.OrderService)            // 目标类型匹配
+args(java.io.Serializable)                         // 参数类型匹配
+@annotation(org.springframework.transaction.Transactional) // 注解匹配
+
+// AspectJ 支持更多
+call(public void OrderService.create())            // 方法调用
+set(private int OrderService.count)                 // 字段设置
+execution(OrderService.new(..))                     // 构造器执行
+```
+
+### 2.2 Spring Boot 中的 AOP 配置
+
+```yaml
+# application.yml
+spring:
+  aop:
+    auto: true              # 自动创建代理（默认 true）
+    proxy-target-class: true  # 强制使用 CGLIB（默认 true，Spring Boot 2.x）
+    expose-proxy: false     # 是否暴露 ThreadLocal 中的代理对象（默认 false）
+```
+
+```java
+// 暴露代理对象（开启后可以通过 AopContext.currentProxy() 获取）
+@EnableAspectJAutoProxy(exposeProxy = true)
+
+@Service
+public class OrderService {
+    public void outer() {
+        // 直接调用 this.inner() 不会走代理
+        this.inner(); // 不会触发 AOP
+
+        // 获取代理对象后调用才会走 AOP
+        ((OrderService) AopContext.currentProxy()).inner();
+    }
+
+    @Transactional
+    public void inner() {
+        // 走事务代理
+    }
+}
+```
+
+## 三、生产避坑
+
+### 3.1 代理对象导致的自我调用问题
+
+这是 Spring AOP 最大的坑：
+
+```java
+@Service
+public class OrderService {
+    @Transactional
+    public void createOrder() {
+        // 通过代理调用 save，事务生效
+        this.save(); // ❌ this 不是代理对象！
+    }
+
+    @Transactional
+    public void save() {
+        // 这里是真正保存数据的地方
+    }
+}
+```
+
+因为 `this` 是原始对象，不是代理对象，所以 `createOrder()` 调用 `this.save()` 时不会经过事务代理，save 方法的事务不会生效。
+
+解决方案：
+1. 注入自身（注入自己的 Bean）
+2. 使用 `AopContext.currentProxy()`
+3. 重构为两个 Bean 相互调用
+4. 使用 AspectJ 编译时织入
+
+```java
+// 解决方案1：注入自身
+@Service
+public class OrderService {
+    @Autowired
+    private OrderService self; // 注入自己
+
+    public void createOrder() {
+        self.save(); // 通过代理对象调用
+    }
+
+    @Transactional
+    public void save() {
+        // 事务生效
+    }
+}
+
+// 解决方案2：AopContext
+@EnableAspectJAutoProxy(exposeProxy = true)
+
+@Service
+public class OrderService {
+    public void createOrder() {
+        ((OrderService) AopContext.currentProxy()).save();
+    }
+}
+```
+
+### 3.2 代理对象的类型判断
+
+```java
+@Service
+public class Demo {
+    @Autowired
+    private ApplicationContext ctx;
+
+    public void demo() {
+        OrderService bean = ctx.getBean(OrderService.class);
+        System.out.println(bean.getClass());
+        // 输出可能是 class com.example.service.OrderService$$EnhancerBySpringCGLIB$$12345678
+        // 而不是 OrderService
+
+        // instanceof 判断要小心
+        System.out.println(bean instanceof OrderService); // true
+    }
+}
+```
+
+### 3.3 事务和 AOP 的执行顺序
+
+```java
+@Transactional
+@Cacheable("users")
+public User getUser(Long id) {
+    // 哪个先执行？
+    return userRepository.findById(id);
+}
+```
+
+Spring AOP 的执行顺序由切面的 Order 决定。Spring 内部切面的 Order：
+1. `TransactionInterceptor`（事务）
+2. `CacheInterceptor`（缓存）
+3. 用户自定义切面
+
+如果用户自定义切面的 Order 小于 TransactionInterceptor，自定义切面会在事务之前执行。
+
+## 四、工程选型
+
+### 4.1 什么时候用 Spring AOP，什么时候用 AspectJ？
+
+| 场景 | 推荐方案 | 原因 |
+| --- | --- | --- |
+| 声明式事务 | Spring AOP | 简单，够用 |
+| 声明式缓存 | Spring AOP | 简单，够用 |
+| 日志记录 | Spring AOP | 大多数场景足够 |
+| 性能监控 | Spring AOP | 简单，但如果需要监控构造函数用 AspectJ |
+| 方法调用拦截 | Spring AOP | 足够 |
+| 字段拦截 | AspectJ | Spring AOP 不支持 |
+| 构造器拦截 | AspectJ | Spring AOP 不支持 |
+
+### 4.2 AOP 性能优化
+
+AOP 代理的创建和使用有性能开销：
+
+```java
+// 不要对不需要代理的 Bean 设置切点
+// ❌ 错误：切面范围太大
+@Around("execution(* com.example..*.*(..))")
+
+// ✅ 正确：精确切点
+@Around("execution(* com.example.service.OrderService.createOrder(..))")
+
+// 使用 @Cacheable 时指定 key，避免无谓的缓存查找开销
+@Cacheable(value = "users", key = "#id")
+public User getUser(Long id) { }
+
+// 使用切面时注意 Order，避免不必要的代理嵌套
+```
+
+## 五、面试总结
+
+AOP 原理是 Spring 面试中的核心高频题。
+
+P5 候选人能说出"AOP 通过代理实现，用于日志、事务等横切关注点"。
+P6 候选人能说出代理在 postProcessAfterInitialization 中创建，能区分 JDK 和 CGLIB 代理，能说出通知的执行顺序。
+P7 候选人能说出 Spring AOP 和 AspectJ 的区别，能解释运行时织入的原理，能解决自我调用的事务失效问题。
+
+记住，AOP 不是背概念，而是理解"为什么需要代理、代理在什么时候创建、通知在什么时候执行"。

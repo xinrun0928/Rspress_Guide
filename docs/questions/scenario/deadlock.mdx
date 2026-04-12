@@ -1,0 +1,452 @@
+---
+title: 死锁排查与解决
+description: 从一个死锁导致服务完全卡死的线上事故出发，深度拆解死锁的排查方法：jstack分析、等待图、常见死锁场景及解决策略。
+---
+
+# 死锁排查与解决
+
+2020年某金融平台的支付系统在高峰期突然完全卡死，所有接口都无法响应，但进程没有崩溃。
+
+技术团队拉了20分钟紧急会议，运维尝试重启后恢复了正常。但30分钟后，系统再次卡死。
+
+最后用jstack抓了线程栈，发现了经典的死锁：线程A持有锁L1等待锁L2，线程B持有锁L2等待锁L1。
+
+排查后发现：两个业务方法，一个是"扣款+发券"，另一个是"发券+扣款"。调用顺序相反，在高并发下必然死锁。
+
+**这次死锁持续了30分钟，影响了约5万笔支付交易，直接损失约20万元。**
+
+这是一个典型的"业务逻辑问题导致死锁"的案例。
+
+【面试官手记】
+
+死锁是并发编程中最严重的问题之一。我面试过的候选人里，能说出"死锁的四个必要条件"的不超过30%，能实际排查出死锁并给出解决方案的不超过10%。死锁的关键是**预防**，而不是排查。理解死锁的成因，才能从根本上避免死锁。
+
+## 一、死锁的四个必要条件 🔴
+
+### 1.1 四个条件
+
+```
+死锁产生的四个必要条件（同时满足才会死锁）：
+
+1. 互斥条件
+   - 资源只能被一个线程持有
+   - 无法改变：锁本身就是互斥的
+
+2. 持有并等待
+   - 线程持有资源A，同时等待资源B
+   - 可以破坏：一次性获取所有资源
+
+3. 不可抢占
+   - 线程持有的资源不能被强制释放
+   - 可以破坏：支持锁超时或锁中断
+
+4. 循环等待
+   - 线程T1等待T2持有的资源，T2等待T1持有的资源
+   - 可以破坏：按固定顺序获取锁
+```
+
+### 1.2 常见死锁场景
+
+```
+场景1：转账业务
+线程A：扣款（用户A）→ 加款（用户B）
+线程B：加款（用户B）→ 扣款（用户A）
+
+场景2：订单+库存
+线程A：锁定订单 → 锁定库存
+线程B：锁定库存 → 锁定订单
+
+场景3：数据库行锁
+事务A：UPDATE orders SET ... WHERE id=1 → UPDATE orders SET ... WHERE id=2
+事务B：UPDATE orders SET ... WHERE id=2 → UPDATE orders SET ... WHERE id=1
+```
+
+### 1.3 面试追问
+
+> 面试官：死锁怎么排查？
+>
+> 候选人：用jstack打印线程栈，看有没有"BLOCKED"状态的线程和死锁检测报告。
+>
+> 面试官：怎么预防死锁？
+>
+> 候选人：两个方法：
+>
+> 一是按固定顺序获取锁，避免循环等待。
+>
+> 二是加锁超时，避免永久等待。
+>
+> 【面试官心理】
+>
+> 死锁的追问通常很深入。能回答出"四个必要条件"的候选人，说明理解死锁原理；能说出"按顺序加锁"的候选人，说明知道预防方法；能说出"实际排查经验"的候选人，说明有生产环境经验。
+
+## 二、排查流程 🔴
+
+### 2.1 jstack检测死锁
+
+```bash
+# 打印线程栈
+jstack <pid>
+
+# 查看是否有死锁
+jstack <pid> | grep -A 20 "Found one deadlock"
+
+# 查看死锁详情
+jstack <pid> | grep -A 50 "Found one deadlock"
+```
+
+```java
+// jstack死锁输出示例
+Found one deadlock:
+=========================
+
+"pool-1-thread-1":
+  waiting for monitor entry [0x00007f8a4c02a800]
+  at com.example.service.AccountService.transfer(AccountService.java:45)
+  - waiting to lock <0x00000007d8a01234> (a java.lang.Object)
+  - locked <0x00000007d8a05678> (a java.lang.Object)
+
+"pool-1-thread-2":
+  waiting for monitor entry [0x00007f8a4c02a800]
+  at com.example.service.AccountService.transfer(AccountService.java:65)
+  - waiting to lock <0x00000007d8a05678> (a java.lang.Object)
+  - locked <0x00000007d8a01234> (a java.lang.Object)
+```
+
+### 2.2 Arthas检测死锁
+
+```bash
+# 启动arthas
+java -jar arthas-boot.jar
+
+# 检测死锁
+thread -b
+
+# 查看所有线程
+thread
+```
+
+### 2.3 等待图分析
+
+```java
+// 死锁分析示例
+线程A：
+  locked obj1
+  waiting for obj2
+
+线程B：
+  locked obj2
+  waiting for obj1
+
+等待图：
+obj1 → [A] → waiting → obj2 → [B] → locked → obj1
+           ↑                                   ↓
+           └───────────────────────────────────┘
+
+这就是循环等待！
+```
+
+## 三、常见死锁场景 🟡
+
+### 3.1 场景一：转账死锁
+
+```java
+// 错误代码
+public void transfer(Long fromId, Long toId, BigDecimal amount) {
+    // 按不同顺序加锁，导致死锁
+    if (fromId < toId) {
+        lock(fromId);
+        lock(toId);
+    } else {
+        lock(toId);
+        lock(fromId);  // 可能和另一个线程形成死锁
+    }
+
+    try {
+        Account from = accountDAO.selectById(fromId);
+        Account to = accountDAO.selectById(toId);
+        from.setBalance(from.getBalance().subtract(amount));
+        to.setBalance(to.getBalance().add(amount));
+        accountDAO.update(from);
+        accountDAO.update(to);
+    } finally {
+        unlock(toId);
+        unlock(fromId);
+    }
+}
+```
+
+```java
+// 正确代码：统一加锁顺序
+public void transfer(Long fromId, Long toId, BigDecimal amount) {
+    // 统一按ID大小顺序加锁
+    Long firstId = fromId < toId ? fromId : toId;
+    Long secondId = fromId < toId ? toId : fromId;
+
+    lock(firstId);
+    lock(secondId);
+
+    try {
+        Account from = accountDAO.selectById(fromId);
+        Account to = accountDAO.selectById(toId);
+        from.setBalance(from.getBalance().subtract(amount));
+        to.setBalance(to.getBalance().add(amount));
+        accountDAO.update(from);
+        accountDAO.update(to);
+    } finally {
+        unlock(secondId);
+        unlock(firstId);
+    }
+}
+```
+
+### 3.2 场景二：数据库行锁死锁
+
+```java
+// MySQL死锁场景
+// 事务A
+UPDATE orders SET status='PAID' WHERE id=1;
+UPDATE orders SET status='PAID' WHERE id=2;
+
+// 事务B
+UPDATE orders SET status='PAID' WHERE id=2;  // 和A的第二个语句冲突
+UPDATE orders SET status='PAID' WHERE id=1;  // 和A的第一个语句冲突
+
+// 解决方案：按固定顺序更新
+UPDATE orders SET status='PAID' WHERE id IN (1, 2) ORDER BY id;
+```
+
+### 3.3 场景三：多把锁死锁
+
+```java
+// 错误代码：嵌套锁
+public void methodA() {
+    synchronized(lock1) {
+        methodB();
+    }
+}
+
+public void methodB() {
+    synchronized(lock2) {  // 如果另一个线程先调用methodB再调用methodA
+        // ...
+    }
+}
+
+// 解决方案1：不要嵌套加锁
+public void methodA() {
+    lock(lock1);
+    try {
+        // 直接调用不需要锁的逻辑
+        doMethodA();
+    } finally {
+        unlock(lock1);
+    }
+}
+
+// 解决方案2：按固定顺序加锁
+public void methodA() {
+    if (System.identityHashCode(lock1) < System.identityHashCode(lock2)) {
+        lock(lock1);
+        lock(lock2);
+    } else {
+        lock(lock2);
+        lock(lock1);
+    }
+}
+```
+
+## 四、解决方案 🟡
+
+### 4.1 预防策略
+
+```
+死锁预防策略：
+
+策略1：按固定顺序获取锁
+- 所有线程按相同顺序获取锁
+- 破坏循环等待条件
+
+策略2：一次性获取所有锁
+- 用AtomicReference + CAS实现
+- 或者用ReentrantLock的tryLock
+
+策略3：锁超时
+- ReentrantLock.tryLock(timeout)
+- 超时后回滚重试
+
+策略4：锁中断
+- ReentrantLock.lockInterruptibly()
+- 支持线程中断
+```
+
+### 4.2 锁超时实现
+
+```java
+// ReentrantLock带超时
+private final ReentrantLock lock = new ReentrantLock();
+
+public void doSomething() {
+    try {
+        // 尝试获取锁，等待最多3秒
+        if (lock.tryLock(3, TimeUnit.SECONDS)) {
+            try {
+                // 业务逻辑
+            } finally {
+                lock.unlock();
+            }
+        } else {
+            // 获取锁失败，超时处理
+            log.warn("获取锁超时，回滚操作");
+            rollback();
+        }
+    } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        rollback();
+    }
+}
+```
+
+### 4.3 监控告警
+
+```java
+// 定期检测死锁
+public class DeadlockDetector {
+
+    public void detect() {
+        ThreadMXBean threadMXBean = ManagementFactory.getThreadMXBean();
+        long[] deadlockedThreads = threadMXBean.findDeadlockedThreads();
+
+        if (deadlockedThreads != null && deadlockedThreads.length > 0) {
+            ThreadInfo[] threadInfos = threadMXBean.getThreadInfo(deadlockedThreads);
+            for (ThreadInfo info : threadInfos) {
+                log.error("检测到死锁: {}", info.getThreadName());
+            }
+            // 发送告警
+            alertService.sendAlert("检测到死锁！");
+        }
+    }
+}
+```
+
+## 五、生产避坑 🟡
+
+### 5.1 死锁排查的五大坑
+
+**坑1：只看堆栈不看代码**
+
+```
+问题：知道死锁了，但不知道为什么会死锁
+场景：堆栈显示lock方法，但不知道业务逻辑
+解决方案：
+- 结合业务代码分析
+- 看方法的调用链
+```
+
+**坑2：只解决当前死锁不解决根本原因**
+
+```
+问题：改了导致死锁的两个方法，但其他地方还有类似的死锁
+场景：只改了两个方法，没检查其他类似代码
+解决方案：
+- 建立代码规范：所有加锁必须统一顺序
+- Code Review检查
+```
+
+**坑3：测试环境没问题生产出问题**
+
+```
+问题：测试环境并发低，死锁概率低
+场景：测试没问题，生产高并发时死锁
+解决方案：
+- 压测覆盖高并发场景
+- 代码审查检查加锁顺序
+```
+
+**坑4：使用了不同的锁类型**
+
+```
+问题：synchronized和ReentrantLock混用
+场景：代码中既有synchronized又有Lock
+解决方案：
+- 统一使用同一种锁
+- 或者确保不同锁之间不会交叉
+```
+
+**坑5：忽略数据库死锁**
+
+```
+问题：只检查应用层锁，忽略数据库行锁
+场景：数据库事务导致的死锁
+解决方案：
+- 查看MySQL的死锁日志
+- SHOW ENGINE INNODB STATUS;
+```
+
+### 5.2 死锁检测工具
+
+| 工具 | 用途 |
+| --- | --- |
+| jstack | 打印线程栈，检测死锁 |
+| Arthas | 在线检测死锁 |
+| JConsole | 线程检测 |
+| VisualVM | 线程dump和分析 |
+| MySQL SHOW ENGINE INNODB STATUS | 数据库行锁死锁检测 |
+
+## 六、真实面试回放 🟡
+
+> **面试官**：什么是死锁？死锁的四个必要条件是什么？
+>
+> **候选人**（小刘）：死锁是两个或多个线程相互等待对方释放锁，导致程序无法继续执行。
+>
+> 四个必要条件是：
+>
+> 1. 互斥：资源只能被一个线程持有
+>
+> 2. 持有并等待：线程持有资源A，同时等待资源B
+>
+> 3. 不可抢占：已经持有的资源不能被强制释放
+>
+> 4. 循环等待：线程T1等待T2，T2等待T1
+>
+> **面试官**：怎么解决死锁？
+>
+> 小刘：预防比解决更重要。预防方法：
+>
+> 一是统一加锁顺序。比如转账业务，无论谁先谁后，都按ID大小顺序加锁。
+>
+> 二是加锁超时。用tryLock()，等多久没拿到就放弃。
+>
+> 三是减少锁粒度。用细粒度锁，或者用无锁数据结构。
+>
+> 如果已经发生死锁，只能重启。
+>
+> **面试官**：synchronized和ReentrantLock都能加锁，有什么区别？
+>
+> 小刘：三个区别：
+>
+> 一是synchronized是JVM层面的，ReentrantLock是JDK层面的。
+>
+> 二是synchronized不能设置超时，ReentrantLock可以用tryLock(timeout)。
+>
+> 三是synchronized不能中断等待，ReentrantLock可以用lockInterruptibly()。
+>
+> 【面试官手记】
+>
+> 小刘这场面试的亮点：
+>
+> 1. 知道死锁的四个必要条件
+>
+> 2. 知道预防比解决更重要
+>
+> 3. 知道synchronized和ReentrantLock的区别
+>
+> 死锁是并发编程的核心问题，能完整回答的候选人，说明理解了并发编程的本质。
+>
+> 追问方向：会问"怎么保证加锁顺序一致"和"数据库死锁怎么排查"，这些是更深入的追问。
+
+死锁排查的核心是**jstack检测 + 代码分析**。记住三个要点：
+
+1. **四个必要条件**：互斥、持有并等待、不可抢占、循环等待
+2. **预防方法**：统一顺序、超时锁、减少锁粒度
+3. **排查工具**：jstack、Arthas thread -b
+
+死锁重在预防，不在排查。按顺序加锁，是最简单有效的预防方法。
