@@ -24,6 +24,8 @@ const siteMeta = {
   description: '系统梳理 Java 后端核心知识，覆盖面试高频考点，助你从容应对技术面试',
   /** 作者信息 */
   author: 'Mr.zhang',
+  /** 网站配色主题 - 对应 styles/global_{theme}.css 样式文件名称 */
+  theme: 'steel',
   /** 站点关键词 - 根据导航栏目自动生成 */
   keywords: [
     // 面试准备
@@ -81,7 +83,7 @@ export default defineConfig({
    * 配置全局 CSS 样式文件路径，会自动注入到所有页面
    * 可用于统一修改主题色、字体、布局等全局样式
    */
-  globalStyles: path.join(__dirname, 'styles/global.css'),
+  globalStyles: path.join(__dirname, `styles/global_${siteMeta.theme}.css`),
 
   /**
    * 网站标题
