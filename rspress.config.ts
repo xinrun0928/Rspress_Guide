@@ -5,9 +5,10 @@
 import * as path from 'node:path';
 import { defineConfig } from '@rspress/core';
 import { pluginSass } from '@rsbuild/plugin-sass';
-import mermaid from 'rspress-plugin-mermaid';
 import { nav } from './theme_config/nav';
 import { sidebar } from './theme_config/sidebar';
+
+import { pluginMermaid } from './plugins/mermaid';
 import { transformerNotationHighlight } from '@shikijs/transformers';
 
 // ==============================================
@@ -56,17 +57,15 @@ const gitHubRepo = 'https://github.com/xinrun0928/Rspress_Guide';
 
 export default defineConfig({
   // ==============================================
-  // 插件配置（Rspress 专属插件，如 mermaid、自定义 remark/unified 插件等）
   // 注意：@rsbuild/plugin-sass 属于构建工具插件，应放在 builderConfig.plugins 中
   // ==============================================
   plugins: [
-    mermaid({
-      mermaidConfig: {
-        theme: 'forest',
-      },
-    }),
+    // Mermaid 图表渲染插件
+    // 支持在文档中使用 ```mermaid 代码块绘制流程图、时序图、状态图等
+    // 主题可选：default | dark | forest | neutral | base
+    pluginMermaid({ theme: 'forest' }),
   ],
-
+  
   // ==============================================
   // 基础站点配置（站点根目录、全局资源、基础信息）
   // ==============================================

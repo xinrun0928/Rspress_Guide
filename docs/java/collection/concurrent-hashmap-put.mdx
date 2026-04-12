@@ -1,0 +1,402 @@
+---
+title: ConcurrentHashMap put 流程
+description: 从 ConcurrentHashMap.put 的源码出发，深挖 JDK8 中 CAS 初始化数组、synchronized 锁链表头、尾插法红黑树插入的全流程，理解并发哈希表的无锁化设计。
+---
+
+# ConcurrentHashMap put 流程
+
+面试官问小李："ConcurrentHashMap 的 put 方法是怎么实现的？"
+
+小李说："用 CAS 和 synchronized。"
+
+面试官追问："什么时候用 CAS，什么时候用 synchronized？"
+
+小李说："...空桶用 CAS，非空桶用 synchronized？"
+
+面试官点点头："那红黑树怎么插入？"
+
+小张又开始支支吾吾。
+
+【面试官心理】
+
+这道题我用来测试候选人对并发编程的深度理解。ConcurrentHashMap JDK8 的 put 流程涉及三个关键机制：CAS 初始化、synchronized 锁桶、TreeBin 红黑树。能讲清楚这三种场景的区别，说明对并发哈希表的理解到位了。
+
+## 一、put 流程总览 🔴
+
+```mermaid
+graph TD
+    A["put(key, value)"] --> B{"table == null?"}
+    B -->|是| C["CAS 初始化 table"]
+    B -->|否| D["计算桶位置: (n-1) & hash"]
+    C --> D
+    D --> E{"桶是否为空?"}
+    E -->|是| F["CAS 插入新节点"]
+    E -->|否| G["检查 f.hash < 0?"]
+    G -->|是| H["f 是 TreeBin 或 ForwardingNode"]
+    H --> I["树插入 / 帮助扩容"]
+    G -->|否| J["链表头插法"]
+    J --> K{"遍历到尾部?"}
+    K -->|是| L["尾部插入, 检查树化"]
+    K -->|否| M["key匹配则更新"]
+    L --> N{"链表长度 >= 8?"}
+    N -->|是| O["树化"]
+    N -->|否| P["size++ > threshold?"}
+    O --> P
+    P -->|是| Q["并发扩容"]
+    P -->|否| R["插入完成"]
+    I --> D
+    M --> R
+    F --> R
+    Q --> R
+```
+
+## 二、CAS 初始化数组 🔴
+
+### 2.1 懒初始化模式
+
+ConcurrentHashMap 的 table 在第一次 put 时才初始化：
+
+```java
+public V put(K key, V value) {
+    return putVal(key, value, false);
+}
+
+final V putVal(K key, V value, boolean onlyIfAbsent) {
+    if (key == null || value == null) throw new NullPointerException();
+
+    int hash = spread(key.hashCode());  // 二次 hash
+    int binCount = 0;
+
+    // 核心：自旋 + CAS
+    for (Node<K, V>[] tab = table;;) {
+        Node<K, V> f;
+        int n, i, fh;
+
+        // 1. 数组为空，初始化
+        if (tab == null || (n = tab.length) == 0) {
+            tab = initTable();  // CAS 初始化
+            n = tab.length;
+        }
+        // ... 后续插入逻辑
+    }
+}
+```
+
+### 2.2 initTable 方法
+
+```java
+private final Node<K, V>[] initTable() {
+    Node<K, V>[] tab;
+    int sc;
+
+    while ((tab = table) == null || tab.length == 0) {
+        // sizeCtl < 0 表示正在初始化，其他线程让出 CPU
+        if ((sc = sizeCtl) < 0)
+            Thread.yield();
+
+        // CAS 设置 sizeCtl = -1，表示正在初始化
+        else if (U.compareAndSwapInt(this, SIZECTL, sc, -1)) {
+            try {
+                if ((tab = table) == null || tab.length == 0) {
+                    // 初始化容量 DEFAULT_CAPACITY = 16
+                    int n = (sc > 0) ? sc : DEFAULT_CAPACITY;
+                    @SuppressWarnings("unchecked")
+                    Node<K, V>[] nt = (Node<K, V>[]) new Node<?, ?>[n];
+                    table = tab = nt;
+                    // sizeCtl = 扩容阈值 = 0.75 * n
+                    sc = n - (n >>> 2);
+                }
+            } finally {
+                sizeCtl = sc;
+            }
+            break;
+        }
+        // 如果 CAS 失败（其他线程正在初始化），继续循环
+    }
+    return tab;
+}
+```
+
+:::tip 💡
+`sizeCtl` 是 ConcurrentHashMap 的核心控制变量：
+- `-1`：正在初始化
+- `-N`：有 N-1 个线程正在扩容
+- 正数：扩容阈值（当 sizeCtl > 0 时）
+- 0：默认值（表示默认容量）
+:::
+
+### 2.3 CAS 的作用
+
+CAS 保证只有一个线程能成功设置 `sizeCtl = -1`，其他线程会：
+1. 发现 `sizeCtl < 0`，调用 `Thread.yield()` 让出 CPU
+2. 下次调度时重试
+
+```java
+// 线程A执行
+U.compareAndSwapInt(this, SIZECTL, sc, -1);  // 成功，线程A初始化数组
+
+// 线程B执行
+U.compareAndSwapInt(this, SIZECTL, sc, -1);  // 失败，sizeCtl 已经变成 -1
+if ((sc = sizeCtl) < 0)
+    Thread.yield();  // 线程B让出CPU
+```
+
+## 三、CAS 插入空桶 🔴
+
+### 3.1 tabAt 方法
+
+ConcurrentHashMap 不直接用 `tab[i]`，而是使用 `tabAt` 保证可见性：
+
+```java
+static final <K, V> Node<K, V> tabAt(Node<K, V>[] tab, int i) {
+    return (Node<K, V>) U.getObjectVolatile(tab, ((long) i << ASHIFT) + ABASE);
+}
+
+// 设置桶的值
+static final <K, V> boolean casTabAt(Node<K, V>[] tab, int i,
+                                      Node<K, V> c, Node<K, V> v) {
+    return U.compareAndSwapObject(tab, ((long) i << ASHIFT) + ABASE, c, v);
+}
+```
+
+### 3.2 插入空桶
+
+```java
+else if ((f = tabAt(tab, i = (n - 1) & hash)) == null) {
+    // 桶为空，CAS 插入新节点
+    if (casTabAt(tab, i, null, new Node<K, V>(hash, key, value, null)))
+        break;  // 插入成功，退出循环
+    // 如果 CAS 失败（其他线程已插入），继续循环重试
+}
+```
+
+**为什么不用 synchronized？**
+
+空桶只需要一个线程插入成功，用 synchronized 加锁太重。用 CAS 轻量且高效。
+
+## 四、synchronized 锁非空桶 🔴
+
+### 4.1 判断桶类型
+
+```java
+if ((f = tabAt(tab, i)) != null) {
+    // 桶不为空
+
+    // f.hash < 0 表示特殊节点
+    if ((fh = f.hash) == MOVED) {
+        // MOVED = -1，表示正在扩容，帮助扩容
+        tab = helpTransfer(tab, f);
+        n = tab.length;
+    }
+    else {
+        // 正常桶：链表或红黑树，用 synchronized 锁住
+        synchronized (f) {
+            // 再次检查桶头，因为其他线程可能已修改
+            if (tabAt(tab, i) == f) {
+                // ... 链表插入或红黑树插入
+            }
+        }
+    }
+}
+```
+
+### 4.2 为什么用 synchronized 而不是 ReentrantLock？
+
+JDK8 改用 synchronized 的原因：
+1. JDK6 之后 synchronized 性能大幅提升（偏向锁、轻量级锁）
+2. synchronized 的锁升级对 JIT 友好
+3. 内存占用更少（不需要 AQS 对象）
+
+### 4.3 链表插入
+
+```java
+if (fh >= 0) {
+    // fh >= 0 表示普通链表节点
+    binCount = 1;
+    for (Node<K, V> e = f;; ++binCount) {
+        Node<K, V> ek;
+        if (e.hash == hash && ((ek = e.key) == key || (ek != null && key.equals(ek)))) {
+            // key 已存在，更新 value
+            V oldValue = e.value;
+            if (!onlyIfAbsent || oldValue == null)
+                e.value = value;
+            afterNodeAccess(e);
+            break;
+        }
+        Node<K, V> pred = e;
+        if ((e = e.next) == null) {
+            // 遍历到尾部，插入新节点（尾插法）
+            pred.next = new Node<K, V>(hash, key, value, null);
+
+            // 检查是否需要树化
+            if (binCount >= TREEIFY_THRESHOLD)  // 8
+                treeifyBin(tab, hash);
+            break;
+        }
+    }
+}
+```
+
+**为什么用尾插法而不是头插法？**
+
+ConcurrentHashMap 用尾插法，避免 JDK7 中头插法导致的链表反转和死循环问题。
+
+## 五、红黑树插入 🟡
+
+### 5.1 TreeBin 节点
+
+当链表长度达到 8 且数组容量 >= 64 时，触发树化：
+
+```java
+else if (f instanceof TreeBin) {
+    // f 是 TreeBin，锁住红黑树
+    Node<K, V> p;
+    binCount = 2;
+    if ((p = ((TreeBin<K, V>) f).putTreeVal(hash, key, value)) != null) {
+        V oldValue = p.value;
+        if (!onlyIfAbsent || oldValue == null)
+            p.value = value;
+        afterNodeAccess(p);
+    }
+}
+```
+
+TreeBin 本身也是一个 Node，但它的 hash 是 `-2`（`MOVED = -1`，`-2` 表示红黑树根节点）：
+
+```java
+static final class TreeBin<K, V> extends Node<K, V> {
+    TreeNode<K, V> root;       // 红黑树根节点
+    TreeNode<K, V> first;      // 桶内第一个节点（链表形式）
+    volatile WT wlock;         // 写锁
+
+    TreeBin(TreeNode<K, V> first) {
+        super(MOVED, null, null, null);
+        this.first = first;
+        TreeNode<K, V> r = null;
+        for (TreeNode<K, V> g = first, p = null; g != null; g = g.next) {
+            // 构建红黑树...
+        }
+    }
+}
+```
+
+### 5.2 putTreeVal
+
+```java
+final TreeNode<K, V> putTreeVal(HashMap<K, V> map, Node<K, V>[] tab, int h, K k, V v) {
+    Class<?> kc = null;
+    boolean searched = false;
+
+    for (TreeNode<K, V> p = root;;) {
+        int dir, ph;
+        K pk;
+        if ((ph = p.hash) > h)
+            dir = -1;
+        else if (ph < h)
+            dir = 1;
+        else if ((pk = p.key) == k || (pk != null && k.equals(pk)))
+            return p;  // key 已存在
+        else if ((kc == null && (kc = comparableClassFor(k)) == null)
+                 || (dir = compareComparables(kc, k, pk)) == 0) {
+            // hash 相等但 equals 不等，搜索左右子树
+            if (!searched) {
+                TreeNode<K, V> q, ch;
+                searched = true;
+                if (((ch = p.left) != null && (q = ch.findTreeNode(h, k, kc)) != null)
+                    || ((ch = p.right) != null && (q = ch.findTreeNode(h, k, kc)) != null))
+                    return q;
+            }
+            dir = tieBreakOrder(k, pk);
+        }
+
+        TreeNode<K, V> xp = p;
+        if ((p = (dir <= 0) ? p.left : p.right) == null) {
+            // 找到插入位置
+            TreeNode<K, V> x = new TreeNode<>(h, k, v, null, xp);
+            if (dir <= 0)
+                xp.left = x;
+            else
+                xp.right = x;
+            // 平衡操作
+            balanceInsertion(root, x);
+            break;
+        }
+    }
+    return null;
+}
+```
+
+## 六、扩容检查 🟡
+
+### 6.1 addCount
+
+```java
+// putVal 完成后
+if (binCount != 0) {
+    if (binCount >= TREEIFY_THRESHOLD)
+        treeifyBin(tab, hash);
+    if (oldVal != null)
+        return oldVal;
+}
+
+// 更新计数
+addCount(1L, binCount);
+```
+
+### 6.2 treeifyBin
+
+```java
+private final void treeifyBin(Node<K, V>[] tab, int hash) {
+    int n, index;
+    Node<K, V> e;
+    if (tab == null || (n = tab.length) < MIN_TREEIFY_CAPACITY)  // 64
+        // 容量 < 64，优先扩容而不是树化
+        tryPresize(n << 1);
+    else if ((e = tabAt(tab, index = (n - 1) & hash)) != null && e.hash >= 0) {
+        // 树化
+        synchronized (e) {
+            if (tabAt(tab, index) == e) {
+                // 链表转红黑树...
+            }
+        }
+    }
+}
+```
+
+## 七、面试追问链 🟢
+
+### 追问一：为什么用 synchronized 而不是 ReentrantLock？
+
+JDK8 之前很多人觉得 synchronized 慢，但实际上：
+- JDK6 引入偏向锁，synchronized 不慢
+- synchronized 内存占用更小（不需要 AQS）
+- JVM 可以做锁消除、锁粗化优化
+
+### 追问二：get 操作需要加锁吗？
+
+不需要。`table` 是 volatile，节点的 `next` 也是 volatile，保证可见性。读操作直接读取，不需要任何同步。
+
+### 追问三：size() 方法怎么实现的？
+
+JDK8 不用加锁，用 CounterCell 数组分散计数：
+
+```java
+private final CounterCell[] counterCells = new CounterCell[CELLS];
+
+private final void addCount(long x, int check) {
+    CounterCell[] as = counterCells;
+    long b = baseCount;
+    // 分散计数到多个 CounterCell，减少 CAS 冲突
+    if ((as != null || !U.compareAndSwapLong(this, BASECOUNT, b, b + x)) {
+        CounterCell a;
+        long v;
+        int m;
+        boolean uncontended = true;
+        // ... 随机选择一个 CounterCell CAS 更新
+    }
+}
+```
+
+【面试官心理】
+
+问到 ConcurrentHashMap put 流程的候选人，通常对并发编程有深入研究。这道题的关键在于理解 CAS 和 synchronized 的使用场景：CAS 用于初始化和空桶插入（轻量竞争），synchronized 用于非空桶的并发修改（防止数据竞争）。能讲清楚这个分工的候选人，基本都对并发编程的锁粒度设计有实际理解。

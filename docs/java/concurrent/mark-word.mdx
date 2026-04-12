@@ -1,0 +1,275 @@
+---
+title: Mark Word：synchronized锁的"身份证"里藏着什么
+description: 从HotSpot源码出发，逐位拆解Mark Word的64位结构在不同锁状态下的存储方式，以及Mark Word如何支撑了synchronized的锁升级机制。
+---
+
+# Mark Word：synchronized锁的"身份证"里藏着什么
+
+候选人小刘在面试中遇到了这样一个问题：
+
+面试官问："Mark Word是什么？它在synchronized中起什么作用？"
+
+小刘说："Mark Word是对象头的一部分，存储了一些对象的状态信息。"
+
+面试官追问："那Mark Word具体有哪些字段？在不同锁状态下分别存储什么？"
+
+小刘支支吾吾答不上来。
+
+【面试官心理】
+Mark Word这道题，能答上来的候选人不到5%。但这道题不是刁难——理解Mark Word是理解synchronized锁升级机制的前提。不懂Mark Word，就不可能真正理解为什么偏向锁能消除同步开销、轻量级锁为什么用CAS、重量级锁为什么慢。JVM的实现细节从来不是面试八股文，但它能真正区分"看过源码"和"只是背过结论"的候选人。
+
+## 一、Mark Word的物理结构 🔴
+
+### 1.1 对象在HotSpot中的内存布局
+
+HotSpot（Oracle/Sun的JVM实现）中的对象在堆内存中的布局分为三部分：
+
+```
++------------------+-------+-------+------------+
+|   对象头 (Header)  | 实例数据 | 对齐填充 |
++------------------+-------+-------+------------+
+| Mark Word | Klass Pointer | 字段... | padding |
++------------------+-------+-------+------------+
+```
+
+- **Mark Word**：对象头第一部分，存储对象的运行时数据
+- **Klass Pointer**：对象头第二部分，指向类元数据的指针（开启指针压缩后为4字节）
+- **实例数据**：对象的字段
+- **对齐填充**：保证对象大小是8字节的倍数
+
+### 1.2 64位Mark Word的完整结构
+
+Mark Word在64位JVM中是**64位（8字节）**，不同的锁状态下，这64位存储的内容完全不同：
+
+```
+无锁状态（normal）：
+| unused:25 | hashcode:31 | cms_free:1 | age:4 | biased_lock:1 | lock:2 |
+  25位未使用     对象的       GC标记      分代    偏向锁         锁标志位
+               hashCode                  年龄    标志
+
+偏向锁状态（biased）：
+| thread:54 | epoch:2 | cms_free:1 | age:4 | biased_lock:1 | lock:2 |
+  线程ID(54位)   偏向epoch   GC标记      分代    偏向锁         锁标志位
+                              (0)        年龄    标志(1)       (101)
+
+轻量级锁状态（thin lock）：
+| ptr_to_lock_record:54 | cms_free:1 | unlocked:1 | lock:2 |
+  指向栈帧中Lock Record的指针    指向锁记录   锁标志位
+  (CAS操作的目标地址)                      (00)
+
+重量级锁状态（fat lock）：
+| ptr_to_monitor:54 | cms_free:1 | inflated:1 | lock:2 |
+  指向Monitor对象的指针     膨胀标记     锁标志位
+  (ObjectMonitor*)                      (10)
+
+GC标记状态：
+| :54 | hashcode:31 | cms_free:1 | lock:2 |
+  全0（正在GC时使用，hashCode等被移到安全点）    (11)
+```
+
+### 1.3 锁标志位：锁状态的身份码
+
+锁标志位（最后2位）是Mark Word中最关键的部分，它决定了Mark Word的其他位存储什么内容：
+
+| 锁标志位 | 锁状态 | 说明 |
+|----------|--------|------|
+| 01 | 无锁 | 对象未被锁定 |
+| 01（biased_lock=1）| 偏向锁 | 偏向锁启用，对象已偏向某个线程 |
+| 00 | 轻量级锁 | CAS自旋锁 |
+| 10 | 重量级锁 | 指向ObjectMonitor |
+| 11 | GC标记 | 正在垃圾回收 |
+
+## 二、不同锁状态下的Mark Word 🔴
+
+### 2.1 无锁状态
+
+```java
+Object obj = new Object();
+System.out.println(System.identityHashCode(obj)); // 调用hashCode()
+```
+
+对象创建时Mark Word处于无锁状态。当第一次调用`System.identityHashCode()`或`hashCode()`时，JVM计算hashCode并写入Mark Word的31位hashCode字段。这个值**一旦写入就不会改变**。
+
+**为什么是31位？** 因为Java的hashCode返回的是int（32位），但有一位被分代年龄占用了，所以hashCode只能用31位。
+
+### 2.2 偏向锁状态
+
+当synchronized第一次被获取时，如果偏向锁启用，JVM通过CAS将Mark Word中的线程ID字段设置为当前线程ID：
+
+```
+| thread:54 | epoch:2 | cms_free:1 | age:4 | biased_lock:1 | lock:2 |
+   当前线程ID   2位      0          年龄    1             01
+```
+
+**偏向锁的撤销**：当另一个线程尝试获取偏向锁时，JVM在**安全点（Safe Point）**撤销偏向锁。安全点意味着JVM已经暂停了所有Java线程（STW或主动safepoint）。
+
+撤销有两种情况：
+1. 原线程不在同步块中：直接修改Mark Word，设置为无锁状态
+2. 原线程正在同步块中：升级到轻量级锁
+
+**epoch字段的作用**：epoch是偏向时间戳，用于批量重偏向和批量撤销优化。当大量线程偏向同一个类时，JVM会批量更新epoch值，使得这些偏向锁快速失效。
+
+### 2.3 轻量级锁状态
+
+线程获取轻量级锁时，在自己的**栈帧**中创建锁记录（Lock Record），然后通过CAS尝试将Mark Word修改为指向锁记录的指针：
+
+```java
+// 轻量级锁获取的伪代码（JIT生成）
+void lock(Object obj) {
+    // 在栈帧中创建锁记录
+    LockRecord* lr = allocate_lock_record();
+    // 将Mark Word复制到锁记录（Displaced Mark Word）
+    lr->displaced_header = obj.mark_word;
+    // CAS尝试将Mark Word替换为指向锁记录的指针
+    if (CAS(&obj.mark_word, lr->displaced_header, lr) == SUCCESS) {
+        // 成功：获得轻量级锁
+    } else {
+        // 失败：竞争激烈，升级到重量级锁
+    }
+}
+```
+
+轻量级锁成功时，Mark Word变成：
+```
+| ptr_to_lock_record:54 | cms_free:1 | unlocked:1 | lock:2 |
+  指向栈帧Lock Record的指针                      00
+```
+
+轻量级锁释放时，CAS将Displaced Mark Word放回。如果CAS成功，锁释放；如果失败，说明锁已升级或被其他线程修改，进入重量级锁的释放流程。
+
+### 2.4 重量级锁状态
+
+Mark Word存储指向ObjectMonitor对象的指针：
+```
+| ptr_to_monitor:54 | cms_free:1 | inflated:1 | lock:2 |
+  指向ObjectMonitor的指针                       10
+```
+
+ObjectMonitor是HotSpot中Monitor的实现，其核心结构：
+
+```cpp
+// HotSpot ObjectMonitor核心字段
+ObjectMonitor() {
+    _header = NULL;          // Mark Word的副本
+    _count = 0;              // 竞争计数
+    _waiters = 0;            // 等待线程数
+    _owner = NULL;           // 持有锁的线程
+    _WaitSet = NULL;         // 等待队列（wait/notify）
+    _EntryList = NULL;      // 竞争队列（BLOCKED线程）
+    _recursions = 0;         // 重入次数
+}
+```
+
+重量级锁的等待涉及**内核态切换**：线程从用户态切换到内核态，加入`_EntryList`等待队列；锁释放后，内核唤醒等待线程，再切换回用户态。这就是重量级锁"慢"的根本原因。
+
+## 三、Mark Word与锁升级的配合 🟡
+
+### 3.1 锁升级的过程就是Mark Word的"变形记"
+
+```
+对象创建
+    ↓
+无锁状态（01，无偏向标记）
+    ↓
+线程A首次获取synchronized
+    ↓
+CAS写入线程ID，Mark Word → 偏向锁（101）
+    ↓
+其他线程B尝试获取偏向锁
+    ↓
+在安全点撤销偏向锁
+    ↓
+线程A不在同步块？ → 直接撤销为无锁（01）
+线程A在同步块？ → 升级轻量级锁（00）
+    ↓
+多个线程交替获取锁
+    ↓
+CAS自旋超过阈值 或 CAS失败
+    ↓
+升级重量级锁（10），Mark Word存储ObjectMonitor指针
+```
+
+### 3.2 锁升级的不可逆性
+
+**重点**：synchronized的锁升级是**单向的**，不可降级：
+- 无锁 → 偏向锁 → 轻量级锁 → 重量级锁
+- 不能从重量级锁降级回轻量级锁或偏向锁
+
+但注意，JDK 15后偏向锁被禁用了（JEP 374），所以实际启动顺序变成了：无锁 → 轻量级锁 → 重量级锁。
+
+## 四、❌ 错误示范
+
+**候选人原话**："Mark Word存的是对象的哈希码和GC信息。"
+
+**问题诊断**：
+- 只说了Mark Word在无锁状态下的一部分内容
+- 没有理解Mark Word在不同锁状态下的结构变化
+- 说明对synchronized底层实现没有深入理解
+
+**候选人原话**："偏向锁比轻量级锁好，应该一直用偏向锁。"
+
+**问题诊断**：
+- 没有理解不同锁状态各自的适用场景
+- 偏向锁只在单线程反复获取同一把锁时有优势
+- 多线程竞争场景下，偏向锁的撤销开销反而是负担
+
+【面试官心理】
+问到Mark Word结构的候选人，要么是JVM方向的深度研究者，要么是在准备P7架构师级别的面试。这道题没有标准答案的背诵价值——它的意义在于考察候选人对JVM底层实现的好奇心和钻研深度。能回答到位的候选人，通常对GC调优、性能分析、线上问题排查都有实战经验。
+
+## 五、实战应用：如何利用Mark Word知识排查问题 💡
+
+### 5.1 查看对象的Mark Word
+
+通过JOL（Java Object Layout）工具可以直接查看对象的内存布局：
+
+```java
+import org.openjdk.jol.info.ClassLayout;
+
+System.out.println(ClassLayout.parseInstance(new Object()).toPrintable());
+```
+
+输出示例：
+```
+[Ljava.lang.Object; object internals:
+OFF  SZ               TYPE DESCRIPTION
+  0   8                    (object header: mark)
+  8   4                    (object header: class)
+ 12   4                    (alignment/padding spacer)
+Instance size: 16 bytes
+```
+
+### 5.2 排查锁竞争问题
+
+通过JVM参数开启偏向锁诊断：
+
+```bash
+java -XX:+UseBiasedLocking -XX:BiasedLockingStartupDelay=0 ...
+```
+
+通过JVM参数记录锁竞争：
+
+```bash
+java -XX:+UnlockDiagnosticVMOptions -XX:PrintBiasedLockingStatistics ...
+```
+
+### 5.3 面试加分点
+
+**加分点1：指针压缩对Mark Word的影响**
+"在64位JVM中，开启指针压缩（-XX:+UseCompressedOops，默认开启）后，Klass Pointer从8字节压缩到4字节。但Mark Word永远是64位，不受影响。"
+
+**加分点2：JEP 374的改动**
+"JDK 15（JEP 374）禁用了偏向锁，因为在高并发服务中，偏向锁的撤销成本和复杂度超过了它的收益。禁用后，启动时序变成无锁→轻量级锁→重量级锁，简化了锁升级模型。"
+
+**加分点3：Mark Word与逃逸分析**
+"Mark Word的存在本身就是为了支持synchronized的锁优化。JIT编译器在做逃逸分析时，如果发现一个对象不逃逸，就会在栈上分配它而不是堆上。此时Mark Word的锁状态永远是无锁，因为不存在跨线程的竞争。"
+
+## 六、面试应对脚本
+
+**面试官**："Mark Word在64位JVM中是什么结构？"
+**标准回答**："64位Mark Word在不同锁状态下存储内容不同。无锁状态存储25位未使用+31位hashCode+1位GC标记+4位分代年龄+1位偏向锁标志+2位锁标志位；偏向锁状态存储54位线程ID+2位epoch+1位GC标记+4位分代年龄+1位偏向锁标志+2位锁标志位；轻量级锁状态存储54位指向栈帧锁记录的指针+1位GC标记+1位未使用+2位锁标志位；重量级锁状态存储54位指向ObjectMonitor的指针+1位GC标记+1位膨胀标记+2位锁标志位。关键点是：锁标志位（最后2位）决定了Mark Word的其他位如何解释。"
+
+**面试官追问**："为什么Mark Word要这样设计，而不是固定字段？"
+**标准回答**："这是典型的空间优化设计。Mark Word固定只有64位，但锁状态有4种不同需求。无锁状态需要存储hashCode（31位）、分代年龄（4位）；偏向锁需要存储线程ID（54位）；轻量级锁需要存储指向Lock Record的指针（54位）；重量级锁需要存储指向Monitor的指针（54位）。通过复用这64位空间，JVM在不增加对象头大小的前提下，实现了四种完全不同的锁状态。这种设计哲学在操作系统和数据库中也很常见——通过状态位区分数据结构的其他字段含义。"
+
+【面试官心理】
+能回答Mark Word结构的候选人，不是靠背的——他们一定看过JVM源码或者读过《深入理解JVM虚拟机》这样的书。更难得的是能解释"为什么要这样设计"——这说明他不只是知道答案，还能理解设计者的权衡。JVM的每一处实现细节都是工程权衡的产物，理解"为什么"才是真正的技术深度。

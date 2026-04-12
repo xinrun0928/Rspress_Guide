@@ -1,0 +1,287 @@
+---
+title: 结构化并发深度解析
+description: 从一道"结构化并发是什么"追问出发，拆解StructuredTaskScope的使用、子作用域继承、并发组合与错误处理及虚拟线程的协同。
+---
+
+候选人小李在阿里P8面试间，面试官问：
+
+"Java 21的结构化并发了解吗？它解决什么问题？"
+
+小李说："跟虚拟线程配套用的，让并发代码更清晰。"面试官追问："`StructuredTaskScope`怎么用？`join()`和`joinUntil()`有什么区别？子作用域里的异常怎么处理？"
+
+小李没答上来。
+
+---
+
+## 一、为什么需要结构化并发？🔴
+
+### 1.1 问题拆解
+
+结构化并发是Java 21引入的**预览特性**（JEP 453），它是虚拟线程的补充，解决的是**并发代码的可维护性**问题。这道题是**P8深度题**，考察候选人对现代并发编程范式的理解。
+
+**第一层：问题背景**
+- 面试官问："传统并发编程有什么问题？"
+- 考察点：线程生命周期管理、异常传播、取消传播
+
+**第二层：结构化并发的核心思想**
+- 面试官追问："结构化并发的"结构化"是什么意思？"
+- 考察点：作用域绑定、资源生命周期
+
+**第三层：StructuredTaskScope API**
+- 面试官继续问："`StructuredTaskScope`怎么用？`fork()`和`join()`的语义是什么？"
+- 考察点：子任务管理、结果组合
+
+**第四层：异常与取消传播**
+- 面试官问："子作用域的异常怎么处理？取消信号怎么传播？"
+- 考察点：取消传播、异常聚合
+
+### 1.2 ❌ 错误示范
+
+**错误回答1："结构化并发就是不用手动管理线程池"**
+
+结构化并发的核心不是"不用线程池"，而是**让并发任务的边界与代码块边界一致**。线程的生命周期必须嵌套在代码块内，不能超出作用域。
+
+**错误回答2："结构化并发就是用`Future`更方便"**
+
+Future是异步编程工具，没有结构化并发的核心特性：**取消传播**、**异常聚合**、**生命周期绑定**。
+
+**错误回答3："结构化并发和Go的goroutine调度一样"**
+
+Java的结构化并发是**协作式**的——子任务的取消依赖于显式检查。而Go的goroutine有协程调度器自动管理取消。
+
+【面试官心理】
+结构化并发是Java 21最前沿的特性之一，这道题我通常用来试探候选人是否跟进最新的并发模型演进。能说出结构化并发的核心问题域（线程生命周期、异常传播）的占20%，能说清StructuredTaskScope两种策略区别的占10%，能说出与虚拟线程关系的占5%。
+
+### 1.3 标准回答
+
+#### 第一步：传统并发的问题——线程逃逸
+
+```java
+// 传统并发：线程生命周期超出代码块边界
+ExecutorService executor = Executors.newFixedThreadPool(10);
+
+void process(List<Request> requests) throws InterruptedException {
+    executor.submit(() -> handle(requests.get(0))); // 线程生命周期开始了
+    executor.submit(() -> handle(requests.get(1))); // 线程生命周期开始了
+    executor.submit(() -> handle(requests.get(2))); // 线程生命周期开始了
+    // 如果当前方法return了，线程还在跑
+    // 如果抛出异常，子任务不会取消
+    // 如果有未检查异常，调用方不知道
+    // ⚠️ 线程逃逸了！
+}
+
+// 解决：必须手动shutdown
+// 必须在finally里join
+// 必须在try-catch里处理异常
+// 代码量翻倍，错误处理复杂
+```
+
+**传统并发的三大问题**：
+
+| 问题 | 现象 | 后果 |
+| --- | --- | --- |
+| 生命周期逃逸 | 子任务在方法返回后仍运行 | 资源泄漏、竞态条件 |
+| 取消不传播 | 主任务取消后子任务继续跑 | 浪费资源 |
+| 异常丢失 | 子任务异常不传播给主任务 | 错误被静默吞掉 |
+
+#### 第二步：结构化并发的核心思想
+
+结构化并发的核心理念：**子任务的生命周期必须嵌套在其父任务的代码块内**。
+
+```java
+// 结构化并发：线程生命周期被代码块约束
+void process(List<Request> requests) throws InterruptedException {
+    try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
+        for (Request r : requests) {
+            scope.fork(() -> handle(r)); // fork创建子任务
+        }
+        scope.join(); // 等待所有子任务完成（或者某个失败导致取消）
+        // 方法返回前，所有子任务必须完成
+        // 如果抛出异常，scope保证子任务被取消
+    }
+}
+// scope.close()时，要么所有任务完成，要么已取消
+// 线程不会逃逸
+```
+
+**结构化并发的三个保证**：
+1. **子任务在父作用域内完成**：`join()`阻塞直到所有子任务结束
+2. **取消传播**：父作用域关闭时，所有子任务自动取消
+3. **异常聚合**：多个子任务异常被聚合后统一抛出
+
+---
+
+## 二、StructuredTaskScope 详解 🟡
+
+### 2.1 两种策略：ShutdownOnFailure vs ShutdownOnSuccess
+
+```java
+// 策略1：ShutdownOnFailure（任一失败，全部取消）
+try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
+    Future<String> f1 = scope.fork(() -> callService1());
+    Future<String> f2 = scope.fork(() -> callService2());
+    Future<String> f3 = scope.fork(() -> callService3());
+
+    scope.join(); // 等待所有子任务
+
+    // 如果任一任务失败，join()抛出ExecutionException
+    // 其他未完成的任务会被取消
+    String result = f1.resultNow() + f2.resultNow() + f3.resultNow();
+}
+
+// 策略2：ShutdownOnSuccess（任一成功，剩余取消）
+try (var scope = new StructuredTaskScope.ShutdownOnSuccess<String>()) {
+    scope.fork(() -> queryPrimary());
+    scope.fork(() -> querySecondary());
+    scope.fork(() -> queryCache());
+
+    scope.join(); // 等待第一个成功
+
+    // 第一个成功的结果被返回
+    // 其他任务自动取消
+    String result = scope.result();
+}
+```
+
+### 2.2 fork-join模式
+
+```java
+// fork：创建子任务，立即返回Future
+Future<Result> f = scope.fork(() -> {
+    // 子任务在虚拟线程中运行
+    return compute();
+});
+
+// join：等待所有子任务（或策略触发）
+scope.join(); // 阻塞直到：
+               // - 所有子任务完成
+               // - ShutdownOnFailure：任一失败
+               // - ShutdownOnSuccess：任一成功
+
+// resultNow：立即获取结果（假设已join）
+Result r = f.resultNow();
+```
+
+**join vs joinUntil**：
+
+```java
+// join()：无限等待
+scope.join();
+
+// joinUntil(Deadline)：带超时
+scope.joinUntil(deadline); // 超过deadline后抛TimeoutException
+```
+
+### 2.3 自定义Scope
+
+```java
+// 自定义结构化并发策略
+public class MyScope extends StructuredTaskScope<String> {
+    private final Queue<String> results = new ConcurrentLinkedQueue<>();
+
+    @Override
+    public void handleComplete(Future<String> future) {
+        switch (future.state()) {
+            case SUCCESS -> results.add(future.resultNow());
+            case FAILED -> results.add("FAILED: " + future.causeNow());
+            case CANCELLED -> results.add("CANCELLED");
+        }
+    }
+}
+```
+
+---
+
+## 三、异常与取消传播 🟡
+
+### 3.1 异常聚合
+
+```java
+try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
+    scope.fork(() -> callService());
+    scope.fork(() -> doSomething());
+
+    scope.join();
+} catch (ExecutionException e) {
+    // 所有子任务的异常被聚合
+    Throwable[] suppressed = e.getCause().getSuppressed();
+    for (Throwable t : suppressed) {
+        log.error("子任务异常", t);
+    }
+}
+```
+
+### 3.2 取消传播
+
+```java
+void process() throws InterruptedException {
+    try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
+        Future<String> f = scope.fork(() -> blockingCall());
+        // scope.close()时，如果f还没完成，自动取消
+        scope.join(); // 等待完成
+    }
+    // scope.close()被隐式调用
+    // 如果join()正常返回，scope正常关闭
+    // 如果有异常，scope在finally中取消未完成的任务
+}
+```
+
+:::tip 💡
+**取消传播的工作原理**：StructuredTaskScope在`close()`时会向所有未完成的子任务发送取消信号。在虚拟线程中，取消信号表现为中断状态——子任务的阻塞调用会抛出`InterruptedException`。
+:::
+
+---
+
+## 四、生产应用场景 🟢
+
+### 4.1 Fan-out（扇出）模式
+
+```java
+// 场景：向多个服务发送请求，返回最快的响应
+String getFastestResponse(List<String> urls) throws ExecutionException, InterruptedException {
+    try (var scope = new StructuredTaskScope.ShutdownOnSuccess<String>()) {
+        for (String url : urls) {
+            scope.fork(() -> httpClient.get(url));
+        }
+        scope.join();
+        return scope.result();
+    }
+}
+```
+
+### 4.2 并行流水线
+
+```java
+// 场景：阶段1并行，阶段2依赖阶段1结果
+try (var scope1 = new StructuredTaskScope.ShutdownOnFailure();
+     var scope2 = new StructuredTaskScope.ShutdownOnFailure()) {
+
+    Future<Result1> r1 = scope1.fork(() -> step1a());
+    Future<Result2> r2 = scope1.fork(() -> step1b());
+    scope1.join();
+
+    // 阶段2只有在阶段1全部成功时才启动
+    scope2.fork(() -> step2a(r1.resultNow()));
+    scope2.fork(() -> step2b(r2.resultNow()));
+    scope2.join();
+}
+```
+
+### 4.3 与虚拟线程的协同
+
+```java
+// 最佳实践：结构化并发 + 虚拟线程
+try (var executor = Executors.newVirtualThreadPerTaskExecutor();
+     var scope = new StructuredTaskScope.ShutdownOnFailure()) {
+
+    // fork在虚拟线程中执行
+    for (Service s : services) {
+        scope.fork(() -> s.call());
+    }
+    scope.join();
+}
+```
+
+:::warning ⚠️
+**限制**：结构化并发目前仍是预览特性（Java 21 JEP 453，Java 22 JEP 463），生产使用需要`--enable-preview`。预计Java 24正式发布。在生产中使用预览特性需要评估风险。
+:::

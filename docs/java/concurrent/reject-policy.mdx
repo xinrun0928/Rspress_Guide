@@ -1,0 +1,312 @@
+---
+title: 线程池拒绝策略：任务被拒绝后该怎么办
+description: 从线上OOM故障出发，深度对比4种内置拒绝策略的差异、自定义拒绝策略的设计，以及CallerRunsPolicy的"自救"机制与副作用。
+---
+
+# 线程池拒绝策略：任务被拒绝后该怎么办
+
+候选人小陈在面试中被问到：
+
+面试官问："如果线程池的任务满了，新任务会被拒绝。那拒绝策略有哪几种？"
+
+小陈说："有4种：AbortPolicy、CallerRunsPolicy、DiscardOldestPolicy和DiscardPolicy。"
+
+面试官追问："那这4种策略分别用在什么场景？"
+
+小陈说："...一般用CallerRunsPolicy？"
+
+面试官继续追问："CallerRunsPolicy有什么副作用？为什么说它会降低整体吞吐量？"
+
+小张彻底答不上来。
+
+【面试官心理】
+拒绝策略是线程池中最容易被忽视的部分。80%的候选人能说出4种策略的名字，但只有30%能讲清楚它们的差异和适用场景。CallerRunsPolicy的副作用是面试中的高频追问——它看起来"最安全"，但实际上可能拖垮调用者线程。
+
+## 一、4种内置拒绝策略 🔴
+
+### 1.1 AbortPolicy（中止策略）：默认策略
+
+```java
+public static class AbortPolicy implements RejectedExecutionHandler {
+    public void rejectedExecution(Runnable r, ThreadPoolExecutor e) {
+        throw new RejectedExecutionException(
+            "Task " + r + " rejected from " + e);
+    }
+}
+```
+
+**特点**：抛出RejectedExecutionException，调用者必须处理。
+
+**适用场景**：
+- 需要严格任务处理的场景（如订单处理、支付流程）
+- 不允许任务丢失，必须显式处理
+- 调用者需要知道任务被拒绝
+
+### 1.2 CallerRunsPolicy（调用者运行策略）：最安全但最慢
+
+```java
+public static class CallerRunsPolicy implements RejectedExecutionHandler {
+    public void rejectedExecution(Runnable r, ThreadPoolExecutor e) {
+        if (!e.isShutdown()) {
+            // 由调用者线程直接执行任务
+            r.run();
+        }
+    }
+}
+```
+
+**特点**：
+- 不丢弃任务，由调用线程直接执行
+- 调用者线程被任务阻塞，降低整体吞吐量
+- 起到"削峰填谷"作用
+
+**适用场景**：
+- 任务必须执行，不允许丢弃
+- 流量突增时的临时缓冲
+- 需要保护下游系统不过载（调用者线程执行任务，速度受调用方限制）
+
+### 1.3 DiscardOldestPolicy（丢弃最老任务策略）
+
+```java
+public static class DiscardOldestPolicy implements RejectedExecutionHandler {
+    public void rejectedExecution(Runnable r, ThreadPoolExecutor e) {
+        if (!e.isShutdown()) {
+            // 丢弃队列中最老的任务
+            e.getQueue().poll();
+            e.execute(r);
+        }
+    }
+}
+```
+
+**特点**：
+- 丢弃队列中等待时间最长的任务
+- 保留最新提交的任务
+- 尝试再次提交被拒绝的任务
+
+**适用场景**：
+- 监控类任务：新数据比旧数据更重要
+- 需要保留最新数据的场景
+
+### 1.4 DiscardPolicy（丢弃策略）：静默丢弃
+
+```java
+public static class DiscardPolicy implements RejectedExecutionHandler {
+    public void rejectedExecution(Runnable r, ThreadPoolExecutor e) {
+        // 什么都不做，任务被静默丢弃
+    }
+}
+```
+
+**特点**：
+- 任务被静默丢弃，不抛出异常
+- 无法感知任务被丢弃
+- 可能导致数据丢失
+
+**适用场景**：
+- 对数据丢失不敏感的场景（如日志采集、统计数据）
+- 只关心最新数据的场景
+
+## 二、CallerRunsPolicy的副作用：调用者线程被拖累 🔴
+
+### 2.1 副作用分析
+
+CallerRunsPolicy的最大问题是**将调用者线程变成执行者线程**：
+
+```java
+// 调用者（主线程）提交任务
+executor.execute(() -> {
+    // 假设线程池满了，拒绝
+    callerRunsPolicy.rejectedExecution(r, e); // 主线程执行任务！
+    // 主线程被阻塞！
+    doSomethingElse(); // 这行代码必须等任务完成才能执行
+});
+```
+
+**副作用一：主线程被任务阻塞**
+
+如果主线程提交任务时线程池满了，主线程会执行任务。如果任务耗时10秒，主线程将被阻塞10秒。
+
+**副作用二：降低整体吞吐量**
+
+```
+场景：线程池有N个worker，调用者线程M个
+
+无CallerRunsPolicy：
+  M个调用者快速提交任务，N个worker处理
+  整体吞吐量 = N * 每秒处理任务数
+
+有CallerRunsPolicy：
+  M个调用者中，一些变成了执行者
+  实际处理能力下降
+  整体吞吐量 < N * 每秒处理任务数
+```
+
+**副作用三：可能产生更大的积压**
+
+调用者线程执行任务的速度通常慢于worker线程（因为调用者线程可能只有1-2个），导致任务积压更多。
+
+### 2.2 正确的使用姿势
+
+```java
+// ✅ 场景：消息处理，积压时用CallerRunsPolicy保护下游
+new ThreadPoolExecutor(
+    corePoolSize, maximumPoolSize,
+    keepAliveTime, TimeUnit.SECONDS,
+    new ArrayBlockingQueue<>(1000),
+    new ThreadFactoryBuilder().setNameFormat("worker-%d").build(),
+    new CallerRunsPolicy() // 积压时由调用线程处理，控制速度
+);
+
+// ✅ 配合超时监控
+new ThreadPoolExecutor(
+    corePoolSize, maximumPoolSize,
+    keepAliveTime, TimeUnit.SECONDS,
+    new ArrayBlockingQueue<>(1000),
+    threadFactory,
+    (r, e) -> {
+        // 超过阈值后，改为丢弃并报警
+        if (e.getTaskCount() > threshold) {
+            log.warn("任务队列已满，丢弃任务");
+            metrics.increment("task.rejected");
+        } else {
+            // 降级为CallerRunsPolicy
+            new CallerRunsPolicy().rejectedExecution(r, e);
+        }
+    }
+);
+```
+
+## 三、自定义拒绝策略 🟡
+
+### 3.1 日志+告警策略
+
+```java
+public class LoggingRejectedExecutionHandler implements RejectedExecutionHandler {
+
+    private static final Logger log = LoggerFactory.getLogger(
+        LoggingRejectedExecutionHandler.class);
+
+    @Override
+    public void rejectedExecution(Runnable r, ThreadPoolExecutor executor) {
+        String taskName = r.getClass().getSimpleName();
+        log.error("任务被拒绝: task={}, poolSize={}, active={}, queueSize={}",
+            taskName,
+            executor.getPoolSize(),
+            executor.getActiveCount(),
+            executor.getQueue().size());
+
+        // 发送告警
+        AlertUtil.send("线程池拒绝任务", taskName);
+
+        // 根据业务选择：丢弃或降级
+        if (isCriticalTask(taskName)) {
+            // 关键任务：记录到数据库，事后补处理
+            saveToFailoverQueue(r);
+        }
+    }
+
+    private boolean isCriticalTask(String taskName) {
+        return taskName.contains("Payment") ||
+               taskName.contains("Order");
+    }
+}
+```
+
+### 3.2 分优先级拒绝策略
+
+```java
+public class PriorityRejectedExecutionHandler implements RejectedExecutionHandler {
+
+    private final RejectedExecutionHandler fallback;
+    private final Map<String, Integer> taskPriority;
+
+    public PriorityRejectedExecutionHandler(
+            RejectedExecutionHandler fallback,
+            Map<String, Integer> taskPriority) {
+        this.fallback = fallback;
+        this.taskPriority = taskPriority;
+    }
+
+    @Override
+    public void rejectedExecution(Runnable r, ThreadPoolExecutor e) {
+        int priority = taskPriority.getOrDefault(
+            r.getClass().getSimpleName(), 0);
+
+        if (priority < 0) {
+            // 低优先级：丢弃
+            log.info("丢弃低优先级任务: {}", r);
+        } else if (priority > 0) {
+            // 高优先级：降级执行
+            fallback.rejectedExecution(r, e);
+        } else {
+            // 普通优先级：丢弃最老的
+            e.getQueue().poll();
+            e.execute(r);
+        }
+    }
+}
+```
+
+## 四、拒绝策略与队列的配合 🟡
+
+### 4.1 有界队列 + 拒绝策略的配合
+
+```
+队列配置            拒绝策略选择
+──────────────────────────────────────────────
+ArrayBlockingQueue(100) + AbortPolicy
+  → 队列满+线程满时抛异常，调用者必须处理
+
+ArrayBlockingQueue(100) + CallerRunsPolicy
+  → 队列满+线程满时调用者执行，削峰填谷
+
+ArrayBlockingQueue(100) + DiscardOldestPolicy
+  → 丢弃最老任务，保留最新数据
+
+ArrayBlockingQueue(100) + DiscardPolicy
+  → 静默丢弃，不抛异常
+```
+
+### 4.2 为什么拒绝策略不能完全替代队列容量
+
+```java
+// ❌ 错误：依赖拒绝策略来限制积压
+new ThreadPoolExecutor(10, 10, 0L, TimeUnit.SECONDS,
+    new LinkedBlockingQueue<>(), // 无界队列！
+    new DiscardPolicy()); // 依赖丢弃来"保护"
+
+// 问题：队列可能积累百万任务 → OOM
+
+// ✅ 正确：队列容量 + 拒绝策略配合
+new ThreadPoolExecutor(10, 10, 60L, TimeUnit.SECONDS,
+    new ArrayBlockingQueue<>(1000), // 有界队列
+    new LoggingRejectedExecutionHandler()); // 拒绝后记录/告警
+```
+
+## 五、❌ 错误示范
+
+**候选人原话**："CallerRunsPolicy最安全，因为任务不会被丢弃。"
+
+**问题诊断**：
+- 忽略了CallerRunsPolicy会拖垮调用者线程
+- 在Web服务的HTTP线程池场景下，可能导致整个服务雪崩
+- 把"不丢失任务"等同于"更安全"
+
+**候选人原话**："拒绝策略比有界队列更好，因为能保证任务不丢失。"
+
+**问题诊断**：
+- 拒绝策略是在队列和线程池都满之后的兜底
+- 如果队列是无界的，队列本身就先爆了
+- 拒绝策略不能替代有界队列
+
+【面试官心理】
+拒绝策略这道题能讲到CallerRunsPolicy副作用的候选人，说明他对线程池的整体设计有系统化理解。这类候选人不会天真地认为"CallerRunsPolicy最安全"，而是会根据业务场景选择合适的策略——严格场景用AbortPolicy、需要削峰用CallerRunsPolicy、监控场景用DiscardOldestPolicy。
+
+## 六、面试应对脚本
+
+**面试官**："CallerRunsPolicy有什么副作用？"
+**标准回答**："CallerRunsPolicy由调用者线程执行被拒绝的任务。这有三个副作用：第一，调用者线程被阻塞，执行任务期间无法做其他事情。如果调用者是HTTP线程池的主线程，整个服务会被拖慢。第二，整体吞吐量下降——因为调用者线程的执行速度通常慢于worker线程池。第三，可能产生更大的积压——调用者线程处理速度慢，新任务还在不断提交，队列积压越来越严重。所以CallerRunsPolicy适合需要削峰填谷、保护下游不过载的场景，但不适合对响应时间敏感的场景。"
+
+【面试官心理】
+能讲清楚CallerRunsPolicy副作用的候选人，说明他不只是知道"做什么"，还知道"不做什么"。这种取舍思维是P6和P7候选人的核心差距之一。

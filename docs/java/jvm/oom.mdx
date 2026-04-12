@@ -1,0 +1,318 @@
+---
+title: 内存溢出排查方法
+description: 从实际生产事故出发，深度剖析各类 OOM 的原因、排查方法、工具使用与解决方案。
+---
+
+面试官问："你们生产环境遇到过 OOM 吗？怎么排查的？"
+
+候选人小赵说："遇到过，用 jmap 导出堆，然后用 MAT 分析。"
+
+面试官追问："jmap 导出的时候服务会不会卡？MAT 怎么定位泄漏点？什么情况下会 OOM，你遇到过哪种？"
+
+小赵说："用 -F 参数强制导出...MAT 的话看 GC Roots 引用链...遇到过堆 OOM。"
+
+面试官继续追问："那元空间 OOM 和堆 OOM 的区别是什么？直接内存 OOM 怎么排查？"
+
+小赵支支吾吾答不上来。
+
+---
+
+## 一、OOM 的六种类型 🔴
+
+### 1.1 问题拆解
+
+OOM 不是一种错误，而是一类错误的统称。不同类型的 OOM 有不同的根因和排查方法。面试官追问"哪种 OOM"，其实在测试候选人是否有实际的生产排查经验。
+
+### 1.2 OOM 类型分类
+
+| 类型 | 错误类型 | 发生区域 | 常见原因 |
+| --- | --- | --- | --- |
+| **堆 OOM** | `java.lang.OutOfMemoryError: Java heap space` | 堆 | 对象泄漏、大数组 |
+| **元空间 OOM** | `java.lang.OutOfMemoryError: Metaspace` | 元空间 | 类加载过多 |
+| **栈溢出** | `java.lang.StackOverflowError` | 虚拟机栈 | 递归过深 |
+| **栈容量不足** | `java.lang.OutOfMemoryError: unable to create new native thread` | 栈 | 线程数过多 |
+| **直接内存 OOM** | `java.lang.OutOfMemoryError: Direct buffer memory` | 直接内存 | NIO 堆外内存泄漏 |
+| **GC 开销超限** | `java.lang.OutOfMemoryError: GC overhead limit exceeded` | 堆 | 频繁 GC 但回收很少 |
+
+---
+
+## 二、堆 OOM 排查 🔴
+
+### 2.1 典型场景
+
+```java
+// 场景1：内存泄漏
+public class MemoryLeak {
+    private static Map<Long, User> cache = new HashMap<>(); // 永不清理
+
+    public static void main(String[] args) {
+        long id = 0;
+        while (true) {
+            cache.put(id++, new User(id, "User" + id));
+            // cache 持续增长，堆溢出
+        }
+    }
+}
+
+// 场景2：大数组
+public class BigArray {
+    public static void main(String[] args) {
+        // 尝试分配 1TB 数组
+        byte[] huge = new byte[1_000_000_000_000]; // 1TB，直接 OOM
+    }
+}
+```
+
+### 2.2 排查步骤
+
+**步骤一：先确认 OOM 类型**
+
+```
+OOM 时的日志通常包含：
+  - 异常类型
+  - 发生时的堆使用情况
+  - GC 统计信息
+```
+
+```java
+// OOM 日志示例
+java.lang.OutOfMemoryError: Java heap space
+Dumping heap to java_pid1234.hprof ...
+Heap dump file created [2147483648 bytes in 12.345s]
+  Heap
+    par new generation   total 958464K, used 873216K
+    eden space 819200K,  95% used
+    from space 139264K,   0% used
+    to   space 139264K,   0% used
+    tenured generation   total 2097152K, used 2097152K  <-- 老年代满了
+    Metaspace       used 52488K, capacity 106496K
+```
+
+**步骤二：导出堆转储**
+
+```bash
+# 方式1：OOM 时自动导出（JDK 8+）
+-XX:+HeapDumpOnOutOfMemoryError
+-XX:HeapDumpPath=/path/to/dump.hprof
+
+# 方式2：手动 jmap 导出（生产慎用 -F）
+jmap -dump:format=b,file=heap.hprof <pid>
+
+# 方式3：gcore + jmap（不中断进程，但需要root）
+gcore <pid>
+jmap -dump:format=b,file=heap.hprof <pid> /path/to/core.<pid>
+
+# 方式4：jcmd（JDK 9+ 推荐）
+jcmd <pid> GC.heap_dump /path/to/dump.hprof
+```
+
+:::warning ⚠️
+**jmap -F 在生产环境中是禁区**。`-F` 参数会强制执行，可能导致进程挂起或崩溃。推荐使用 `-XX:+HeapDumpOnOutOfMemoryError` 在 OOM 发生时自动导出，或者用 `jcmd`（JDK 11+）。
+:::
+
+**步骤三：MAT 分析**
+
+```bash
+# MAT 下载地址：https://eclipse.dev/mat/downloads.php
+# 启动 MAT
+./ParseHeapDump.sh heap.hprof
+
+# 关键分析功能：
+# 1. Histogram：按类统计对象数量和大小
+# 2. Dominator Tree：找出占用内存最多的对象路径
+# 3. Top Consumers：找出最大的对象
+# 4. Leak Suspects：自动检测泄漏点
+```
+
+**MAT 查找泄漏的步骤**：
+
+```
+1. 打开 Histogram → 视图
+2. 按-shallow size 降序排列
+3. 找出异常大的类（如 HashMap 有几百万个 entry）
+4. 右键 → Path To GC Roots → exclude weak/soft references
+5. 找到泄漏的 GC Root 引用链
+```
+
+---
+
+## 三、元空间 OOM 🟡
+
+### 3.1 典型场景
+
+```java
+// 场景1：动态类生成失控
+public class MetaspaceLeak {
+    public static void main(String[] args) {
+        int count = 0;
+        try {
+            while (true) {
+                // CGLib 动态生成类，每个类占用元空间
+                Enhancer enhancer = new Enhancer();
+                enhancer.setSuperclass(MetaspaceLeak.class);
+                enhancer.setCallbackType(MethodInterceptor.class);
+                enhancer.create();
+                count++;
+            }
+        } catch (Error e) {
+            System.out.println("Generated classes: " + count);
+            throw e;
+        }
+    }
+}
+```
+
+### 3.2 排查方法
+
+```bash
+# 1. jstat 查看元空间使用
+jstat -gc <pid> | awk '{print $6, $7}'  # MU(Metaspace Used), MC(Metaspace Capacity)
+
+# 2. 观察元空间增长趋势
+# 元空间持续增长且不下降 = 类加载器泄漏
+
+# 3. 如果有大量类加载器实例，检查是否有类加载器未释放
+# 典型场景：热部署时旧 ClassLoader 未清理
+```
+
+### 3.3 解决方案
+
+```bash
+# 限制元空间大小（生产必须）
+-XX:MaxMetaspaceSize=256m
+
+# 元空间回收触发阈值
+-XX:MetaspaceSize=128m
+```
+
+---
+
+## 四、栈溢出（StackOverflowError）🔴
+
+### 4.1 典型场景
+
+```java
+public class StackOverflowDemo {
+    public static long depth = 0;
+
+    public static void recursive() {
+        depth++;
+        recursive(); // 无限递归
+    }
+
+    public static void main(String[] args) {
+        try {
+            recursive();
+        } catch (StackOverflowError e) {
+            System.out.println("递归深度: " + depth);
+            // 深度取决于 -Xss 设置：默认 1MB，约 10万层
+        }
+    }
+}
+```
+
+### 4.2 排查方法
+
+```bash
+# 增加栈大小（治标）
+-Xss512k    # 减少每层栈帧大小，增加深度
+-Xss2m      # 增大总栈空间
+
+# 核心治本：找到无限递归的位置
+# 用 -XX:+PrintStackTraceAtFullGC（JDK 8）
+# 或添加日志打印递归深度
+```
+
+---
+
+## 五、GC Overhead Limit Exceeded 🟡
+
+### 5.1 触发条件
+
+JVM 在连续 5 次 GC 后，如果堆内存回收量不足 2%，且堆使用率仍然很高，触发此 OOM。
+
+```java
+// 典型场景：大量无用对象但引用链未断
+public class GCOverheadDemo {
+    public static void main(String[] args) {
+        Map<String, String> map = new HashMap<>();
+        int i = 0;
+        try {
+            while (true) {
+                // 临时对象放在局部变量表里，但 map 持有旧对象引用
+                map.put(String.valueOf(i++), String.valueOf(i++));
+            }
+        } catch (OutOfMemoryError e) {
+            // GC 拼命回收，但 HashMap 持续增长，回收赶不上分配
+            throw e;
+        }
+    }
+}
+```
+
+### 5.2 排查与解决
+
+```bash
+# 关闭 GC Overhead Limit（不推荐，仅调试用）
+-XX:-UseGCOverheadLimit
+
+# 解决方案：
+# 1. 找到真正的内存泄漏（用 MAT）
+# 2. 增大堆 -Xmx
+# 3. 优化代码，减少对象创建
+```
+
+---
+
+## 六、直接内存 OOM 🟡
+
+### 6.1 典型场景
+
+```java
+// NIO 直接内存泄漏
+public class DirectMemoryLeak {
+    public static void main(String[] args) throws IOException {
+        // ByteBuffer.allocateDirect() 分配堆外内存
+        // 这些内存不受堆大小限制，但受 -XX:MaxDirectMemorySize 控制
+
+        List<ByteBuffer> buffers = new ArrayList<>();
+        int i = 0;
+        while (true) {
+            // 分配 10MB 直接内存
+            ByteBuffer buf = ByteBuffer.allocateDirect(10 * 1024 * 1024);
+            buffers.add(buf); // 持有引用，无法回收
+            i++;
+        }
+    }
+}
+```
+
+### 6.2 排查方法
+
+```bash
+# 限制直接内存大小
+-XX:MaxDirectMemorySize=512m
+
+# 监控直接内存使用
+# JDK 8+: jcmd <pid> VM.native_memory summary
+# 或在代码中添加直接内存监控：
+MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
+ObjectName name = new ObjectName("java.nio:type=BufferPool,name=direct");
+MBeanInfo info = mbs.getMBeanInfo(name);
+```
+
+---
+
+## 七、生产排查命令速查 🟢
+
+| 场景 | 命令 | 说明 |
+| --- | --- | --- |
+| 堆内存实时 | `jstat -gcutil <pid> 1000` | 每秒观察堆使用 |
+| 堆转储 | `jcmd <pid> GC.heap_dump` | JDK 11+，推荐 |
+| 元空间使用 | `jstat -gc <pid> \| awk '{print $6}'` | Metaspace 使用量 |
+| 线程数 | `jstack <pid> \| grep "Thread-" \| wc -l` | 线程数 |
+| 进程内存 | `ps aux \| grep <pid>` | RSS 内存占用 |
+| OOM 日志 | `grep -i "OutOfMemoryError" logs/*.log` | 搜索 OOM 日志 |
+
+【面试官心理】
+能说出一套完整 OOM 排查流程的候选人，说明他有实际的生产经验。从"确认类型 → 导出数据 → 分析 → 定位 → 解决"，每一步都有工具和方法论的候选人，在 P6/P7 面试中最具竞争力。

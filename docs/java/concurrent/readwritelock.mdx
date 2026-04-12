@@ -1,0 +1,380 @@
+---
+title: ReentrantReadWriteLock：读写锁的读写冲突与写饥饿
+description: 从一个读多写少场景的并发问题出发，深度拆解ReentrantReadWriteLock的读写锁互斥原理、state字段的高低位设计、写锁饥饿问题与解决方案。
+---
+
+# ReentrantReadWriteLock：读写锁的读写冲突与写饥饿
+
+候选人小林在阿里面试时，遇到了这样一个场景题：
+
+面试官问："你的项目中有个读多写少的缓存，如何保证并发安全？"
+
+小林说："可以用ReadWriteLock，读写锁分离。"
+
+面试官追问："那读写锁的原理是什么？读锁和写锁分别是如何实现的？"
+
+小林说："读锁是共享锁，写锁是独占锁。"
+
+面试官继续追问："那你说说，读锁在释放时如何唤醒等待的写锁？会出现读写冲突吗？写饥饿怎么解决？"
+
+小林彻底卡住了。
+
+【面试官心理】
+这道题我用来筛选候选人对读写锁深层机制的理解。知道ReadWriteLock是"读写分离"的占80%，能说出state字段分成高16位和低16位的占40%，能讲清楚写锁饥饿问题和JDK解决方案的只有20%。读写锁的难点不在于使用，而在于理解读锁和写锁的交互——读锁释放时如何判断是否需要唤醒写锁，写锁饥饿的根因是什么。
+
+## 一、读写锁的核心思想 🔴
+
+### 1.1 为什么要读写锁
+
+在读多写少的场景下，普通的互斥锁（如synchronized或ReentrantLock）会过度限制并发：
+
+```java
+// 普通互斥锁：读和写互相阻塞
+ReentrantLock lock = new ReentrantLock();
+
+Object read() {
+    lock.lock();
+    try { return data; }
+    finally { lock.unlock(); }
+}
+
+void write(Object val) {
+    lock.lock();
+    try { data = val; }
+    finally { lock.unlock(); }
+}
+```
+
+问题：即使有1000个线程同时读数据，它们也要排队等同一把锁。**读操作不需要互斥**，只要没有写操作，多个读可以并行。
+
+### 1.2 读写锁的规则
+
+| 操作 | 其他读锁 | 其他写锁 |
+|------|---------|---------|
+| 获取读锁 | ✅ 并行（共享） | ❌ 阻塞（互斥） |
+| 获取写锁 | ❌ 阻塞（互斥） | ❌ 阻塞（互斥） |
+
+读写锁的核心规则：
+- **读锁共享**：多个线程可以同时持有读锁
+- **写锁互斥**：同一时刻只能有一个线程持有写锁
+- **读写互斥**：读锁和写锁不能同时存在
+
+## 二、ReentrantReadWriteLock的实现原理 🔴
+
+### 2.1 state字段的巧妙设计
+
+ReentrantReadWriteLock用一个int类型的state变量，**同时表示读锁计数和写锁计数**：
+
+```java
+// state = 高16位(读锁计数) | 低16位(写锁计数)
+//   11111111 11111111  00000000 00000000
+//              读锁计数            写锁计数
+//                                    写锁计数
+
+static final int SHARED_SHIFT   = 16;
+static final int SHARED_UNIT    = (1 << SHARED_SHIFT);  // 0x10000
+static final int MAX_COUNT      = (1 << SHARED_SHIFT) - 1; // 65535
+static final int EXCLUSIVE_MASK = (1 << SHARED_SHIFT) - 1; // 0xFFFF
+
+// 读取高16位（读锁计数）
+static int sharedCount(int c)    { return c >>> SHARED_SHIFT; }
+// 读取低16位（写锁计数）
+static int exclusiveCount(int c) { return c & EXCLUSIVE_MASK; }
+```
+
+**设计精妙之处**：一个int变量同时存储两种锁的计数，通过位运算分离。
+
+### 2.2 读锁（共享锁）的获取
+
+```java
+// ReadLock.lock()
+public void lock() {
+    sync.acquireShared(1);
+}
+
+// Sync.tryAcquireShared
+protected final int tryAcquireShared(int unused) {
+    Thread current = Thread.currentThread();
+    int c = getState();
+
+    // 写锁已被占用？不允许获取读锁（读写互斥）
+    if (exclusiveCount(c) != 0 &&
+        getExclusiveOwnerThread() != current)
+        return -1; // 获取失败
+
+    // 获取读锁计数
+    int r = sharedCount(c);
+
+    // 缓存变量，避免重复计算
+    if (!readerShouldBlock()) {  // 是否应该阻塞读锁？
+        if (r < MAX_COUNT) {
+            // CAS增加读锁计数
+            if (compareAndSetState(c, c + SHARED_UNIT)) {
+                // 成功：设置当前线程的读锁持有信息
+                firstReader = current;
+                firstReaderHoldCount = 1;
+                return 1;
+            }
+        }
+    }
+
+    // CAS失败或应该阻塞：进入完整获取流程
+    return fullTryAcquireShared(current);
+}
+```
+
+**关键点**：
+- 写锁被占用时，读锁不能获取（读写互斥）
+- 使用`firstReader`/`firstReaderHoldCount`优化单线程重入读锁的性能（避免每次都CAS）
+
+### 2.3 读锁的释放与唤醒传播
+
+```java
+// ReadLock.unlock()
+public void unlock() {
+    sync.releaseShared(1);
+}
+
+// Sync.releaseShared
+public final boolean releaseShared(int arg) {
+    if (tryReleaseShared(arg)) {
+        doReleaseShared(); // 唤醒等待的写锁
+        return true;
+    }
+    return false;
+}
+
+// Sync.tryReleaseShared：减少读锁计数
+protected final boolean tryReleaseShared(int unused) {
+    int c = getState();
+    int nextc = c - SHARED_UNIT;
+
+    // 检查firstReader
+    if (Thread.currentThread() == firstReader) {
+        if (firstReaderHoldCount == 1)
+            firstReader = null;
+        else
+            firstReaderHoldCount--;
+    }
+
+    // CAS减少读锁计数
+    return compareAndSetState(c, nextc);
+}
+```
+
+**重要**：当最后一个读锁被释放时，`doReleaseShared()`会唤醒队列中等待的写锁。这是读写锁交互的关键。
+
+### 2.4 写锁（独占锁）的获取
+
+```java
+// WriteLock.lock()
+public void lock() {
+    sync.acquire(1);
+}
+
+// Sync.tryAcquire
+protected final boolean tryAcquire(int acquires) {
+    Thread current = Thread.currentThread();
+    int c = getState();
+    int w = exclusiveCount(c);
+
+    // 已经有锁了
+    if (c != 0) {
+        // 有读锁或其他写锁，不允许获取写锁
+        if (w == 0 || current != getExclusiveOwnerThread())
+            return false;
+        // 可重入
+        int nextc = c + acquires;
+        if (nextc > MAX_COUNT)
+            throw new Error("Maximum lock count exceeded");
+        setState(nextc);
+        return true;
+    }
+
+    // 没有锁，尝试获取
+    if (writerShouldBlock() ||  // 非公平锁返回false（直接抢），公平锁检查队列
+        !compareAndSetState(c, c + acquires))
+        return false;
+
+    setExclusiveOwnerThread(current);
+    return true;
+}
+```
+
+## 三、写锁饥饿问题 🔴
+
+### 3.1 写饥饿的根因
+
+在非公平模式下，读锁可能导致写锁饥饿：
+
+```
+时间线：
+T1: 写锁W1获取，写操作
+T2: 读锁R1到达，想获取读锁，但W1占用，阻塞
+T3: 写锁W2到达，想获取写锁，但R1已等待，排队在W2前
+T4: W1释放，唤醒R1，R1获取读锁
+T5: 读锁R2到达，由于非公平，R2可以在W2之前插队获取读锁
+T6: R1释放，R2还在持有读锁，W2继续等待
+T7: 读锁R3到达...R4到达...R5到达...  ← 写锁W2永远等不到！
+```
+
+**根因**：非公平模式下，新来的读锁可以在写锁之前插队。只要有新的读锁不断到来，写锁永远在等待。
+
+### 3.2 JDK的解决方案：ReaderNotifiedInEachRelease
+
+JDK 1.8引入了策略来解决写饥饿问题。核心思路是：**当写锁等待时，新来的读锁需要被阻塞，而不是插队**。
+
+通过`readerShouldBlock()`方法判断：
+
+```java
+// NonfairSync
+final boolean readerShouldBlock() {
+    return apparentlyFirstQueuedIsExclusive();
+}
+
+// apparentlyFirstQueuedIsExclusive：如果队列第一个等待的是写锁，返回true
+final boolean apparentlyFirstQueuedIsExclusive() {
+    Node h, s;
+    return (h = head) != null &&
+           (s = h.next) != null &&
+           !s.isShared() &&          // 第一个等待者是写锁（非共享）
+           s.thread != null;
+}
+```
+
+**逻辑**：如果第一个等待的是写锁，新来的读锁应该阻塞，让写锁先执行。
+
+但这个策略**不能完全解决写饥饿**——如果读锁R1在写锁之前等待（因为W1还没释放），后续到来的写锁W2仍然排在R1之后。如果读锁R2、R3不断到来，它们可以插在W2之前。
+
+### 3.3 升降级：写锁降级为读锁
+
+ReentrantReadWriteLock支持**锁降级**：
+
+```java
+// 写锁降级为读锁
+public void process() {
+    writeLock.lock();
+    try {
+        // 读取数据并修改
+        update();
+        // 降级：获取读锁
+        readLock.lock();
+    } finally {
+        writeLock.unlock(); // 释放写锁，但保留读锁
+    }
+    try {
+        // 此时持有读锁，可以安全地读取
+        read();
+    } finally {
+        readLock.unlock();
+    }
+}
+```
+
+**注意**：不支持**锁升级**（读锁升级为写锁）——会导致死锁：
+```java
+// ❌ 死锁：读锁升级为写锁
+readLock.lock();      // 获取读锁
+writeLock.lock();     // 尝试获取写锁 → 死锁！
+readLock.unlock();    // 永远不会执行
+```
+
+## 四、生产避坑：读写锁的陷阱 ⚠️
+
+### 4.1 读多写少场景的性能问题
+
+```java
+// ❌ 错误：在读锁内执行耗时IO操作
+readLock.lock();
+try {
+    Thread.sleep(1000); // 持有读锁1秒！
+    return cache.get(key);
+} finally {
+    readLock.lock();
+}
+
+// 问题：1000个并发读请求，第二个请求要等1秒才能获取读锁
+```
+
+读锁虽然可以共享，但**持有读锁的时间不能太长**，否则会阻塞等待的写锁。
+
+### 4.2 缓存场景的正确做法
+
+```java
+// ✅ 正确：读写锁 + 缓存
+private final Map<K, V> cache = new HashMap<>();
+private final ReentrantReadWriteLock rwLock = new ReentrantReadWriteLock();
+
+V read(K key) {
+    rwLock.readLock().lock();
+    try {
+        return cache.get(key);
+    } finally {
+        rwLock.readLock().unlock();
+    }
+}
+
+void write(K key, V value) {
+    rwLock.writeLock().lock();
+    try {
+        cache.put(key, value);
+    } finally {
+        rwLock.writeLock().unlock();
+    }
+}
+```
+
+### 4.3 StampedLock：读写锁的改进版
+
+JDK 8引入了`StampedLock`，它用"票据"替代了读写锁的共享/独占模式：
+
+```java
+StampedLock lock = new StampedLock();
+
+// 乐观读：不需要获取锁，只读一次
+long stamp = lock.tryOptimisticRead();
+V value = cache.get(key);
+if (!lock.validate(stamp)) {  // 检查stamp是否有效
+    // stamp无效，说明中间有写操作，重试
+    stamp = lock.readLock();
+    try {
+        value = cache.get(key);
+    } finally {
+        lock.unlockRead(stamp);
+    }
+}
+```
+
+StampedLock的优势：
+- 乐观读不需要获取锁，无额外开销
+- 支持写锁降级为乐观读
+
+## 五、❌ 错误示范
+
+**候选人原话**："读写锁解决了所有读多写少场景的并发问题。"
+
+**问题诊断**：
+- 忽略了写锁饥饿问题
+- 没有理解非公平模式下读锁可以插队到写锁之前
+- 以为读写锁是万能的，没有性能陷阱
+
+**候选人原话**："StampedLock比ReadWriteLock好，应该总是用StampedLock。"
+
+**问题诊断**：
+- StampedLock不支持重入（不可重入！）
+- StampedLock的悲观读锁和ReadWriteLock的读锁实现不同
+- StampedLock需要手动管理票据，更容易出错
+
+【面试官心理】
+读写锁这道题，能讲到state字段高低位设计的候选人，说明他对位运算和状态设计有实战经验。能讲清楚写锁饥饿问题的候选人，说明他对并发场景有深入思考。能提到StampedLock并对比两者的候选人，说明他有跟进JDK演进的习惯。这三个层次，恰好对应了P5→P6→P7的差距。
+
+## 六、面试应对脚本
+
+**面试官**："ReentrantReadWriteLock是如何用一个state变量同时表示读锁和写锁的？"
+**标准回答**："JDK 1.8的ReentrantReadWriteLock用一个int类型的state，高16位表示读锁计数，低16位表示写锁计数。sharedCount(c)用无符号右移获取读锁计数，exclusiveCount(c)用按位与获取写锁计数。读锁每次获取增加SHARED_UNIT(0x10000)，写锁每次获取增加1。设计精妙之处在于：一个int变量同时存储了两种锁的信息，通过位运算分离，而不是维护两个独立的计数器。"
+
+**面试官追问**："写锁饥饿是怎么产生的？如何解决？"
+**标准回答**："写锁饥饿发生在非公平模式下：写锁W1持有时，读锁R1到达并等待；写锁W2到达排在R1后面；W1释放后R1获取读锁；但如果新的读锁R2到来，由于非公平可以直接插队。如果R1、R2、R3...不断到来，W2永远等不到。JDK通过readerShouldBlock()在某种程度上缓解：当第一个等待者是写锁时，新来的读锁被阻塞。但由于R1在W2之前已经在等待，R1之后的读锁仍然可以插队。更根本的解决方案是使用StampedLock，或者在设计上控制读锁持有时间。"
+
+【面试官心理】
+能回答state字段设计的候选人，对位运算和状态设计有基本功。能讲清楚写锁饥饿的候选人，对并发场景有实战思考。能对比StampedLock的候选人，说明他有跟进JDK演进的意识。这三层次的递进，恰好映射了P5→P6→P7的技术成长路径。

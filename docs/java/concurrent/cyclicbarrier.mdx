@@ -1,0 +1,347 @@
+---
+title: CyclicBarrier：可重置的线程集合点
+description: 从多线程同步汇合场景出发，深度拆解CyclicBarrier的await/daisyChain机制、Generation概念、ReentrantLock+Condition的内部实现，以及它与CountDownLatch的区别。
+---
+
+# CyclicBarrier：可重置的线程集合点
+
+候选人小周在面试中遇到了这样的问题：
+
+面试官问："CountDownLatch和CyclicBarrier有什么区别？"
+
+小周说："CountDownLatch是一次性的，CyclicBarrier可以循环使用。"
+
+面试官追问："那CyclicBarrier是怎么实现循环的？Generation是什么？"
+
+小周停顿了一下："...好像是用来区分不同的周期的？"
+
+面试官继续追问："CyclicBarrier的await()为什么用ReentrantLock而不是synchronized？"
+
+小周彻底答不上来了。
+
+【面试官心理】
+CyclicBarrier和CountDownLatch的对比是Java并发包中最经典的对比题之一。90%的候选人能说出"一次性vs可循环"，但只有30%能说出Generation的作用，只有10%能讲清楚CyclicBarrier为什么用ReentrantLock+Condition而不是synchronized。能答到第三层的候选人，说明他对并发工具的选型有实战思考。
+
+## 一、CyclicBarrier是什么：N个线程的集合点 🔴
+
+### 1.1 场景引入：并行计算的分段同步
+
+想象一个并行计算场景：将一个大任务拆成4个子任务并行执行，等所有子任务完成第一阶段计算后，再合并结果，然后进入第二阶段。
+
+```java
+// ✅ 使用CyclicBarrier
+CyclicBarrier barrier = new CyclicBarrier(4, () -> {
+    // 所有线程到达后执行的回调（最后一个到达的线程执行）
+    System.out.println("所有线程完成第一阶段，合并结果...");
+    mergeResults();
+});
+
+for (int i = 0; i < 4; i++) {
+    final int id = i;
+    new Thread(() -> {
+        doPhase1(id);           // 第一阶段
+        barrier.await();        // 等待所有人
+        doPhase2(id);           // 第二阶段
+        barrier.await();        // 再等所有人
+        doPhase3(id);
+    }).start();
+}
+```
+
+### 1.2 核心特性
+
+- **N路汇合**：指定N个线程互相等待
+- **可重置**：所有线程通过后，可以再次使用（循环）
+- **屏障关闭**：任一线程中断或超时，视为屏障破坏
+
+### 1.3 典型使用场景
+
+**场景一：多玩家游戏的开局等待**
+
+```java
+// 等待4个玩家都加载完成后同时开始游戏
+CyclicBarrier gameBarrier = new CyclicBarrier(4, () -> {
+    startGame(); // 4个玩家都就绪后开始
+});
+
+for (int i = 0; i < 4; i++) {
+    final int playerId = i;
+    new Thread(() -> {
+        loadGameAssets(playerId);
+        gameBarrier.await(); // 等待所有玩家
+        // 从这里开始，4个玩家的游戏状态是一致的
+    }).start();
+}
+```
+
+**场景二：多路并行计算的归并**
+
+```java
+// MapReduce风格的并行计算
+CyclicBarrier barrier = new CyclicBarrier(N, () -> {
+    // N个Mapper都完成后，执行Reducer
+    reducer.reduce();
+});
+
+ExecutorService executor = Executors.newFixedThreadPool(N);
+for (int i = 0; i < N; i++) {
+    executor.submit(() -> {
+        MapResult r = mapper.map(i);
+        barrier.await(); // 等待所有Mapper完成
+        // ...
+    });
+}
+```
+
+## 二、CyclicBarrier的底层实现 🔴
+
+### 2.1 核心结构
+
+```java
+public class CyclicBarrier {
+    private final ReentrantLock lock = new ReentrantLock();
+    // 两个Condition：trip和generation
+    private final Condition trip = lock.newCondition();
+    private final int parties;          // 参与线程数
+    private final Runnable barrierCommand; // 到达后的回调
+
+    // 剩余等待线程数（倒计时）
+    private int count;
+
+    // 代际：用于标识不同的周期
+    private static class Generation {
+        boolean broken = false;
+    }
+    private Generation generation = new Generation();
+}
+```
+
+**关键发现**：CyclicBarrier使用**ReentrantLock + Condition**实现，而不是AQS！这和CountDownLatch不同。
+
+### 2.2 await()的实现
+
+```java
+public int await() throws InterruptedException, BrokenBarrierException {
+    return dowait(false, 0L);
+}
+
+private int dowait(boolean timed, long nanos) {
+    final ReentrantLock lock = this.lock;
+    lock.lock();
+    try {
+        Generation g = generation;
+
+        // 检查屏障是否已破坏
+        if (g.broken)
+            throw new BrokenBarrierException();
+
+        if (Thread.interrupted()) {
+            breakBarrier();
+            throw new InterruptedException();
+        }
+
+        int index = --count;  // 计数器减1
+
+        // 最后一个到达的线程
+        if (index == 0) {
+            boolean ranAction = false;
+            try {
+                if (barrierCommand != null)
+                    barrierCommand.run(); // 执行回调
+                ranAction = true;
+                nextGeneration(); // 重置屏障，进入下一代
+                return 0;
+            } finally {
+                if (!ranAction)
+                    breakBarrier();
+            }
+        }
+
+        // 不是最后一个：等待
+        for (;;) {
+            try {
+                if (!timed)
+                    trip.await(); // 阻塞等待
+                else
+                    nanos = trip.awaitNanos(nanos);
+            } catch (InterruptedException ie) {
+                if (g == generation && !g.broken) {
+                    breakBarrier();
+                    throw ie;
+                } else {
+                    Thread.currentThread().interrupt();
+                }
+            }
+
+            if (g.broken)
+                throw new BrokenBarrierException();
+
+            if (g != generation) // 已进入下一代
+                return index;
+
+            if (timed && nanos <= 0) {
+                breakBarrier();
+                throw new TimeoutException();
+            }
+        }
+    } finally {
+        lock.unlock();
+    }
+}
+```
+
+### 2.3 Generation：循环的核心
+
+```java
+private void nextGeneration() {
+    // 唤醒所有等待线程
+    trip.signalAll();
+    // 重置计数器
+    count = parties;
+    // 创建新一代
+    generation = new Generation();
+}
+```
+
+**Generation的作用**：当所有线程通过屏障后，`nextGeneration()`创建新的Generation对象，原来的generation对象被废弃。
+
+这解决了**"重置"**问题：
+- 线程在`await()`中park等待
+- `signalAll()`唤醒所有线程
+- 被唤醒的线程检查`g != generation`——因为generation已经换了
+- 发现自己已经"穿越"到了下一代，`return index`
+
+### 2.4 屏障破坏（Broken Barrier）
+
+如果等待中的线程被中断或超时，`breakBarrier()`会破坏屏障：
+
+```java
+private void breakBarrier() {
+    generation.broken = true;   // 标记为破坏
+    count = parties;            // 重置计数
+    trip.signalAll();           // 唤醒所有等待线程
+}
+```
+
+破坏后，所有后续的`await()`都会立即抛出`BrokenBarrierException`。
+
+## 三、CyclicBarrier vs CountDownLatch：深度对比 🟡
+
+### 3.1 实现层面的差异
+
+| 维度 | CyclicBarrier | CountDownLatch |
+|------|-------------|---------------|
+| 底层实现 | ReentrantLock + Condition | AQS共享模式 |
+| 线程角色 | 等待者自己（互相等待） | 等待者是旁观者（等别人完成） |
+| 计数器 | 在CyclicBarrier对象中 | 在AQS的state中 |
+| 可重置 | ✅ Generation机制 | ❌ state归零后不能重置 |
+| 回调支持 | ✅ 最后一个到达的线程执行 | ❌ 不支持 |
+
+### 3.2 为什么CyclicBarrier不用AQS？
+
+这是一个很好的追问。答案是：**CyclicBarrier的线程是自己等待、自己唤醒自己**。
+
+CountDownLatch中：
+- 子线程执行`countDown()`减少计数器
+- 主线程执行`await()`等待
+- 线程角色不同，不需要自己唤醒自己
+
+CyclicBarrier中：
+- 所有线程都调用`await()`
+- 所有线程都等待，然后**互相被唤醒**
+- 使用`signalAll()`唤醒所有等待者
+
+所以CyclicBarrier不需要AQS的CLH队列——它只需要一个简单的计数器 + Condition队列即可。
+
+## 四、生产避坑：BrokenBarrier的陷阱 ⚠️
+
+### 4.1 屏障破坏导致永久等待
+
+```java
+// ❌ 危险：超时设置不当
+CyclicBarrier barrier = new CyclicBarrier(3);
+
+// 线程A
+try {
+    barrier.await(1, TimeUnit.MILLISECONDS); // 超时！
+    // 如果超时，屏障被破坏
+} catch (Exception e) {
+    // 吞掉了异常
+}
+
+// 线程B和线程C
+try {
+    barrier.await(); // 永久阻塞！因为屏障已被破坏
+} catch (BrokenBarrierException e) {
+    // ...
+}
+```
+
+### 4.2 中断处理
+
+```java
+// ✅ 正确：线程中断时正确处理
+try {
+    barrier.await();
+} catch (InterruptedException e) {
+    Thread.currentThread().interrupt();
+    // 通知其他线程
+    breakBarrier();
+} catch (BrokenBarrierException e) {
+    // 屏障已破坏，后续线程已收到通知
+}
+```
+
+### 4.3 线程异常导致屏障破坏
+
+```java
+// ❌ 危险：线程异常退出
+Runnable task = () -> {
+    if (Math.random() < 0.1) {
+        throw new RuntimeException("任务失败");
+    }
+    barrier.await(); // 如果抛出异常，屏障被破坏
+    // 后续线程永久阻塞
+};
+
+// ✅ 正确：在await外围try-catch
+Runnable task = () -> {
+    try {
+        doTask();
+        barrier.await();
+    } catch (Exception e) {
+        breakBarrier();
+        throw e;
+    }
+};
+```
+
+## 五、❌ 错误示范
+
+**候选人原话**："CyclicBarrier和CountDownLatch一样，都能重置。"
+
+**问题诊断**：
+- CountDownLatch不能重置！
+- 只有CyclicBarrier可以通过reset()重置
+- 这是两个工具最核心的区别
+
+**候选人原话**："CyclicBarrier用的是AQS实现的。"
+
+**问题诊断**：
+- CyclicBarrier用的是ReentrantLock + Condition
+- CountDownLatch用的是AQS共享模式
+- 说明候选人没有深入看过源码
+
+【面试官心理】
+CyclicBarrier这道题能答到Generation层面的候选人，说明他有不只一次地深入阅读JUC源码的经历。Generation是Doug Lea的一个精妙设计——通过创建新的对象来区分不同的"代"，而不是修改状态标志。这种用对象身份来区分状态的方式，在并发编程中有广泛应用。
+
+## 六、面试应对脚本
+
+**面试官**："CyclicBarrier是怎么实现可重置的？"
+**标准回答**："CyclicBarrier使用Generation内部类来实现可重置。每次所有线程通过屏障后，nextGeneration()会创建一个新的Generation对象，并将计数器重置为parties。被唤醒的线程在dowait()中检查g != generation时，发现generation已经换了，就知道自己'穿越'到了下一代，直接返回。这样不同的'代'之间通过Generation对象的身份来隔离，不需要修改任何状态标志。"
+
+**面试官追问**："CyclicBarrier为什么用ReentrantLock而不是AQS？"
+**标准回答**："因为CyclicBarrier和CountDownLatch的线程角色不同。CountDownLatch是子线程执行countDown()减少计数器，主线程执行await()等待——线程角色不同，不需要自己唤醒自己，所以用AQS的共享模式让countDown()触发releaseShared，唤醒await()的线程。CyclicBarrier是所有线程都调用await()，等待同一件事，然后互相被唤醒——唤醒操作来自signalAll()而不是await()本身。所以CyclicBarrier只需要ReentrantLock + Condition就足够了，不需要AQS的复杂队列机制。"
+
+【面试官心理】
+能回答CyclicBarrier和CountDownLatch实现差异的候选人，对并发工具的理解已经到了"知其然更知其所以然"的层次。理解为什么两个工具选择不同的底层实现——这是真正的技术深度。Doug Lea在设计这两个工具时，没有用同一个底层机制，而是根据它们的语义选择了最合适的实现方式。

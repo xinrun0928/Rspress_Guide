@@ -1,0 +1,342 @@
+---
+title: synchronized vs ReentrantLock：谁才是并发之王
+description: 从一道高频面试题出发，深度对比synchronized与ReentrantLock的底层实现、公平性、可中断性、限时等待，以及什么场景下该选谁。
+---
+
+# synchronized vs ReentrantLock：谁才是并发之王
+
+候选人小陈在面试中遇到了一个经典问题：
+
+面试官问："synchronized和ReentrantLock有什么区别？"
+
+小陈说："synchronized是JDK内置的，ReentrantLock是java.util.concurrent包提供的。"
+
+面试官追问："还有呢？"
+
+小陈说："ReentrantLock性能更好？"
+
+面试官继续追问："那你用ReentrantLock实现过什么功能？synchronized做不到的？"
+
+小陈彻底说不出话了。
+
+【面试官心理】
+这道题我出了不下500次。80%的候选人能说出"ReentrantLock是显式的，要手动解锁"，但只有30%能说出公平性/非公平性的区别，只有10%能说清楚什么时候选synchronized什么时候选ReentrantLock。知道API的区隔只是第一步，理解底层实现的差异才能真正做出正确的技术选型。
+
+## 一、表面区别：API层面的对比 🔴
+
+### 1.1 基本用法
+
+```java
+// synchronized：隐式锁
+public synchronized void doSomething() {
+    // 自动获取锁，自动释放锁
+}
+
+// ReentrantLock：显式锁
+private final ReentrantLock lock = new ReentrantLock();
+
+public void doSomething() {
+    lock.lock();
+    try {
+        // 业务逻辑
+    } finally {
+        lock.unlock(); // 必须手动释放，且放在finally中
+    }
+}
+```
+
+**synchronized的优点**：简单，编译器/JIT自动处理锁的获取和释放，不会有忘记释放的问题。
+
+**ReentrantLock的优点**：灵活，支持公平/非公平、可中断、超时等待。
+
+### 1.2 核心API对比
+
+| 功能 | synchronized | ReentrantLock |
+|------|--------------|---------------|
+| 锁的获取 | 隐式，自动释放 | 显式lock()/tryLock()，必须手动unlock() |
+| 公平性 | 非公平锁 | 支持fair=true/false配置 |
+| 可中断 | 不可中断 | lockInterruptibly()支持中断 |
+| 限时等待 | 不支持 | tryLock(long time, TimeUnit) |
+| 多条件await | wait()/notify() | newCondition()创建多个条件队列 |
+| 锁重入 | 支持（可重入） | 支持（可重入） |
+| 锁测试 | 不可测试 | isLocked() / isHeldByCurrentThread() |
+
+### 1.3 可重入性：两者都有
+
+synchronized和ReentrantLock都是**可重入锁**——同一个线程可以反复获取同一把锁：
+
+```java
+synchronized (lock) {
+    synchronized (lock) { // 合法，同一个线程重入
+        synchronized (lock) {
+            // 三层嵌套，但只占用一把锁
+        }
+    }
+}
+```
+
+ReentrantLock的内部维护了一个`sync`字段（Sync类型的AQS），Sync继承自`AbstractOwnableSynchronizer`，记录了当前持有锁的线程和重入次数。
+
+## 二、底层实现对比：Mark Word vs AQS 🔴
+
+### 2.1 synchronized的底层
+
+synchronized的底层实现依赖对象头的Mark Word和Monitor机制：
+
+- 偏向锁/轻量级锁：通过Mark Word的CAS修改实现
+- 重量级锁：通过ObjectMonitor实现，线程进入内核态等待
+
+```cpp
+// HotSpot ObjectMonitor的关键操作
+void ObjectMonitor::enter(TRAPS) {
+    // 尝试获取锁
+    if (TrySpin(_owner)) {
+        _owner = Thread::current();
+        return;
+    }
+    // 自旋失败，加入等待队列（CXL/EntryList）
+    ObjectWaiter node;
+    node.TState = ObjectWaiter::TS_CXQ;
+    // ...
+    // 阻塞当前线程
+}
+```
+
+### 2.2 ReentrantLock的底层
+
+ReentrantLock内部有一个`Sync`继承自`AbstractQueuedSynchronizer`（AQS）：
+
+```java
+// ReentrantLock.NonfairSync
+static final class NonfairSync extends Sync {
+    final void lock() {
+        if (compareAndSetState(0, 1)) // CAS修改state变量
+            setExclusiveOwnerThread(Thread.currentThread());
+        else
+            acquire(1); // 失败则走AQS标准流程
+    }
+}
+
+// ReentrantLock.FairSync
+static final class FairSync extends Sync {
+    final void lock() {
+        acquire(1); // 直接走AQS，加入等待队列前检查前驱节点
+    }
+}
+```
+
+**核心差异**：synchronized依赖ObjectMonitor的EntryList队列，ReentrantLock依赖AQS的双向链表队列。两者都是CLH队列的变体，但实现细节不同。
+
+## 三、公平性：ReentrantLock的杀手级特性 🔴
+
+### 3.1 公平锁 vs 非公平锁
+
+**非公平锁**：线程竞争锁时，不排队，直接尝试CAS抢锁。只有CAS失败后才进入等待队列。
+
+**公平锁**：线程竞争锁时，必须检查等待队列。如果队列中有更早等待的线程，则乖乖排队。
+
+```java
+// 非公平锁（默认）
+ReentrantLock lock1 = new ReentrantLock();
+
+// 公平锁
+ReentrantLock lock2 = new ReentrantLock(true);
+
+// synchronized也是非公平锁
+```
+
+### 3.2 公平锁的代价
+
+**公平锁的性能比非公平锁差很多**，原因：
+
+1. **每次获取锁都要检查队列**：多了O(n)的链表遍历
+2. **增加线程切换次数**：即使队列非空，非公平锁也可能让新来的线程直接抢到锁（如果当前锁刚好释放），避免了线程切换
+3. **饥饿风险**：非公平锁可能导致等待线程长期获取不到锁（Thread Starvation）
+
+**JDK文档明确建议**：大多数场景下，应该使用非公平锁。ReentrantLock默认非公平就是这个原因。
+
+### 3.3 公平锁的适用场景
+
+**什么时候用公平锁？** 需要严格按请求顺序执行，避免饥饿。比如：
+- 某些任务调度器，必须按优先级顺序
+- 需要保证所有线程都有机会执行的场景
+
+## 四、可中断与限时等待：ReentrantLock的核心优势 🔴
+
+### 4.1 可中断等待：lockInterruptibly()
+
+```java
+ReentrantLock lock = new ReentrantLock();
+
+public void doSomething() throws InterruptedException {
+    lock.lockInterruptibly(); // 可以响应中断
+    try {
+        // 业务逻辑
+    } finally {
+        lock.unlock();
+    }
+}
+```
+
+`synchronized`的`wait()`是支持中断的，但`synchronized`的`lock()`（对应重量级锁的acquire）**不响应中断**——线程会一直阻塞直到获取锁，期间不能被中断。
+
+ReentrantLock的`lockInterruptibly()`允许在等待过程中被中断，抛出`InterruptedException`。
+
+**典型使用场景**：优雅关闭——关闭命令到达时，正在等待锁的线程应该能收到中断信号并停止等待。
+
+### 4.2 限时等待：tryLock()
+
+```java
+public boolean doSomethingWithTimeout(long timeout, TimeUnit unit) {
+    try {
+        // 尝试在timeout时间内获取锁，获取不到就放弃
+        if (lock.tryLock(timeout, unit)) {
+            try {
+                // 业务逻辑
+                return true;
+            } finally {
+                lock.unlock();
+            }
+        } else {
+            // 获取锁超时，执行降级逻辑
+            return false;
+        }
+    } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        return false;
+    }
+}
+```
+
+`synchronized`没有对应的功能。如果需要"等一会儿等不到就算了"，只能用`ReentrantLock.tryLock()`。
+
+**典型使用场景**：分布式锁的本地降级——获取分布式锁失败后，尝试在本地获取一个备份锁，等一会儿等不到就降级处理。
+
+### 4.3 tryLock()的无参版本
+
+```java
+if (lock.tryLock()) { // 立即返回，不等待
+    try {
+        // 拿到锁
+    } finally {
+        lock.unlock();
+    }
+} else {
+    // 没拿到锁，执行其他逻辑
+}
+```
+
+非阻塞的tryLock()适合用在判断锁是否被持有的场景。
+
+## 五、Condition：ReentrantLock的配套武器 🟡
+
+### 5.1 为什么需要Condition
+
+synchronized配合`wait()/notify()/notifyAll()`使用，问题是**只有一个等待队列**。如果业务需要按不同条件分开等待，比如"当库存>0时唤醒消费者"和"当有新订单时唤醒仓库"，`wait()/notify()`就力不从心了。
+
+ReentrantLock配合`Condition`可以创建**多个条件队列**：
+
+```java
+private final ReentrantLock lock = new ReentrantLock();
+private final Condition notEmpty = lock.newCondition();  // 队列非空条件
+private final Condition notFull = lock.newCondition();   // 队列非满条件
+
+public void put(Object item) throws InterruptedException {
+    lock.lock();
+    try {
+        while (queue.isFull()) {
+            notFull.await(); // 队列满时等待
+        }
+        queue.add(item);
+        notEmpty.signal(); // 唤醒消费者
+    } finally {
+        lock.unlock();
+    }
+}
+
+public Object take() throws InterruptedException {
+    lock.lock();
+    try {
+        while (queue.isEmpty()) {
+            notEmpty.await(); // 队列空时等待
+        }
+        Object item = queue.remove();
+        notFull.signal(); // 唤醒生产者
+        return item;
+    } finally {
+        lock.unlock();
+    }
+}
+```
+
+### 5.2 Condition vs Object.wait()
+
+| 维度 | Object.wait/notify | Condition.await/signal |
+|------|--------------------|-----------------------|
+| 队列数量 | 只有一个（Object内置） | 可创建多个 |
+| 要求 | 必须在synchronized块中调用 | 必须在Lock.lock()之后调用 |
+| signalAll | notifyAll唤醒所有 | signalAll唤醒所有 |
+| 公平性 | 不支持 | 支持（队列FIFO） |
+
+## 六、❌ 错误示范
+
+**候选人原话**："ReentrantLock性能比synchronized好，所以应该尽量用ReentrantLock。"
+
+**问题诊断**：
+- 没有区分锁的实际使用场景
+- synchronized在JDK 1.6后有偏向锁和轻量级锁优化，在无竞争或低竞争场景下性能接近ReentrantLock
+- ReentrantLock的灵活性是有代价的（更复杂的代码，更容易出错）
+
+**候选人原话**："synchronized不能响应中断，所以不推荐使用。"
+
+**问题诊断**：
+- synchronized的wait()是响应中断的，只是lock()不响应
+- 在大多数业务场景下，锁的等待不是长时间阻塞的
+- 混淆了synchronized块和synchronized的wait()
+
+**候选人原话**："tryLock()就是非阻塞获取锁，获取不到就返回false，没什么特别的。"
+
+**问题诊断**：
+- 忽略了tryLock()的重载版本tryLock(timeout, unit)
+- 没有理解限时等待在实际业务中的价值（比如避免死锁）
+
+【面试官心理】
+synchronized和ReentrantLock的对比，是一道经典的"理解深度"测试题。知道API差异是基础，能说出底层实现的差异是中游，能讲清楚什么时候该用哪个才是高手。大部分候选人把这道题答成了"synchronized是JDK内置的，不够灵活；ReentrantLock是第三方的，更灵活"，——这不算错，但太浅了。真正的高手会从JVM优化、公平性需求、可中断性需求、多个条件队列这四个维度给出具体的选型建议。
+
+## 七、选型指南 💡
+
+### 7.1 什么时候选synchronized
+
+- ✅ 简单场景：只需要一个简单的互斥锁，不需要公平性/可中断/限时
+- ✅ 低竞争场景：JDK 1.6的锁优化在低竞争下表现很好
+- ✅ JDK版本兼容：不需要最新的并发API
+- ✅ 快速开发：不想处理手动unlock()的复杂性
+
+### 7.2 什么时候选ReentrantLock
+
+- ✅ 需要公平锁：严格按请求顺序执行
+- ✅ 需要可中断：`lockInterruptibly()`处理优雅关闭
+- ✅ 需要限时等待：`tryLock(timeout)`避免无限等待
+- ✅ 需要多个等待队列：`newCondition()`实现多条件同步
+- ✅ 需要锁测试：`isLocked()`/`isHeldByCurrentThread()`查询锁状态
+- ✅ 需要与`ReadWriteLock`等高级锁配合
+
+### 7.3 性能对比（实测参考）
+
+| 场景 | synchronized | ReentrantLock |
+|------|-------------|---------------|
+| 无竞争 | 偏向锁，极快 | CAS+volatile，略慢 |
+| 低竞争（2-4线程）| 轻量级锁，快 | CAS+自旋，快 |
+| 高竞争 | 重量级锁，慢 | AQS+Park，慢 |
+| 公平锁 | N/A | 额外队列检查，慢 |
+
+## 八、面试应对脚本
+
+**面试官**："synchronized和ReentrantLock有什么区别？"
+**标准回答**："表面上看，synchronized是隐式锁，JVM自动处理加锁/解锁；ReentrantLock是显式锁，需要手动lock/unlock。但更深层的区别是：synchronized依赖ObjectMonitor实现，ReentrantLock依赖AQS实现；synchronized是非公平的，ReentrantLock可以配置公平/非公平；synchronized不支持可中断和限时等待，ReentrantLock支持lockInterruptibly()和tryLock()；synchronized只有一个等待队列，ReentrantLock通过newCondition()可以创建多个条件队列。选型建议是：简单互斥用synchronized，需要高级特性（公平、可中断、多条件队列）用ReentrantLock。"
+
+**面试官追问**："为什么JDK要保留synchronized而不全部用ReentrantLock替代？"
+**标准回答**："synchronized有三个不可替代的优点：第一，JVM层面内置，编译器/JIT天然支持，锁优化（偏向锁、锁粗化、锁消除、自适应自旋）都是针对synchronized设计的；第二，API极简，不会忘记释放锁，ReentrantLock忘记unlock()就会死锁；第三，synchronized配合wait/notify是JDK早期就有的标准做法，生态最广。ReentrantLock虽然灵活，但增加了代码复杂度，也引入了更多的出错可能（忘记finally、异常路径的锁释放）。两者不是替代关系，是互补关系。"
+
+【面试官心理】
+能把synchronized和ReentrantLock的关系说成"互补而非替代"的候选人，说明他对技术选型有成熟的思考方式。他不是那种"新API一定比旧API好"的追赶者，而是能权衡取舍的工程师。这类候选人在实际项目中，不会为了"炫技"而选择更复杂的方案。

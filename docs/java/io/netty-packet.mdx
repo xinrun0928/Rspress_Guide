@@ -1,0 +1,339 @@
+---
+title: Netty 粘包与拆包解决方案
+description: 从线上Bug出发，逐层拆解TCP粘包拆包的成因、四种主流解决方案，以及LineBased、FixedLength、LengthField等编解码器的实战用法。
+---
+
+字节跳动1-2面试间，候选人小郑正在讲Netty项目经验，面试官问：
+
+"你们Netty处理的是什么协议？"
+
+小郑说："自定义TCP协议。"面试官："那你遇到过粘包拆包问题吗？"
+
+小郑说："遇到过。"面试官："具体是什么情况？你怎么解决的？"
+
+小郑说："就是...数据粘在一起了...我们用LengthFieldBasedDecoder..."
+
+面试官追问："那你说说，粘包是怎么产生的？拆包呢？为什么TCP会粘包，UDP会不会？"
+
+小郑支支吾吾。
+
+面试官继续追问："LengthFieldBasedDecoder的三个核心参数是什么？如果报文长度字段不在最前面怎么办？"
+
+小郑彻底崩溃。
+
+【面试官心理】
+粘包拆包是Netty面试中出现频率最高的实战问题之一。90%的候选人知道"有这个问题"，但能讲清楚原理、能说清四种解决方案适用场景、能正确配置LengthFieldBasedDecoder参数的，不到30%。这道题是P6的硬门槛。
+
+## 一、粘包拆包的成因 🔴
+
+### 1.1 TCP为什么会粘包
+
+TCP是一个**面向字节流**的协议，不是面向消息的协议。应用程序的"一条消息"在TCP眼中只是一串字节，没有任何边界标记。
+
+```
+应用层发送：
+  [消息A] [消息B] [消息C]
+  
+TCP层看到的（可能）：
+  [消息A消息B][消息C]
+    ↑ 粘包      ↑ 半包
+    ↓            ↓
+  一个TCP包   被拆分成
+  包含多条     多个TCP包
+```
+
+**粘包**：多条应用层消息被合并到一个TCP包中发送。
+
+**拆包**：一条应用层消息被拆分到多个TCP包中。
+
+### 1.2 粘包的三种成因
+
+```
+成因1: 发送端问题
+  应用层连续快速发送两条消息
+  [消息A][消息B]
+    ↓
+  TCP Nagle算法合并（或直接发送）
+  [消息A消息B]  ← 粘在一起
+
+成因2: 接收端问题  
+  操作系统TCP接收缓冲区一次read()读到了多条消息
+  [缓冲区: 消息A消息B消息C]
+    ↓ read(1024)
+  [消息A消息B消息C]  ← 一次读走全部
+
+成因3: MTU/MSS限制
+  消息大小超过MSS（1460字节）
+  [消息A(3000字节)]
+    ↓ 被拆分成多个IP包
+  [第1片][第2片][第3片]
+```
+
+:::warning ⚠️
+关键误解：很多人以为"粘包是Netty的bug"。其实粘包是**TCP的正常行为**，是面向字节流协议的固有特性。Netty只是提供了工具来解决这个问题。
+
+### 1.3 UDP不会粘包
+
+UDP是**面向数据报**的协议，每条消息都有独立的边界：
+
+```
+UDP发送：
+  [消息A] → DatagramPacket A
+  [消息B] → DatagramPacket B
+  [消息C] → DatagramPacket C
+
+UDP接收：
+  每条消息独立到达，不会合并，也不会拆分
+```
+
+所以TCP有粘包问题，UDP没有。如果你的应用是UDP（如DNS、实时音视频），不需要处理粘包。
+
+### 1.4 ❌ 错误示范
+
+**候选人原话1**："粘包就是Netty的问题。"
+
+**问题诊断**：
+- 混淆了协议层和框架层。粘包是TCP的固有特性，与Netty无关。Netty只是提供了解决方案。
+
+**候选人原话2**："粘包是因为TCP缓冲区太小。"
+
+**问题诊断**：
+- TCP缓冲区大小影响的是"一次能读多少"，不是粘包的根因。粘包的根因是**TCP不维护应用层消息边界**。
+
+【面试官心理】
+TCP/UDP的区分是最基础的问题。能把粘包拆包的原理讲清楚（面向字节流vs面向消息、MTU限制、Nagle算法），说明理解了TCP的传输层原理。这道题答不好的，通常计算机网络基础也不扎实。
+
+## 二、四种主流解决方案 🔴
+
+### 2.1 方案对比
+
+| 方案 | 核心原理 | 适用场景 | 缺点 |
+| --- | --- | --- | --- |
+| 固定长度 | 每条消息长度固定 | 简单场景、协议固定 | 浪费带宽 |
+| 分隔符 | 用特殊字符标记消息结束 | 文本协议 | 内容不能包含分隔符 |
+| 长度字段 | 消息头+长度字段+数据 | 二进制协议（推荐） | 需要解析头 |
+| 行解码 | 按换行符分割 | 文本协议 | 性能略低 |
+
+### 2.2 方案一：固定长度（FixedLengthFrameDecoder）
+
+```java
+// 服务器端
+public class EchoServerInitializer extends ChannelInitializer<SocketChannel> {
+    @Override
+    protected void initChannel(SocketChannel ch) {
+        // 每100字节视为一条消息，不足100字节的会等待后续数据
+        ch.pipeline().addLast(
+            new FixedLengthFrameDecoder(100)
+        );
+        ch.pipeline().addLast(new EchoServerHandler());
+    }
+}
+```
+
+**适用场景**：消息长度固定、协议固定的内部系统。
+
+**缺点**：带宽浪费（短消息也要占满固定长度）。
+
+### 2.3 方案二：分隔符解码（DelimiterBasedFrameDecoder）
+
+```java
+// 服务器端：按 "\r\n" 分割
+public class DelimiterServerInitializer extends ChannelInitializer<SocketChannel> {
+    @Override
+    protected void initChannel(SocketChannel ch) {
+        ByteBuf delimiter = Unpooled.copiedBuffer("\r\n".getBytes());
+
+        ch.pipeline().addLast(
+            new DelimiterBasedFrameDecoder(1024, delimiter)
+        );
+        ch.pipeline().addLast(new StringDecoder());
+        ch.pipeline().addLast(new DelimiterServerHandler());
+    }
+}
+```
+
+**适用场景**：文本协议，如Redis协议、SMTP协议。
+
+**缺点**：消息内容中不能包含分隔符（需要转义，增加复杂度）。
+
+### 2.4 方案三：长度字段（LengthFieldBasedFrameDecoder）
+
+这是Netty最灵活、最强大的解决方案。
+
+```java
+// 协议格式：
+// [4字节长度字段][1字节版本][消息体]
+// 长度字段 = 版本+消息体 的总字节数
+
+public class LengthFieldInitializer extends ChannelInitializer<SocketChannel> {
+    @Override
+    protected void initChannel(SocketChannel ch) {
+        ch.pipeline().addLast(
+            new LengthFieldBasedFrameDecoder(
+                1024,          // maxFrameLength: 单帧最大长度
+                0,             // lengthFieldOffset: 长度字段的偏移量
+                4,             // lengthFieldLength: 长度字段本身占几个字节
+                0,             // lengthAdjustment: 长度调整值
+                4              // initialBytesToStrip: 帧头丢弃字节数
+            )
+        );
+        ch.pipeline().addLast(new BusinessHandler());
+    }
+}
+```
+
+**协议示例**：
+
+```
+原始数据：
+  [0x00 0x00 0x00 0x05][0x01][Hello]
+   ↑ 长度字段=5     ↑ 版本  ↑ 5字节消息体
+
+解析后（假设 initialBytesToStrip=4）：
+  [0x01][Hello]
+  ↑ 版本  ↑ 消息体（长度字段被丢弃）
+```
+
+### 2.5 长度字段参数详解 🟡
+
+`LengthFieldBasedFrameDecoder`的5个参数是最容易被问到的：
+
+```java
+new LengthFieldBasedFrameDecoder(
+    maxFrameLength,        // 最大帧长度，防止畸形数据
+    lengthFieldOffset,      // 长度字段的起始位置（偏移量）
+    lengthFieldLength,      // 长度字段占几个字节（1/2/3/4）
+    lengthAdjustment,       // 长度补偿 = 总帧长 - 长度字段值
+    initialBytesToStrip     // 解码后丢弃的字节数（通常=长度字段长度）
+)
+```
+
+**参数计算公式**：
+
+```
+总帧长度 = lengthFieldOffset + lengthFieldLength + lengthAdjustment + 消息体长度
+总帧长度 = lengthFieldOffset + lengthFieldLength + 实际数据长度
+```
+
+**常见配置示例**：
+
+```java
+// 协议1: [长度4字节][数据]  (最常见)
+new LengthFieldBasedFrameDecoder(65535, 0, 4, 0, 4);
+//  lenOffset=0, lenLen=4, adjustment=0, strip=4
+
+// 协议2: [魔数2字节][长度4字节][数据]
+new LengthFieldBasedFrameDecoder(65535, 2, 4, 0, 6);
+//  lenOffset=2, lenLen=4, adjustment=0, strip=6
+
+// 协议3: [长度4字节][魔数2字节][数据] (长度包含魔数)
+new LengthFieldBasedFrameDecoder(65535, 0, 4, -2, 4);
+//  lenOffset=0, lenLen=4, adjustment=-2, strip=4
+
+// 协议4: [魔数2字节][长度4字节][数据]
+new LengthFieldBasedFrameDecoder(65535, 2, 4, 0, 6);
+//  lenOffset=2, lenLen=4, adjustment=0, strip=6
+```
+
+:::tip 💡
+面试加分点：如果能说出`initialBytesToStrip=4`意味着"解码后丢弃长度字段，只把消息体传给Handler"，说明真正理解了参数含义。
+
+## 三、生产踩坑实录 🟡
+
+### 3.1 半包问题
+
+**线上案例**：某推送服务，消息长度<1024时正常，>1024的消息总是只收到一半。
+
+**根因**：`FixedLengthFrameDecoder(1024)`没有处理跨包数据，如果一条消息被分成两个TCP包传输，第二个包的数据会被丢弃。
+
+**解决**：使用`LengthFieldBasedFrameDecoder`，确保完整消息被正确组装。
+
+### 3.2 畸形数据攻击
+
+```java
+// ❌ 没有设置 maxFrameLength 的危险配置
+new LengthFieldBasedFrameDecoder(
+    Integer.MAX_VALUE,  // 没有上限！
+    0, 4, 0, 4
+);
+// 攻击者发送一个长度字段=2GB的消息，
+// Netty会尝试分配2GB内存 → OOM
+
+// ✅ 正确配置
+new LengthFieldBasedFrameDecoder(
+    1024 * 1024,  // 最大1MB
+    0, 4, 0, 4
+);
+```
+
+### 3.3 分隔符编码问题
+
+```java
+// ❌ 错误：消息内容中包含分隔符
+String msg = "HTTP/1.1 200 OK\r\nContent: test"; // 包含\r\n
+
+// ✅ 正确：消息内容中的分隔符需要转义
+// 协议规定：\r\n 作为分隔符，消息体中的\r\n需要用\r\n转义
+// 或者：使用更少出现的内容作为分隔符
+ByteBuf delimiter = Unpooled.copiedBuffer("|||".getBytes());
+```
+
+## 四、自定义协议设计 🟢
+
+### 4.1 推荐协议格式
+
+```
+┌────────┬──────────┬──────────┬────────────────┐
+│ 魔数   │ 版本号   │ 长度字段 │ 消息体         │
+│ 4字节  │ 1字节    │ 4字节    │ N字节          │
+└────────┴──────────┴──────────┴────────────────┘
+```
+
+```java
+// 协议头定义
+public class ProtocolHeader {
+    public static final int MAGIC = 0xCAFEBABE;  // 魔数
+    public static final int VERSION = 1;           // 版本号
+    public static final int HEADER_SIZE = 9;       // 4+1+4=9字节
+}
+
+// 消息格式：
+// [魔数4字节][版本1字节][长度4字节][数据N字节]
+```
+
+### 4.2 编解码器实现
+
+```java
+// 编码器
+public class MessageEncoder extends MessageToMessageEncoder<Message> {
+    @Override
+    protected void encode(ChannelHandlerContext ctx, Message msg, List<Object> out) {
+        ByteBuf buf = ctx.alloc().buffer();
+        buf.writeInt(ProtocolHeader.MAGIC);
+        buf.writeByte(ProtocolHeader.VERSION);
+        byte[] data = serialize(msg);
+        buf.writeInt(data.length);
+        buf.writeBytes(data);
+        out.add(buf);
+    }
+}
+
+// 解码器（使用LengthFieldBasedFrameDecoder配合自定义解码）
+public class MessageDecoder extends LengthFieldBasedFrameDecoder {
+    public MessageDecoder() {
+        super(65535, 4, 4, -9, 8);
+        // 4=魔数偏移, 4=长度字段长度, -9=长度补偿, 8=丢弃魔数+长度
+    }
+}
+```
+
+## 五、面试通关话术 🟢
+
+**开场**：
+> TCP是面向字节流的协议，不维护应用层消息的边界，所以会出现粘包和拆包。粘包是多个消息被合并到一个TCP包，拆包是一个消息被拆分到多个TCP包。UDP是面向数据报的，每条消息有独立边界，不会粘包。
+
+**被追问解决方案**：
+> 常见方案有四种：固定长度（简单但浪费带宽）、分隔符（适合文本协议如Redis）、长度字段（最灵活，推荐生产使用）、行解码（按换行符分割，适合日志类文本）。生产环境推荐长度字段方案，通过`LengthFieldBasedFrameDecoder`配置。
+
+**被追问参数配置**：
+> `maxFrameLength`设置单帧上限防止畸形攻击，`lengthFieldOffset`指定长度字段位置，`lengthFieldLength`指定长度字段占几个字节，`lengthAdjustment`处理长度字段是否包含帧头，`initialBytesToStrip`决定解码后丢弃多少字节。

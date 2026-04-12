@@ -1,0 +1,352 @@
+---
+title: Fork/Join框架：分而治之的并行艺术
+description: 从JDK 7引入的Fork/Join框架出发，深度拆解Work-Stealing算法、ForkJoinPool的工作原理、RecursiveTask与RecursiveAction的使用。
+---
+
+# Fork/Join框架：分而治之的并行艺术
+
+候选人小周在面试中遇到了这样一个问题：
+
+面试官问："你知道Fork/Join框架吗？它和普通线程池有什么区别？"
+
+小周说："Fork/Join用于并行处理分治算法，比如归并排序。"
+
+面试官追问："那你说说Work-Stealing是什么？为什么需要它？"
+
+小周说："...是让空闲的线程去偷其他线程的任务？"
+
+面试官继续追问："那ForkJoinPool和ThreadPoolExecutor的核心区别是什么？"
+
+小张答不上来。
+
+【面试官心理】
+Fork/Join是JDK 7引入的最精妙的并发框架之一。它的Work-Stealing算法是Doug Lea的杰作，在并行计算领域有广泛应用。知道Work-Stealing的候选人，说明他对并行计算算法有深入理解。这类候选人在处理大规模数据并行计算时，不会简单地用ThreadPoolExecutor，而是能正确选择ForkJoinPool。
+
+## 一、Fork/Join的核心思想 🔴
+
+### 1.1 分治算法的并行化
+
+Fork/Join的核心思想来自分治算法：
+
+```
+大问题 → 分成小问题 → 并行处理小问题 → 合并结果
+```
+
+经典应用：
+- **归并排序**：将数组分成两半，分别排序，然后合并
+- **并行求和**：将数组分成多段，分别求和，然后合并
+- **快速排序**：分区的并行化
+
+### 1.2 对比普通线程池
+
+| 维度 | ThreadPoolExecutor | ForkJoinPool |
+|------|-------------------|--------------|
+| 任务模型 | 独立任务池 | Work-Stealing（工作窃取） |
+| 任务粒度 | 独立任务 | 递归拆分的小任务 |
+| 负载均衡 | 无（静态分配） | 自动（窃取机制） |
+| 线程利用 | 空闲线程无法帮忙 | 空闲线程主动窃取任务 |
+| 适用场景 | IO密集型、独立任务 | CPU密集型、分治算法 |
+
+### 1.3 ForkJoinPool vs ThreadPoolExecutor
+
+```java
+// ThreadPoolExecutor：固定任务分配
+ExecutorService pool = Executors.newFixedThreadPool(4);
+pool.submit(task1); // task1固定分配给某个线程
+pool.submit(task2); // task2固定分配给某个线程
+
+// ForkJoinPool：Work-Stealing
+ForkJoinPool fjPool = ForkJoinPool.commonPool();
+fjPool.invoke(forkJoinTask); // 任务自动拆分和调度
+```
+
+## 二、Work-Stealing：让空闲线程主动帮忙 🔴
+
+### 2.1 Work-Stealing的核心思想
+
+在传统线程池中，任务被静态分配给线程。如果某个线程提前完成，它就空闲着。
+
+Work-Stealing解决了这个问题：
+
+```
+时间T1:
+  线程1: [任务A] [任务B] [任务C]  ← 工作最多
+  线程2: [任务X] [任务Y]           ← 工作较少
+  线程3: [任务P] [任务Q] [任务R]   ← 工作最多
+
+时间T2（线程2空闲，线程3工作多）:
+  线程1: [任务C]
+  线程2: [任务R] ← 窃取！去线程3的队列尾部偷任务
+  线程3: [任务P] [任务Q]
+```
+
+**关键点**：
+- 每个线程有自己的**双端队列（Deque）**
+- 空闲线程从其他线程的队列**尾部**窃取任务
+- 从尾部窃取是因为：尾部是最新加入的任务，被执行的可能性最小，减少冲突
+
+### 2.2 ForkJoinPool的内部结构
+
+```java
+public class ForkJoinPool extends AbstractExecutorService {
+    // 工作线程数组
+    final ForkJoinWorkerThreadFactory factory;
+    final ForkJoinWorkerThread[] workers;
+
+    // 工作窃取队列
+    static final class WorkQueue {
+        volatile int source;  // 窃取来源标记
+        int top;              // push/pop在这里（top端）
+        int base;             // poll/counter在这里（base端）
+        ForkJoinTask<?>[] array;
+    }
+}
+```
+
+### 2.3 任务窃取的执行流程
+
+```java
+// LIFO: push/pop（本地线程操作）
+void push(ForkJoinTask<?> task) {
+    ForkJoinTask<?>[] a = array;
+    int s = top++;
+    a[s] = task;
+    // CAS设置活跃度
+}
+
+// FIFO: poll（窃取操作）
+ForkJoinTask<?> poll() {
+    ForkJoinTask<?>[] a = array;
+    int b = base;
+    if (a != null) {
+        int s = --top;
+        ForkJoinTask<?> t = a[s];
+        // 窃取从base端进行，减少冲突
+    }
+}
+```
+
+**设计精妙之处**：本地线程使用LIFO（push/pop），窃取线程使用FIFO（poll）。
+- 本地线程用LIFO：因为刚fork的任务通常和当前任务相关，放在一起利用CPU缓存
+- 窃取用FIFO：从最老的任务开始，减少冲突
+
+## 三、ForkJoinTask的使用 🔴
+
+### 3.1 RecursiveTask：有返回值的任务
+
+```java
+// 并行求和：使用RecursiveTask
+public class SumTask extends RecursiveTask<Long> {
+    private static final int THRESHOLD = 10000;
+    private final long[] array;
+    private final int start, end;
+
+    public SumTask(long[] array, int start, int end) {
+        this.array = array;
+        this.start = start;
+        this.end = end;
+    }
+
+    @Override
+    protected Long compute() {
+        int length = end - start;
+
+        // 粒度足够小，直接计算
+        if (length <= THRESHOLD) {
+            long sum = 0;
+            for (int i = start; i < end; i++) {
+                sum += array[i];
+            }
+            return sum;
+        }
+
+        // 拆分任务
+        int mid = start + length / 2;
+        SumTask left = new SumTask(array, start, mid);
+        SumTask right = new SumTask(array, mid, end);
+
+        // fork：异步提交到线程池
+        left.fork();
+        right.fork();
+
+        // join：等待并获取结果
+        long leftResult = left.join();
+        long rightResult = right.join();
+
+        return leftResult + rightResult;
+    }
+}
+
+// 使用
+ForkJoinPool pool = ForkJoinPool.commonPool();
+long sum = pool.invoke(new SumTask(array, 0, array.length));
+```
+
+### 3.2 RecursiveAction：无返回值的任务
+
+```java
+// 并行数组处理：使用RecursiveAction
+public class SortTask extends RecursiveAction {
+    private static final int THRESHOLD = 1000;
+    private final Comparable[] array;
+    private final int start, end;
+
+    public SortTask(Comparable[] array, int start, int end) {
+        this.array = array;
+        this.start = start;
+        this.end = end;
+    }
+
+    @Override
+    protected void compute() {
+        int length = end - start;
+        if (length <= THRESHOLD) {
+            Arrays.sort(array, start, end);
+            return;
+        }
+
+        int mid = start + length / 2;
+        SortTask left = new SortTask(array, start, mid);
+        SortTask right = new SortTask(array, mid, end);
+
+        invokeAll(left, right); // 提交所有任务（fork+join的组合）
+
+        merge(start, mid, end); // 合并
+    }
+}
+```
+
+### 3.3 fork/join vs invokeAll
+
+```java
+// fork + join：手动控制
+left.fork();
+right.fork();
+leftResult = left.join();
+rightResult = right.join();
+
+// invokeAll：自动管理
+invokeAll(left, right); // 内部自动fork和join
+```
+
+**invokeAll更简洁**：推荐使用。
+
+## 四、ForkJoinPool的配置 🟡
+
+### 4.1 默认ForkJoinPool
+
+```java
+// commonPool：默认线程数 = CPU核心数 - 1
+ForkJoinPool commonPool = ForkJoinPool.commonPool();
+
+// 也可以指定并行度
+ForkJoinPool pool = new ForkJoinPool(8); // 8个worker线程
+```
+
+### 4.2 合适的并行度设置
+
+```java
+// CPU密集型：并行度 = CPU核心数
+Runtime.getRuntime().availableProcessors();
+
+// IO密集型（需要更多线程）：
+// 但ForkJoinPool主要用于CPU密集型
+// 对于IO密集型，用ThreadPoolExecutor更合适
+```
+
+### 4.3 异常处理
+
+```java
+// ForkJoinTask不会抛出受检异常
+// 需要用CheckedException包装
+public class ExceptionTask extends RecursiveTask<Integer> {
+    @Override
+    protected Integer compute() {
+        try {
+            return callService();
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+}
+
+// 或者使用Quietly.invoke静默处理
+try {
+    ForkJoinTask<Integer> task = new ExceptionTask();
+    task.invoke();
+    Integer result = task.get();
+} catch (Exception e) {
+    log.error("并行计算失败", e);
+}
+```
+
+## 五、Java 8 Stream的并行模式 🟡
+
+### 5.1 parallelStream的底层实现
+
+```java
+// parallelStream使用ForkJoinPool.commonPool
+List<Order> orders = getOrders();
+double avgPrice = orders.parallelStream()
+    .mapToDouble(Order::getPrice)
+    .average()
+    .orElse(0.0);
+
+// 底层等价于：
+ForkJoinPool pool = ForkJoinPool.commonPool();
+pool.submit(() ->
+    orders.stream()
+        .mapToDouble(Order::getPrice)
+        .average()
+        .orElse(0.0)
+).join();
+```
+
+### 5.2 何时使用parallelStream
+
+```java
+// ✅ 适合：CPU密集型操作 + 大数据集
+long sum = data.parallelStream()
+    .mapToLong(this::computeHeavy)
+    .sum();
+
+// ❌ 不适合：IO密集型操作
+long sum = data.parallelStream()
+    .mapToLong(this::callRemoteService) // IO操作！
+    .sum();
+
+// ❌ 不适合：小数据集
+long sum = listOf100Items.parallelStream()
+    .mapToLong(this::compute) // 小数据并行化开销 > 计算本身
+    .sum();
+```
+
+## 六、❌ 错误示范
+
+**候选人原话**："ForkJoinPool比ThreadPoolExecutor快，所以应该总是用ForkJoinPool。"
+
+**问题诊断**：
+- ForkJoinPool的Work-Stealing适用于**分治类任务**
+- 对于普通的独立任务，ThreadPoolExecutor更简单、更合适
+- IO密集型任务应该用ThreadPoolExecutor
+
+**候选人原话**："ForkJoinPool会自动把任务拆分到最细粒度。"
+
+**问题诊断**：
+- ForkJoinPool的任务拆分由程序员控制（通过递归+fork）
+- 如果拆分粒度太大，Work-Stealing的优势发挥不出来
+- 如果拆分粒度太小，线程创建和管理的开销会超过收益
+
+【面试官心理】
+Fork/Join和Work-Stealing是Java并发框架中最精妙的设计之一。能讲清楚Work-Stealing原理的候选人，说明他对并行计算算法有深入理解。这类候选人在处理大规模数据并行计算（如MapReduce风格的计算）时，能正确选择ForkJoinPool并合理设计任务粒度。
+
+## 七、面试应对脚本
+
+**面试官**："Work-Stealing是什么？为什么需要它？"
+**标准回答**："Work-Stealing是ForkJoinPool的核心算法。在传统线程池中，任务被静态分配给线程，空闲线程无法帮助其他线程。在Work-Stealing中，每个线程有自己的双端队列（Deque）。当一个线程完成了自己的任务，它会从其他线程的队列尾部'窃取'一个任务来执行。从尾部窃取是因为尾部是最老的任务，被执行的可能性最小，减少冲突。本地线程使用LIFO（push/pop），利用CPU缓存局部性；窃取用FIFO，从base端获取。这个设计让CPU始终有工作可做，最大化CPU利用率。"
+
+**面试官追问**："ForkJoinPool和ThreadPoolExecutor的区别是什么？"
+**标准回答**："核心区别是任务模型和负载均衡方式。ThreadPoolExecutor中每个任务独立分配给线程，没有负载均衡机制。ForkJoinPool使用Work-Stealing，空闲线程主动窃取其他线程的任务，实现自动负载均衡。ForkJoinPool适合分治类任务（如归并排序），ThreadPoolExecutor适合独立任务的并行处理。ForkJoinPool的并行度默认是CPU核心数-1，ThreadPoolExecutor需要手动配置。"
+
+【面试官心理】
+能回答Work-Stealing原理的候选人，说明他对并行计算算法有深入研究。这种候选人通常对性能优化有极高的热情，会主动研究JDK源码和算法设计。

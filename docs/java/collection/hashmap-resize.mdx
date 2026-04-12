@@ -1,0 +1,365 @@
+---
+title: HashMap 扩容机制深度解析
+description: 从一道"HashMap 扩容时会不会死循环"出发，深挖 JDK8 扩容源码、对半扩容的设计权衡、以及生产环境中的性能陷阱与优化策略。
+---
+
+# HashMap 扩容机制深度解析
+
+2024年双十一零点，某电商订单服务的 GC 停顿时间从 50ms 飙到 2s。
+
+DBA 发现数据库连接池正常，Redis 正常，网络正常。排查到最后，发现是 Java 进程在疯狂 GC。
+
+事后复盘：开发同学写了这么一段代码：
+
+```java
+Map<String, Order> orders = new HashMap<>();
+for (Order order : orderList) {  // 40万订单
+    orders.put(order.getId(), order);
+}
+```
+
+40万订单，HashMap 扩容了 18 次，每次扩容都要重新 hash 所有元素。DBA 在 GC 日志里看到了持续的 stop-the-world。
+
+这次事故的根因，就是 HashMap 扩容。
+
+【面试官心理】
+
+这道题我用来筛选有没有生产经验的候选人。能答出"预设容量"的只是基本操作，能说出"扩容时 stop-the-world"、"JDK7 死循环"、"JDK8 尾插法"这些深层机制的，才是真正踩过坑或者看过源码的。
+
+## 一、扩容的本质 🔴
+
+### 1.1 什么是扩容
+
+HashMap 的扩容（resize）发生在两个场景：
+1. **初始化**：第一次 put 时，数组为空，调用 resize() 初始化数组
+2. **容量不足**：元素数量超过 `threshold = capacity * loadFactor`
+
+扩容的操作是：创建容量为原来 2 倍的新数组，将所有元素 rehash 到新数组中。
+
+### 1.2 最简扩容实现
+
+```java
+// 有问题的扩容实现
+private void resize() {
+    Entry<K, V>[] oldTable = table;
+    int oldCapacity = oldTable.length;
+    int newCapacity = oldCapacity * 2;  // 2倍扩容
+
+    Entry<K, V>[] newTable = new Entry[newCapacity];
+
+    for (int i = 0; i < oldCapacity; i++) {
+        Entry<K, V> e = oldTable[i];
+        if (e != null) {
+            // 重新计算位置
+            int index = e.key.hashCode() % newCapacity;
+            e.next = newTable[index];
+            newTable[index] = e;  // 头插法
+        }
+    }
+    table = newTable;
+    threshold = (int)(newCapacity * loadFactor);
+}
+```
+
+这段代码能跑，但有**致命问题**：
+
+1. **头插法导致链表反转**：JDK7 中，两个线程同时扩容时，链表会形成环形，get 时死循环
+2. **没有处理迭代器的 modCount**：扩容后迭代器失效
+
+JDK8 修复了这些问题。
+
+## 二、JDK8 扩容源码 🔴
+
+### 2.1 resize 方法
+
+```java
+final Node<K, V>[] resize() {
+    Node<K, V>[] oldTab = table;
+    int oldCap = (oldTab == null) ? 0 : oldTab.length;
+    int oldThr = threshold;
+    int newCap, newThr = 0;
+
+    if (oldCap > 0) {
+        // 容量已达上限，不再扩容
+        if (oldCap >= MAXIMUM_CAPACITY) {
+            threshold = Integer.MAX_VALUE;
+            return oldTab;
+        }
+        // 新容量 = 旧容量 * 2
+        else if ((newCap = oldCap << 1) < MAXIMUM_CAPACITY &&
+                 oldCap >= DEFAULT_INITIAL_CAPACITY)
+            newThr = oldThr << 1;  // 阈值也翻倍
+    }
+    else if (oldThr > 0)
+        // 使用构造时指定的 initialCapacity（通过 threshold 存储）
+        newCap = oldThr;
+    else {
+        // 使用默认参数
+        newCap = DEFAULT_INITIAL_CAPACITY;  // 16
+        newThr = (int)(DEFAULT_LOAD_FACTOR * DEFAULT_INITIAL_CAPACITY);  // 12
+    }
+
+    if (newThr == 0) {
+        float ft = (float)newCap * loadFactor;
+        newThr = (newCap < MAXIMUM_CAPACITY && ft < (float)MAXIMUM_CAPACITY ?
+                  (int)ft : Integer.MAX_VALUE);
+    }
+
+    threshold = newThr;
+
+    // 创建新数组
+    @SuppressWarnings("rawtypes")
+    Node<K, V>[] newTab = (Node<K, V>[]) new Node[newCap];
+    table = newTab;
+
+    // 核心：迁移数据
+    if (oldTab != null) {
+        for (int j = 0; j < oldCap; ++j) {
+            Node<K, V> e;
+            if ((e = oldTab[j]) != null) {
+                oldTab[j] = null;  // 释放旧引用，帮助 GC
+
+                if (e.next == null)
+                    // 桶内只有一个节点，直接计算新位置
+                    newTab[e.hash & (newCap - 1)] = e;
+                else if (e instanceof TreeNode)
+                    // 红黑树节点，分裂处理
+                    ((TreeNode<K, V>)e).split(this, newTab, j, oldCap);
+                else {
+                    // 链表节点 JDK8 优化：不用全部 rehash
+                    Node<K, V> loHead = null, loTail = null;
+                    Node<K, V> hiHead = null, hiTail = null;
+                    Node<K, V> next;
+                    do {
+                        next = e.next;
+                        // 关键：判断是否需要移动到高位桶
+                        if ((e.hash & oldCap) == 0) {
+                            // 留在原位置（原桶的低位部分）
+                            if (loTail == null)
+                                loHead = e;
+                            else
+                                loTail.next = e;
+                            loTail = e;
+                        }
+                        else {
+                            // 移动到新位置（原位置 + oldCap）
+                            if (hiTail == null)
+                                hiHead = e;
+                            else
+                                hiTail.next = e;
+                            hiTail = e;
+                        }
+                    } while ((e = next) != null);
+
+                    // 尾插法，不会反转链表
+                    if (loTail != null) {
+                        loTail.next = null;
+                        newTab[j] = loHead;
+                    }
+                    if (hiTail != null) {
+                        hiTail.next = null;
+                        newTab[j + oldCap] = hiHead;  // 新位置 = 原位置 + oldCap
+                    }
+                }
+            }
+        }
+    }
+    return newTab;
+}
+```
+
+### 2.2 JDK8 扩容的关键优化
+
+这是面试官最爱追问的细节：**JDK8 扩容时，为什么不需要重新计算每个元素的 hash？**
+
+```java
+// 旧数组容量 16, 新数组容量 32
+// 旧数组: index = hash & 15 = hash & 0b1111
+// 新数组: index = hash & 31 = hash & 0b11111
+```
+
+关键在于 `(e.hash & oldCap) == 0` 这个判断：
+
+```java
+// hash & oldCap 的结果只有两种：0 或 oldCap
+// 因为 oldCap 是 2 的幂次，二进制只有一位是 1
+
+假设 oldCap = 16 = 0b00010000
+hash 的第 5 位（从 0 开始计数）决定结果：
+  hash = 0bXXXX XXX? XXXX (第5位是0) → hash & 16 = 0
+  hash = 0bXXXX XXX1 XXXX (第5位是1) → hash & 16 = 16
+```
+
+所以，**JDK8 扩容时每个元素只需要判断新增的那一位是 0 还是 1**，而不是重新计算整个 hash。
+
+:::tip 💡
+这个优化是 JDK8 引入的，JDK7 需要对每个元素重新计算 `hash % newCap`。当元素很多时，JDK8 的这个优化能节省大量计算。
+:::
+
+### 2.3 尾插法的安全保证
+
+JDK7 用头插法：
+```java
+newTab[index] = e;  // 新节点成为桶的头
+e.next = oldHead;   // 旧头成为新头的next
+```
+
+JDK8 用尾插法：
+```java
+loTail.next = e;  // 接在链表尾部
+loTail = e;
+```
+
+**头插法的问题**：在多线程环境下，两个线程同时扩容，会导致链表反转，形成环形链表：
+
+```
+初始链表: A -> B -> C
+
+线程1执行一半: A -> B -> C (正准备插入)
+线程2也在扩容: B -> A -> C (链表反转了！)
+
+继续执行后，可能形成: A -> B -> A (环形！)
+get 操作: 死循环！
+```
+
+JDK8 的尾插法保证了链表顺序不变，不会形成环形。
+
+## 三、扩容次数计算 🟡
+
+### 3.1 扩容序列
+
+初始容量 16，负载因子 0.75，扩容阈值 = 12：
+
+| 次数 | 容量 | 触发时机 | 累计元素 |
+| --- | --- | --- | --- |
+| 1 | 16 | 初始化 | 0 |
+| 2 | 32 | 第13个元素 | 13 |
+| 3 | 64 | 第25个元素 | 25 |
+| 4 | 128 | 第49个元素 | 49 |
+| 5 | 256 | 第97个元素 | 97 |
+| ... | ... | ... | ... |
+
+N 个元素需要的扩容次数约为 `log₂(N/16)`，100万个元素需要约 **26次扩容**。
+
+### 3.2 扩容性能代价
+
+每次扩容涉及：
+1. **分配新数组**：GC 压力
+2. **rehash 所有元素**：CPU 计算
+3. **复制数据**：`System.arraycopy` 或逐个复制
+
+| 数据量 | 扩容次数 | rehash 元素总数 |
+| --- | --- | --- |
+| 100 | 3 | 16 + 32 + 64 ≈ 112 |
+| 1,000 | 7 | 16 + 32 + 64 + ... + 512 ≈ 1008 |
+| 10,000 | 10 | 约 16368 |
+| 1,000,000 | 17 | 约 1,048,560 |
+
+100万个元素，rehash 超过 100 万次，每次涉及对象操作。这就是双十一零点 HashMap 扩容导致 GC 停顿的根因。
+
+## 四、生产避坑指南 🔴
+
+### 4.1 场景一：批量数据导入
+
+```java
+// ❌ 翻车写法：每次 add 都可能触发扩容
+Map<String, Order> orders = new HashMap<>();
+for (Order order : orderList) {  // 100万条
+    orders.put(order.getId(), order);  // 扩容 + rehash
+}
+
+// ✅ 正确：预设容量
+Map<String, Order> orders = new HashMap<>(orderList.size() * 2);
+// 为什么不直接用 size()？因为负载因子 0.75，需要预留空间
+// size() * 2 确保不会触发扩容
+
+// ✅ 更保守：再加点余量
+Map<String, Order> orders = new HashMap<>((int)(orderList.size() / 0.75));
+```
+
+:::warning ⚠️
+`new HashMap<>(size)` 设置的是 initialCapacity，不是实际容量。HashMap 会将 size 向上取整到 2 的幂次。比如 `new HashMap<>(100)` 实际 initialCapacity 是 128，预估 96 个元素触发扩容。
+:::
+
+### 4.2 场景二：接口返回值
+
+```java
+// ❌ 错误：HashMap 默认容量 16，如果返回的 list 很大，调用方 put 时会扩容
+public Map<String, Object> getData() {
+    return new HashMap<>();  // 容量16
+}
+
+// ✅ 正确：根据数据量预估
+public Map<String, Object> getData() {
+    Map<String, Object> map = new HashMap<>(expectedSize);
+    // ... 填充数据
+    return map;
+}
+
+// ✅ 或者使用 Collections.singletonMap / Map.of（如果数据固定）
+public Map<String, Object> getConfig() {
+    return Map.of("key1", "value1", "key2", "value2");
+}
+```
+
+### 4.3 场景三：本地缓存
+
+```java
+// ❌ 错误：无限增长
+Map<String, Object> cache = new HashMap<>();
+while (true) {
+    cache.put(key, value);  // 无限扩容，内存爆炸
+}
+
+// ✅ 正确：使用 LinkedHashMap 实现 LRU 缓存
+Map<String, Object> cache = new LinkedHashMap<>(16, 0.75f, true) {
+    @Override
+    protected boolean removeEldestEntry(Map.Entry eldest) {
+        return size() > MAX_CACHE_SIZE;  // 超过容量自动删除最老元素
+    }
+};
+```
+
+## 五、面试追问链 🟡
+
+### 追问一：JDK7 和 JDK8 扩容有什么区别？
+
+| 维度 | JDK7 | JDK8 |
+| --- | --- | --- |
+| 链表方向 | 头插法（可能死循环） | 尾插法（安全） |
+| rehash | 重新计算 hash | 只判断新增位 |
+| 迭代器安全 | 扩容时可能 fail-fast | 更安全 |
+| 迁移顺序 | 和原顺序相反 | 和原顺序相同 |
+
+### 追问二：容量必须是 2 的幂次，怎么保证？
+
+HashMap 提供了 `tableSizeFor()` 方法：
+
+```java
+static final int tableSizeFor(int cap) {
+    int n = cap - 1;
+    n |= n >>> 1;
+    n |= n >>> 2;
+    n |= n >>> 4;
+    n |= n >>> 8;
+    n |= n >>> 16;
+    return (n < 0) ? 1 : (n >= MAXIMUM_CAPACITY) ? MAXIMUM_CAPACITY : n + 1;
+}
+```
+
+`tableSizeFor(10)` 返回 16，`tableSizeFor(15)` 返回 16，`tableSizeFor(16)` 返回 16，`tableSizeFor(17)` 返回 32。
+
+### 追问三：扩容阈值是怎么计算的？
+
+```java
+threshold = (int)(capacity * loadFactor)
+// 例如：capacity = 16, loadFactor = 0.75
+// threshold = 12
+
+// 当 size > threshold 时触发扩容
+if (++size > threshold) resize();
+```
+
+【面试官心理】
+
+问到"容量必须是2的幂次"和"tableSizeFor"的候选人，通常是看过源码或者对设计有追求的。我追问的目的是确认他是真的理解，而不是背了几行注释。扩容机制是 HashMap 中最复杂也最容易被忽略的部分，能讲清楚 JDK8 优化点的，基本都值得发offer。
