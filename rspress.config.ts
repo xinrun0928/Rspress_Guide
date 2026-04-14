@@ -26,7 +26,7 @@ const siteMeta = {
   /** 作者信息 */
   author: 'Mr.zhang',
   /** 网站配色主题 - 对应 styles/global_{theme}.css 样式文件名称 */
-  theme: 'steel',
+  theme: 'default',
   /** 站点关键词 - 根据导航栏目自动生成 */
   keywords: [
     // 面试准备
