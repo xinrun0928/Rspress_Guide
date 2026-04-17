@@ -1,0 +1,534 @@
+---
+title: Netty 粘包 / 拆包解决方案
+description: TCP粘包拆包是什么？为什么会出现？怎么解决？Netty内置的解码器怎么用？本文通过图解和实战代码讲透这个网络开发难题。
+---
+
+# Netty 粘包 / 拆包解决方案
+
+做过网络编程的同学，基本都踩过粘包和拆包的坑。明明发送的是两条消息，接收方却收到了一条；或者一条消息被拆成了两段，收到的数据是残缺的。
+
+我之前带一个实习生做一个 IM 系统，他写的代码发消息正常，但收消息经常解析出错。排查了半天，发现就是粘包没处理好。
+
+今天我们就来彻底搞懂粘包和拆包，以及 Netty 是怎么解决的。
+
+## 一、TCP 粘包和拆包是什么
+
+### 1.1 TCP 的流特性
+
+TCP 是面向流的协议，数据像水流一样传输，没有消息边界：
+
+```
+发送端：              TCP 数据流：                接收端：
+                                   
+消息A ─────────────→ ████████████████ ─────────────→ 消息A+消息B
+消息B ─────────────→ █████                  （粘在一起）
+                                       
+或者：
+                                   
+消息A ─────────────→ ████ ████████████ ───────→ A? AB? 乱码！
+消息B ─────────────→ （不完整）
+```
+
+### 1.2 粘包的原因
+
+多个消息被"粘"在一起，接收方一次性收到多个消息：
+
+| 原因 | 说明 |
+| --- | --- |
+| 发送方写入速度快 | 多个小数据包被 TCP 合并成一个大包发送 |
+| 接收方读取缓冲区 | 内核缓冲区积累了一定数据才交付给应用 |
+| Nagle 算法 | TCP 为了减少小包发送，会等待合并 |
+
+### 1.3 拆包的原因
+
+一个消息被拆成了多段，接收方分多次收到：
+
+| 原因 | 说明 |
+| --- | --- |
+| 消息大于 MTU | 超过网络层的最大传输单元，被拆分 |
+| TCP 窗口机制 | 数据量大时分窗口传输 |
+| 应用读取不及时 | 缓冲区积累，只读到部分数据 |
+
+### 1.4 【直观类比】
+
+【直观类比】
+
+把 TCP 想象成快递运输：
+
+- **粘包**：你发了 3 个快递（3 条消息），快递公司为了省油，把它们装进同一个集装箱运输。收货人打开集装箱，看到的是 3 个混在一起的包裹。
+- **拆包**：你发了一个大件（1 条大消息），集装箱装不下，快递公司把它拆成两部分运输。收货人只收到了前半部分。
+
+TCP 只保证"按顺序、可靠地传输字节流"，不保证"按消息边界交付"。
+
+## 二、常见解决方案
+
+### 2.1 固定长度
+
+最简单的方案：每个消息都是固定长度。
+
+```
+[固定长度消息] [固定长度消息] [固定长度消息]
+      100B            100B            100B
+```
+
+```java
+// 发送端：每条消息固定 100 字节
+public class FixedLengthSender {
+    public void send(String message, ChannelHandlerContext ctx) {
+        byte[] bytes = message.getBytes();
+        byte[] fixed = new byte[100];
+        System.arraycopy(bytes, 0, fixed, 0, Math.min(bytes.length, 100));
+        ctx.writeAndFlush(Unpooled.wrappedBuffer(fixed));
+    }
+}
+```
+
+```java
+// Netty 解码：FixedLengthFrameDecoder
+public class NettyFixedLengthServer {
+    public static void main(String[] args) {
+        ServerBootstrap bootstrap = new ServerBootstrap();
+        bootstrap.childHandler(new ChannelInitializer<SocketChannel>() {
+            @Override
+            protected void initChannel(SocketChannel ch) {
+                // 固定长度解码器：每 100 字节切一刀
+                ch.pipeline().addLast(new FixedLengthFrameDecoder(100));
+                ch.pipeline().addLast(new MyHandler());
+            }
+        });
+    }
+}
+```
+
+**缺点**：浪费带宽，消息长度不固定时难以使用。
+
+### 2.2 特殊分隔符
+
+用特殊字符分隔消息，比如换行符 `\n`。
+
+```
+消息A\n消息B\n消息C\n
+```
+
+```java
+// 发送端：每条消息以 \n 结尾
+public class DelimiterSender {
+    public void send(String message, ChannelHandlerContext ctx) {
+        ByteBuf buf = Unpooled.buffer();
+        buf.writeBytes(message.getBytes());
+        buf.writeByte('\n');  // 分隔符
+        ctx.writeAndFlush(buf);
+    }
+}
+```
+
+```java
+// Netty 解码：LineBasedFrameDecoder
+public class NettyDelimiterServer {
+    public static void main(String[] args) {
+        ServerBootstrap bootstrap = new ServerBootstrap();
+        bootstrap.childHandler(new ChannelInitializer<SocketChannel>() {
+            @Override
+            protected void initChannel(SocketChannel ch) {
+                // 行分隔符解码器
+                ch.pipeline().addLast(new LineBasedFrameDecoder(1024));
+                ch.pipeline().addLast(new MyHandler());
+            }
+        });
+    }
+}
+```
+
+**缺点**：如果消息内容本身包含分隔符，需要转义。
+
+### 2.3 长度字段（最常用）
+
+在消息头中放长度字段，接收方根据长度来切分。
+
+```
+┌────────────────┬───────────────┐
+│   Length (4B)  │    Content   │
+│     0x0C        │   12 bytes   │
+└────────────────┴───────────────┘
+```
+
+这是最灵活的方案，适合二进制协议。
+
+## 三、LengthFieldBasedFrameDecoder 详解
+
+### 3.1 参数说明
+
+Netty 的 `LengthFieldBasedFrameDecoder` 是处理粘包拆包的核心：
+
+```java
+public LengthFieldBasedFrameDecoder(
+    int maxFrameLength,       // 最大帧长度（超过会抛异常）
+    int lengthFieldOffset,    // 长度字段的偏移量
+    int lengthFieldLength,    // 长度字段的字节数（1/2/3/4）
+    int lengthAdjustment,     // 长度调整值
+    int initialBytesToStrip   // 解码后跳过的字节数
+)
+```
+
+### 3.2 常见模式
+
+**模式1：长度字段在最前面**
+
+```
+原始数据: [Length: 4][Content: Hello]
+                ↑
+           lengthFieldOffset = 0
+           lengthFieldLength = 4
+```
+
+```java
+// 解码
+ch.pipeline().addLast(new LengthFieldBasedFrameDecoder(
+    1024,     // maxFrameLength
+    0,        // lengthFieldOffset
+    4,        // lengthFieldLength
+    0,        // lengthAdjustment（Length 后面就是 Content）
+    0         // initialBytesToStrip（不跳过任何字节）
+));
+```
+
+**模式2：跳过长度字段**
+
+```java
+// 解码后跳过长度字段
+ch.pipeline().addLast(new LengthFieldBasedFrameDecoder(
+    1024,     // maxFrameLength
+    0,        // lengthFieldOffset
+    4,        // lengthFieldLength
+    0,        // lengthAdjustment
+    4         // initialBytesToStrip（跳过 4 字节的长度字段）
+));
+// 收到的 msg 只有 Content 部分
+```
+
+**模式3：长度字段在中间**
+
+```
+原始数据: [Header][Length: 4][Content]
+              ↑       ↑
+         offset=8  lengthFieldLength=4
+```
+
+```java
+ch.pipeline().addLast(new LengthFieldBasedFrameDecoder(
+    1024,
+    8,       // 长度字段在偏移 8 的位置
+    4,
+    0,       // 不调整
+    0
+));
+```
+
+**模式4：长度字段包含自己**
+
+```
+原始数据: [Length: 5][Content: Hello]
+              ↑
+         Length = 4（不包含自己） + 1 = 5
+         lengthAdjustment = 0
+```
+
+```java
+ch.pipeline().addLast(new LengthFieldBasedFrameDecoder(
+    1024,
+    0,
+    4,        // 4 字节长度
+    -4,       // lengthAdjustment = -(长度字段字节数)
+    0
+));
+```
+
+## 四、实战：自定义协议编解码
+
+### 4.1 协议设计
+
+```
+┌──────────┬──────────┬──────────┬──────────────┬──────────┐
+│ Magic(2) │ Version  │  Type    │  Length(4)   │  Body    │
+│  0xCAFE  │ (1 byte)│ (2 byte) │   (int)      │ (N byte) │
+└──────────┴──────────┴──────────┴──────────────┴──────────┘
+```
+
+| 字段 | 字节数 | 说明 |
+| --- | --- | --- |
+| Magic | 2 | 固定魔数 0xCAFE，用于识别协议 |
+| Version | 1 | 协议版本号 |
+| Type | 2 | 消息类型 |
+| Length | 4 | Body 长度 |
+| Body | N | 消息体 |
+
+### 4.2 消息实体类
+
+```java
+public class Packet {
+    private short magic = (short) 0xCAFE;
+    private byte version = 1;
+    private short type;
+    private int length;
+    private byte[] body;
+    
+    // 省略 getter/setter/constructor
+}
+```
+
+### 4.3 编码器
+
+```java
+public class PacketEncoder extends MessageToByteEncoder<Packet> {
+    @Override
+    protected void encode(ChannelHandlerContext ctx, Packet packet, ByteBuf out) {
+        // 分配足够的空间
+        out.writeShort(packet.getMagic());
+        out.writeByte(packet.getVersion());
+        out.writeShort(packet.getType());
+        out.writeInt(packet.getLength());
+        out.writeBytes(packet.getBody());
+    }
+}
+```
+
+### 4.4 解码器
+
+```java
+public class PacketDecoder extends ByteToMessageDecoder {
+    @Override
+    protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) {
+        // 1. 检查是否有足够的数据（至少 9 字节：2+1+2+4）
+        if (in.readableBytes() < 9) {
+            return;
+        }
+        
+        // 2. 标记读取位置
+        in.markReaderIndex();
+        
+        // 3. 读取头部
+        short magic = in.readShort();
+        if (magic != 0xCAFE) {
+            throw new CorruptedFrameException("Invalid magic: " + magic);
+        }
+        
+        byte version = in.readByte();
+        short type = in.readShort();
+        int length = in.readInt();
+        
+        // 4. 检查是否有完整的 body
+        if (in.readableBytes() < length) {
+            in.resetReaderIndex();  // 数据不完整，重置位置
+            return;
+        }
+        
+        // 5. 读取 body
+        byte[] body = new byte[length];
+        in.readBytes(body);
+        
+        // 6. 构建消息
+        Packet packet = new Packet();
+        packet.setMagic(magic);
+        packet.setVersion(version);
+        packet.setType(type);
+        packet.setLength(length);
+        packet.setBody(body);
+        
+        out.add(packet);
+    }
+}
+```
+
+### 4.5 配置 Pipeline
+
+```java
+public class NettyServer {
+    public static void main(String[] args) {
+        ServerBootstrap bootstrap = new ServerBootstrap();
+        bootstrap.childHandler(new ChannelInitializer<SocketChannel>() {
+            @Override
+            protected void initChannel(SocketChannel ch) {
+                ch.pipeline()
+                  // 1. 解决粘包拆包
+                  .addLast(new LengthFieldBasedFrameDecoder(
+                      1024 * 1024,  // 最大 1MB
+                      7,            // 长度字段在偏移 7 的位置
+                      4,            // 4 字节长度
+                      0,            // 不调整
+                      0             // 不跳过
+                  ))
+                  // 2. 自定义解码
+                  .addLast(new PacketDecoder())
+                  // 3. 自定义编码
+                  .addLast(new PacketEncoder())
+                  // 4. 业务 Handler
+                  .addLast(new BusinessHandler());
+            }
+        });
+    }
+}
+```
+
+## 五、常用编解码器组合
+
+### 5.1 TextLine 编解码
+
+用于基于行的文本协议：
+
+```java
+ch.pipeline()
+  .addLast(new LineBasedFrameDecoder(1024))  // 按 \n 分割
+  .addLast(new StringDecoder())               // 解码成 String
+  .addLast(new StringEncoder());              // 编码成 String
+```
+
+### 5.2 JSON 编解码
+
+```java
+// 使用 Jackson
+ch.pipeline()
+  .addLast(new LengthFieldBasedFrameDecoder(1024 * 1024, 0, 4, 0, 4))
+  .addLast(new LengthFieldPrepender(4))  // 添加长度字段
+  .addLast(new JsonDecoder())            // JSON 解码
+  .addLast(new JsonEncoder());           // JSON 编码
+```
+
+### 5.3 Protobuf 编解码
+
+```java
+// 使用 protobuf
+ch.pipeline()
+  .addLast(new ProtobufVarint32FrameAdapter())
+  .addLast(new ProtobufDecoder(MyMessage.getDefaultInstance()))
+  .addLast(new ProtobufEncoder());
+```
+
+## 六、生产避坑
+
+### 6.1 ❌ 错误示范：没有处理半包
+
+```java
+public class BadDecoder extends ByteToMessageDecoder {
+    @Override
+    protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) {
+        // ❌ 错误：假设数据总是完整的
+        byte[] body = new byte[in.readableBytes()];
+        in.readBytes(body);
+        out.add(new String(body));
+    }
+}
+```
+
+正确做法：检查数据是否足够，不够就等待：
+
+```java
+@Override
+protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) {
+    // 检查是否有至少 4 字节的长度字段
+    if (in.readableBytes() < 4) {
+        return;  // 数据不够，等待更多数据
+    }
+    
+    // 标记位置
+    in.markReaderIndex();
+    
+    // 读取长度
+    int length = in.readInt();
+    
+    // 检查是否有完整数据
+    if (in.readableBytes() < length) {
+        in.resetReaderIndex();  // 数据不完整，重置
+        return;
+    }
+    
+    // 读取数据
+    byte[] body = new byte[length];
+    in.readBytes(body);
+    out.add(new String(body));
+}
+```
+
+### 6.2 ❌ 错误示范：LengthFieldPrepender 不当使用
+
+```java
+// ❌ 错误配置：两次加长度字段
+ch.pipeline()
+  .addLast(new LengthFieldPrepender(4))  // 加了长度
+  .addLast(new LengthFieldPrepender(4)); // 又加了一个长度
+```
+
+### 6.3 ❌ 错误示范：没有处理异常数据
+
+```java
+@Override
+protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) {
+    // ❌ 没有检查数据合法性
+    int length = in.readInt();
+    
+    // 如果 length 是负数或极大，会 OOM
+    byte[] body = new byte[length];  // 可能整数溢出
+}
+```
+
+正确做法：检查长度范围：
+
+```java
+@Override
+protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) {
+    if (in.readableBytes() < 4) {
+        return;
+    }
+    
+    in.markReaderIndex();
+    int length = in.readInt();
+    
+    // 检查长度合法性
+    if (length < 0 || length > 1024 * 1024) {
+        throw new CorruptedFrameException("Invalid length: " + length);
+    }
+    
+    if (in.readableBytes() < length) {
+        in.resetReaderIndex();
+        return;
+    }
+    
+    byte[] body = new byte[length];
+    in.readBytes(body);
+    out.add(new String(body));
+}
+```
+
+## 七、面试追问链
+
+### 第一层：基础概念
+
+面试官问："什么是 TCP 粘包和拆包？"
+
+粘包是多个消息被合并成一个 TCP 包发送，接收方一次收到多个消息。拆包是一个消息被分成多个 TCP 包，接收方分多次收到。原因是 TCP 是流协议，不保证按消息边界交付。
+
+### 第二层：解决方案
+
+面试官追问："有哪些解决粘包拆包的方案？"
+
+固定长度（简单但浪费）、分隔符（如 `\n`，需要转义）、长度字段（最灵活）。Netty 提供了 `FixedLengthFrameDecoder`、`LineBasedFrameDecoder`、`LengthFieldBasedFrameDecoder`。
+
+### 第三层：LengthField 参数
+
+面试官追问："LengthFieldBasedFrameDecoder 的参数怎么配置？"
+
+`maxFrameLength` 是最大帧长度；`lengthFieldOffset` 是长度字段的偏移；`lengthFieldLength` 是长度字段的字节数；`lengthAdjustment` 是长度调整；`initialBytesToStrip` 是解码后跳过的字节数。
+
+### 第四层：自定义协议
+
+面试官追问："你做过自定义协议吗？"
+
+可以描述自己做过的协议设计，比如头部包含魔数、版本号、消息类型、长度字段、消息体，以及相应的编码器和解码器实现。
+
+【学习小结】
+- TCP 是流协议，没有消息边界
+- 粘包：多条消息合并成一个包
+- 拆包：一条消息被分成多个包
+- 解决方案：固定长度、分隔符、长度字段
+- LengthFieldBasedFrameDecoder 是最灵活的方案
+- 解码时必须检查数据是否完整
+- 异常数据要抛出 CorruptedFrameException
